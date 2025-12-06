@@ -1,5 +1,12 @@
 import stdlib.sl
 
+:asm mem-slot {
+    lea rax, [rel print_buf]
+    sub r12, 8
+    mov [r12], rax
+}
+;
+
 : test-add
     5 7 + puts
 ;
@@ -32,6 +39,28 @@ import stdlib.sl
     2 5 swap - puts
 ;
 
+: test-store
+    mem-slot dup
+    123 swap !
+    @ puts
+;
+
+
+: test-mmap
+    0      # addr hint (NULL)
+    4096   # length (page)
+    3      # prot (PROT_READ | PROT_WRITE)
+    34     # flags (MAP_PRIVATE | MAP_ANON)
+    -1     # fd (ignored for MAP_ANON)
+    0      # offset
+    mmap
+    dup
+    1337 swap !
+    dup
+    @ puts
+    4096 munmap drop
+;
+
 : main
     test-add
     test-sub
@@ -41,5 +70,7 @@ import stdlib.sl
     test-drop
     test-dup
     test-swap
+    test-store
+    test-mmap
     0
 ;

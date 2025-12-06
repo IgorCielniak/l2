@@ -58,7 +58,13 @@ class Reader:
 		token_start = 0
 		token_line = 1
 		token_column = 0
-		for char in source:
+		source_len = len(source)
+		while index < source_len:
+			char = source[index]
+			if char == "#":
+				while index < source_len and source[index] != "\n":
+					index += 1
+				continue
 			if char.isspace():
 				if lexeme:
 					yield Token(

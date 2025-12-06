@@ -109,6 +109,50 @@ puts_finish_digits:
 }
 ;
 
+:asm @ {
+	mov rax, [r12]
+	mov rax, [rax]
+	mov [r12], rax
+}
+;
+
+:asm ! {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	mov [rax], rbx
+	add r12, 8
+}
+;
+
+:asm mmap {
+	mov r9, [r12]
+	add r12, 8
+	mov r8, [r12]
+	add r12, 8
+	mov r10, [r12]
+	add r12, 8
+	mov rdx, [r12]
+	add r12, 8
+	mov rsi, [r12]
+	add r12, 8
+	mov rdi, [r12]
+	mov rax, 9
+	syscall
+	mov [r12], rax
+}
+;
+
+:asm munmap {
+	mov rsi, [r12]
+	add r12, 8
+	mov rdi, [r12]
+	mov rax, 11
+	syscall
+	mov [r12], rax
+}
+;
+
 :asm exit {
 	mov rdi, [r12]
 	add r12, 8

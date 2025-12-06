@@ -32,6 +32,23 @@
 - **Typed views**: Optional helper words interpret memory as bytes, half-words, floats, or structs but core semantics stay cell-based.
 - **User-defined types**: `struct`, `union`, and `enum` builders produce layout descriptors plus accessor words that expand to raw loads/stores.
 
+### 4.1 Struct Builder
+
+```
+struct: Point
+    field x 8
+    field y 8
+;struct
+```
+
+- `struct:` is an immediate word. It consumes field declarations until the matching `;struct` token.
+- Each `field <name> <bytes>` line appends a member with byte size `<bytes>`; fields are laid out sequentially without implicit padding.
+- The builder expands into ordinary word definitions:
+  - `<Struct>.size` plus `<Struct>.<field>.size` and `<Struct>.<field>.offset` constants.
+  - `<Struct>.<field>@ ( addr -- value )` loads a field by computing `addr + offset` and applying `@`.
+  - `<Struct>.<field>! ( value addr -- )` stores a field via `addr + offset !`.
+- Because the output is plain L2 code, users can inspect or override any generated word, and additional helpers (e.g., pointer arithmetic or iterators) can be layered on top with regular macros.
+
 ## 5. Stacks & Calling Convention
 - **Data stack**: Unlimited (up to memory). Manipulated via standard words (`dup`, `swap`, `rot`, `over`). Compiled code keeps top-of-stack in registers when possible for performance.
 - **Return stack**: Used for control flow. Directly accessible for meta-programming; users must avoid corrupting call frames unless intentional.

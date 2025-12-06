@@ -109,6 +109,72 @@ puts_finish_digits:
 }
 ;
 
+:asm == {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	sete bl
+	mov [r12], rbx
+}
+;
+
+:asm != {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	setne bl
+	mov [r12], rbx
+}
+;
+
+:asm < {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	setl bl
+	mov [r12], rbx
+}
+;
+
+:asm > {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	setg bl
+	mov [r12], rbx
+}
+;
+
+:asm <= {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	setle bl
+	mov [r12], rbx
+}
+;
+
+:asm >= {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	cmp rbx, rax
+	mov rbx, 0
+	setge bl
+	mov [r12], rbx
+}
+;
+
 :asm @ {
 	mov rax, [r12]
 	mov rax, [rax]

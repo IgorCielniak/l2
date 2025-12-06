@@ -7,6 +7,30 @@ import stdlib.sl
 }
 ;
 
+macro: square
+    dup *
+;macro
+
+macro: defconst 2
+    : $1
+        $2
+    ;
+;macro
+
+macro: defadder 3
+    : $1
+        $2 $3 +
+    ;
+;macro
+
+defconst MAGIC 99
+defadder add13 5 8
+
+struct: Point
+    field x 8
+    field y 8
+;struct
+
 : test-add
     5 7 + puts
 ;
@@ -61,6 +85,74 @@ import stdlib.sl
     4096 munmap drop
 ;
 
+: test-macro
+    9 square puts
+    MAGIC puts
+    add13 puts
+;
+
+: test-if
+    5 5 == if
+        111 puts
+    else
+        222 puts
+    then
+;
+
+: test-else-if
+    2
+    dup 1 == if
+        50 puts
+    else
+        dup 2 == if
+            60 puts
+        else
+            70 puts
+        then
+    then
+    drop
+;
+
+: test-for
+    0
+    5 for
+        1 +
+    next
+    puts
+;
+
+: test-for-zero
+    123
+    0 for
+        drop
+    next
+    puts
+;
+
+: test-struct
+    mem-slot
+    dup 111 swap Point.x!
+    dup 222 swap Point.y!
+    dup Point.x@ puts
+    Point.y@ puts
+    Point.size puts
+;
+
+: test-cmp
+    5 5 == puts
+    5 4 == puts
+    5 4 != puts
+    4 4 != puts
+    3 5 < puts
+    5 3 < puts
+    5 3 > puts
+    3 5 > puts
+    5 5 <= puts
+    6 5 <= puts
+    5 5 >= puts
+    4 5 >= puts
+;
+
 : main
     test-add
     test-sub
@@ -72,5 +164,12 @@ import stdlib.sl
     test-swap
     test-store
     test-mmap
+    test-macro
+    test-if
+    test-else-if
+    test-for
+    test-for-zero
+    test-cmp
+    test-struct
     0
 ;

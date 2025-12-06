@@ -15,7 +15,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
 
 
 class ParseError(Exception):
@@ -131,6 +131,47 @@ class Module(ASTNode):
 	forms: List[ASTNode]
 
 
+@dataclass
+class MacroDefinition:
+	name: str
+	tokens: List[str]
+	param_count: int = 0
+
+
+@dataclass
+class StructField:
+	name: str
+	offset: int
+	size: int
+
+
+@dataclass
+class BranchZero(ASTNode):
+	target: str
+
+
+@dataclass
+class Jump(ASTNode):
+	target: str
+
+
+@dataclass
+class Label(ASTNode):
+	name: str
+
+
+@dataclass
+class ForBegin(ASTNode):
+	loop_label: str
+	end_label: str
+
+
+@dataclass
+class ForNext(ASTNode):
+	loop_label: str
+	end_label: str
+
+
 MacroHandler = Callable[["Parser"], Optional[List[ASTNode]]]
 IntrinsicEmitter = Callable[["FunctionEmitter"], None]
 
@@ -143,6 +184,8 @@ class Word:
 	definition: Optional[Union[Definition, AsmDefinition]] = None
 	macro: Optional[MacroHandler] = None
 	intrinsic: Optional[IntrinsicEmitter] = None
+	macro_expansion: Optional[List[str]] = None
+	macro_params: int = 0
 
 
 @dataclass
@@ -175,6 +218,9 @@ class Parser:
 		self.definition_stack: List[Word] = []
 		self.last_defined: Optional[Word] = None
 		self.source: str = ""
+		self.macro_recording: Optional[MacroDefinition] = None
+		self.control_stack: List[Dict[str, str]] = []
+		self.label_counter = 0
 
 	# Public helpers for macros ------------------------------------------------
 	def next_token(self) -> Token:
@@ -197,9 +243,13 @@ class Parser:
 		self.context_stack = [Module(forms=[])]
 		self.definition_stack.clear()
 		self.last_defined = None
+		self.control_stack = []
+		self.label_counter = 0
 
 		while not self._eof():
 			token = self._consume()
+			if self._handle_macro_recording(token):
+				continue
 			lexeme = token.lexeme
 			if lexeme == ":":
 				self._begin_definition(token)
@@ -210,10 +260,29 @@ class Parser:
 			if lexeme == ":asm":
 				self._parse_asm_definition(token)
 				continue
+			if lexeme == "if":
+				self._handle_if_control()
+				continue
+			if lexeme == "else":
+				self._handle_else_control()
+				continue
+			if lexeme == "then":
+				self._handle_then_control()
+				continue
+			if lexeme == "for":
+				self._handle_for_control()
+				continue
+			if lexeme == "next":
+				self._handle_next_control()
+				continue
+			if self._maybe_expand_macro(token):
+				continue
 			self._handle_token(token)
 
 		if len(self.context_stack) != 1:
 			raise ParseError("unclosed definition at EOF")
+		if self.control_stack:
+			raise ParseError("unclosed control structure at EOF")
 
 		module = self.context_stack.pop()
 		if not isinstance(module, Module):  # pragma: no cover - defensive
@@ -236,6 +305,107 @@ class Parser:
 			return
 
 		self._append_node(WordRef(name=token.lexeme))
+
+	def _handle_macro_recording(self, token: Token) -> bool:
+		if self.macro_recording is None:
+			return False
+		if token.lexeme == ";macro":
+			self._finish_macro_recording(token)
+		else:
+			self.macro_recording.tokens.append(token.lexeme)
+		return True
+
+	def _maybe_expand_macro(self, token: Token) -> bool:
+		word = self.dictionary.lookup(token.lexeme)
+		if word and word.macro_expansion is not None:
+			args = self._collect_macro_args(word.macro_params)
+			self._inject_macro_tokens(word, token, args)
+			return True
+		return False
+
+	def _inject_macro_tokens(self, word: Word, token: Token, args: List[str]) -> None:
+		replaced: List[str] = []
+		for lex in word.macro_expansion or []:
+			if lex.startswith("$"):
+				idx = int(lex[1:]) - 1
+				if idx < 0 or idx >= len(args):
+					raise ParseError(f"macro {word.name} missing argument for {lex}")
+				replaced.append(args[idx])
+			else:
+				replaced.append(lex)
+		insertion = [
+			Token(lexeme=lex, line=token.line, column=token.column, start=token.start, end=token.end)
+			for lex in replaced
+		]
+		self.tokens[self.pos:self.pos] = insertion
+
+	def _collect_macro_args(self, count: int) -> List[str]:
+		args: List[str] = []
+		for _ in range(count):
+			if self._eof():
+				raise ParseError("macro invocation missing arguments")
+			args.append(self._consume().lexeme)
+		return args
+
+	def _start_macro_recording(self, name: str, param_count: int) -> None:
+		if self.macro_recording is not None:
+			raise ParseError("nested macro definitions are not supported")
+		self.macro_recording = MacroDefinition(name=name, tokens=[], param_count=param_count)
+
+	def _finish_macro_recording(self, token: Token) -> None:
+		if self.macro_recording is None:
+			raise ParseError(f"unexpected ';macro' at {token.line}:{token.column}")
+		macro_def = self.macro_recording
+		self.macro_recording = None
+		word = Word(name=macro_def.name)
+		word.macro_expansion = list(macro_def.tokens)
+		word.macro_params = macro_def.param_count
+		self.dictionary.register(word)
+
+	def _push_control(self, entry: Dict[str, str]) -> None:
+		self.control_stack.append(entry)
+
+	def _pop_control(self, expected: Tuple[str, ...]) -> Dict[str, str]:
+		if not self.control_stack:
+			raise ParseError("control stack underflow")
+		entry = self.control_stack.pop()
+		if entry.get("type") not in expected:
+			raise ParseError(f"mismatched control word '{entry.get('type')}'")
+		return entry
+
+	def _new_label(self, prefix: str) -> str:
+		label = f"L_{prefix}_{self.label_counter}"
+		self.label_counter += 1
+		return label
+
+	def _handle_if_control(self) -> None:
+		false_label = self._new_label("if_false")
+		self._append_node(BranchZero(target=false_label))
+		self._push_control({"type": "if", "false": false_label})
+
+	def _handle_else_control(self) -> None:
+		entry = self._pop_control(("if",))
+		end_label = self._new_label("if_end")
+		self._append_node(Jump(target=end_label))
+		self._append_node(Label(name=entry["false"]))
+		self._push_control({"type": "else", "end": end_label})
+
+	def _handle_then_control(self) -> None:
+		entry = self._pop_control(("if", "else"))
+		if entry["type"] == "if":
+			self._append_node(Label(name=entry["false"]))
+		else:
+			self._append_node(Label(name=entry["end"]))
+
+	def _handle_for_control(self) -> None:
+		loop_label = self._new_label("for_loop")
+		end_label = self._new_label("for_end")
+		self._append_node(ForBegin(loop_label=loop_label, end_label=end_label))
+		self._push_control({"type": "for", "loop": loop_label, "end": end_label})
+
+	def _handle_next_control(self) -> None:
+		entry = self._pop_control(("for",))
+		self._append_node(ForNext(loop_label=entry["loop"], end_label=entry["end"]))
 
 	def _begin_definition(self, token: Token) -> None:
 		if self._eof():
@@ -447,6 +617,21 @@ class Assembler:
 		if isinstance(node, WordRef):
 			self._emit_wordref(node, builder)
 			return
+		if isinstance(node, BranchZero):
+			self._emit_branch_zero(node, builder)
+			return
+		if isinstance(node, Jump):
+			builder.emit(f"    jmp {node.target}")
+			return
+		if isinstance(node, Label):
+			builder.emit(f"{node.name}:")
+			return
+		if isinstance(node, ForBegin):
+			self._emit_for_begin(node, builder)
+			return
+		if isinstance(node, ForNext):
+			self._emit_for_next(node, builder)
+			return
 		raise CompileError(f"unsupported AST node {node!r}")
 
 	def _emit_wordref(self, ref: WordRef, builder: FunctionEmitter) -> None:
@@ -457,6 +642,27 @@ class Assembler:
 			word.intrinsic(builder)
 			return
 		builder.emit(f"    call {sanitize_label(ref.name)}")
+
+	def _emit_branch_zero(self, node: BranchZero, builder: FunctionEmitter) -> None:
+		builder.pop_to("rax")
+		builder.emit("    test rax, rax")
+		builder.emit(f"    jz {node.target}")
+
+	def _emit_for_begin(self, node: ForBegin, builder: FunctionEmitter) -> None:
+		builder.pop_to("rax")
+		builder.emit("    cmp rax, 0")
+		builder.emit(f"    jle {node.end_label}")
+		builder.emit("    sub r13, 8")
+		builder.emit("    mov [r13], rax")
+		builder.emit(f"{node.loop_label}:")
+
+	def _emit_for_next(self, node: ForNext, builder: FunctionEmitter) -> None:
+		builder.emit("    mov rax, [r13]")
+		builder.emit("    dec rax")
+		builder.emit("    mov [r13], rax")
+		builder.emit(f"    jg {node.loop_label}")
+		builder.emit("    add r13, 8")
+		builder.emit(f"{node.end_label}:")
 
 	def _runtime_prelude(self) -> List[str]:
 		return [
@@ -513,9 +719,111 @@ def macro_immediate(parser: Parser) -> Optional[List[ASTNode]]:
 	return None
 
 
+def macro_begin_text_macro(parser: Parser) -> Optional[List[ASTNode]]:
+	if parser._eof():
+		raise ParseError("macro name missing after 'macro:'")
+	name_token = parser.next_token()
+	param_count = 0
+	peek = parser.peek_token()
+	if peek is not None:
+		try:
+			param_count = int(peek.lexeme, 0)
+			parser.next_token()
+		except ValueError:
+			param_count = 0
+	parser._start_macro_recording(name_token.lexeme, param_count)
+	return None
+
+
+def macro_end_text_macro(parser: Parser) -> Optional[List[ASTNode]]:
+	if parser.macro_recording is None:
+		raise ParseError("';macro' without matching 'macro:'")
+	# Actual closing handled in parser loop when ';macro' token is seen.
+	return None
+
+
+def _struct_emit_definition(tokens: List[Token], template: Token, name: str, body: Sequence[str]) -> None:
+	def make_token(lexeme: str) -> Token:
+		return Token(
+			lexeme=lexeme,
+			line=template.line,
+			column=template.column,
+			start=template.start,
+			end=template.end,
+		)
+
+	tokens.append(make_token(":"))
+	tokens.append(make_token(name))
+	for lexeme in body:
+		tokens.append(make_token(lexeme))
+	tokens.append(make_token(";"))
+
+
+def macro_struct_begin(parser: Parser) -> Optional[List[ASTNode]]:
+	if parser._eof():
+		raise ParseError("struct name missing after 'struct:'")
+	name_token = parser.next_token()
+	struct_name = name_token.lexeme
+	fields: List[StructField] = []
+	current_offset = 0
+	while True:
+		if parser._eof():
+			raise ParseError("unterminated struct definition (missing ';struct')")
+		token = parser.next_token()
+		if token.lexeme == ";struct":
+			break
+		if token.lexeme != "field":
+			raise ParseError(f"expected 'field' or ';struct' in struct '{struct_name}' definition")
+		if parser._eof():
+			raise ParseError("field name missing in struct definition")
+		field_name_token = parser.next_token()
+		if parser._eof():
+			raise ParseError(f"field size missing for '{field_name_token.lexeme}'")
+		size_token = parser.next_token()
+		try:
+			field_size = int(size_token.lexeme, 0)
+		except ValueError as exc:
+			raise ParseError(
+				f"invalid field size '{size_token.lexeme}' in struct '{struct_name}'"
+			) from exc
+		fields.append(StructField(field_name_token.lexeme, current_offset, field_size))
+		current_offset += field_size
+
+	generated: List[Token] = []
+	_struct_emit_definition(generated, name_token, f"{struct_name}.size", [str(current_offset)])
+	for field in fields:
+		size_word = f"{struct_name}.{field.name}.size"
+		offset_word = f"{struct_name}.{field.name}.offset"
+		_struct_emit_definition(generated, name_token, size_word, [str(field.size)])
+		_struct_emit_definition(generated, name_token, offset_word, [str(field.offset)])
+		_struct_emit_definition(
+			generated,
+			name_token,
+			f"{struct_name}.{field.name}@",
+			[offset_word, "+", "@"],
+		)
+		_struct_emit_definition(
+			generated,
+			name_token,
+			f"{struct_name}.{field.name}!",
+			[offset_word, "+", "!"],
+		)
+
+	parser.tokens[parser.pos:parser.pos] = generated
+	return None
+
+
+def macro_struct_end(parser: Parser) -> Optional[List[ASTNode]]:
+	raise ParseError("';struct' must follow a 'struct:' block")
+
+
 def bootstrap_dictionary() -> Dictionary:
 	dictionary = Dictionary()
 	dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
+	dictionary.register(Word(name="macro:", immediate=True, macro=macro_begin_text_macro))
+	dictionary.register(Word(name=";macro", immediate=True, macro=macro_end_text_macro))
+	dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
+	dictionary.register(Word(name=";struct", immediate=True, macro=macro_struct_end))
 	return dictionary
 
 

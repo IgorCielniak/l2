@@ -31,6 +31,12 @@ struct: Point
     field y 8
 ;struct
 
+extend-syntax
+
+fn fancy_add(int left, int right){
+    return (left + right) * right;
+}
+
 : test-add
     5 7 + puts
 ;
@@ -153,6 +159,13 @@ struct: Point
     4 5 >= puts
 ;
 
+: test-c-fn
+    3
+    7
+    fancy_add()
+    puts
+;
+
 : main
     test-add
     test-sub
@@ -171,5 +184,6 @@ struct: Point
     test-for-zero
     test-cmp
     test-struct
+    test-c-fn
     0
 ;

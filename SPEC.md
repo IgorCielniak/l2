@@ -25,6 +25,7 @@
   - `lookup`: resolves token → word entry; can be replaced to build new namespaces or module systems.
 - **Compile vs interpret**: Each word advertises stack effect + immediacy. Immediate words execute during compilation (macro behavior). Others emit code or inline asm.
 - **Syntax morphing**: Provide primitives `set-reader`, `with-reader`, and word-lists so layers (e.g., Lisp-like forms) can be composed.
+- **Inline Python hooks**: `:py name { ... } ;` executes the enclosed Python block immediately, then registers `name` as a word whose behavior is provided by that block. Define a `macro(ctx)` function to intercept compilation (receiving a `MacroContext` with helpers like `next_token`, `emit_literal`, `new_label`, `inject_tokens`, and direct access to the active parser), and/or an `intrinsic(builder)` function to emit custom assembly. This lets end users extend the language—parsing source, manipulating AST nodes, or writing NASM—without touching the bootstrap source. The standard library’s `extend-syntax` and `fn` forms are ordinary `:py` blocks built with these APIs, so users can clone or replace them entirely from L2 source files.
 
 ## 4. Core Types & Data Model
 - **Cells**: 64-bit signed integers; all stack operations use cells.
@@ -48,6 +49,24 @@ struct: Point
   - `<Struct>.<field>@ ( addr -- value )` loads a field by computing `addr + offset` and applying `@`.
   - `<Struct>.<field>! ( value addr -- )` stores a field via `addr + offset !`.
 - Because the output is plain L2 code, users can inspect or override any generated word, and additional helpers (e.g., pointer arithmetic or iterators) can be layered on top with regular macros.
+
+### 4.2 Lightweight C-style Sugar
+
+- `extend-syntax` is implemented as a `:py` macro that toggles a reader mode where identifiers suffixed with `()` (e.g., `foo()`) are rewritten as ordinary word calls. The call still obeys data-stack calling conventions; the parentheses are purely syntactic sugar.
+- The same user-defined macro stack unlocks a compact function form:
+
+  ```
+  fn add(int left, int right){
+      return (left + right) * right;
+  }
+  ```
+
+  expands into a normal colon definition which consumes two stack arguments (`left` and `right`), mirrors them onto the return stack, evaluates the infix expression, and cleans up the temporary frame before returning.
+- Current limitations:
+  - Only `int` parameters are recognized.
+  - Function bodies must be a single `return <expr>;` statement. `<expr>` may contain parameter names, integer literals, parentheses, and the binary operators `+ - * / %`.
+  - Parameter names become available by index via `rpick`, so advanced bodies can still drop into raw L2 code if needed.
+- Since the generated code uses the return stack to store arguments, it happily composes with loops/conditionals—the frame lives beneath any subsequent `for` counters and is explicitly released before the word returns. Because `fn` lives in user space, nothing stops you from swapping it out for a completely different parser (pattern matching, keyword arguments, etc.) using the same `:py` facility.
 
 ## 5. Stacks & Calling Convention
 - **Data stack**: Unlimited (up to memory). Manipulated via standard words (`dup`, `swap`, `rot`, `over`). Compiled code keeps top-of-stack in registers when possible for performance.
@@ -102,6 +121,7 @@ struct: Point
 
 ## 14. Standard Library Sketch
 - **Core words**: Arithmetic, logic, stack ops, comparison, memory access, control flow combinators.
+- **Return-stack helpers**: `>r`, `r>`, `rdrop`, and `rpick` shuffle values between the data stack and the return stack. They’re used by the `fn` sugar but also available to user code for building custom control constructs.
 - **Meta words**: Reader management, dictionary inspection, definition forms (`:`, `:noninline`, `:asm`, `immediate`).
 - **Allocators**: Default bump allocator, arena allocator, and hook to install custom malloc/free pairs.
 - **FFI/syscalls**: Thin wrappers plus convenience words for POSIX-level APIs.

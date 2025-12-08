@@ -13,9 +13,10 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
 
 
 class ParseError(Exception):
@@ -109,7 +110,7 @@ class WordRef(ASTNode):
 
 @dataclass
 class Literal(ASTNode):
-	value: int
+	value: Any
 
 
 @dataclass
@@ -117,6 +118,7 @@ class Definition(ASTNode):
 	name: str
 	body: List[ASTNode]
 	immediate: bool = False
+	compile_only: bool = False
 
 
 @dataclass
@@ -124,6 +126,7 @@ class AsmDefinition(ASTNode):
 	name: str
 	body: str
 	immediate: bool = False
+	compile_only: bool = False
 
 
 @dataclass
@@ -172,7 +175,63 @@ class ForNext(ASTNode):
 	end_label: str
 
 
-MacroHandler = Callable[["Parser"], Optional[List[ASTNode]]]
+class MacroContext:
+	"""Small facade exposed to Python-defined macros."""
+
+	def __init__(self, parser: "Parser") -> None:
+		self._parser = parser
+
+	@property
+	def parser(self) -> "Parser":
+		return self._parser
+
+	def next_token(self) -> Token:
+		return self._parser.next_token()
+
+	def peek_token(self) -> Optional[Token]:
+		return self._parser.peek_token()
+
+	def emit_literal(self, value: int) -> None:
+		self._parser.emit_node(Literal(value=value))
+
+	def emit_word(self, name: str) -> None:
+		self._parser.emit_node(WordRef(name=name))
+
+	def emit_node(self, node: ASTNode) -> None:
+		self._parser.emit_node(node)
+
+	def inject_tokens(self, tokens: Sequence[str], template: Optional[Token] = None) -> None:
+		if template is None:
+			template = Token(lexeme="", line=0, column=0, start=0, end=0)
+		generated = [
+			Token(
+				lexeme=lex,
+				line=template.line,
+				column=template.column,
+				start=template.start,
+				end=template.end,
+			)
+			for lex in tokens
+		]
+		self.inject_token_objects(generated)
+
+	def inject_token_objects(self, tokens: Sequence[Token]) -> None:
+		self._parser.tokens[self._parser.pos:self._parser.pos] = list(tokens)
+
+	def enable_call_syntax(self) -> None:
+		self._parser.call_syntax_enabled = True
+
+	def disable_call_syntax(self) -> None:
+		self._parser.call_syntax_enabled = False
+
+	def new_label(self, prefix: str) -> str:
+		return self._parser._new_label(prefix)
+
+	def most_recent_definition(self) -> Optional[Word]:
+		return self._parser.most_recent_definition()
+
+
+MacroHandler = Callable[[MacroContext], Optional[List[ASTNode]]]
 IntrinsicEmitter = Callable[["FunctionEmitter"], None]
 
 
@@ -186,6 +245,8 @@ class Word:
 	intrinsic: Optional[IntrinsicEmitter] = None
 	macro_expansion: Optional[List[str]] = None
 	macro_params: int = 0
+	compile_time_intrinsic: Optional[Callable[["CompileTimeVM"], None]] = None
+	compile_only: bool = False
 
 
 @dataclass
@@ -221,6 +282,8 @@ class Parser:
 		self.macro_recording: Optional[MacroDefinition] = None
 		self.control_stack: List[Dict[str, str]] = []
 		self.label_counter = 0
+		self.call_syntax_enabled = False
+		self.compile_time_vm = CompileTimeVM(self)
 
 	# Public helpers for macros ------------------------------------------------
 	def next_token(self) -> Token:
@@ -245,6 +308,7 @@ class Parser:
 		self.last_defined = None
 		self.control_stack = []
 		self.label_counter = 0
+		self.call_syntax_enabled = False
 
 		while not self._eof():
 			token = self._consume()
@@ -259,6 +323,9 @@ class Parser:
 				continue
 			if lexeme == ":asm":
 				self._parse_asm_definition(token)
+				continue
+			if lexeme == ":py":
+				self._parse_py_definition(token)
 				continue
 			if lexeme == "if":
 				self._handle_if_control()
@@ -291,20 +358,34 @@ class Parser:
 
 	# Internal helpers ---------------------------------------------------------
 	def _handle_token(self, token: Token) -> None:
+		if self.call_syntax_enabled:
+			call_target = self._maybe_call_form(token.lexeme)
+			if call_target is not None:
+				self._append_node(WordRef(name=call_target))
+				return
 		if self._try_literal(token):
 			return
 
 		word = self.dictionary.lookup(token.lexeme)
 		if word and word.immediate:
-			if not word.macro:
-				raise ParseError(f"immediate word {word.name} lacks macro handler")
-			produced = word.macro(self)
-			if produced:
-				for node in produced:
-					self._append_node(node)
+			if word.macro:
+				produced = word.macro(MacroContext(self))
+				if produced:
+					for node in produced:
+						self._append_node(node)
+			else:
+				self._execute_immediate_word(word)
 			return
 
 		self._append_node(WordRef(name=token.lexeme))
+
+	def _execute_immediate_word(self, word: Word) -> None:
+		try:
+			self.compile_time_vm.invoke(word)
+		except ParseError:
+			raise
+		except Exception as exc:  # pragma: no cover - defensive
+			raise ParseError(f"compile-time word '{word.name}' failed: {exc}") from exc
 
 	def _handle_macro_recording(self, token: Token) -> bool:
 		if self.macro_recording is None:
@@ -378,6 +459,14 @@ class Parser:
 		self.label_counter += 1
 		return label
 
+	def _maybe_call_form(self, lexeme: str) -> Optional[str]:
+		if len(lexeme) <= 2 or not lexeme.endswith("()"):
+			return None
+		name = lexeme[:-2]
+		if not name or not _is_identifier(name):
+			return None
+		return name
+
 	def _handle_if_control(self) -> None:
 		false_label = self._new_label("if_false")
 		self._append_node(BranchZero(target=false_label))
@@ -428,6 +517,7 @@ class Parser:
 			raise ParseError("';' can only close definitions")
 		word = self.definition_stack.pop()
 		ctx.immediate = word.immediate
+		ctx.compile_only = word.compile_only
 		module = self.context_stack[-1]
 		if not isinstance(module, Module):
 			raise ParseError("nested definitions are not supported yet")
@@ -458,6 +548,7 @@ class Parser:
 			self.dictionary.register(word)
 		word.definition = definition
 		definition.immediate = word.immediate
+		definition.compile_only = word.compile_only
 		module = self.context_stack[-1]
 		if not isinstance(module, Module):
 			raise ParseError("asm definitions must be top-level forms")
@@ -468,6 +559,50 @@ class Parser:
 		terminator = self._consume()
 		if terminator.lexeme != ";":
 			raise ParseError(f"expected ';' after asm definition at {terminator.line}:{terminator.column}")
+
+	def _parse_py_definition(self, token: Token) -> None:
+		if self._eof():
+			raise ParseError(f"definition name missing after ':py' at {token.line}:{token.column}")
+		name_token = self._consume()
+		brace_token = self._consume()
+		if brace_token.lexeme != "{":
+			raise ParseError(f"expected '{{' after py name at {brace_token.line}:{brace_token.column}")
+		block_start = brace_token.end
+		block_end: Optional[int] = None
+		while not self._eof():
+			next_token = self._consume()
+			if next_token.lexeme == "}":
+				block_end = next_token.start
+				break
+		if block_end is None:
+			raise ParseError("missing '}' to terminate py body")
+		py_body = textwrap.dedent(self.source[block_start:block_end])
+		word = self.dictionary.lookup(name_token.lexeme)
+		if word is None:
+			word = Word(name=name_token.lexeme)
+		namespace = self._py_exec_namespace()
+		try:
+			exec(py_body, namespace)
+		except Exception as exc:  # pragma: no cover - user code
+			raise ParseError(f"python macro body for '{word.name}' raised: {exc}") from exc
+		macro_fn = namespace.get("macro")
+		intrinsic_fn = namespace.get("intrinsic")
+		if macro_fn is None and intrinsic_fn is None:
+			raise ParseError("python definition must define 'macro' or 'intrinsic'")
+		if macro_fn is not None:
+			word.macro = macro_fn
+			word.immediate = True
+		if intrinsic_fn is not None:
+			word.intrinsic = intrinsic_fn
+		self.dictionary.register(word)
+		if self._eof():
+			raise ParseError("py definition missing terminator ';'")
+		terminator = self._consume()
+		if terminator.lexeme != ";":
+			raise ParseError(f"expected ';' after py definition at {terminator.line}:{terminator.column}")
+
+	def _py_exec_namespace(self) -> Dict[str, Any]:
+		return dict(PY_EXEC_GLOBALS)
 
 	def _append_node(self, node: ASTNode) -> None:
 		target = self.context_stack[-1]
@@ -482,7 +617,11 @@ class Parser:
 		try:
 			value = int(token.lexeme, 0)
 		except ValueError:
-			return False
+			string_value = _parse_string_literal(token)
+			if string_value is None:
+				return False
+			self._append_node(Literal(value=string_value))
+			return True
 		self._append_node(Literal(value=value))
 		return True
 
@@ -495,6 +634,163 @@ class Parser:
 
 	def _eof(self) -> bool:
 		return self.pos >= len(self.tokens)
+
+
+class CompileTimeVM:
+	def __init__(self, parser: Parser) -> None:
+		self.parser = parser
+		self.dictionary = parser.dictionary
+		self.stack: List[Any] = []
+		self.return_stack: List[Any] = []
+
+	def reset(self) -> None:
+		self.stack.clear()
+		self.return_stack.clear()
+
+	def push(self, value: Any) -> None:
+		self.stack.append(value)
+
+	def pop(self) -> Any:
+		if not self.stack:
+			raise ParseError("compile-time stack underflow")
+		return self.stack.pop()
+
+	def peek(self) -> Any:
+		if not self.stack:
+			raise ParseError("compile-time stack underflow")
+		return self.stack[-1]
+
+	def pop_int(self) -> int:
+		value = self.pop()
+		if not isinstance(value, int):
+			raise ParseError("expected integer on compile-time stack")
+		return value
+
+	def pop_str(self) -> str:
+		value = self.pop()
+		if not isinstance(value, str):
+			raise ParseError("expected string on compile-time stack")
+		return value
+
+	def pop_list(self) -> List[Any]:
+		value = self.pop()
+		if not isinstance(value, list):
+			raise ParseError("expected list on compile-time stack")
+		return value
+
+	def pop_token(self) -> Token:
+		value = self.pop()
+		if not isinstance(value, Token):
+			raise ParseError("expected token on compile-time stack")
+		return value
+
+	def invoke(self, word: Word) -> None:
+		self.reset()
+		self._call_word(word)
+
+	def _call_word(self, word: Word) -> None:
+		if word.compile_time_intrinsic is not None:
+			word.compile_time_intrinsic(self)
+			return
+		definition = word.definition
+		if definition is None:
+			raise ParseError(f"word '{word.name}' has no compile-time definition")
+		if isinstance(definition, AsmDefinition):
+			raise ParseError(f"word '{word.name}' cannot run at compile time")
+		self._execute_nodes(definition.body)
+
+	def _call_word_by_name(self, name: str) -> None:
+		word = self.dictionary.lookup(name)
+		if word is None:
+			raise ParseError(f"unknown word '{name}' during compile-time execution")
+		self._call_word(word)
+
+	def _execute_nodes(self, nodes: Sequence[ASTNode]) -> None:
+		label_positions = self._label_positions(nodes)
+		loop_pairs = self._for_pairs(nodes)
+		loop_stack: List[Dict[str, Any]] = []
+		ip = 0
+		while ip < len(nodes):
+			node = nodes[ip]
+			if isinstance(node, Literal):
+				self.push(node.value)
+				ip += 1
+				continue
+			if isinstance(node, WordRef):
+				self._call_word_by_name(node.name)
+				ip += 1
+				continue
+			if isinstance(node, BranchZero):
+				condition = self.pop()
+				flag: bool
+				if isinstance(condition, bool):
+					flag = condition
+				elif isinstance(condition, int):
+					flag = condition != 0
+				else:
+					raise ParseError("branch expects integer or boolean condition")
+				if not flag:
+					ip = self._jump_to_label(label_positions, node.target)
+				else:
+					ip += 1
+				continue
+			if isinstance(node, Jump):
+				ip = self._jump_to_label(label_positions, node.target)
+				continue
+			if isinstance(node, Label):
+				ip += 1
+				continue
+			if isinstance(node, ForBegin):
+				count = self.pop_int()
+				if count <= 0:
+					match = loop_pairs.get(ip)
+					if match is None:
+						raise ParseError("internal loop bookkeeping error")
+					ip = match + 1
+					continue
+				loop_stack.append({"remaining": count, "begin": ip})
+				ip += 1
+				continue
+			if isinstance(node, ForNext):
+				if not loop_stack:
+					raise ParseError("'next' without matching 'for'")
+				frame = loop_stack[-1]
+				frame["remaining"] -= 1
+				if frame["remaining"] > 0:
+					ip = frame["begin"] + 1
+					continue
+				loop_stack.pop()
+				ip += 1
+				continue
+			raise ParseError(f"unsupported compile-time AST node {node!r}")
+
+	def _label_positions(self, nodes: Sequence[ASTNode]) -> Dict[str, int]:
+		positions: Dict[str, int] = {}
+		for idx, node in enumerate(nodes):
+			if isinstance(node, Label):
+				positions[node.name] = idx
+		return positions
+
+	def _for_pairs(self, nodes: Sequence[ASTNode]) -> Dict[int, int]:
+		stack: List[int] = []
+		pairs: Dict[int, int] = {}
+		for idx, node in enumerate(nodes):
+			if isinstance(node, ForBegin):
+				stack.append(idx)
+			elif isinstance(node, ForNext):
+				if not stack:
+					raise ParseError("'next' without matching 'for'")
+				begin_idx = stack.pop()
+				pairs[begin_idx] = idx
+				pairs[idx] = begin_idx
+		if stack:
+			raise ParseError("'for' without matching 'next'")
+		return pairs
+
+	def _jump_to_label(self, labels: Dict[str, int], target: str) -> int:
+		if target not in labels:
+			raise ParseError(f"unknown label '{target}' during compile-time execution")
+		return labels[target]
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +858,54 @@ def sanitize_label(name: str) -> str:
 	return f"word_{safe}"
 
 
+def _is_identifier(text: str) -> bool:
+	if not text:
+		return False
+	first = text[0]
+	if not (first.isalpha() or first == "_"):
+		return False
+	return all(ch.isalnum() or ch == "_" for ch in text)
+
+
+def _parse_string_literal(token: Token) -> Optional[str]:
+	text = token.lexeme
+	if len(text) < 2 or text[0] != '"' or text[-1] != '"':
+		return None
+	body = text[1:-1]
+	result: List[str] = []
+	idx = 0
+	while idx < len(body):
+		char = body[idx]
+		if char != "\\":
+			result.append(char)
+			idx += 1
+			continue
+		idx += 1
+		if idx >= len(body):
+			raise ParseError(
+				f"unterminated escape sequence in string literal at {token.line}:{token.column}"
+			)
+		escape = body[idx]
+		idx += 1
+		if escape == 'n':
+			result.append("\n")
+		elif escape == 't':
+			result.append("\t")
+		elif escape == 'r':
+			result.append("\r")
+		elif escape == '0':
+			result.append("\0")
+		elif escape == '"':
+			result.append('"')
+		elif escape == "\\":
+			result.append("\\")
+		else:
+			raise ParseError(
+				f"unsupported escape sequence '\\{escape}' in string literal at {token.line}:{token.column}"
+			)
+	return "".join(result)
+
+
 class Assembler:
 	def __init__(self, dictionary: Dictionary) -> None:
 		self.dictionary = dictionary
@@ -578,10 +922,13 @@ class Assembler:
 		if stray_forms:
 			raise CompileError("top-level literals or word references are not supported yet")
 
-		if not any(defn.name == "main" for defn in definitions):
+		runtime_defs = [
+			defn for defn in definitions if not getattr(defn, "compile_only", False)
+		]
+		if not any(defn.name == "main" for defn in runtime_defs):
 			raise CompileError("missing 'main' definition")
 
-		for definition in definitions:
+		for definition in runtime_defs:
 			self._emit_definition(definition, emission.text)
 
 		emission.bss.extend(self._bss_layout())
@@ -612,6 +959,8 @@ class Assembler:
 
 	def _emit_node(self, node: ASTNode, builder: FunctionEmitter) -> None:
 		if isinstance(node, Literal):
+			if not isinstance(node.value, int):
+				raise CompileError("string literals are compile-time only")
 			builder.push_literal(node.value)
 			return
 		if isinstance(node, WordRef):
@@ -638,6 +987,8 @@ class Assembler:
 		word = self.dictionary.lookup(ref.name)
 		if word is None:
 			raise CompileError(f"unknown word '{ref.name}'")
+		if word.compile_only:
+			raise CompileError(f"word '{ref.name}' is compile-time only")
 		if word.intrinsic:
 			word.intrinsic(builder)
 			return
@@ -709,7 +1060,8 @@ class Assembler:
 # ---------------------------------------------------------------------------
 
 
-def macro_immediate(parser: Parser) -> Optional[List[ASTNode]]:
+def macro_immediate(ctx: MacroContext) -> Optional[List[ASTNode]]:
+	parser = ctx.parser
 	word = parser.most_recent_definition()
 	if word is None:
 		raise ParseError("'immediate' must follow a definition")
@@ -719,7 +1071,19 @@ def macro_immediate(parser: Parser) -> Optional[List[ASTNode]]:
 	return None
 
 
-def macro_begin_text_macro(parser: Parser) -> Optional[List[ASTNode]]:
+def macro_compile_only(ctx: MacroContext) -> Optional[List[ASTNode]]:
+	parser = ctx.parser
+	word = parser.most_recent_definition()
+	if word is None:
+		raise ParseError("'compile-only' must follow a definition")
+	word.compile_only = True
+	if word.definition is not None:
+		word.definition.compile_only = True
+	return None
+
+
+def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[ASTNode]]:
+	parser = ctx.parser
 	if parser._eof():
 		raise ParseError("macro name missing after 'macro:'")
 	name_token = parser.next_token()
@@ -735,7 +1099,8 @@ def macro_begin_text_macro(parser: Parser) -> Optional[List[ASTNode]]:
 	return None
 
 
-def macro_end_text_macro(parser: Parser) -> Optional[List[ASTNode]]:
+def macro_end_text_macro(ctx: MacroContext) -> Optional[List[ASTNode]]:
+	parser = ctx.parser
 	if parser.macro_recording is None:
 		raise ParseError("';macro' without matching 'macro:'")
 	# Actual closing handled in parser loop when ';macro' token is seen.
@@ -759,7 +1124,714 @@ def _struct_emit_definition(tokens: List[Token], template: Token, name: str, bod
 	tokens.append(make_token(";"))
 
 
-def macro_struct_begin(parser: Parser) -> Optional[List[ASTNode]]:
+class SplitLexer:
+	def __init__(self, parser: Parser, separators: str) -> None:
+		self.parser = parser
+		self.separators = set(separators)
+		self.buffer: List[Token] = []
+
+	def _fill(self) -> None:
+		while not self.buffer:
+			if self.parser._eof():
+				raise ParseError("unexpected EOF inside custom lexer")
+			token = self.parser.next_token()
+			parts = _split_token_by_chars(token, self.separators)
+			if not parts:
+				continue
+			self.buffer.extend(parts)
+
+	def peek(self) -> Token:
+		self._fill()
+		return self.buffer[0]
+
+	def pop(self) -> Token:
+		token = self.peek()
+		self.buffer.pop(0)
+		return token
+
+	def expect(self, lexeme: str) -> Token:
+		token = self.pop()
+		if token.lexeme != lexeme:
+			raise ParseError(f"expected '{lexeme}' but found '{token.lexeme}'")
+		return token
+
+	def collect_brace_block(self) -> List[Token]:
+		depth = 1
+		collected: List[Token] = []
+		while depth > 0:
+			token = self.pop()
+			if token.lexeme == "{":
+				depth += 1
+				collected.append(token)
+				continue
+			if token.lexeme == "}":
+				depth -= 1
+				if depth == 0:
+					break
+				collected.append(token)
+				continue
+			collected.append(token)
+		return collected
+
+	def push_back(self) -> None:
+		if not self.buffer:
+			return
+		self.parser.tokens[self.parser.pos:self.parser.pos] = self.buffer
+		self.buffer = []
+
+
+def _split_token_by_chars(token: Token, separators: Set[str]) -> List[Token]:
+	lex = token.lexeme
+	if not lex:
+		return []
+	parts: List[Token] = []
+	idx = 0
+	while idx < len(lex):
+		char = lex[idx]
+		if char in separators:
+			parts.append(Token(
+				lexeme=char,
+				line=token.line,
+				column=token.column + idx,
+				start=token.start + idx,
+				end=token.start + idx + 1,
+			))
+			idx += 1
+			continue
+		start_idx = idx
+		while idx < len(lex) and lex[idx] not in separators:
+			idx += 1
+		segment = lex[start_idx:idx]
+		if segment:
+			parts.append(Token(
+				lexeme=segment,
+				line=token.line,
+				column=token.column + start_idx,
+				start=token.start + start_idx,
+				end=token.start + idx,
+			))
+	return parts
+
+
+def _ensure_list(value: Any) -> List[Any]:
+	if not isinstance(value, list):
+		raise ParseError("expected list value")
+	return value
+
+
+def _ensure_dict(value: Any) -> Dict[Any, Any]:
+	if not isinstance(value, dict):
+		raise ParseError("expected map value")
+	return value
+
+
+def _ensure_lexer(value: Any) -> SplitLexer:
+	if not isinstance(value, SplitLexer):
+		raise ParseError("expected lexer value")
+	return value
+
+
+def _truthy(value: Any) -> bool:
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, int):
+		return value != 0
+	return value is not None
+
+
+def _coerce_str(value: Any) -> str:
+	if isinstance(value, str):
+		return value
+	if isinstance(value, bool):
+		return "1" if value else "0"
+	if isinstance(value, int):
+		return str(value)
+	raise ParseError("expected string-compatible value")
+
+
+def _default_template(template: Optional[Token]) -> Token:
+	if template is None:
+		return Token(lexeme="", line=0, column=0, start=0, end=0)
+	if not isinstance(template, Token):
+		raise ParseError("expected token for template")
+	return template
+
+
+def _trunc_divmod(a: int, b: int) -> Tuple[int, int]:
+	if b == 0:
+		raise ParseError("division by zero")
+	quot = abs(a) // abs(b)
+	if (a < 0) ^ (b < 0):
+		quot = -quot
+	rem = a - quot * b
+	return quot, rem
+
+
+def _ct_dup(vm: CompileTimeVM) -> None:
+	vm.push(vm.peek())
+
+
+def _ct_drop(vm: CompileTimeVM) -> None:
+	vm.pop()
+
+
+def _ct_swap(vm: CompileTimeVM) -> None:
+	a = vm.pop()
+	b = vm.pop()
+	vm.push(a)
+	vm.push(b)
+
+
+def _ct_over(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 2:
+		raise ParseError("over requires two stack values")
+	vm.push(vm.stack[-2])
+
+
+def _ct_rot(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 3:
+		raise ParseError("rot requires three stack values")
+	vm.stack[-3], vm.stack[-2], vm.stack[-1] = vm.stack[-2], vm.stack[-1], vm.stack[-3]
+
+
+def _ct_nip(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 2:
+		raise ParseError("nip requires two stack values")
+	top = vm.pop()
+	vm.pop()
+	vm.push(top)
+
+
+def _ct_tuck(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 2:
+		raise ParseError("tuck requires two stack values")
+	first = vm.pop()
+	second = vm.pop()
+	vm.push(first)
+	vm.push(second)
+	vm.push(first)
+
+
+def _ct_2dup(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 2:
+		raise ParseError("2dup requires two stack values")
+	second = vm.pop()
+	first = vm.pop()
+	vm.push(first)
+	vm.push(second)
+	vm.push(first)
+	vm.push(second)
+
+
+def _ct_2drop(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 2:
+		raise ParseError("2drop requires two stack values")
+	vm.pop()
+	vm.pop()
+
+
+def _ct_2swap(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 4:
+		raise ParseError("2swap requires four stack values")
+	a = vm.pop()
+	b = vm.pop()
+	c = vm.pop()
+	d = vm.pop()
+	vm.push(a)
+	vm.push(b)
+	vm.push(c)
+	vm.push(d)
+
+
+def _ct_2over(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 4:
+		raise ParseError("2over requires four stack values")
+	vm.push(vm.stack[-4])
+	vm.push(vm.stack[-3])
+
+
+def _ct_minus_rot(vm: CompileTimeVM) -> None:
+	if len(vm.stack) < 3:
+		raise ParseError("-rot requires three stack values")
+	vm.stack[-3], vm.stack[-2], vm.stack[-1] = vm.stack[-1], vm.stack[-3], vm.stack[-2]
+
+
+def _ct_binary_int(vm: CompileTimeVM, func: Callable[[int, int], int]) -> None:
+	b = vm.pop_int()
+	a = vm.pop_int()
+	vm.push(func(a, b))
+
+
+def _ct_add(vm: CompileTimeVM) -> None:
+	_ct_binary_int(vm, lambda a, b: a + b)
+
+
+def _ct_sub(vm: CompileTimeVM) -> None:
+	_ct_binary_int(vm, lambda a, b: a - b)
+
+
+def _ct_mul(vm: CompileTimeVM) -> None:
+	_ct_binary_int(vm, lambda a, b: a * b)
+
+
+def _ct_div(vm: CompileTimeVM) -> None:
+	divisor = vm.pop_int()
+	dividend = vm.pop_int()
+	quot, _ = _trunc_divmod(dividend, divisor)
+	vm.push(quot)
+
+
+def _ct_mod(vm: CompileTimeVM) -> None:
+	divisor = vm.pop_int()
+	dividend = vm.pop_int()
+	_, rem = _trunc_divmod(dividend, divisor)
+	vm.push(rem)
+
+
+def _ct_compare(vm: CompileTimeVM, predicate: Callable[[Any, Any], bool]) -> None:
+	b = vm.pop()
+	a = vm.pop()
+	vm.push(1 if predicate(a, b) else 0)
+
+
+def _ct_eq(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a == b)
+
+
+def _ct_ne(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a != b)
+
+
+def _ct_lt(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a < b)
+
+
+def _ct_le(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a <= b)
+
+
+def _ct_gt(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a > b)
+
+
+def _ct_ge(vm: CompileTimeVM) -> None:
+	_ct_compare(vm, lambda a, b: a >= b)
+
+
+def _ct_and(vm: CompileTimeVM) -> None:
+	b = _truthy(vm.pop())
+	a = _truthy(vm.pop())
+	vm.push(1 if (a and b) else 0)
+
+
+def _ct_or(vm: CompileTimeVM) -> None:
+	b = _truthy(vm.pop())
+	a = _truthy(vm.pop())
+	vm.push(1 if (a or b) else 0)
+
+
+def _ct_not(vm: CompileTimeVM) -> None:
+	vm.push(1 if not _truthy(vm.pop()) else 0)
+
+
+def _ct_to_r(vm: CompileTimeVM) -> None:
+	vm.return_stack.append(vm.pop())
+
+
+def _ct_r_from(vm: CompileTimeVM) -> None:
+	if not vm.return_stack:
+		raise ParseError("return stack underflow")
+	vm.push(vm.return_stack.pop())
+
+
+def _ct_rdrop(vm: CompileTimeVM) -> None:
+	if not vm.return_stack:
+		raise ParseError("return stack underflow")
+	vm.return_stack.pop()
+
+
+def _ct_rpick(vm: CompileTimeVM) -> None:
+	index = vm.pop_int()
+	if index < 0 or index >= len(vm.return_stack):
+		raise ParseError("rpick index out of range")
+	vm.push(vm.return_stack[-1 - index])
+
+
+def _ct_nil(vm: CompileTimeVM) -> None:
+	vm.push(None)
+
+
+def _ct_nil_p(vm: CompileTimeVM) -> None:
+	vm.push(1 if vm.pop() is None else 0)
+
+
+def _ct_list_new(vm: CompileTimeVM) -> None:
+	vm.push([])
+
+
+def _ct_list_clone(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	vm.push(list(lst))
+
+
+def _ct_list_append(vm: CompileTimeVM) -> None:
+	value = vm.pop()
+	lst = _ensure_list(vm.pop())
+	lst.append(value)
+	vm.push(lst)
+
+
+def _ct_list_pop(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	if not lst:
+		raise ParseError("cannot pop from empty list")
+	value = lst.pop()
+	vm.push(lst)
+	vm.push(value)
+
+
+def _ct_list_pop_front(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	if not lst:
+		raise ParseError("cannot pop from empty list")
+	value = lst.pop(0)
+	vm.push(lst)
+	vm.push(value)
+
+
+def _ct_list_length(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	vm.push(len(lst))
+
+
+def _ct_list_empty(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	vm.push(1 if not lst else 0)
+
+
+def _ct_list_get(vm: CompileTimeVM) -> None:
+	index = vm.pop_int()
+	lst = _ensure_list(vm.pop())
+	try:
+		vm.push(lst[index])
+	except IndexError as exc:
+		raise ParseError("list index out of range") from exc
+
+
+def _ct_list_set(vm: CompileTimeVM) -> None:
+	value = vm.pop()
+	index = vm.pop_int()
+	lst = _ensure_list(vm.pop())
+	try:
+		lst[index] = value
+	except IndexError as exc:
+		raise ParseError("list index out of range") from exc
+	vm.push(lst)
+
+
+def _ct_list_clear(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	lst.clear()
+	vm.push(lst)
+
+
+def _ct_list_extend(vm: CompileTimeVM) -> None:
+	source = _ensure_list(vm.pop())
+	target = _ensure_list(vm.pop())
+	target.extend(source)
+	vm.push(target)
+
+
+def _ct_list_last(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	if not lst:
+		raise ParseError("list is empty")
+	vm.push(lst[-1])
+
+
+def _ct_map_new(vm: CompileTimeVM) -> None:
+	vm.push({})
+
+
+def _ct_map_set(vm: CompileTimeVM) -> None:
+	value = vm.pop()
+	key = vm.pop()
+	map_obj = _ensure_dict(vm.pop())
+	map_obj[key] = value
+	vm.push(map_obj)
+
+
+def _ct_map_get(vm: CompileTimeVM) -> None:
+	key = vm.pop()
+	map_obj = _ensure_dict(vm.pop())
+	vm.push(map_obj)
+	if key in map_obj:
+		vm.push(map_obj[key])
+		vm.push(1)
+	else:
+		vm.push(None)
+		vm.push(0)
+
+
+def _ct_map_has(vm: CompileTimeVM) -> None:
+	key = vm.pop()
+	map_obj = _ensure_dict(vm.pop())
+	vm.push(map_obj)
+	vm.push(1 if key in map_obj else 0)
+
+
+def _ct_string_eq(vm: CompileTimeVM) -> None:
+	right = vm.pop_str()
+	left = vm.pop_str()
+	vm.push(1 if left == right else 0)
+
+
+def _ct_string_length(vm: CompileTimeVM) -> None:
+	value = vm.pop_str()
+	vm.push(len(value))
+
+
+def _ct_string_append(vm: CompileTimeVM) -> None:
+	right = vm.pop_str()
+	left = vm.pop_str()
+	vm.push(left + right)
+
+
+def _ct_string_to_number(vm: CompileTimeVM) -> None:
+	text = vm.pop_str()
+	try:
+		value = int(text, 0)
+		vm.push(value)
+		vm.push(1)
+	except ValueError:
+		vm.push(0)
+		vm.push(0)
+
+
+def _ct_int_to_string(vm: CompileTimeVM) -> None:
+	value = vm.pop_int()
+	vm.push(str(value))
+
+
+def _ct_identifier_p(vm: CompileTimeVM) -> None:
+	value = vm.pop_str()
+	vm.push(1 if _is_identifier(value) else 0)
+
+
+def _ct_token_lexeme(vm: CompileTimeVM) -> None:
+	token = vm.pop_token()
+	vm.push(token.lexeme)
+
+
+def _ct_token_from_lexeme(vm: CompileTimeVM) -> None:
+	template_value = vm.pop()
+	lexeme = vm.pop_str()
+	template = _default_template(template_value)
+	vm.push(Token(
+		lexeme=lexeme,
+		line=template.line,
+		column=template.column,
+		start=template.start,
+		end=template.end,
+	))
+
+
+def _ct_next_token(vm: CompileTimeVM) -> None:
+	token = vm.parser.next_token()
+	vm.push(token)
+
+
+def _ct_peek_token(vm: CompileTimeVM) -> None:
+	vm.push(vm.parser.peek_token())
+
+
+def _ct_inject_tokens(vm: CompileTimeVM) -> None:
+	tokens = _ensure_list(vm.pop())
+	if not all(isinstance(item, Token) for item in tokens):
+		raise ParseError("inject-tokens expects a list of tokens")
+	vm.parser.inject_token_objects(tokens)
+
+
+def _ct_emit_definition(vm: CompileTimeVM) -> None:
+	body = _ensure_list(vm.pop())
+	name_value = vm.pop()
+	if isinstance(name_value, Token):
+		template = name_value
+		name = name_value.lexeme
+	elif isinstance(name_value, str):
+		template = _default_template(vm.pop())
+		name = name_value
+	else:
+		raise ParseError("emit-definition expects token or string for name")
+	lexemes = [
+		item.lexeme if isinstance(item, Token) else _coerce_str(item)
+		for item in body
+	]
+	generated: List[Token] = []
+	_struct_emit_definition(generated, template, name, lexemes)
+	vm.parser.inject_token_objects(generated)
+
+
+def _ct_parse_error(vm: CompileTimeVM) -> None:
+	message = vm.pop_str()
+	raise ParseError(message)
+
+
+def _ct_enable_call_syntax(vm: CompileTimeVM) -> None:
+	vm.parser.call_syntax_enabled = True
+
+
+def _ct_disable_call_syntax(vm: CompileTimeVM) -> None:
+	vm.parser.call_syntax_enabled = False
+
+
+def _ct_lexer_new(vm: CompileTimeVM) -> None:
+	separators = vm.pop_str()
+	vm.push(SplitLexer(vm.parser, separators))
+
+
+def _ct_lexer_pop(vm: CompileTimeVM) -> None:
+	lexer = _ensure_lexer(vm.pop())
+	token = lexer.pop()
+	vm.push(lexer)
+	vm.push(token)
+
+
+def _ct_lexer_peek(vm: CompileTimeVM) -> None:
+	lexer = _ensure_lexer(vm.pop())
+	vm.push(lexer)
+	vm.push(lexer.peek())
+
+
+def _ct_lexer_expect(vm: CompileTimeVM) -> None:
+	lexeme = vm.pop_str()
+	lexer = _ensure_lexer(vm.pop())
+	token = lexer.expect(lexeme)
+	vm.push(lexer)
+	vm.push(token)
+
+
+def _ct_lexer_collect_brace(vm: CompileTimeVM) -> None:
+	lexer = _ensure_lexer(vm.pop())
+	vm.push(lexer)
+	vm.push(lexer.collect_brace_block())
+
+
+def _ct_lexer_push_back(vm: CompileTimeVM) -> None:
+	lexer = _ensure_lexer(vm.pop())
+	lexer.push_back()
+	vm.push(lexer)
+
+
+def _register_compile_time_primitives(dictionary: Dictionary) -> None:
+	def register(name: str, func: Callable[[CompileTimeVM], None], *, compile_only: bool = False) -> None:
+		word = dictionary.lookup(name)
+		if word is None:
+			word = Word(name=name)
+			dictionary.register(word)
+		word.compile_time_intrinsic = func
+		if compile_only:
+			word.compile_only = True
+
+	register("dup", _ct_dup)
+	register("drop", _ct_drop)
+	register("swap", _ct_swap)
+	register("over", _ct_over)
+	register("rot", _ct_rot)
+	register("nip", _ct_nip)
+	register("tuck", _ct_tuck)
+	register("2dup", _ct_2dup)
+	register("2drop", _ct_2drop)
+	register("2swap", _ct_2swap)
+	register("2over", _ct_2over)
+	register("-rot", _ct_minus_rot)
+	register("+", _ct_add)
+	register("-", _ct_sub)
+	register("*", _ct_mul)
+	register("/", _ct_div)
+	register("%", _ct_mod)
+	register("==", _ct_eq)
+	register("!=", _ct_ne)
+	register("<", _ct_lt)
+	register("<=", _ct_le)
+	register(">", _ct_gt)
+	register(">=", _ct_ge)
+	register("and", _ct_and)
+	register("or", _ct_or)
+	register("not", _ct_not)
+	register(">r", _ct_to_r)
+	register("r>", _ct_r_from)
+	register("rdrop", _ct_rdrop)
+	register("rpick", _ct_rpick)
+
+	register("nil", _ct_nil, compile_only=True)
+	register("nil?", _ct_nil_p, compile_only=True)
+	register("list-new", _ct_list_new, compile_only=True)
+	register("list-clone", _ct_list_clone, compile_only=True)
+	register("list-append", _ct_list_append, compile_only=True)
+	register("list-pop", _ct_list_pop, compile_only=True)
+	register("list-pop-front", _ct_list_pop_front, compile_only=True)
+	register("list-length", _ct_list_length, compile_only=True)
+	register("list-empty?", _ct_list_empty, compile_only=True)
+	register("list-get", _ct_list_get, compile_only=True)
+	register("list-set", _ct_list_set, compile_only=True)
+	register("list-clear", _ct_list_clear, compile_only=True)
+	register("list-extend", _ct_list_extend, compile_only=True)
+	register("list-last", _ct_list_last, compile_only=True)
+
+	register("map-new", _ct_map_new, compile_only=True)
+	register("map-set", _ct_map_set, compile_only=True)
+	register("map-get", _ct_map_get, compile_only=True)
+	register("map-has?", _ct_map_has, compile_only=True)
+
+	register("string=", _ct_string_eq, compile_only=True)
+	register("string-length", _ct_string_length, compile_only=True)
+	register("string-append", _ct_string_append, compile_only=True)
+	register("string>number", _ct_string_to_number, compile_only=True)
+	register("int>string", _ct_int_to_string, compile_only=True)
+	register("identifier?", _ct_identifier_p, compile_only=True)
+
+	register("token-lexeme", _ct_token_lexeme, compile_only=True)
+	register("token-from-lexeme", _ct_token_from_lexeme, compile_only=True)
+	register("next-token", _ct_next_token, compile_only=True)
+	register("peek-token", _ct_peek_token, compile_only=True)
+	register("inject-tokens", _ct_inject_tokens, compile_only=True)
+	register("emit-definition", _ct_emit_definition, compile_only=True)
+	register("parse-error", _ct_parse_error, compile_only=True)
+	register("enable-call-syntax", _ct_enable_call_syntax, compile_only=True)
+	register("disable-call-syntax", _ct_disable_call_syntax, compile_only=True)
+
+	register("lexer-new", _ct_lexer_new, compile_only=True)
+	register("lexer-pop", _ct_lexer_pop, compile_only=True)
+	register("lexer-peek", _ct_lexer_peek, compile_only=True)
+	register("lexer-expect", _ct_lexer_expect, compile_only=True)
+	register("lexer-collect-brace", _ct_lexer_collect_brace, compile_only=True)
+	register("lexer-push-back", _ct_lexer_push_back, compile_only=True)
+
+
+
+
+PY_EXEC_GLOBALS: Dict[str, Any] = {
+	"MacroContext": MacroContext,
+	"Token": Token,
+	"Literal": Literal,
+	"WordRef": WordRef,
+	"BranchZero": BranchZero,
+	"Jump": Jump,
+	"Label": Label,
+	"ForBegin": ForBegin,
+	"ForNext": ForNext,
+	"StructField": StructField,
+	"Definition": Definition,
+	"Module": Module,
+	"ParseError": ParseError,
+	"emit_definition": _struct_emit_definition,
+	"is_identifier": _is_identifier,
+}
+
+
+def macro_struct_begin(ctx: MacroContext) -> Optional[List[ASTNode]]:
+	parser = ctx.parser
 	if parser._eof():
 		raise ParseError("struct name missing after 'struct:'")
 	name_token = parser.next_token()
@@ -813,17 +1885,19 @@ def macro_struct_begin(parser: Parser) -> Optional[List[ASTNode]]:
 	return None
 
 
-def macro_struct_end(parser: Parser) -> Optional[List[ASTNode]]:
+def macro_struct_end(ctx: MacroContext) -> Optional[List[ASTNode]]:
 	raise ParseError("';struct' must follow a 'struct:' block")
 
 
 def bootstrap_dictionary() -> Dictionary:
 	dictionary = Dictionary()
 	dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
+	dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
 	dictionary.register(Word(name="macro:", immediate=True, macro=macro_begin_text_macro))
 	dictionary.register(Word(name=";macro", immediate=True, macro=macro_end_text_macro))
 	dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
 	dictionary.register(Word(name=";struct", immediate=True, macro=macro_struct_end))
+	_register_compile_time_primitives(dictionary)
 	return dictionary
 
 

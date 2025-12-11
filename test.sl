@@ -1,4 +1,5 @@
 import stdlib.sl
+import fn.sl
 
 :asm mem-slot {
     lea rax, [rel print_buf]
@@ -33,8 +34,8 @@ struct: Point
 
 extend-syntax
 
-fn fancy_add(int left, int right){
-    return (left + right) * right;
+fn fancy_add(int a, int b){
+    return (a + b) * b;
 }
 
 : test-add

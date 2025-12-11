@@ -73,6 +73,11 @@ word_dup:
 word_drop:
 	add r12, 8
     ret
+word_over:
+	mov rax, [r12 + 8]
+	sub r12, 8
+	mov [r12], rax
+    ret
 word_swap:
 	mov rax, [r12]
 	mov rbx, [r12 + 8]
@@ -221,6 +226,13 @@ word_r_3e:
     ret
 word_rdrop:
 	add r13, 8
+    ret
+word_pick:
+	mov rcx, [r12]
+	add r12, 8
+	mov rax, [r12 + rcx * 8]
+	sub r12, 8
+	mov [r12], rax
     ret
 word_rpick:
 	mov rcx, [r12]
@@ -461,18 +473,18 @@ word_test_2dif:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_0
+    jz L_if_false_24
     ; push 111
     sub r12, 8
     mov qword [r12], 111
     call word_puts
-    jmp L_if_end_1
-L_if_false_0:
+    jmp L_if_end_25
+L_if_false_24:
     ; push 222
     sub r12, 8
     mov qword [r12], 222
     call word_puts
-L_if_end_1:
+L_if_end_25:
     ret
 word_test_2delse_2dif:
     ; push 2
@@ -486,13 +498,13 @@ word_test_2delse_2dif:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_2
+    jz L_if_false_26
     ; push 50
     sub r12, 8
     mov qword [r12], 50
     call word_puts
-    jmp L_if_end_3
-L_if_false_2:
+    jmp L_if_end_27
+L_if_false_26:
     call word_dup
     ; push 2
     sub r12, 8
@@ -501,19 +513,19 @@ L_if_false_2:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_4
+    jz L_if_false_28
     ; push 60
     sub r12, 8
     mov qword [r12], 60
     call word_puts
-    jmp L_if_end_5
-L_if_false_4:
+    jmp L_if_end_29
+L_if_false_28:
     ; push 70
     sub r12, 8
     mov qword [r12], 70
     call word_puts
-L_if_end_5:
-L_if_end_3:
+L_if_end_29:
+L_if_end_27:
     call word_drop
     ret
 word_test_2dfor:
@@ -526,10 +538,10 @@ word_test_2dfor:
     mov rax, [r12]
     add r12, 8
     cmp rax, 0
-    jle L_for_end_7
+    jle L_for_end_31
     sub r13, 8
     mov [r13], rax
-L_for_loop_6:
+L_for_loop_30:
     ; push 1
     sub r12, 8
     mov qword [r12], 1
@@ -537,9 +549,9 @@ L_for_loop_6:
     mov rax, [r13]
     dec rax
     mov [r13], rax
-    jg L_for_loop_6
+    jg L_for_loop_30
     add r13, 8
-L_for_end_7:
+L_for_end_31:
     call word_puts
     ret
 word_test_2dfor_2dzero:
@@ -552,17 +564,17 @@ word_test_2dfor_2dzero:
     mov rax, [r12]
     add r12, 8
     cmp rax, 0
-    jle L_for_end_9
+    jle L_for_end_33
     sub r13, 8
     mov [r13], rax
-L_for_loop_8:
+L_for_loop_32:
     call word_drop
     mov rax, [r13]
     dec rax
     mov [r13], rax
-    jg L_for_loop_8
+    jg L_for_loop_32
     add r13, 8
-L_for_end_9:
+L_for_end_33:
     call word_puts
     ret
 word_test_2dstruct:

@@ -1,4 +1,24 @@
-:asm puts {
+section .text
+%define DSTK_BYTES 65536
+%define RSTK_BYTES 65536
+%define PRINT_BUF_BYTES 128
+global _start
+_start:
+    ; initialize data/return stack pointers
+    lea r12, [rel dstack_top]
+    mov r15, r12
+    lea r13, [rel rstack_top]
+    call word_main
+    mov rax, 0
+    cmp r12, r15
+    je .no_exit_value
+    mov rax, [r12]
+    add r12, 8
+.no_exit_value:
+    mov rdi, rax
+    mov rax, 60
+    syscall
+word_puts:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, rax
@@ -44,79 +64,59 @@ puts_finish_digits:
 	mov r9, rsi
 	mov rsi, r9
 	syscall
-}
-;
-
-:asm dup {
+    ret
+word_dup:
 	mov rax, [r12]
 	sub r12, 8
 	mov [r12], rax
-}
-;
-
-:asm drop {
+    ret
+word_drop:
 	add r12, 8
-}
-;
-
-:asm over {
+    ret
+word_over:
 	mov rax, [r12 + 8]
 	sub r12, 8
 	mov [r12], rax
-}
-;
-
-:asm swap {
+    ret
+word_swap:
 	mov rax, [r12]
 	mov rbx, [r12 + 8]
 	mov [r12], rbx
 	mov [r12 + 8], rax
-}
-;
-
-:asm + {
+    ret
+word__2b:
 	mov rax, [r12]
 	add r12, 8
 	add qword [r12], rax
-}
-;
-
-:asm - {
+    ret
+word__2d:
 	mov rax, [r12]
 	add r12, 8
 	sub qword [r12], rax
-}
-;
-
-:asm * {
+    ret
+word__2a:
 	mov rax, [r12]
 	add r12, 8
 	imul qword [r12]
 	mov [r12], rax
-}
-;
-
-:asm / {
+    ret
+word__2f:
 	mov rbx, [r12]
 	add r12, 8
 	mov rax, [r12]
 	cqo
 	idiv rbx
 	mov [r12], rax
-}
-;
-
-:asm % {
+    ret
+word__25:
 	mov rbx, [r12]
 	add r12, 8
 	mov rax, [r12]
 	cqo
 	idiv rbx
 	mov [r12], rdx
-}
-;
-
-:asm == {
+    ret
+word__3d_3d:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -124,10 +124,8 @@ puts_finish_digits:
 	mov rbx, 0
 	sete bl
 	mov [r12], rbx
-}
-;
-
-:asm != {
+    ret
+word__21_3d:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -135,10 +133,8 @@ puts_finish_digits:
 	mov rbx, 0
 	setne bl
 	mov [r12], rbx
-}
-;
-
-:asm < {
+    ret
+word__3c:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -146,10 +142,8 @@ puts_finish_digits:
 	mov rbx, 0
 	setl bl
 	mov [r12], rbx
-}
-;
-
-:asm > {
+    ret
+word__3e:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -157,10 +151,8 @@ puts_finish_digits:
 	mov rbx, 0
 	setg bl
 	mov [r12], rbx
-}
-;
-
-:asm <= {
+    ret
+word__3c_3d:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -168,10 +160,8 @@ puts_finish_digits:
 	mov rbx, 0
 	setle bl
 	mov [r12], rbx
-}
-;
-
-:asm >= {
+    ret
+word__3e_3d:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
@@ -179,26 +169,20 @@ puts_finish_digits:
 	mov rbx, 0
 	setge bl
 	mov [r12], rbx
-}
-;
-
-:asm @ {
+    ret
+word__40:
 	mov rax, [r12]
 	mov rax, [rax]
 	mov [r12], rax
-}
-;
-
-:asm ! {
+    ret
+word__21:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, [r12]
 	mov [rax], rbx
 	add r12, 8
-}
-;
-
-:asm mmap {
+    ret
+word_mmap:
 	mov r9, [r12]
 	add r12, 8
 	mov r8, [r12]
@@ -213,62 +197,102 @@ puts_finish_digits:
 	mov rax, 9
 	syscall
 	mov [r12], rax
-}
-;
-
-:asm munmap {
+    ret
+word_munmap:
 	mov rsi, [r12]
 	add r12, 8
 	mov rdi, [r12]
 	mov rax, 11
 	syscall
 	mov [r12], rax
-}
-;
-
-:asm exit {
+    ret
+word_exit:
 	mov rdi, [r12]
 	add r12, 8
 	mov rax, 60
 	syscall
-}
-;
-
-:asm >r {
+    ret
+word__3er:
 	mov rax, [r12]
 	add r12, 8
 	sub r13, 8
 	mov [r13], rax
-}
-;
-
-:asm r> {
+    ret
+word_r_3e:
 	mov rax, [r13]
 	add r13, 8
 	sub r12, 8
 	mov [r12], rax
-}
-;
-
-:asm rdrop {
+    ret
+word_rdrop:
 	add r13, 8
-}
-;
-
-:asm pick {
+    ret
+word_pick:
 	mov rcx, [r12]
 	add r12, 8
 	mov rax, [r12 + rcx * 8]
 	sub r12, 8
 	mov [r12], rax
-}
-;
-
-:asm rpick {
+    ret
+word_rpick:
 	mov rcx, [r12]
 	add r12, 8
 	mov rax, [r13 + rcx * 8]
 	sub r12, 8
 	mov [r12], rax
-}
-;
+    ret
+word_main:
+    ; push 0
+    sub r12, 8
+    mov qword [r12], 0
+    ; push 5
+    sub r12, 8
+    mov qword [r12], 5
+    mov rax, [r12]
+    add r12, 8
+    cmp rax, 0
+    jle L_for_end_1
+    sub r13, 8
+    mov [r13], rax
+L_for_loop_0:
+    ; push 1
+    sub r12, 8
+    mov qword [r12], 1
+    call word__2b
+    mov rax, [r13]
+    dec rax
+    mov [r13], rax
+    jg L_for_loop_0
+    add r13, 8
+L_for_end_1:
+    call word_puts
+    ; push 5
+    sub r12, 8
+    mov qword [r12], 5
+    ; push 5
+    sub r12, 8
+    mov qword [r12], 5
+    call word__3d_3d
+    call word_puts
+    ; push 5
+    sub r12, 8
+    mov qword [r12], 5
+    ; push 4
+    sub r12, 8
+    mov qword [r12], 4
+    call word__3d_3d
+    call word_puts
+    ; push 0
+    sub r12, 8
+    mov qword [r12], 0
+    ret
+section .bss
+align 16
+dstack: resb DSTK_BYTES
+dstack_top:
+align 16
+rstack: resb RSTK_BYTES
+rstack_top:
+align 16
+print_buf: resb PRINT_BUF_BYTES
+print_buf_end:

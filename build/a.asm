@@ -261,50 +261,17 @@ word_rpick:
 	mov [r12], rax
     ret
 word_main:
-    ; push 0
+    ; push str_0
     sub r12, 8
-    mov qword [r12], 0
-    ; push 5
+    mov qword [r12], str_0
+    ; push 11
     sub r12, 8
-    mov qword [r12], 5
-    mov rax, [r12]
-    add r12, 8
-    cmp rax, 0
-    jle L_for_end_1
-    sub r13, 8
-    mov [r13], rax
-L_for_loop_0:
-    ; push 1
-    sub r12, 8
-    mov qword [r12], 1
-    call word__2b
-    mov rax, [r13]
-    dec rax
-    mov [r13], rax
-    jg L_for_loop_0
-    add r13, 8
-L_for_end_1:
-    call word_puts
-    ; push 5
-    sub r12, 8
-    mov qword [r12], 5
-    ; push 5
-    sub r12, 8
-    mov qword [r12], 5
-    call word__3d_3d
-    call word_puts
-    ; push 5
-    sub r12, 8
-    mov qword [r12], 5
-    ; push 4
-    sub r12, 8
-    mov qword [r12], 4
-    call word__3d_3d
-    call word_puts
-    ; push 0
-    sub r12, 8
-    mov qword [r12], 0
+    mov qword [r12], 11
+    call word_puts_str
     ret
+section .data
+str_0: db 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0
+str_0_len equ 11
 section .bss
 align 16
 dstack: resb DSTK_BYTES

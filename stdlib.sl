@@ -47,6 +47,27 @@ puts_finish_digits:
 }
 ;
 
+:asm puts_str {
+	; expects (addr, len) on data stack
+	mov rdx, [r12]
+	add r12, 8
+	mov rsi, [r12]
+	add r12, 8
+	cmp rdx, 0
+	je puts_str_write_newline
+	mov rax, 1
+	mov rdi, 1
+	syscall
+puts_str_write_newline:
+	mov byte [rel print_buf], 10
+	mov rax, 1
+	mov rdi, 1
+	lea rsi, [rel print_buf]
+	mov rdx, 1
+	syscall
+}
+;
+
 :asm dup {
 	mov rax, [r12]
 	sub r12, 8

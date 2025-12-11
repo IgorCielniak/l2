@@ -1006,6 +1006,13 @@ class FunctionEmitter:
 			f"    mov qword [r12], {value}",
 		])
 
+	def push_label(self, label: str) -> None:
+		self.text.extend([
+			f"    ; push {label}",
+			"    sub r12, 8",
+			f"    mov qword [r12], {label}",
+		])
+
 	def push_from(self, register: str) -> None:
 		self.text.extend([
 			"    sub r12, 8",
@@ -1083,10 +1090,14 @@ class Assembler:
 		self.dictionary = dictionary
 		self.stack_bytes = 65536
 		self.io_buffer_bytes = 128
+		self._string_literals: Dict[str, Tuple[str, int]] = {}
+		self._data_section: Optional[List[str]] = None
 
 	def emit(self, module: Module) -> Emission:
 		emission = Emission()
 		emission.text.extend(self._runtime_prelude())
+		self._string_literals = {}
+		self._data_section = emission.data
 
 		valid_defs = (Definition, AsmDefinition)
 		definitions = [form for form in module.forms if isinstance(form, valid_defs)]
@@ -1104,7 +1115,22 @@ class Assembler:
 			self._emit_definition(definition, emission.text)
 
 		emission.bss.extend(self._bss_layout())
+		self._data_section = None
 		return emission
+
+	def _intern_string_literal(self, value: str) -> Tuple[str, int]:
+		if self._data_section is None:
+			raise CompileError("string literal emission requested without data section")
+		if value in self._string_literals:
+			return self._string_literals[value]
+		label = f"str_{len(self._string_literals)}"
+		encoded = value.encode("utf-8")
+		bytes_with_nul = list(encoded) + [0]
+		byte_list = ", ".join(str(b) for b in bytes_with_nul)
+		self._data_section.append(f"{label}: db {byte_list}")
+		self._data_section.append(f"{label}_len equ {len(encoded)}")
+		self._string_literals[value] = (label, len(encoded))
+		return self._string_literals[value]
 
 	def _emit_definition(self, definition: Union[Definition, AsmDefinition], text: List[str]) -> None:
 		label = sanitize_label(definition.name)
@@ -1131,9 +1157,15 @@ class Assembler:
 
 	def _emit_node(self, node: ASTNode, builder: FunctionEmitter) -> None:
 		if isinstance(node, Literal):
-			if not isinstance(node.value, int):
-				raise CompileError("string literals are compile-time only")
-			builder.push_literal(node.value)
+			if isinstance(node.value, int):
+				builder.push_literal(node.value)
+				return
+			if isinstance(node.value, str):
+				label, length = self._intern_string_literal(node.value)
+				builder.push_label(label)
+				builder.push_literal(length)
+				return
+			raise CompileError(f"unsupported literal type {type(node.value)!r}")
 			return
 		if isinstance(node, WordRef):
 			self._emit_wordref(node, builder)

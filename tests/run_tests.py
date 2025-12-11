@@ -99,6 +99,20 @@ compile-only
 """,
         expected_stdout="6\n",
     ),
+    TestCase(
+        name="string_puts",
+        source=f"""
+import {ROOT / 'stdlib.sl'}
+
+: main
+    \"hello world\" puts_str
+    \"line1\\nline2\" puts_str
+    \"\" puts_str
+    0
+;
+""",
+        expected_stdout="hello world\nline1\nline2\n\n",
+    ),
 ]
 
 

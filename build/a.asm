@@ -19,6 +19,36 @@ _start:
     mov rax, 60
     syscall
 word_puts:
+	; detects string if top is len>=0 and next is a pointer in [data_start, data_end)
+	mov rax, [r12]      ; len or int value
+	mov rbx, [r12 + 8]  ; possible address
+	cmp rax, 0
+	jl puts_print_int
+	lea r8, [rel data_start]
+	lea r9, [rel data_end]
+	cmp rbx, r8
+	jl puts_print_int
+	cmp rbx, r9
+	jge puts_print_int
+	; treat as string: (addr below len)
+	mov rdx, rax        ; len
+	mov rsi, rbx        ; addr
+	add r12, 16         ; pop len + addr
+	test rdx, rdx
+	jz puts_str_newline_only
+	mov rax, 1
+	mov rdi, 1
+	syscall
+puts_str_newline_only:
+	mov byte [rel print_buf], 10
+	mov rax, 1
+	mov rdi, 1
+	lea rsi, [rel print_buf]
+	mov rdx, 1
+	syscall
+	ret
+
+puts_print_int:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, rax
@@ -63,25 +93,6 @@ puts_finish_digits:
 	mov rdx, rcx
 	mov r9, rsi
 	mov rsi, r9
-	syscall
-    ret
-word_puts_str:
-	; expects (addr, len) on data stack
-	mov rdx, [r12]
-	add r12, 8
-	mov rsi, [r12]
-	add r12, 8
-	cmp rdx, 0
-	je puts_str_write_newline
-	mov rax, 1
-	mov rdi, 1
-	syscall
-puts_str_write_newline:
-	mov byte [rel print_buf], 10
-	mov rax, 1
-	mov rdi, 1
-	lea rsi, [rel print_buf]
-	mov rdx, 1
 	syscall
     ret
 word_dup:
@@ -267,11 +278,13 @@ word_main:
     ; push 11
     sub r12, 8
     mov qword [r12], 11
-    call word_puts_str
+    call word_puts
     ret
 section .data
+data_start:
 str_0: db 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0
 str_0_len equ 11
+data_end:
 section .bss
 align 16
 dstack: resb DSTK_BYTES

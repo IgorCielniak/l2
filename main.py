@@ -1114,13 +1114,25 @@ class Assembler:
 		for definition in runtime_defs:
 			self._emit_definition(definition, emission.text)
 
+		if self._data_section is not None:
+			if not self._data_section:
+				self._data_section.append("data_start:")
+			if not self._data_section or self._data_section[-1] != "data_end:":
+				self._data_section.append("data_end:")
 		emission.bss.extend(self._bss_layout())
 		self._data_section = None
 		return emission
 
+	def _ensure_data_start(self) -> None:
+		if self._data_section is None:
+			raise CompileError("data section is not initialized")
+		if not self._data_section:
+			self._data_section.append("data_start:")
+
 	def _intern_string_literal(self, value: str) -> Tuple[str, int]:
 		if self._data_section is None:
 			raise CompileError("string literal emission requested without data section")
+		self._ensure_data_start()
 		if value in self._string_literals:
 			return self._string_literals[value]
 		label = f"str_{len(self._string_literals)}"

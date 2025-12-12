@@ -1,5 +1,5 @@
 import stdlib.sl
 
 : main
-    "hello world" puts_str
+    "hello world" puts
 ;

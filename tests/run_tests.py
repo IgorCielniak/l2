@@ -105,9 +105,9 @@ compile-only
 import {ROOT / 'stdlib.sl'}
 
 : main
-    \"hello world\" puts_str
-    \"line1\\nline2\" puts_str
-    \"\" puts_str
+    \"hello world\" puts
+    \"line1\\nline2\" puts
+    \"\" puts
     0
 ;
 """,

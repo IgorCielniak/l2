@@ -1,4 +1,34 @@
 :asm puts {
+	; detects string if top is len>=0 and next is a pointer in [data_start, data_end)
+	mov rax, [r12]      ; len or int value
+	mov rbx, [r12 + 8]  ; possible address
+	cmp rax, 0
+	jl puts_print_int
+	lea r8, [rel data_start]
+	lea r9, [rel data_end]
+	cmp rbx, r8
+	jl puts_print_int
+	cmp rbx, r9
+	jge puts_print_int
+	; treat as string: (addr below len)
+	mov rdx, rax        ; len
+	mov rsi, rbx        ; addr
+	add r12, 16         ; pop len + addr
+	test rdx, rdx
+	jz puts_str_newline_only
+	mov rax, 1
+	mov rdi, 1
+	syscall
+puts_str_newline_only:
+	mov byte [rel print_buf], 10
+	mov rax, 1
+	mov rdi, 1
+	lea rsi, [rel print_buf]
+	mov rdx, 1
+	syscall
+	ret
+
+puts_print_int:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, rax
@@ -43,27 +73,6 @@ puts_finish_digits:
 	mov rdx, rcx
 	mov r9, rsi
 	mov rsi, r9
-	syscall
-}
-;
-
-:asm puts_str {
-	; expects (addr, len) on data stack
-	mov rdx, [r12]
-	add r12, 8
-	mov rsi, [r12]
-	add r12, 8
-	cmp rdx, 0
-	je puts_str_write_newline
-	mov rax, 1
-	mov rdi, 1
-	syscall
-puts_str_write_newline:
-	mov byte [rel print_buf], 10
-	mov rax, 1
-	mov rdi, 1
-	lea rsi, [rel print_buf]
-	mov rdx, 1
 	syscall
 }
 ;

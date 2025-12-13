@@ -19,7 +19,7 @@ _start:
     mov rax, 60
     syscall
 word_puts:
-	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
+	; detects string if top is len>=0 and next is a pointer in [data_start, data_end)
 	mov rax, [r12]      ; len or int value
 	mov rbx, [r12 + 8]  ; possible address
 	cmp rax, 0

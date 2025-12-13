@@ -19,7 +19,7 @@ _start:
     mov rax, 60
     syscall
 word_puts:
-	; detects string if top is len>=0 and next is a pointer in [data_start, data_end)
+	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
 	mov rax, [r12]      ; len or int value
 	mov rbx, [r12 + 8]  ; possible address
 	cmp rax, 0
@@ -113,6 +113,64 @@ word_swap:
 	mov rbx, [r12 + 8]
 	mov [r12], rbx
 	mov [r12 + 8], rax
+    ret
+word_rot:
+	mov rax, [r12]       ; x3
+	mov rbx, [r12 + 8]   ; x2
+	mov rcx, [r12 + 16]  ; x1
+	mov [r12], rcx       ; top = x1
+	mov [r12 + 8], rax   ; next = x3
+	mov [r12 + 16], rbx  ; third = x2
+    ret
+word__2drot:
+	mov rax, [r12]       ; x3
+	mov rbx, [r12 + 8]   ; x2
+	mov rcx, [r12 + 16]  ; x1
+	mov [r12], rbx       ; top = x2
+	mov [r12 + 8], rcx   ; next = x1
+	mov [r12 + 16], rax  ; third = x3
+    ret
+word_nip:
+	mov rax, [r12]
+	add r12, 8           ; drop lower element
+	mov [r12], rax       ; keep original top
+    ret
+word_tuck:
+	mov rax, [r12]       ; x2
+	mov rbx, [r12 + 8]   ; x1
+	sub r12, 8           ; make room
+	mov [r12], rax       ; x2
+	mov [r12 + 8], rbx   ; x1
+	mov [r12 + 16], rax  ; x2
+    ret
+word_2dup:
+	mov rax, [r12]       ; b
+	mov rbx, [r12 + 8]   ; a
+	sub r12, 8
+	mov [r12], rbx       ; push a
+	sub r12, 8
+	mov [r12], rax       ; push b
+    ret
+word_2drop:
+	add r12, 16
+    ret
+word_2swap:
+	mov rax, [r12]        ; d
+	mov rbx, [r12 + 8]    ; c
+	mov rcx, [r12 + 16]   ; b
+	mov rdx, [r12 + 24]   ; a
+	mov [r12], rcx        ; top = b
+	mov [r12 + 8], rdx    ; next = a
+	mov [r12 + 16], rax   ; third = d
+	mov [r12 + 24], rbx   ; fourth = c
+    ret
+word_2over:
+	mov rax, [r12 + 16]   ; b
+	mov rbx, [r12 + 24]   ; a
+	sub r12, 8
+	mov [r12], rbx        ; push a
+	sub r12, 8
+	mov [r12], rax        ; push b
     ret
 word__2b:
 	mov rax, [r12]
@@ -241,6 +299,39 @@ word_exit:
 	add r12, 8
 	mov rax, 60
 	syscall
+    ret
+word_and:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	test rax, rax
+	setz cl
+	test rbx, rbx
+	setz dl
+	movzx rcx, cl
+	movzx rdx, dl
+	and rcx, rdx
+	mov [r12], rcx
+    ret
+word_or:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	test rax, rax
+	setz cl
+	test rbx, rbx
+	setz dl
+	movzx rcx, cl
+	movzx rdx, dl
+	or rcx, rdx
+	mov [r12], rcx
+    ret
+word_not:
+	mov rax, [r12]
+	test rax, rax
+	setz al
+	movzx rax, al
+	mov [r12], rax
     ret
 word__3er:
 	mov rax, [r12]

@@ -100,27 +100,29 @@ compile-only
 compile-only
 
 : fn-lexemes-from-tokens
-	list-new >r                 # tokens    (r: acc)
-	0                           # tokens idx
+	>r                   # (r: tokens)
+	list-new             # acc
 begin
-	over list-length over swap >= if   # stop when idx >= len
-		drop drop                # drop idx and tokens (flag consumed by if)
-		r> exit                  # return acc
+	0 rpick list-empty? if
+		rdrop exit
 	then
-	over over list-get token-lexeme   # tokens idx lex
-	r> swap list-append >r            # tokens idx
-	1 +                               # tokens idx+1
+	0 rpick list-pop-front     # acc tokens' first
+	rdrop                      # acc tokens'
+	swap                       # acc first tokens'
+	>r                         # acc first   (r: tokens')
+	token-lexeme          # acc lex
+	list-append           # acc'
 again
 ;
 compile-only
 
 : fn-validate-body
 	dup list-length 0 == if "empty function body" parse-error then
-	dup >r 0 r> swap list-get "return" string= 0 == if "function body must start with 'return'" parse-error then
+	dup 0 list-get token-lexeme "return" string= 0 == if "function body must start with 'return'" parse-error then
 	dup list-last ";" string= 0 == if "function body must terminate with ';'" parse-error then
-	list-clone                     # work on a copy
-	list-pop drop                  # drop trailing ';'
-	list-pop-front drop            # drop leading 'return'
+	list-clone                     # body body'
+	list-pop drop                  # body expr' (trim trailing ';')
+	list-pop-front drop            # body expr  (trim leading 'return')
 	dup list-length 0 == if "missing return expression" parse-error then
 ;
 compile-only

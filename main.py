@@ -871,7 +871,15 @@ class CompileTimeVM:
 			raise ParseError(f"word '{word.name}' has no asm body")
 		asm_body = definition.body.strip("\n")
 
-		string_mode = word.name == "puts"
+		# Determine whether this asm uses string semantics (len,addr pairs)
+		# by scanning the asm body for string-related labels. This avoids
+		# hardcoding a specific word name (like 'puts') and lets any word
+		# that expects (len, addr) work the same way.
+		string_mode = False
+		if asm_body:
+			lowered = asm_body.lower()
+			if any(k in lowered for k in ("data_start", "data_end", "print_buf", "print_buf_end")):
+				string_mode = True
 
 		handles = self._handles
 

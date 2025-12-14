@@ -362,7 +362,34 @@ word_rpick:
 	sub r12, 8
 	mov [r12], rax
     ret
+word_foo:
+    call word__3er
+    call word__3er
+    ; push 1
+    sub r12, 8
+    mov qword [r12], 1
+    call word_puts
+    ; push 0
+    sub r12, 8
+    mov qword [r12], 0
+    call word_rpick
+    ; push 1
+    sub r12, 8
+    mov qword [r12], 1
+    call word_rpick
+    call word__2b
+    call word_rdrop
+    call word_rdrop
+    ret
 word_main:
+    ; push 3
+    sub r12, 8
+    mov qword [r12], 3
+    ; push 2
+    sub r12, 8
+    mov qword [r12], 2
+    call word_foo
+    call word_puts
     ; push 0
     sub r12, 8
     mov qword [r12], 0

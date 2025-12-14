@@ -1,13 +1,15 @@
 import stdlib.sl
 import fn.sl
 
-fn foo(int a){
-    return a + 1;
+fn foo(int a, int b){
+    1
+    puts
+    return a b +;
 }
 
 : main
     extend-syntax
-    foo(1)
+    foo(3, 2)
     puts
     0
 ;

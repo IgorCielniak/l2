@@ -128,6 +128,46 @@ compile-only
 ;
 compile-only
 
+
+: fn-filter-raw-body             # bodyLexemes -- tokens
+	list-new swap                   # out body
+begin
+	dup list-empty? if
+		drop                           # out
+		exit
+	then
+	list-pop-front                  # out body' tok
+	swap >r                         # out tok           (r: body')
+	dup "return" string= if
+		drop
+		r>
+		continue
+	then
+	dup ";" string= if
+		drop
+		r>
+		continue
+	then
+	list-append                     # out'
+	r>                              # out' body'
+	continue
+again
+;
+compile-only
+
+
+: fn-body->tokens                # bodyLexemes -- tokens
+	dup list-length 0 == if "empty function body" parse-error then
+	dup 0 list-get token-lexeme "return" string= if
+		fn-validate-body              # expr
+		shunt                         # postfix
+		exit
+	then
+	fn-filter-raw-body
+	dup list-length 0 == if "empty function body" parse-error then
+;
+compile-only
+
 : fn-emit-prologue             # params out -- params out
 	over list-length              # params out n
 begin
@@ -322,8 +362,7 @@ compile-only
 	fn-collect-body                   # params bodyTokens
 	swap >r                           # bodyTokens (r: params)
 	fn-lexemes-from-tokens            # lexemes
-	fn-validate-body                  # expr
-	shunt                             # postfix
+	fn-body->tokens                   # tokens
 	r>                                # postfix params
 	fn-build-body                     # body
 	r> drop                           # drop name string

@@ -594,18 +594,18 @@ word_test_2dif:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_34
+    jz L_if_false_40
     ; push 111
     sub r12, 8
     mov qword [r12], 111
     call word_puts
-    jmp L_if_end_35
-L_if_false_34:
+    jmp L_if_end_41
+L_if_false_40:
     ; push 222
     sub r12, 8
     mov qword [r12], 222
     call word_puts
-L_if_end_35:
+L_if_end_41:
     ret
 word_test_2delse_2dif:
     ; push 2
@@ -619,13 +619,13 @@ word_test_2delse_2dif:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_36
+    jz L_if_false_42
     ; push 50
     sub r12, 8
     mov qword [r12], 50
     call word_puts
-    jmp L_if_end_37
-L_if_false_36:
+    jmp L_if_end_43
+L_if_false_42:
     call word_dup
     ; push 2
     sub r12, 8
@@ -634,19 +634,19 @@ L_if_false_36:
     mov rax, [r12]
     add r12, 8
     test rax, rax
-    jz L_if_false_38
+    jz L_if_false_44
     ; push 60
     sub r12, 8
     mov qword [r12], 60
     call word_puts
-    jmp L_if_end_39
-L_if_false_38:
+    jmp L_if_end_45
+L_if_false_44:
     ; push 70
     sub r12, 8
     mov qword [r12], 70
     call word_puts
-L_if_end_39:
-L_if_end_37:
+L_if_end_45:
+L_if_end_43:
     call word_drop
     ret
 word_test_2dfor:
@@ -659,10 +659,10 @@ word_test_2dfor:
     mov rax, [r12]
     add r12, 8
     cmp rax, 0
-    jle L_for_end_41
+    jle L_for_end_47
     sub r13, 8
     mov [r13], rax
-L_for_loop_40:
+L_for_loop_46:
     ; push 1
     sub r12, 8
     mov qword [r12], 1
@@ -670,9 +670,9 @@ L_for_loop_40:
     mov rax, [r13]
     dec rax
     mov [r13], rax
-    jg L_for_loop_40
+    jg L_for_loop_46
     add r13, 8
-L_for_end_41:
+L_for_end_47:
     call word_puts
     ret
 word_test_2dfor_2dzero:
@@ -685,17 +685,17 @@ word_test_2dfor_2dzero:
     mov rax, [r12]
     add r12, 8
     cmp rax, 0
-    jle L_for_end_43
+    jle L_for_end_49
     sub r13, 8
     mov [r13], rax
-L_for_loop_42:
+L_for_loop_48:
     call word_drop
     mov rax, [r13]
     dec rax
     mov [r13], rax
-    jg L_for_loop_42
+    jg L_for_loop_48
     add r13, 8
-L_for_end_43:
+L_for_end_49:
     call word_puts
     ret
 word_test_2dstruct:

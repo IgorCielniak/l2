@@ -226,9 +226,11 @@ compile-only
 	# number?
 	dup string>number              # out map tok num ok
 	if
-		# drop tok, append num
-		swap drop                    # out map num
-		swap >r                      # out num   (r: map)
+		# (out map tok num) -> (out' map)
+		>r                           # out map tok        (r: num)
+		drop                         # out map
+		r>                           # out map num
+		swap >r                      # out num            (r: map)
 		list-append                  # out'
 		r>                           # out' map
 		exit
@@ -236,16 +238,15 @@ compile-only
 	drop                           # out map tok
 
 	# param?
-	dup >r                         # out map tok   (r: tok)
+	dup >r                         # out map tok        (r: tok)
 	map-get                        # out map idx|nil ok
 	if
 		# append idx
-		swap >r                      # out idx   (r: map tok)
+		swap >r                      # out idx            (r: map tok)
 		list-append                  # out'
 		r>                           # out' map
 		# append "rpick"
-		"rpick"                      # out' map "rpick"
-		swap >r                      # out' "rpick"   (r: map tok)
+		"rpick" swap >r             # out' "rpick"      (r: map tok)
 		list-append                  # out''
 		r>                           # out'' map
 		# drop saved tok
@@ -255,7 +256,7 @@ compile-only
 	# not a param: drop idx|nil, append original tok
 	drop                           # out map
 	r>                             # out map tok
-	swap >r                        # out tok   (r: map)
+	swap >r                        # out tok            (r: map)
 	list-append                    # out'
 	r>                             # out' map
 ;

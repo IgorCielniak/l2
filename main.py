@@ -476,6 +476,7 @@ class Parser:
 
 	def _execute_immediate_word(self, word: Word) -> None:
 		try:
+			print(f"[ct] invoking {word.name}")
 			self.compile_time_vm.invoke(word)
 		except ParseError:
 			raise
@@ -1066,6 +1067,7 @@ class CompileTimeVM:
 		word = self.dictionary.lookup(name)
 		if word is None:
 			raise ParseError(f"unknown word '{name}' during compile-time execution")
+		print(f"[ct-call] {name} stack={self.stack}")
 		self._call_word(word)
 
 	def _execute_nodes(self, nodes: Sequence[ASTNode]) -> None:
@@ -1741,17 +1743,6 @@ def _ct_nil(vm: CompileTimeVM) -> None:
 	vm.push(None)
 
 
-def _ct_puts(vm: CompileTimeVM) -> None:
-	value = vm.pop()
-	if isinstance(value, str):
-		print(value)
-		return
-	if isinstance(value, int):
-		print(value)
-		return
-	raise ParseError("puts expects string or integer at compile time")
-
-
 def _ct_nil_p(vm: CompileTimeVM) -> None:
 	vm.push(1 if vm.pop() is None else 0)
 
@@ -1794,6 +1785,27 @@ def _ct_list_pop_front(vm: CompileTimeVM) -> None:
 	value = lst.pop(0)
 	vm.push(lst)
 	vm.push(value)
+
+
+def _ct_list_peek_front(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	if not lst:
+		raise ParseError("cannot peek from empty list")
+	vm.push(lst)
+	vm.push(lst[0])
+
+
+def _ct_list_push_front(vm: CompileTimeVM) -> None:
+	value = vm.pop()
+	lst = _ensure_list(vm.pop())
+	lst.insert(0, value)
+	vm.push(lst)
+
+
+def _ct_list_reverse(vm: CompileTimeVM) -> None:
+	lst = _ensure_list(vm.pop())
+	lst.reverse()
+	vm.push(lst)
 
 
 def _ct_list_length(vm: CompileTimeVM) -> None:
@@ -1886,8 +1898,11 @@ def _ct_map_has(vm: CompileTimeVM) -> None:
 
 
 def _ct_string_eq(vm: CompileTimeVM) -> None:
-	right = vm.pop_str()
-	left = vm.pop_str()
+	try:
+		right = vm.pop_str()
+		left = vm.pop_str()
+	except ParseError as exc:
+		raise ParseError(f"string= expects strings; stack={vm.stack!r}") from exc
 	vm.push(1 if left == right else 0)
 
 
@@ -1947,47 +1962,6 @@ def _ct_add_token_chars(vm: CompileTimeVM) -> None:
 	vm.parser.reader.add_token_chars(chars)
 
 
-def _ct_fn_param_index(vm: CompileTimeVM) -> None:
-	name = vm.pop_str()
-	params = _ensure_list(vm.pop())
-	try:
-		idx = params.index(name)
-		vm.push(params)
-		vm.push(idx)
-		vm.push(1)
-	except ValueError:
-		vm.push(params)
-		vm.push(-1)
-		vm.push(0)
-
-
-def _ct_fn_translate_postfix(vm: CompileTimeVM) -> None:
-	params = _ensure_list(vm.pop())
-	postfix = _ensure_list(vm.pop())
-	prologue: List[Any] = [">r"] * len(params)
-	translated: List[Any] = []
-	for tok in postfix:
-		if isinstance(tok, int):
-			translated.append(tok)
-			continue
-		if isinstance(tok, str):
-			try:
-				num_value = int(tok, 0)
-				translated.append(num_value)
-				continue
-			except ValueError:
-				pass
-		if isinstance(tok, str) and tok in params:
-			idx = params.index(tok)
-			translated.append(idx)
-			translated.append("rpick")
-		else:
-			translated.append(tok)
-	epilogue: List[Any] = ["rdrop"] * len(params)
-	out: List[Any] = prologue + translated + epilogue
-	vm.push(out)
-
-
 def _ct_shunt(vm: CompileTimeVM) -> None:
 	"""Convert an infix token list (strings) to postfix using +,-,*,/,%."""
 	ops: List[str] = []
@@ -2024,8 +1998,6 @@ def _ct_shunt(vm: CompileTimeVM) -> None:
 def _ct_int_to_string(vm: CompileTimeVM) -> None:
 	value = vm.pop_int()
 	vm.push(str(value))
-
-
 
 
 def _ct_identifier_p(vm: CompileTimeVM) -> None:
@@ -2161,6 +2133,9 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
 	register("drop", _ct_drop)
 	register("list-pop", _ct_list_pop, compile_only=True)
 	register("list-pop-front", _ct_list_pop_front, compile_only=True)
+	register("list-peek-front", _ct_list_peek_front, compile_only=True)
+	register("list-push-front", _ct_list_push_front, compile_only=True)
+	register("list-reverse", _ct_list_reverse, compile_only=True)
 	register("list-length", _ct_list_length, compile_only=True)
 	register("list-empty?", _ct_list_empty, compile_only=True)
 	register("list-get", _ct_list_get, compile_only=True)
@@ -2179,8 +2154,6 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
 	register("string-length", _ct_string_length, compile_only=True)
 	register("string-append", _ct_string_append, compile_only=True)
 	register("string>number", _ct_string_to_number, compile_only=True)
-	register("fn-param-index", _ct_fn_param_index, compile_only=True)
-	register("fn-translate-postfix", _ct_fn_translate_postfix, compile_only=True)
 	register("int>string", _ct_int_to_string, compile_only=True)
 	register("identifier?", _ct_identifier_p, compile_only=True)
 	register("shunt", _ct_shunt, compile_only=True)

@@ -363,18 +363,12 @@ word_rpick:
 	mov [r12], rax
     ret
 word_main:
-    ; push str_0
+    ; push 0
     sub r12, 8
-    mov qword [r12], str_0
-    ; push 11
-    sub r12, 8
-    mov qword [r12], 11
-    call word_puts
+    mov qword [r12], 0
     ret
 section .data
 data_start:
-str_0: db 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0
-str_0_len equ 11
 data_end:
 section .bss
 align 16

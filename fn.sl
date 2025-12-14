@@ -30,6 +30,7 @@ again
 immediate
 compile-only
 
+
 : extend-syntax
 	"call-syntax-rewrite" set-token-hook
 ;
@@ -124,6 +125,181 @@ compile-only
 	list-pop drop                  # body expr' (trim trailing ';')
 	list-pop-front drop            # body expr  (trim leading 'return')
 	dup list-length 0 == if "missing return expression" parse-error then
+;
+compile-only
+
+: fn-emit-prologue             # params out -- params out
+	over list-length              # params out n
+begin
+	dup 0 > if
+		1 -                      # params out n-1
+		>r                       # params out      (r: n-1)
+		">r" list-append         # params out'
+		r>                       # params out' n-1
+		continue
+	then
+	drop                         # params out
+	exit
+again
+;
+compile-only
+
+: fn-emit-epilogue             # params out -- out
+	over list-length >r           # params out   (r: n)
+begin
+	r> dup 0 > if
+		1 - >r
+		"rdrop" list-append
+		continue
+	then
+	drop                          # drop counter
+	swap drop                     # out
+	exit
+again
+;
+compile-only
+
+: fn-translate-prologue-loop   # count --
+	dup 0 > if
+		1 -
+		0 rpick ">r" list-append drop
+		fn-translate-prologue-loop
+		then
+	drop
+;
+compile-only
+
+: fn-translate-epilogue-loop   # count --
+	dup 0 > if
+		1 -
+		0 rpick "rdrop" list-append drop
+		fn-translate-epilogue-loop
+		then
+	drop
+;
+compile-only
+
+: fn-param-index                # params name -- params idx flag
+	>r                             # params        (r: name)
+	0                              # params idx
+
+begin
+	over list-length over swap >= if    # params idx flag (idx >= len?)
+		drop                      # params
+		r> drop                   # drop name
+		-1 0 exit                 # params -1 0
+	then                        # params idx
+	over over list-get            # params idx elem
+	0 rpick string=               # params idx flag
+	if
+		r> drop                   # drop name
+		1 exit                    # params idx 1
+	then
+	drop                          # params idx
+	1 +                           # params idx+1
+again
+;
+compile-only
+
+
+: fn-build-param-map            # params -- params map
+	map-new                         # params map
+	0                               # params map idx
+	begin
+		2 pick list-length            # params map idx len
+		over swap >= if               # params map idx flag
+			drop                        # params map
+			exit
+		then                          # params map idx
+		2 pick over list-get          # params map idx name
+		swap                          # params map name idx
+		dup >r                        # params map name idx   (r: idx)
+		map-set                       # params map'
+		r> 1 +                         # params map' idx'
+		continue
+	again
+;
+compile-only
+
+
+: fn-translate-token            # out map tok -- out map
+	# number?
+	dup string>number              # out map tok num ok
+	if
+		# drop tok, append num
+		swap drop                    # out map num
+		swap >r                      # out num   (r: map)
+		list-append                  # out'
+		r>                           # out' map
+		exit
+	then
+	drop                           # out map tok
+
+	# param?
+	dup >r                         # out map tok   (r: tok)
+	map-get                        # out map idx|nil ok
+	if
+		# append idx
+		swap >r                      # out idx   (r: map tok)
+		list-append                  # out'
+		r>                           # out' map
+		# append "rpick"
+		"rpick"                      # out' map "rpick"
+		swap >r                      # out' "rpick"   (r: map tok)
+		list-append                  # out''
+		r>                           # out'' map
+		# drop saved tok
+		r> drop                      # out'' map
+		exit
+	then
+	# not a param: drop idx|nil, append original tok
+	drop                           # out map
+	r>                             # out map tok
+	swap >r                        # out tok   (r: map)
+	list-append                    # out'
+	r>                             # out' map
+;
+compile-only
+
+
+: fn-translate-postfix-loop     # map out postfix -- map out
+	begin
+		dup list-empty? if
+			drop
+			exit
+		then
+		list-pop-front               # map out postfix' tok
+		swap >r                      # map out tok   (r: postfix')
+		>r swap r>                   # out map tok   (r: postfix')
+		fn-translate-token           # out map
+		swap                         # map out
+		r>                           # map out postfix'
+		continue
+	again
+;
+compile-only
+
+
+: fn-translate-postfix          # postfix params -- out
+	swap                             # params postfix
+	list-new                         # params postfix out
+
+	# prologue: stash args on return stack (emit ">r")
+	swap >r                          # params out       (r: postfix)
+	fn-emit-prologue                  # params out
+	r> swap                           # params postfix out
+
+	# build param map (name -> index)
+	2 pick fn-build-param-map         # params postfix out params map
+	>r drop r>                        # params postfix out map
+	# reorder to: params map out postfix
+	swap >r swap r> swap              # params map out postfix
+
+	# translate tokens
+	fn-translate-postfix-loop          # params map out
+	# drop map, emit epilogue
+	swap drop                         # params out
+	fn-emit-epilogue                   # out
 ;
 compile-only
 

@@ -526,18 +526,17 @@ word_main:
     ; push str_0
     sub r12, 8
     mov qword [r12], str_0
-    ; push 22
-    sub r12, 8
-    mov qword [r12], 22
-    call word_swap
-    ; push str_1
-    sub r12, 8
-    mov qword [r12], str_1
     ; push 27
     sub r12, 8
     mov qword [r12], 27
     call word_swap
-    call word_2swap
+    ; push str_1
+    sub r12, 8
+    mov qword [r12], str_1
+    ; push 22
+    sub r12, 8
+    mov qword [r12], 22
+    call word_swap
     call word_write_file
     call word_dup
     ; push 0
@@ -573,10 +572,10 @@ L_if_false_0:
     ret
 section .data
 data_start:
-str_0: db 47, 116, 109, 112, 47, 108, 50, 95, 116, 101, 115, 116, 95, 119, 114, 105, 116, 101, 46, 116, 120, 116, 0
-str_0_len equ 22
-str_1: db 104, 101, 108, 108, 111, 32, 102, 114, 111, 109, 32, 119, 114, 105, 116, 101, 95, 102, 105, 108, 101, 32, 116, 101, 115, 116, 10, 0
-str_1_len equ 27
+str_0: db 104, 101, 108, 108, 111, 32, 102, 114, 111, 109, 32, 119, 114, 105, 116, 101, 95, 102, 105, 108, 101, 32, 116, 101, 115, 116, 10, 0
+str_0_len equ 27
+str_1: db 47, 116, 109, 112, 47, 108, 50, 95, 116, 101, 115, 116, 95, 119, 114, 105, 116, 101, 46, 116, 120, 116, 0
+str_1_len equ 22
 str_2: db 119, 114, 111, 116, 101, 32, 98, 121, 116, 101, 115, 58, 32, 0
 str_2_len equ 13
 str_3: db 119, 114, 105, 116, 101, 32, 102, 97, 105, 108, 101, 100, 32, 101, 114, 114, 110, 111, 61, 0

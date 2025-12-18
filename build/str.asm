@@ -472,7 +472,57 @@ word_read_file:
 	mov qword [r12 + 8], -3
 	ret
     ret
-word_main:
+word_write_file:
+	; stack: path_ptr (top), path_len, buf_ptr, buf_len
+	mov rsi, [r12]        ; path_ptr
+	mov rdx, [r12 + 8]    ; path_len
+	mov r15, [r12 + 16]   ; buf_ptr (save in callee-saved r15)
+	mov r13, [r12 + 24]   ; buf_len (save in callee-saved r13)
+	add r12, 32           ; pop 4 args (we saved buf info)
+
+	; open(path_ptr, O_WRONLY|O_CREAT|O_TRUNC, 0666)
+	mov rdi, rsi          ; filename
+	mov rsi, 577          ; flags = O_WRONLY|O_CREAT|O_TRUNC
+	mov rdx, 438          ; mode = 0o666
+	mov rax, 2            ; syscall: open
+	syscall
+	cmp rax, 0
+	jl .fail_open
+	mov r9, rax           ; save fd
+
+	; write(fd, buf_ptr, buf_len) -- use preserved r15/r13 which survive syscalls
+	mov rax, 1            ; syscall: write
+	mov rdi, r9           ; fd
+	mov rsi, r15          ; buf_ptr
+	mov rdx, r13          ; buf_len
+	syscall
+	mov r10, rax          ; save write result
+	cmp r10, 0
+	jl .fail_write
+
+	; close(fd)
+	mov rax, 3            ; syscall: close
+	mov rdi, r9
+	syscall
+
+	sub r12, 8
+	mov [r12], r10
+	ret
+
+.fail_write:
+	mov rax, 3
+	mov rdi, r9
+	syscall
+	sub r12, 8
+	mov [r12], r10
+	ret
+
+.fail_open:
+	sub r12, 8
+	mov [r12], rax
+	ret
+    ret
+word_main2:
     ; push str_0
     sub r12, 8
     mov qword [r12], str_0
@@ -486,10 +536,22 @@ word_main:
     sub r12, 8
     mov qword [r12], 0
     ret
+word_main:
+    ; push str_1
+    sub r12, 8
+    mov qword [r12], str_1
+    ; push 7
+    sub r12, 8
+    mov qword [r12], 7
+    call word_dup
+    call word_puts
+    ret
 section .data
 data_start:
 str_0: db 115, 116, 114, 46, 115, 108, 0
 str_0_len equ 6
+str_1: db 118, 99, 120, 122, 118, 103, 103, 0
+str_1_len equ 7
 data_end:
 section .bss
 align 16

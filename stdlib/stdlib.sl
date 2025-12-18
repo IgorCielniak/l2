@@ -26,16 +26,6 @@
 }
 ;
 
-# : strlen ( addr len -- len )
-:asm strlen {
-	mov rax, [r12]      ; addr
-	mov rcx, [r12 + 8]  ; len
-	add r12, 16         ; pop len and addr
-	mov [r12], rcx      ; push len
-	ret
-}
-;
-
 :asm puts {
 	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
 	mov rax, [r12]      ; len or int value

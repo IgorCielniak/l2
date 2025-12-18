@@ -31,6 +31,7 @@ CASES: List[TestCase] = [
         name="call_syntax_parens",
         source=f"""
 import {ROOT / 'stdlib/stdlib.sl'}
+import {ROOT / 'stdlib/io.sl'}
 import {ROOT / 'fn.sl'}
 
 : main
@@ -52,6 +53,7 @@ fn foo(int a, int b){{
         name="loops_and_cmp",
         source=f"""
 import {ROOT / 'stdlib/stdlib.sl'}
+import {ROOT / 'stdlib/io.sl'}
 
 : main
     0
@@ -70,6 +72,7 @@ import {ROOT / 'stdlib/stdlib.sl'}
         name="override_dup_compile_time",
         source=f"""
 import {ROOT / 'stdlib/stdlib.sl'}
+import {ROOT / 'stdlib/io.sl'}
 
 : dup
     6
@@ -103,6 +106,7 @@ compile-only
         name="string_puts",
         source=f"""
 import {ROOT / 'stdlib/stdlib.sl'}
+import {ROOT / 'stdlib/io.sl'}
 
 : main
     \"hello world\" puts

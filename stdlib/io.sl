@@ -132,3 +132,149 @@
 	ret
 }
 ;
+
+# : read_stdin ( max_len -- len addr | neg_errno 0 )
+:asm read_stdin {
+	; stack: max_len
+	mov r14, [r12]        ; max_len
+	add r12, 8            ; pop max_len
+
+	; mmap(NULL, max_len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+	mov rax, 9            ; syscall: mmap
+	xor rdi, rdi          ; addr = NULL
+	mov rsi, r14          ; length
+	mov rdx, 3            ; PROT_READ|PROT_WRITE
+	mov r10, 34           ; MAP_PRIVATE|MAP_ANONYMOUS
+	mov r8, -1            ; fd = -1
+	xor r9, r9            ; offset = 0
+	syscall
+	cmp rax, -4095
+	jae .fail_mmap
+	mov rbx, rax          ; buffer addr
+	xor rcx, rcx          ; bytes_read = 0
+
+.read_loop:
+	mov rax, 0            ; syscall: read
+	mov rdi, 0            ; fd = stdin
+	lea rsi, [rbx + rcx]  ; buf + offset
+	mov rdx, r14
+	sub rdx, rcx          ; remaining = max_len - bytes_read
+	syscall
+	cmp rax, 0
+	je .done_read
+	js .read_error
+	add rcx, rax
+	cmp rcx, r14
+	jl .read_loop
+
+.done_read:
+	; push len (rcx) then addr (rbx)
+	sub r12, 16
+	mov [r12], rcx
+	mov [r12 + 8], rbx
+	ret
+
+.read_error:
+	; return negative errno in rax, addr = 0
+	sub r12, 16
+	mov [r12], rax
+	mov qword [r12 + 8], 0
+	ret
+
+.fail_mmap:
+	sub r12, 16
+	mov qword [r12], -1
+	mov qword [r12 + 8], 0
+	ret
+}
+;
+
+:asm puts {
+	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
+	mov rax, [r12]      ; len or int value
+	mov rbx, [r12 + 8]  ; possible address
+	cmp rax, 0
+	jl puts_print_int
+	lea r8, [rel data_start]
+	lea r9, [rel data_end]
+	cmp rbx, r8
+	jl puts_print_int
+	cmp rbx, r9
+	jge puts_print_int
+	; treat as string: (addr below len)
+	mov rdx, rax        ; len
+	mov rsi, rbx        ; addr
+	add r12, 16         ; pop len + addr
+	test rdx, rdx
+	jz puts_str_newline_only
+	mov rax, 1
+	mov rdi, 1
+	syscall
+puts_str_newline_only:
+	mov byte [rel print_buf], 10
+	mov rax, 1
+	mov rdi, 1
+	lea rsi, [rel print_buf]
+	mov rdx, 1
+	syscall
+	ret
+puts_print_int:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, rax
+	mov r8, 0
+	cmp rbx, 0
+	jge puts_abs
+	neg rbx
+	mov r8, 1
+puts_abs:
+	lea rsi, [rel print_buf_end]
+	mov rcx, 0
+	mov r10, 10
+	cmp rbx, 0
+	jne puts_digits
+	dec rsi
+	mov byte [rsi], '0'
+	inc rcx
+	jmp puts_sign
+puts_digits:
+puts_loop:
+	xor rdx, rdx
+	mov rax, rbx
+	div r10
+	add dl, '0'
+	dec rsi
+	mov [rsi], dl
+	inc rcx
+	mov rbx, rax
+	test rbx, rbx
+	jne puts_loop
+puts_sign:
+	cmp r8, 0
+	je puts_finish_digits
+	dec rsi
+	mov byte [rsi], '-'
+	inc rcx
+puts_finish_digits:
+	mov byte [rsi + rcx], 10
+	inc rcx
+	mov rax, 1
+	mov rdi, 1
+	mov rdx, rcx
+	mov r9, rsi
+	mov rsi, r9
+	syscall
+}
+;
+
+# : write_buf ( len addr -- )
+:asm write_buf {
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr
+	add r12, 16           ; pop len + addr
+	mov rax, 1            ; syscall: write
+	mov rdi, 1            ; fd = stdout
+	syscall
+	ret
+}
+;

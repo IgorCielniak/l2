@@ -1,4 +1,5 @@
 import stdlib/stdlib.sl
+import stdlib/io.sl
 import fn.sl
 
 : main

@@ -1,3 +1,41 @@
+# : c@ ( addr -- byte )
+:asm c@ {
+	mov rax, [r12]
+	movzx rax, byte [rax]
+	mov [r12], rax
+	ret
+}
+;
+
+# : c! ( byte addr -- )
+:asm c! {
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	mov [rbx], al
+	ret
+}
+;
+
+# : r@ ( -- x )
+:asm r@ {
+	mov rax, [r13]
+	sub r12, 8
+	mov [r12], rax
+	ret
+}
+;
+
+# : strlen ( addr len -- len )
+:asm strlen {
+	mov rax, [r12]      ; addr
+	mov rcx, [r12 + 8]  ; len
+	add r12, 16         ; pop len and addr
+	mov [r12], rcx      ; push len
+	ret
+}
+;
+
 :asm puts {
 	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
 	mov rax, [r12]      ; len or int value
@@ -81,6 +119,18 @@ puts_finish_digits:
 	mov rax, [r12]
 	sub r12, 8
 	mov [r12], rax
+}
+;
+
+# : write_buf ( len addr -- )
+:asm write_buf {
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr
+	add r12, 16           ; pop len + addr
+	mov rax, 1            ; syscall: write
+	mov rdi, 1            ; fd = stdout
+	syscall
+	ret
 }
 ;
 
@@ -303,20 +353,22 @@ puts_finish_digits:
 ;
 
 :asm mmap {
-	mov r9, [r12]
-	add r12, 8
-	mov r8, [r12]
-	add r12, 8
-	mov r10, [r12]
-	add r12, 8
-	mov rdx, [r12]
-	add r12, 8
-	mov rsi, [r12]
-	add r12, 8
-	mov rdi, [r12]
-	mov rax, 9
-	syscall
-	mov [r12], rax
+    ; Save rsp and align to 16 bytes for syscall ABI
+    mov rax, rsp
+    and rsp, -16
+    mov rdi, [r12+40]   ; addr
+    mov rsi, [r12+32]   ; length
+    mov rdx, [r12+24]   ; prot
+    mov r10, [r12+16]   ; flags
+    mov r8,  [r12+8]    ; fd
+    mov r9,  [r12]      ; offset
+    add r12, 48         ; pop 6 args
+    mov rax, 9          ; syscall: mmap
+    syscall
+    mov rsp, rax        ; restore rsp
+    sub r12, 8
+    mov [r12], rax      ; push result
+    ret
 }
 ;
 

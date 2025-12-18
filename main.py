@@ -2138,7 +2138,6 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
 	register("list-new", _ct_list_new, compile_only=True)
 	register("list-clone", _ct_list_clone, compile_only=True)
 	register("list-append", _ct_list_append, compile_only=True)
-	register("drop", _ct_drop)
 	register("list-pop", _ct_list_pop, compile_only=True)
 	register("list-pop-front", _ct_list_pop_front, compile_only=True)
 	register("list-peek-front", _ct_list_peek_front, compile_only=True)

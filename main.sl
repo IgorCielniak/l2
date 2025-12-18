@@ -1,4 +1,4 @@
-import stdlib.sl
+import stdlib/stdlib.sl
 import fn.sl
 
 : main

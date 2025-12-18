@@ -18,17 +18,30 @@ _start:
     mov rdi, rax
     mov rax, 60
     syscall
+word_c_40:
+	mov rax, [r12]
+	movzx rax, byte [rax]
+	mov [r12], rax
+	ret
+    ret
+word_c_21:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	mov [rbx], al
+	ret
+    ret
+word_r_40:
+	mov rax, [r13]
+	sub r12, 8
+	mov [r12], rax
+	ret
+    ret
 word_strlen:
-	mov rsi, [r12]      ; addr
-	mov rcx, 0
-strlen_loop:
-	mov al, [rsi + rcx]
-	cmp al, 0
-	je strlen_done
-	inc rcx
-	jmp strlen_loop
-strlen_done:
-	mov [r12], rcx      ; len
+	mov rax, [r12]      ; addr
+	mov rcx, [r12 + 8]  ; len
+	add r12, 16         ; pop len and addr
+	mov [r12], rcx      ; push len
 	ret
     ret
 word_puts:
@@ -38,7 +51,7 @@ word_puts:
 	cmp rax, 0
 	jl puts_print_int
 	lea r8, [rel data_start]
-	lea r9, [rel data_end]
+	lea r9, [rel print_buf_end]
 	cmp rbx, r8
 	jl puts_print_int
 	cmp rbx, r9
@@ -108,10 +121,79 @@ puts_finish_digits:
 	mov rsi, r9
 	syscall
     ret
+word_print_int:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, rax
+	mov r8, 0
+	cmp rbx, 0
+	jge .print_abs
+	neg rbx
+	mov r8, 1
+.print_abs:
+	lea rsi, [rel print_buf_end]
+	mov rcx, 0
+	mov r10, 10
+	cmp rbx, 0
+	jne .print_digits
+	dec rsi
+	mov byte [rsi], '0'
+	inc rcx
+	jmp .print_sign
+.print_digits:
+.print_loop:
+	xor rdx, rdx
+	mov rax, rbx
+	div r10
+	add dl, '0'
+	dec rsi
+	mov [rsi], dl
+	inc rcx
+	mov rbx, rax
+	test rbx, rbx
+	jne .print_loop
+.print_sign:
+	cmp r8, 0
+	je .print_finish
+	dec rsi
+	mov byte [rsi], '-'
+	inc rcx
+.print_finish:
+	mov byte [rsi + rcx], 10
+	inc rcx
+	mov rax, 1
+	mov rdi, 1
+	mov rdx, rcx
+	mov r9, rsi
+	mov rsi, r9
+	syscall
+	ret
+    ret
+word_push_data_start:
+    lea rax, [rel data_start]
+    sub r12, 8
+    mov [r12], rax
+    ret
+    ret
+word_push_print_buf_addr:
+    lea rax, [rel print_buf]
+    sub r12, 8
+    mov [r12], rax
+    ret
+    ret
 word_dup:
 	mov rax, [r12]
 	sub r12, 8
 	mov [r12], rax
+    ret
+word_write_buf:
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr
+	add r12, 16           ; pop len + addr
+	mov rax, 1            ; syscall: write
+	mov rdi, 1            ; fd = stdout
+	syscall
+	ret
     ret
 word_drop:
 	add r12, 8
@@ -126,6 +208,44 @@ word_swap:
 	mov rbx, [r12 + 8]
 	mov [r12], rbx
 	mov [r12 + 8], rax
+    ret
+word_mkstr:
+	mov rax, [r12]       ; ptr
+	mov rbx, [r12 + 8]   ; len
+	mov [r12], rbx       ; top = len
+	mov [r12 + 8], rax   ; next = ptr
+	ret
+    ret
+word_mkstr_copy:
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr (source)
+	add r12, 16           ; pop len+addr
+
+	; compute cap = PRINT_BUF_BYTES - 1 (leave room for newline or NUL)
+	lea rdi, [rel print_buf]
+	mov rcx, 127          ; PRINT_BUF_BYTES-1 (PRINT_BUF_BYTES=128)
+	cmp rdx, rcx
+	cmova rdx, rcx        ; rdx = min(len, cap)
+
+	; copy rdx bytes from rsi -> rdi using rep movsb
+	test rdx, rdx
+	jz .done_copy
+	; save callee-saved r14, use it to hold base dest pointer
+	push r14
+	mov r14, rdi          ; r14 = base dest (print_buf)
+	mov rcx, rdx          ; counter = copied length
+	cld
+	rep movsb
+	mov rbx, r14          ; move saved base into rbx for return
+	pop r14               ; restore original r14
+
+.done_copy:
+	; push copied length and pointer to print_buf (use saved rbx)
+	sub r12, 8
+	mov [r12], rdx        ; len
+	sub r12, 8
+	mov [r12], rbx        ; addr -> print_buf base
+	ret
     ret
 word_rot:
 	mov rax, [r12]       ; x3
@@ -284,20 +404,22 @@ word__21:
 	add r12, 8
     ret
 word_mmap:
-	mov r9, [r12]
-	add r12, 8
-	mov r8, [r12]
-	add r12, 8
-	mov r10, [r12]
-	add r12, 8
-	mov rdx, [r12]
-	add r12, 8
-	mov rsi, [r12]
-	add r12, 8
-	mov rdi, [r12]
-	mov rax, 9
-	syscall
-	mov [r12], rax
+    ; Save rsp and align to 16 bytes for syscall ABI
+    mov rax, rsp
+    and rsp, -16
+    mov rdi, [r12+40]   ; addr
+    mov rsi, [r12+32]   ; length
+    mov rdx, [r12+24]   ; prot
+    mov r10, [r12+16]   ; flags
+    mov r8,  [r12+8]    ; fd
+    mov r9,  [r12]      ; offset
+    add r12, 48         ; pop 6 args
+    mov rax, 9          ; syscall: mmap
+    syscall
+    mov rsp, rax        ; restore rsp
+    sub r12, 8
+    mov [r12], rax      ; push result
+    ret
     ret
 word_munmap:
 	mov rsi, [r12]
@@ -376,18 +498,16 @@ word_rpick:
 	mov [r12], rax
     ret
 word_main:
-    ; push str_0
+    call word_push_print_buf_addr
+    call word_print_int
+    call word_push_data_start
+    call word_print_int
+    ; push 0
     sub r12, 8
-    mov qword [r12], str_0
-    ; push 11
-    sub r12, 8
-    mov qword [r12], 11
-    call word_puts
+    mov qword [r12], 0
     ret
 section .data
 data_start:
-str_0: db 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0
-str_0_len equ 11
 data_end:
 section .bss
 align 16

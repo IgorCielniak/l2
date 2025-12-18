@@ -18,17 +18,30 @@ _start:
     mov rdi, rax
     mov rax, 60
     syscall
+word_c_40:
+	mov rax, [r12]
+	movzx rax, byte [rax]
+	mov [r12], rax
+	ret
+    ret
+word_c_21:
+	mov rax, [r12]
+	add r12, 8
+	mov rbx, [r12]
+	mov [rbx], al
+	ret
+    ret
+word_r_40:
+	mov rax, [r13]
+	sub r12, 8
+	mov [r12], rax
+	ret
+    ret
 word_strlen:
-	mov rsi, [r12]      ; addr
-	mov rcx, 0
-strlen_loop:
-	mov al, [rsi + rcx]
-	cmp al, 0
-	je strlen_done
-	inc rcx
-	jmp strlen_loop
-strlen_done:
-	mov [r12], rcx      ; len
+	mov rax, [r12]      ; addr
+	mov rcx, [r12 + 8]  ; len
+	add r12, 16         ; pop len and addr
+	mov [r12], rcx      ; push len
 	ret
     ret
 word_puts:
@@ -112,6 +125,15 @@ word_dup:
 	mov rax, [r12]
 	sub r12, 8
 	mov [r12], rax
+    ret
+word_write_buf:
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr
+	add r12, 16           ; pop len + addr
+	mov rax, 1            ; syscall: write
+	mov rdi, 1            ; fd = stdout
+	syscall
+	ret
     ret
 word_drop:
 	add r12, 8
@@ -284,20 +306,22 @@ word__21:
 	add r12, 8
     ret
 word_mmap:
-	mov r9, [r12]
-	add r12, 8
-	mov r8, [r12]
-	add r12, 8
-	mov r10, [r12]
-	add r12, 8
-	mov rdx, [r12]
-	add r12, 8
-	mov rsi, [r12]
-	add r12, 8
-	mov rdi, [r12]
-	mov rax, 9
-	syscall
-	mov [r12], rax
+    ; Save rsp and align to 16 bytes for syscall ABI
+    mov rax, rsp
+    and rsp, -16
+    mov rdi, [r12+40]   ; addr
+    mov rsi, [r12+32]   ; length
+    mov rdx, [r12+24]   ; prot
+    mov r10, [r12+16]   ; flags
+    mov r8,  [r12+8]    ; fd
+    mov r9,  [r12]      ; offset
+    add r12, 48         ; pop 6 args
+    mov rax, 9          ; syscall: mmap
+    syscall
+    mov rsp, rax        ; restore rsp
+    sub r12, 8
+    mov [r12], rax      ; push result
+    ret
     ret
 word_munmap:
 	mov rsi, [r12]
@@ -375,19 +399,186 @@ word_rpick:
 	sub r12, 8
 	mov [r12], rax
     ret
+word_read_file:
+	; stack: path_ptr (top), path_len (next)
+	mov rsi, [r12]        ; path_ptr
+	mov rdx, [r12 + 8]    ; path_len
+	add r12, 16           ; pop args
+
+	; open(path_ptr, O_RDONLY=0, mode=0)
+	mov rax, 2            ; syscall: open
+	mov rdi, rsi          ; filename
+	xor rsi, rsi          ; flags = O_RDONLY
+	xor rdx, rdx          ; mode = 0
+	syscall
+	mov r10, rax          ; save open() result
+	cmp rax, 0
+	jl .fail_open
+	mov r8, rax           ; fd
+
+	; use lseek to determine file size: lseek(fd, 0, SEEK_END)
+	mov rax, 8            ; syscall: lseek
+	mov rdi, r8           ; fd
+	xor rsi, rsi          ; offset = 0
+	mov rdx, 2            ; SEEK_END
+	syscall
+	mov r11, rax          ; save lseek() result
+	cmp rax, 0
+	jl .close_fail_lseek
+	mov rsi, rax          ; length = size
+
+	; mmap(NULL, size, PROT_READ=1, MAP_PRIVATE=2, fd, 0)
+	mov rax, 9            ; syscall: mmap
+	xor rdi, rdi          ; addr = NULL
+	; rsi already holds length
+	mov rdx, 1            ; PROT_READ
+	mov r10, 2            ; MAP_PRIVATE
+	mov r8, r8            ; fd
+	xor r9, r9            ; offset = 0
+	syscall
+	mov rbx, rax          ; addr
+	mov r12, r12          ; (no-op, for debug)
+	mov rax, 3            ; syscall: close
+	mov rdi, r8           ; fd
+	syscall
+	cmp rbx, -4095
+	jae .fail_mmap
+	sub r12, 16
+	mov [r12], rsi        ; len (rsi held length across syscall)
+	mov [r12 + 8], rbx    ; addr
+	ret
+
+.close_fail_lseek:
+	mov rax, 3
+	mov rdi, r8
+	syscall
+	mov rax, r11          ; return lseek() error code
+	sub r12, 16
+	mov [r12], rax
+	mov qword [r12 + 8], -1
+	ret
+
+.fail_open:
+	mov rax, r10          ; return open() error code
+	sub r12, 16
+	mov [r12], rax
+	mov qword [r12 + 8], -2
+	ret
+
+.fail_mmap:
+	mov rax, -1           ; return mmap() error
+	sub r12, 16
+	mov [r12], rax
+	mov qword [r12 + 8], -3
+	ret
+    ret
 word_main:
     ; push str_0
     sub r12, 8
     mov qword [r12], str_0
-    ; push 11
+    ; push 13
     sub r12, 8
-    mov qword [r12], 11
+    mov qword [r12], 13
+    call word_swap
+    call word_read_file
+    call word_dup
+    ; push 0
+    sub r12, 8
+    mov qword [r12], 0
+    call word__3e
+    mov rax, [r12]
+    add r12, 8
+    test rax, rax
+    jz L_if_false_0
+    call word_write_buf
+    ; push 0
+    sub r12, 8
+    mov qword [r12], 0
+    call word_exit
+L_if_false_0:
+    call word_dup
+    ; push -2
+    sub r12, 8
+    mov qword [r12], -2
+    call word__3d_3d
+    mov rax, [r12]
+    add r12, 8
+    test rax, rax
+    jz L_if_false_1
+    call word_drop
+    ; push str_1
+    sub r12, 8
+    mov qword [r12], str_1
+    ; push 21
+    sub r12, 8
+    mov qword [r12], 21
     call word_puts
+    call word_swap
+    call word_puts
+    call word_exit
+L_if_false_1:
+    call word_dup
+    ; push -1
+    sub r12, 8
+    mov qword [r12], -1
+    call word__3d_3d
+    mov rax, [r12]
+    add r12, 8
+    test rax, rax
+    jz L_if_false_2
+    call word_drop
+    ; push str_2
+    sub r12, 8
+    mov qword [r12], str_2
+    ; push 22
+    sub r12, 8
+    mov qword [r12], 22
+    call word_puts
+    call word_swap
+    call word_puts
+    call word_exit
+L_if_false_2:
+    call word_dup
+    ; push -3
+    sub r12, 8
+    mov qword [r12], -3
+    call word__3d_3d
+    mov rax, [r12]
+    add r12, 8
+    test rax, rax
+    jz L_if_false_3
+    call word_drop
+    ; push str_3
+    sub r12, 8
+    mov qword [r12], str_3
+    ; push 13
+    sub r12, 8
+    mov qword [r12], 13
+    call word_puts
+    call word_exit
+L_if_false_3:
+    ; push str_4
+    sub r12, 8
+    mov qword [r12], str_4
+    ; push 25
+    sub r12, 8
+    mov qword [r12], 25
+    call word_puts
+    call word_dup
+    call word_exit
     ret
 section .data
 data_start:
-str_0: db 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0
-str_0_len equ 11
+str_0: db 47, 101, 116, 99, 47, 104, 111, 115, 116, 110, 97, 109, 101, 0
+str_0_len equ 13
+str_1: db 111, 112, 101, 110, 40, 41, 32, 102, 97, 105, 108, 101, 100, 58, 32, 101, 114, 114, 110, 111, 61, 0
+str_1_len equ 21
+str_2: db 102, 115, 116, 97, 116, 40, 41, 32, 102, 97, 105, 108, 101, 100, 58, 32, 101, 114, 114, 110, 111, 61, 0
+str_2_len equ 22
+str_3: db 109, 109, 97, 112, 40, 41, 32, 102, 97, 105, 108, 101, 100, 0
+str_3_len equ 13
+str_4: db 117, 110, 107, 110, 111, 119, 110, 32, 114, 101, 97, 100, 95, 102, 105, 108, 101, 32, 102, 97, 105, 108, 117, 114, 101, 0
+str_4_len equ 25
 data_end:
 section .bss
 align 16

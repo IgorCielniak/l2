@@ -476,7 +476,6 @@ class Parser:
 
 	def _execute_immediate_word(self, word: Word) -> None:
 		try:
-			print(f"[ct] invoking {word.name}")
 			self.compile_time_vm.invoke(word)
 		except ParseError:
 			raise
@@ -1075,7 +1074,6 @@ class CompileTimeVM:
 		word = self.dictionary.lookup(name)
 		if word is None:
 			raise ParseError(f"unknown word '{name}' during compile-time execution")
-		print(f"[ct-call] {name} stack={self.stack}")
 		self._call_word(word)
 
 	def _execute_nodes(self, nodes: Sequence[ASTNode]) -> None:
@@ -2294,6 +2292,7 @@ class Compiler:
 		self.parser = Parser(self.dictionary, self.reader)
 		self.assembler = Assembler(self.dictionary)
 
+
 	def compile_source(self, source: str) -> Emission:
 		tokens = self.reader.tokenize(source)
 		module = self.parser.parse(tokens, source)
@@ -2328,12 +2327,19 @@ class Compiler:
 		return "\n".join(lines) + "\n"
 
 
-def run_nasm(asm_path: Path, obj_path: Path) -> None:
-	subprocess.run(["nasm", "-f", "elf64", "-o", str(obj_path), str(asm_path)], check=True)
+def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
+	cmd = ["nasm", "-f", "elf64"]
+	if debug:
+		cmd.append("-g")
+	cmd += ["-o", str(obj_path), str(asm_path)]
+	subprocess.run(cmd, check=True)
 
 
-def run_linker(obj_path: Path, exe_path: Path) -> None:
-	subprocess.run(["ld", "-o", str(exe_path), str(obj_path)], check=True)
+def run_linker(obj_path: Path, exe_path: Path, debug: bool = False) -> None:
+	cmd = ["ld", "-o", str(exe_path), str(obj_path)]
+	if debug:
+		cmd.append("-g")
+	subprocess.run(cmd, check=True)
 
 
 def cli(argv: Sequence[str]) -> int:
@@ -2342,6 +2348,8 @@ def cli(argv: Sequence[str]) -> int:
 	parser.add_argument("-o", dest="output", type=Path, default=Path("a.out"))
 	parser.add_argument("--emit-asm", action="store_true", help="stop after generating asm")
 	parser.add_argument("--temp-dir", type=Path, default=Path("build"))
+	parser.add_argument("--debug", action="store_true", help="compile with debug info")
+    
 	args = parser.parse_args(argv)
 
 	compiler = Compiler()
@@ -2356,8 +2364,8 @@ def cli(argv: Sequence[str]) -> int:
 		print(f"[info] wrote {asm_path}")
 		return 0
 
-	run_nasm(asm_path, obj_path)
-	run_linker(obj_path, args.output)
+	run_nasm(asm_path, obj_path, debug=args.debug)
+	run_linker(obj_path, args.output, debug=args.debug)
 	print(f"[info] built {args.output}")
 	return 0
 

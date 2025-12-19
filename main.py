@@ -15,6 +15,7 @@ import ctypes
 import mmap
 import subprocess
 import sys
+import shutil
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2292,7 +2293,6 @@ class Compiler:
 		self.parser = Parser(self.dictionary, self.reader)
 		self.assembler = Assembler(self.dictionary)
 
-
 	def compile_source(self, source: str) -> Emission:
 		tokens = self.reader.tokenize(source)
 		module = self.parser.parse(tokens, source)
@@ -2344,13 +2344,31 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False) -> None:
 
 def cli(argv: Sequence[str]) -> int:
 	parser = argparse.ArgumentParser(description="L2 compiler driver")
-	parser.add_argument("source", type=Path, help="input .sl file")
+	parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
 	parser.add_argument("-o", dest="output", type=Path, default=Path("a.out"))
 	parser.add_argument("--emit-asm", action="store_true", help="stop after generating asm")
 	parser.add_argument("--temp-dir", type=Path, default=Path("build"))
 	parser.add_argument("--debug", action="store_true", help="compile with debug info")
-    
+	parser.add_argument("--run", action="store_true", help="run the built binary after successful build")
+	parser.add_argument("--dbg", action="store_true", help="launch gdb on the built binary after successful build")
+	parser.add_argument("--clean", action="store_true", help="remove the temp build directory and exit")
+
 	args = parser.parse_args(argv)
+
+	if args.clean:
+		try:
+			if args.temp_dir.exists():
+				shutil.rmtree(args.temp_dir)
+				print(f"[info] removed {args.temp_dir}")
+			else:
+				print(f"[info] {args.temp_dir} does not exist")
+		except Exception as exc:
+			print(f"[error] failed to remove {args.temp_dir}: {exc}")
+			return 1
+		return 0
+
+	if args.source is None:
+		parser.error("the following arguments are required: source")
 
 	compiler = Compiler()
 	emission = compiler.compile_file(args.source)
@@ -2367,6 +2385,11 @@ def cli(argv: Sequence[str]) -> int:
 	run_nasm(asm_path, obj_path, debug=args.debug)
 	run_linker(obj_path, args.output, debug=args.debug)
 	print(f"[info] built {args.output}")
+	exe_path = Path(args.output).resolve()
+	if args.dbg:
+		subprocess.run(["gdb", str(exe_path)])
+	elif args.run:
+		subprocess.run([str(exe_path)])
 	return 0
 
 

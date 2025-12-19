@@ -4,10 +4,10 @@ import fn.sl
 
 : main
     2 40 +
-    puts
+    puti cr
     extend-syntax
     foo(1, 2)
-    puts
+    puti cr
     0
 ;
 

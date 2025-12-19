@@ -36,10 +36,10 @@ import {ROOT / 'fn.sl'}
 
 : main
     2 40 +
-    puts
+    puti cr
     extend-syntax
     foo(1, 2)
-    puts
+    puti cr
     0
 ;
 
@@ -60,9 +60,9 @@ import {ROOT / 'stdlib/io.sl'}
     5 for
         1 +
     next
-    puts
-    5 5 == puts
-    5 4 == puts
+    puti cr
+    5 5 == puti cr
+    5 4 == puti cr
     0
 ;
 """,
@@ -96,7 +96,7 @@ compile-only
 
 : main
     emit-overridden
-    puts
+    puti cr
     0
 ;
 """,

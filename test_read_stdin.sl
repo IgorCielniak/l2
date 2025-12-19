@@ -3,7 +3,7 @@ import stdlib/io.sl
 
 : main
     1024
-    read_stdin   # returns (len addr)
+    read_stdin   # returns (addr len)
     dup 0 > if
         write_buf
         0 exit

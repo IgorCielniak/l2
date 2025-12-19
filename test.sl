@@ -40,41 +40,41 @@ fn fancy_add(int a, int b){
 }
 
 : test-add
-    5 7 + puts
+    5 7 + puti cr
 ;
 
 : test-sub
-    10 3 - puts
+    10 3 - puti cr
 ;
 
 : test-mul
-    6 7 * puts
+    6 7 * puti cr
 ;
 
 : test-div
-    84 7 / puts
+    84 7 / puti cr
 ;
 
 : test-mod
-    85 7 % puts
+    85 7 % puti cr
 ;
 
 : test-drop
-    10 20 drop puts
+    10 20 drop puti cr
 ;
 
 : test-dup
-    11 dup + puts
+    11 dup + puti cr
 ;
 
 : test-swap
-    2 5 swap - puts
+    2 5 swap - puti cr
 ;
 
 : test-store
     mem-slot dup
     123 swap !
-    @ puts
+    @ puti cr
 ;
 
 
@@ -89,33 +89,33 @@ fn fancy_add(int a, int b){
     dup
     1337 swap !
     dup
-    @ puts
+    @ puti cr
     4096 munmap drop
 ;
 
 : test-macro
-    9 square puts
-    MAGIC puts
-    add13 puts
+    9 square puti cr
+    MAGIC puti cr
+    add13 puti cr
 ;
 
 : test-if
     5 5 == if
-        111 puts
+        111 puti cr
     else
-        222 puts
+        222 puti cr
     then
 ;
 
 : test-else-if
     2
     dup 1 == if
-        50 puts
+        50 puti cr
     else
         dup 2 == if
-            60 puts
+            60 puti cr
         else
-            70 puts
+            70 puti cr
         then
     then
     drop
@@ -126,7 +126,7 @@ fn fancy_add(int a, int b){
     5 for
         1 +
     next
-    puts
+    puti cr
 ;
 
 : test-for-zero
@@ -134,38 +134,38 @@ fn fancy_add(int a, int b){
     0 for
         drop
     next
-    puts
+    puti cr
 ;
 
 : test-struct
     mem-slot
     dup 111 swap Point.x!
     dup 222 swap Point.y!
-    dup Point.x@ puts
-    Point.y@ puts
-    Point.size puts
+    dup Point.x@ puti cr
+    Point.y@ puti cr
+    Point.size puti cr
 ;
 
 : test-cmp
-    5 5 == puts
-    5 4 == puts
-    5 4 != puts
-    4 4 != puts
-    3 5 < puts
-    5 3 < puts
-    5 3 > puts
-    3 5 > puts
-    5 5 <= puts
-    6 5 <= puts
-    5 5 >= puts
-    4 5 >= puts
+    5 5 == puti cr
+    5 4 == puti cr
+    5 4 != puti cr
+    4 4 != puti cr
+    3 5 < puti cr
+    5 3 < puti cr
+    5 3 > puti cr
+    3 5 > puti cr
+    5 5 <= puti cr
+    6 5 <= puti cr
+    5 5 >= puti cr
+    4 5 >= puti cr
 ;
 
 : test-c-fn
     3
     7
     fancy_add()
-    puts
+    puti cr
 ;
 
 : main

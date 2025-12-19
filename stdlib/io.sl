@@ -1,14 +1,13 @@
-
 # L2 IO Primitives
 
-# : read_file ( path_ptr path_len -- len addr | 0 0 )
+# : read_file ( path_addr path_len -- addr len | 0 0 )
 #   Reads the file at the given path (pointer+length, not null-terminated),
-#   returns (len addr) of mapped file, or (0 0) on error.
+#   returns (addr len) of mapped file, or (0 0) on error.
 
 :asm read_file {
-	; stack: path_ptr (top), path_len (next)
-	mov rsi, [r12]        ; path_ptr
-	mov rdx, [r12 + 8]    ; path_len
+	; stack: path_addr (NOS), path_len (TOS)
+	mov rdx, [r12]        ; path_len
+	mov rsi, [r12 + 8]    ; path_addr
 	add r12, 16           ; pop args
 
 	; open(path_ptr, O_RDONLY=0, mode=0)
@@ -82,11 +81,11 @@
 
 # : write_file ( path_ptr path_len buf_ptr buf_len -- bytes_written | neg_errno )
 :asm write_file {
-	; stack: path_ptr (top), path_len, buf_ptr, buf_len
-	mov rsi, [r12]        ; path_ptr
-	mov rdx, [r12 + 8]    ; path_len
-	mov r15, [r12 + 16]   ; buf_ptr (save in callee-saved r15)
-	mov r13, [r12 + 24]   ; buf_len (save in callee-saved r13)
+	; stack: path_addr, path_len, buf_addr, buf_len (TOS)
+	mov r13, [r12]        ; buf_len
+	mov r15, [r12 + 8]    ; buf_addr
+	mov rdx, [r12 + 16]   ; path_len
+	mov rsi, [r12 + 24]   ; path_addr
 	add r12, 32           ; pop 4 args (we saved buf info)
 
 	; open(path_ptr, O_WRONLY|O_CREAT|O_TRUNC, 0666)
@@ -133,7 +132,7 @@
 }
 ;
 
-# : read_stdin ( max_len -- len addr | neg_errno 0 )
+# : read_stdin ( max_len -- addr len | neg_errno 0 )
 :asm read_stdin {
 	; stack: max_len
 	mov r14, [r12]        ; max_len
@@ -192,28 +191,28 @@
 }
 ;
 
-:asm puts {
+:asm print {
 	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
 	mov rax, [r12]      ; len or int value
 	mov rbx, [r12 + 8]  ; possible address
 	cmp rax, 0
-	jl puts_print_int
+	jl .print_int
 	lea r8, [rel data_start]
 	lea r9, [rel data_end]
 	cmp rbx, r8
-	jl puts_print_int
+	jl .print_int
 	cmp rbx, r9
-	jge puts_print_int
+	jge .print_int
 	; treat as string: (addr below len)
 	mov rdx, rax        ; len
 	mov rsi, rbx        ; addr
 	add r12, 16         ; pop len + addr
 	test rdx, rdx
-	jz puts_str_newline_only
+	jz .str_newline_only
 	mov rax, 1
 	mov rdi, 1
 	syscall
-puts_str_newline_only:
+.str_newline_only:
 	mov byte [rel print_buf], 10
 	mov rax, 1
 	mov rdi, 1
@@ -221,27 +220,27 @@ puts_str_newline_only:
 	mov rdx, 1
 	syscall
 	ret
-puts_print_int:
+.print_int:
 	mov rax, [r12]
 	add r12, 8
 	mov rbx, rax
 	mov r8, 0
 	cmp rbx, 0
-	jge puts_abs
+	jge .abs
 	neg rbx
 	mov r8, 1
-puts_abs:
+.abs:
 	lea rsi, [rel print_buf_end]
 	mov rcx, 0
 	mov r10, 10
 	cmp rbx, 0
-	jne puts_digits
+	jne .digits
 	dec rsi
 	mov byte [rsi], '0'
 	inc rcx
-	jmp puts_sign
-puts_digits:
-puts_loop:
+	jmp .sign
+.digits:
+.loop:
 	xor rdx, rdx
 	mov rax, rbx
 	div r10
@@ -251,14 +250,14 @@ puts_loop:
 	inc rcx
 	mov rbx, rax
 	test rbx, rbx
-	jne puts_loop
-puts_sign:
+	jne .loop
+.sign:
 	cmp r8, 0
-	je puts_finish_digits
+	je .finish_digits
 	dec rsi
 	mov byte [rsi], '-'
 	inc rcx
-puts_finish_digits:
+.finish_digits:
 	mov byte [rsi + rcx], 10
 	inc rcx
 	mov rax, 1
@@ -270,8 +269,9 @@ puts_finish_digits:
 }
 ;
 
-# : write_buf ( len addr -- )
+# : write_buf ( addr len -- )
 :asm write_buf {
+	; data_start (trigger string_mode in compile-time VM)
 	mov rdx, [r12]        ; len
 	mov rsi, [r12 + 8]    ; addr
 	add r12, 16           ; pop len + addr
@@ -281,3 +281,67 @@ puts_finish_digits:
 	ret
 }
 ;
+
+# : putc ( char -- )
+:asm putc {
+	mov rax, [r12]
+	add r12, 8
+	lea rsi, [rel print_buf]
+	mov [rsi], al
+	mov rax, 1
+	mov rdi, 1
+	mov rdx, 1
+	syscall
+	ret
+}
+;
+
+# : puti ( int -- )
+:asm puti {
+	mov rax, [r12]      ; get int
+	add r12, 8          ; pop
+	mov rbx, rax
+	mov r8, 0           ; sign flag
+	cmp rbx, 0
+	jge .puti_pos
+	neg rbx
+	mov r8, 1
+.puti_pos:
+	lea rsi, [rel print_buf_end]
+	mov rcx, 0
+	mov r10, 10
+	cmp rbx, 0
+	jne .puti_digits
+	dec rsi
+	mov byte [rsi], '0'
+	inc rcx
+	jmp .puti_sign
+.puti_digits:
+.puti_loop:
+	xor rdx, rdx
+	mov rax, rbx
+	div r10
+	add dl, '0'
+	dec rsi
+	mov [rsi], dl
+	inc rcx
+	mov rbx, rax
+	test rbx, rbx
+	jne .puti_loop
+.puti_sign:
+	cmp r8, 0
+	je .puti_done
+	dec rsi
+	mov byte [rsi], '-'
+	inc rcx
+.puti_done:
+	mov rax, 1          ; syscall: write
+	mov rdi, 1          ; fd: stdout
+	mov rdx, rcx        ; length
+	syscall
+	ret
+}
+;
+
+: cr 10 putc ;
+: puts write_buf cr ;

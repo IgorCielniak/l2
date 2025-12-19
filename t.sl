@@ -4,13 +4,13 @@ import fn.sl
 
 fn foo(int a, int b){
     1
-    puts
+    puti cr
     return a b +;
 }
 
 : main
     extend-syntax
     foo(3, 2)
-    puts
+    puti cr
     0
 ;

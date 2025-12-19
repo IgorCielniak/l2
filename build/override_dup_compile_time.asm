@@ -446,26 +446,29 @@ word_read_stdin:
 	cmp rax, -4095
 	jae .fail_mmap
 	mov rbx, rax          ; buffer addr
-	xor rcx, rcx          ; bytes_read = 0
+	xor r9, r9          ; bytes_read = 0
 
 .read_loop:
 	mov rax, 0            ; syscall: read
 	mov rdi, 0            ; fd = stdin
-	lea rsi, [rbx + rcx]  ; buf + offset
+	lea rsi, [rbx + r9]  ; buf + offset
 	mov rdx, r14
-	sub rdx, rcx          ; remaining = max_len - bytes_read
+	sub rdx, r9          ; remaining = max_len - bytes_read
 	syscall
 	cmp rax, 0
 	je .done_read
 	js .read_error
-	add rcx, rax
-	cmp rcx, r14
+	add r9, rax
 	jl .read_loop
 
 .done_read:
 	; push len (rcx) then addr (rbx)
+	cmp r9, r14
+	je .done_no_null
+	mov byte [rbx + r9], 0
+.done_no_null:
 	sub r12, 16
-	mov [r12], rcx
+	mov [r12], r9
 	mov [r12 + 8], rbx
 	ret
 

@@ -60,7 +60,7 @@ class Reader:
 	def __init__(self) -> None:
 		self.line = 1
 		self.column = 0
-		self.custom_tokens: Set[str] = {"(", ")", "{", "}", ";", ",", "[", "]"}
+		self.custom_tokens: Set[str] = {"(", ")", "{", "}", ";", ",", "[", "]", "*"}
 		self._token_order: List[str] = sorted(self.custom_tokens, key=len, reverse=True)
 
 	def add_tokens(self, tokens: Iterable[str]) -> None:
@@ -333,6 +333,9 @@ class Word:
 	compile_time_intrinsic: Optional[Callable[["CompileTimeVM"], None]] = None
 	compile_only: bool = False
 	compile_time_override: bool = False
+	is_extern: bool = False  # New: mark as extern
+	extern_inputs: int = 0
+	extern_outputs: int = 0
 
 
 @dataclass
@@ -428,6 +431,9 @@ class Parser:
 			if lexeme == ":py":
 				self._parse_py_definition(token)
 				continue
+			if lexeme == "extern":
+				self._parse_extern(token)
+				continue
 			if lexeme == "if":
 				self._handle_if_control()
 				continue
@@ -458,6 +464,111 @@ class Parser:
 		return module
 
 	# Internal helpers ---------------------------------------------------------
+
+	def _parse_extern(self, token: Token) -> None:
+		# extern <name> [inputs outputs]
+		# OR
+		# extern <ret_type> <name>(<args>)
+
+		if self._eof():
+			raise ParseError(f"extern missing name at {token.line}:{token.column}")
+
+		# Heuristic: check if the first token is a likely C type
+		c_types = {"void", "int", "long", "char", "bool", "size_t", "float", "double"}
+		
+		# Peek at tokens to decide mode
+		t1 = self._consume()
+		is_c_decl = False
+		
+		# If t1 is a type (or type*), and next is name, and next is '(', it's C-style.
+		# But since we already consumed t1, we have to proceed carefully.
+		
+		# Check if t1 looks like a type
+		base_type = t1.lexeme.rstrip("*")
+		if base_type in c_types:
+			# Likely C-style, but let's confirm next token is not a number (which would mean t1 was the name in raw mode)
+			peek = self.peek_token()
+			if peek is not None and peek.lexeme != "(" and not peek.lexeme.isdigit():
+				# t1=type, peek=name. Confirm peek2='('?
+				# Actually, if t1 is "int", it's extremely unlikely to be a function name in L2.
+				is_c_decl = True
+
+		if is_c_decl:
+			# C-Style Parsing
+			ret_type = t1.lexeme
+			if self._eof():
+				raise ParseError("extern missing name after return type")
+			name_token = self._consume()
+			name = name_token.lexeme
+			
+			# Handle pointers in name token if tokenizer didn't split them (e.g. *name)
+			while name.startswith("*"):
+				name = name[1:]
+			
+			if self._eof() or self._consume().lexeme != "(":
+				raise ParseError(f"expected '(' after extern function name '{name}'")
+			
+			inputs = 0
+			while True:
+				if self._eof():
+					raise ParseError("extern unclosed '('")
+				peek = self.peek_token()
+				if peek.lexeme == ")":
+					self._consume()
+					break
+				
+				# Parse argument type
+				arg_type_tok = self._consume()
+				arg_type = arg_type_tok.lexeme
+				
+				# Handle "type *" sequence
+				peek_ptr = self.peek_token()
+				while peek_ptr and peek_ptr.lexeme == "*":
+					self._consume()
+					arg_type += "*"
+					peek_ptr = self.peek_token()
+
+				if arg_type != "void":
+					inputs += 1
+					# Optional argument name
+					peek_name = self.peek_token()
+					if peek_name and peek_name.lexeme not in (",", ")"):
+						self._consume() # Consume arg name
+
+				peek_sep = self.peek_token()
+				if peek_sep and peek_sep.lexeme == ",":
+					self._consume()
+			
+			outputs = 0 if ret_type == "void" else 1
+			
+			word = self.dictionary.lookup(name)
+			if word is None:
+				word = Word(name=name)
+				self.dictionary.register(word)
+			word.is_extern = True
+			word.extern_inputs = inputs
+			word.extern_outputs = outputs
+			
+		else:
+			# Raw/Legacy Parsing
+			name = t1.lexeme
+			word = self.dictionary.lookup(name)
+			if word is None:
+				word = Word(name=name)
+				self.dictionary.register(word)
+			word.is_extern = True
+
+			# Check for optional inputs/outputs
+			peek = self.peek_token()
+			if peek is not None and peek.lexeme.isdigit():
+				word.extern_inputs = int(self._consume().lexeme)
+				peek = self.peek_token()
+				if peek is not None and peek.lexeme.isdigit():
+					word.extern_outputs = int(self._consume().lexeme)
+			else:
+				word.extern_inputs = 0
+				word.extern_outputs = 0
+
 	def _handle_token(self, token: Token) -> None:
 		if self._try_literal(token):
 			return
@@ -1356,8 +1467,14 @@ class Assembler:
 		self._string_literals: Dict[str, Tuple[str, int]] = {}
 		self._data_section: Optional[List[str]] = None
 
+	def _emit_externs(self, text: List[str]) -> None:
+		externs = sorted([w.name for w in self.dictionary.words.values() if getattr(w, "is_extern", False)])
+		for name in externs:
+			text.append(f"extern {name}")
+
 	def emit(self, module: Module) -> Emission:
 		emission = Emission()
+		self._emit_externs(emission.text)
 		emission.text.extend(self._runtime_prelude())
 		self._string_literals = {}
 		self._data_section = emission.data
@@ -1471,7 +1588,35 @@ class Assembler:
 		if word.intrinsic:
 			word.intrinsic(builder)
 			return
-		builder.emit(f"    call {sanitize_label(ref.name)}")
+		if getattr(word, "is_extern", False):
+			inputs = getattr(word, "extern_inputs", 0)
+			outputs = getattr(word, "extern_outputs", 0)
+			if inputs > 0 or outputs > 0:
+				regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+				if inputs > 6:
+					raise CompileError(f"extern '{ref.name}' has too many inputs ({inputs} > 6)")
+				
+				# Pop inputs in reverse register order (argN is top of stack -> last reg)
+				current_regs = regs[:inputs]
+				for reg in reversed(current_regs):
+					builder.pop_to(reg)
+				
+				# Align RSP and call
+				builder.emit("    push rbp")
+				builder.emit("    mov rbp, rsp")
+				builder.emit("    and rsp, -16")
+				builder.emit(f"    call {ref.name}")
+				builder.emit("    leave")
+				
+				if outputs == 1:
+					builder.push_from("rax")
+				elif outputs > 1:
+					raise CompileError("extern only supports 0 or 1 output")
+			else:
+				# Emit call to unresolved symbol (let linker resolve it)
+				builder.emit(f"    call {ref.name}")
+		else:
+			builder.emit(f"    call {sanitize_label(ref.name)}")
 
 	def _emit_branch_zero(self, node: BranchZero, builder: FunctionEmitter) -> None:
 		builder.pop_to("rax")
@@ -2335,8 +2480,16 @@ def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
 	subprocess.run(cmd, check=True)
 
 
-def run_linker(obj_path: Path, exe_path: Path, debug: bool = False) -> None:
+def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs: Optional[List[str]] = None) -> None:
 	cmd = ["ld", "-o", str(exe_path), str(obj_path)]
+	if libs:
+		cmd.extend(["-dynamic-linker", "/lib64/ld-linux-x86-64.so.2"])
+		for lib in libs:
+			# If the user passed a full .so name, use -l:libname.so, else -l<name>
+			if lib.endswith('.so') or '.so.' in lib:
+				cmd.append(f"-l:{lib}")
+			else:
+				cmd.append(f"-l{lib}")
 	if debug:
 		cmd.append("-g")
 	subprocess.run(cmd, check=True)
@@ -2352,8 +2505,21 @@ def cli(argv: Sequence[str]) -> int:
 	parser.add_argument("--run", action="store_true", help="run the built binary after successful build")
 	parser.add_argument("--dbg", action="store_true", help="launch gdb on the built binary after successful build")
 	parser.add_argument("--clean", action="store_true", help="remove the temp build directory and exit")
+	parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
 
-	args = parser.parse_args(argv)
+	# Parse known and unknown args to allow -l flags anywhere
+	args, unknown = parser.parse_known_args(argv)
+	# Collect any -l flags from unknown args (e.g. -lfoo or -l foo)
+	i = 0
+	while i < len(unknown):
+		if unknown[i] == "-l" and i + 1 < len(unknown):
+			args.libs.append(unknown[i + 1])
+			i += 2
+		elif unknown[i].startswith("-l"):
+			args.libs.append(unknown[i][2:])
+			i += 1
+		else:
+			i += 1
 
 	if args.clean:
 		try:
@@ -2383,7 +2549,7 @@ def cli(argv: Sequence[str]) -> int:
 		return 0
 
 	run_nasm(asm_path, obj_path, debug=args.debug)
-	run_linker(obj_path, args.output, debug=args.debug)
+	run_linker(obj_path, args.output, debug=args.debug, libs=args.libs)
 	print(f"[info] built {args.output}")
 	exe_path = Path(args.output).resolve()
 	if args.dbg:

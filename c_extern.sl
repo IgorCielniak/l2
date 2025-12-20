@@ -1,7 +1,4 @@
-import ../stdlib/io.sl
-
-# Raw extern (no ABI handling)
-extern raw_extern_test
+import stdlib/io.sl
 
 # C-style externs (auto ABI handling)
 extern long labs(long n)

@@ -60,7 +60,7 @@ class Reader:
 	def __init__(self) -> None:
 		self.line = 1
 		self.column = 0
-		self.custom_tokens: Set[str] = {"(", ")", "{", "}", ";", ",", "[", "]", "*"}
+		self.custom_tokens: Set[str] = {"(", ")", "{", "}", ";", ",", "[", "]"}
 		self._token_order: List[str] = sorted(self.custom_tokens, key=len, reverse=True)
 
 	def add_tokens(self, tokens: Iterable[str]) -> None:
@@ -336,6 +336,7 @@ class Word:
 	is_extern: bool = False  # New: mark as extern
 	extern_inputs: int = 0
 	extern_outputs: int = 0
+	extern_signature: Optional[Tuple[List[str], str]] = None  # (arg_types, ret_type)
 
 
 @dataclass
@@ -509,6 +510,7 @@ class Parser:
 				raise ParseError(f"expected '(' after extern function name '{name}'")
 			
 			inputs = 0
+			arg_types: List[str] = []
 			while True:
 				if self._eof():
 					raise ParseError("extern unclosed '('")
@@ -530,6 +532,7 @@ class Parser:
 
 				if arg_type != "void":
 					inputs += 1
+					arg_types.append(arg_type)
 					# Optional argument name
 					peek_name = self.peek_token()
 					if peek_name and peek_name.lexeme not in (",", ")"):
@@ -548,6 +551,7 @@ class Parser:
 			word.is_extern = True
 			word.extern_inputs = inputs
 			word.extern_outputs = outputs
+			word.extern_signature = (arg_types, ret_type)
 			
 		else:
 			# Raw/Legacy Parsing
@@ -839,17 +843,29 @@ class Parser:
 		else:  # pragma: no cover - defensive
 			raise ParseError("unknown parse context")
 
-	def _try_literal(self, token: Token) -> bool:
+	def _try_literal(self, token: Token) -> None:
 		try:
 			value = int(token.lexeme, 0)
+			self._append_node(Literal(value=value))
+			return True
 		except ValueError:
-			string_value = _parse_string_literal(token)
-			if string_value is None:
-				return False
+			pass
+
+		# Try float
+		try:
+			if "." in token.lexeme or "e" in token.lexeme.lower():
+				value = float(token.lexeme)
+				self._append_node(Literal(value=value))
+				return True
+		except ValueError:
+			pass
+
+		string_value = _parse_string_literal(token)
+		if string_value is not None:
 			self._append_node(Literal(value=string_value))
 			return True
-		self._append_node(Literal(value=value))
-		return True
+
+		return False
 
 	def _consume(self) -> Token:
 		self._ensure_tokens(self.pos)
@@ -1359,6 +1375,14 @@ class FunctionEmitter:
 			f"    mov qword [r12], {value}",
 		])
 
+	def push_float(self, label: str) -> None:
+		self.text.extend([
+			f"    ; push float from {label}",
+			"    sub r12, 8",
+			f"    mov rax, [rel {label}]",
+			"    mov [r12], rax",
+		])
+
 	def push_label(self, label: str) -> None:
 		self.text.extend([
 			f"    ; push {label}",
@@ -1465,6 +1489,7 @@ class Assembler:
 		self.stack_bytes = 65536
 		self.io_buffer_bytes = 128
 		self._string_literals: Dict[str, Tuple[str, int]] = {}
+		self._float_literals: Dict[float, str] = {}
 		self._data_section: Optional[List[str]] = None
 
 	def _emit_externs(self, text: List[str]) -> None:
@@ -1477,6 +1502,7 @@ class Assembler:
 		self._emit_externs(emission.text)
 		emission.text.extend(self._runtime_prelude())
 		self._string_literals = {}
+		self._float_literals = {}
 		self._data_section = emission.data
 
 		valid_defs = (Definition, AsmDefinition)
@@ -1524,6 +1550,21 @@ class Assembler:
 		self._string_literals[value] = (label, len(encoded))
 		return self._string_literals[value]
 
+	def _intern_float_literal(self, value: float) -> str:
+		if self._data_section is None:
+			raise CompileError("float literal emission requested without data section")
+		self._ensure_data_start()
+		if value in self._float_literals:
+			return self._float_literals[value]
+		label = f"flt_{len(self._float_literals)}"
+		# Use hex representation of double precision float
+		import struct
+		hex_val = struct.pack('>d', value).hex()
+		# NASM expects hex starting with 0x
+		self._data_section.append(f"{label}: dq 0x{hex_val}")
+		self._float_literals[value] = label
+		return label
+
 	def _emit_definition(self, definition: Union[Definition, AsmDefinition], text: List[str]) -> None:
 		label = sanitize_label(definition.name)
 		text.append(f"{label}:")
@@ -1551,6 +1592,10 @@ class Assembler:
 		if isinstance(node, Literal):
 			if isinstance(node.value, int):
 				builder.push_literal(node.value)
+				return
+			if isinstance(node.value, float):
+				label = self._intern_float_literal(node.value)
+				builder.push_float(label)
 				return
 			if isinstance(node.value, str):
 				label, length = self._intern_string_literal(node.value)
@@ -1591,24 +1636,63 @@ class Assembler:
 		if getattr(word, "is_extern", False):
 			inputs = getattr(word, "extern_inputs", 0)
 			outputs = getattr(word, "extern_outputs", 0)
+			signature = getattr(word, "extern_signature", None)
+
 			if inputs > 0 or outputs > 0:
 				regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-				if inputs > 6:
-					raise CompileError(f"extern '{ref.name}' has too many inputs ({inputs} > 6)")
-				
-				# Pop inputs in reverse register order (argN is top of stack -> last reg)
-				current_regs = regs[:inputs]
-				for reg in reversed(current_regs):
-					builder.pop_to(reg)
-				
-				# Align RSP and call
+				xmm_regs = [f"xmm{i}" for i in range(8)]
+
+				arg_types = signature[0] if signature else []
+				ret_type = signature[1] if signature else None
+
+				if len(arg_types) != inputs and signature:
+					raise CompileError(f"extern '{ref.name}' mismatch: {inputs} inputs vs {len(arg_types)} types")
+
+				int_idx = 0
+				xmm_idx = 0
+
+				mapping: List[Tuple[str, str]] = [] # (type, target_reg)
+
+				if not arg_types:
+					# Legacy/Raw mode: assume all ints
+					if inputs > 6:
+						raise CompileError(f"extern '{ref.name}' has too many inputs ({inputs} > 6)")
+					for i in range(inputs):
+						mapping.append(("int", regs[i]))
+				else:
+					for type_name in arg_types:
+						if type_name in ("float", "double"):
+							if xmm_idx >= 8:
+								raise CompileError(f"extern '{ref.name}' has too many float inputs")
+							mapping.append(("float", xmm_regs[xmm_idx]))
+							xmm_idx += 1
+						else:
+							if int_idx >= 6:
+								raise CompileError(f"extern '{ref.name}' has too many int inputs")
+							mapping.append(("int", regs[int_idx]))
+							int_idx += 1
+
+				for type_name, reg in reversed(mapping):
+					if type_name == "float":
+						builder.pop_to("rax")
+						builder.emit(f"    movq {reg}, rax")
+					else:
+						builder.pop_to(reg)
+
 				builder.emit("    push rbp")
 				builder.emit("    mov rbp, rsp")
 				builder.emit("    and rsp, -16")
+				builder.emit(f"    mov al, {xmm_idx}")
 				builder.emit(f"    call {ref.name}")
 				builder.emit("    leave")
-				
-				if outputs == 1:
+
+				# Handle Return Value
+				if ret_type in ("float", "double"):
+					# Result in xmm0, move to stack
+					builder.emit("    sub r12, 8")
+					builder.emit("    movq rax, xmm0")
+					builder.emit("    mov [r12], rax")
+				elif outputs == 1:
 					builder.push_from("rax")
 				elif outputs > 1:
 					raise CompileError("extern only supports 0 or 1 output")

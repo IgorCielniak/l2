@@ -2543,9 +2543,16 @@ class Compiler:
 		except FileNotFoundError as exc:
 			raise ParseError(f"cannot import {path}: {exc}") from exc
 		lines: List[str] = []
+		in_py_block = False
 		for idx, line in enumerate(contents.splitlines()):
 			stripped = line.strip()
-			if stripped.startswith("import "):
+			# Detect :py block start/end
+			if stripped.startswith(":py") and "{" in stripped:
+				in_py_block = True
+			if in_py_block and "}" in stripped:
+				in_py_block = False
+			# Only process import as file import if not in :py block
+			if not in_py_block and stripped.startswith("import "):
 				target = stripped.split(None, 1)[1].strip()
 				if not target:
 					raise ParseError(f"empty import target in {path}:{idx + 1}")

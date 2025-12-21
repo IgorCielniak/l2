@@ -1,3 +1,8 @@
+:asm int3 {
+	int3
+}
+;
+
 # : c@ ( addr -- byte )
 :asm c@ {
 	mov rax, [r12]

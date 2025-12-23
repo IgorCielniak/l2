@@ -257,22 +257,20 @@
 ;
 
 :asm mmap {
-    ; Save rsp and align to 16 bytes for syscall ABI
-    mov rax, rsp
-    and rsp, -16
-    mov rdi, [r12+40]   ; addr
-    mov rsi, [r12+32]   ; length
-    mov rdx, [r12+24]   ; prot
-    mov r10, [r12+16]   ; flags
-    mov r8,  [r12+8]    ; fd
-    mov r9,  [r12]      ; offset
-    add r12, 48         ; pop 6 args
-    mov rax, 9          ; syscall: mmap
-    syscall
-    mov rsp, rax        ; restore rsp
-    sub r12, 8
-    mov [r12], rax      ; push result
-    ret
+	mov r9, [r12]
+	add r12, 8
+	mov r8, [r12]
+	add r12, 8
+	mov r10, [r12]
+	add r12, 8
+	mov rdx, [r12]
+	add r12, 8
+	mov rsi, [r12]
+	add r12, 8
+	mov rdi, [r12]
+	mov rax, 9
+	syscall
+	mov [r12], rax
 }
 ;
 

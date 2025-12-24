@@ -26,7 +26,7 @@ struct: Point
     field y 8
 ;struct
 
-: main
+: main2
     32 alloc           # allocate 32 bytes (enough for a Point struct)
     dup 111 swap Point.x!
     dup 222 swap Point.y!

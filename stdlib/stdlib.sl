@@ -413,3 +413,19 @@
 	mov [r12], rax         ; push value
 }
 ;
+
+# : neg ( x -- -x )
+:asm neg {
+    mov rax, [r12]   ; get value
+    neg rax          ; arithmetic negation
+    mov [r12], rax   ; store result
+}
+;
+
+# : bitnot ( 0|1 -- 1|0 )
+:asm bitnot {
+    mov rax, [r12]   ; get value
+    xor rax, 1       ; flip lowest bit
+    mov [r12], rax   ; store result
+}
+;

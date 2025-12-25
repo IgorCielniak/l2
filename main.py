@@ -450,6 +450,15 @@ class Parser:
 			if lexeme == "next":
 				self._handle_next_control()
 				continue
+			if lexeme == "begin":
+				self._handle_begin_control()
+				continue
+			if lexeme == "while":
+				self._handle_while_control()
+				continue
+			if lexeme == "repeat":
+				self._handle_repeat_control()
+				continue
 			if self._maybe_expand_macro(token):
 				continue
 			self._handle_token(token)
@@ -722,6 +731,22 @@ class Parser:
 	def _handle_next_control(self) -> None:
 		entry = self._pop_control(("for",))
 		self._append_node(ForNext(loop_label=entry["loop"], end_label=entry["end"]))
+
+	def _handle_begin_control(self) -> None:
+		begin_label = self._new_label("begin")
+		end_label = self._new_label("end")
+		self._append_node(Label(name=begin_label))
+		self._push_control({"type": "begin", "begin": begin_label, "end": end_label})
+
+	def _handle_while_control(self) -> None:
+		entry = self._pop_control(("begin",))
+		self._append_node(BranchZero(target=entry["end"]))
+		self._push_control(entry)
+
+	def _handle_repeat_control(self) -> None:
+		entry = self._pop_control(("begin",))
+		self._append_node(Jump(target=entry["begin"]))
+		self._append_node(Label(name=entry["end"]))
 
 	def _begin_definition(self, token: Token) -> None:
 		if self._eof():

@@ -1,16 +1,3 @@
-: debug
-	for
-		puti cr
-	next
-	exit
-;
-
-# : int3 ( -- )
-:asm int3 {
-	int3
-}
-;
-
 # : c@ ( addr -- byte )
 :asm c@ {
 	mov rax, [r12]         ; get address from stack
@@ -304,6 +291,7 @@
 	mov rdi, [r12]         ; addr
 	mov rax, 9             ; syscall: mmap
 	syscall
+	sub r12, 8
 	mov [r12], rax         ; return addr
 }
 ;
@@ -315,6 +303,7 @@
 	mov rdi, [r12]         ; addr
 	mov rax, 11            ; syscall: munmap
 	syscall
+	sub r12, 8
 	mov [r12], rax         ; return value
 }
 ;

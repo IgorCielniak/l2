@@ -1754,7 +1754,18 @@ class Assembler:
 			"%define RSTK_BYTES 65536",
 			"%define PRINT_BUF_BYTES 128",
 			"global _start",
+			"global argc",
+			"global argv",
+			"section .data",
+			"argc: dq 0",
+			"argv: dq 0",
+			"section .text",
 			"_start:",
+			"    ; Linux x86-64 startup: argc/argv from stack",
+			"    mov rdi, [rsp]",         # argc
+			"    lea rsi, [rsp+8]",      # argv
+			"    mov [rel argc], rdi",
+			"    mov [rel argv], rsi",
 			"    ; initialize data/return stack pointers",
 			"    lea r12, [rel dstack_top]",
 			"    mov r15, r12",

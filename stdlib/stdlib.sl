@@ -1,3 +1,54 @@
+# : strlen ( addr -- len )
+# for null terminated strings
+
+:asm strlen {
+	mov rsi, [r12]      ; address
+	xor rcx, rcx        ; length counter
+.strlen_loop:
+	mov al, [rsi]
+	test al, al
+	jz .strlen_done
+	inc rcx
+	inc rsi
+	jmp .strlen_loop
+.strlen_done:
+	mov rax, rcx
+	mov [r12], rax      ; store length on stack
+	ret
+}
+;
+
+# : argc ( -- n )
+:asm argc {
+	extern argc
+	mov rax, [rel argc]
+	sub r12, 8
+	mov [r12], rax
+	ret
+}
+;
+
+# : argv ( -- ptr )
+:asm argv {
+	extern argv
+	mov rax, [rel argv]
+	sub r12, 8
+	mov [r12], rax
+	ret
+}
+;
+
+# : argv@ ( n -- ptr )
+:asm argv@ {
+	extern argv
+	mov rbx, [r12]      ; n
+	mov rax, [rel argv]
+	mov rax, [rax + rbx*8]
+	mov [r12], rax
+	ret
+}
+;
+
 # : c@ ( addr -- byte )
 :asm c@ {
 	mov rax, [r12]         ; get address from stack

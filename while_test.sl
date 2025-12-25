@@ -3,9 +3,9 @@ import stdlib/io.sl
 
 : main
     10
-    begin
-        dup 0 >
     while
+        dup 0 >
+    do
         dup puti cr
         1 -
     repeat

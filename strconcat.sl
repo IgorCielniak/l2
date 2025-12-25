@@ -3,8 +3,10 @@ import stdlib/io.sl
 
 : strconcat
     0 pick 3 pick +
-    >r >r >r >r >r
-    8 alloc
+    dup
+    >r >r >r >r >r >r
+    5 rpick
+    alloc
     r> r>
     dup >r
     strcpy
@@ -20,6 +22,9 @@ import stdlib/io.sl
     swap
     0 rpick
     nip
+    rot
+    drop
+    rdrop rdrop rdrop
 ;
 
 : alloc
@@ -64,7 +69,7 @@ import stdlib/io.sl
 ;
 
 : main
-    "hello " "world"
+    "hello world hello world hello " "world hello world hello world"
     strconcat
     puts
 ;

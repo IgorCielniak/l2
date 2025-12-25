@@ -1,3 +1,10 @@
+: debug
+	for
+		puti cr
+	next
+	exit
+;
+
 # : int3 ( -- )
 :asm int3 {
 	int3

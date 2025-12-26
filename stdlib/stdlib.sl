@@ -379,6 +379,7 @@
 	mov rsi, [r12]         ; len
 	add r12, 8
 	mov rdi, [r12]         ; addr
+	add r12, 8
 	mov rax, 11            ; syscall: munmap
 	syscall
 	sub r12, 8

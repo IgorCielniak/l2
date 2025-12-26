@@ -1793,6 +1793,8 @@ class Assembler:
 			"align 16",
 			"print_buf: resb PRINT_BUF_BYTES",
 			"print_buf_end:",
+			"align 16",
+			"persistent: resb 64",
 		]
 
 	def write_asm(self, emission: Emission, path: Path) -> None:

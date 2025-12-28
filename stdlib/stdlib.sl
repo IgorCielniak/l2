@@ -1,27 +1,11 @@
 # Reserve 64 bytes in .bss
 # persistent: resb 64
+# push the addr of it
 
-# : p@ ( offset -- n )
-:asm p@ {
-	mov rax, [r12]         ; offset
-	lea rbx, [rel persistent]
-	add rax, rbx           ; address = persistent + offset
-	mov rax, [rax]         ; load value
-	mov [r12], rax         ; store on stack
-	ret
-}
-;
-
-# : p! ( value offset -- )
-:asm p! {
-	mov rbx, [r12]         ; offset
-	add r12, 8
-	mov rax, [r12]         ; value
-	lea rcx, [rel persistent]
-	add rcx, rbx           ; address = persistent + offset
-	mov [rcx], rax         ; store value
-	add r12, 8             ; pop value
-	ret
+:asm mem {
+	lea rax, [rel persistent]
+	sub r12, 8
+	mov [r12], rax
 }
 ;
 

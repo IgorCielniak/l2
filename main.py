@@ -324,7 +324,6 @@ IntrinsicEmitter = Callable[["FunctionEmitter"], None]
 class Word:
 	name: str
 	immediate: bool = False
-	stack_effect: str = "( -- )"
 	definition: Optional[Union[Definition, AsmDefinition]] = None
 	macro: Optional[MacroHandler] = None
 	intrinsic: Optional[IntrinsicEmitter] = None
@@ -1511,8 +1510,6 @@ class _CTHandleTable:
 class Assembler:
 	def __init__(self, dictionary: Dictionary) -> None:
 		self.dictionary = dictionary
-		self.stack_bytes = 65536
-		self.io_buffer_bytes = 128
 		self._string_literals: Dict[str, Tuple[str, int]] = {}
 		self._float_literals: Dict[float, str] = {}
 		self._data_section: Optional[List[str]] = None

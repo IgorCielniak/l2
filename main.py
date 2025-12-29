@@ -2625,10 +2625,6 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
 
     if use_lld:
         cmd.extend(["-m", "elf_x86_64"])
-    else:
-        raise RuntimeError(
-            "GNU ld does not support x86_64 on this platform. Install lld."
-        )
 
     cmd.extend([
         "-o", str(exe_path),

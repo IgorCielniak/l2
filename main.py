@@ -2606,19 +2606,49 @@ def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
 	subprocess.run(cmd, check=True)
 
 
-def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs: Optional[List[str]] = None) -> None:
-	cmd = ["ld", "-o", str(exe_path), str(obj_path)]
-	if libs:
-		cmd.extend(["-dynamic-linker", "/lib64/ld-linux-x86-64.so.2"])
-		for lib in libs:
-			# If the user passed a full .so name, use -l:libname.so, else -l<name>
-			if lib.endswith('.so') or '.so.' in lib:
-				cmd.append(f"-l:{lib}")
-			else:
-				cmd.append(f"-l{lib}")
-	if debug:
-		cmd.append("-g")
-	subprocess.run(cmd, check=True)
+def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
+    libs = libs or []
+
+    lld = shutil.which("ld.lld")
+    ld = shutil.which("ld")
+
+    if lld:
+        linker = lld
+        use_lld = True
+    elif ld:
+        linker = ld
+        use_lld = False
+    else:
+        raise RuntimeError("No linker found")
+
+    cmd = [linker]
+
+    if use_lld:
+        cmd.extend(["-m", "elf_x86_64"])
+    else:
+        raise RuntimeError(
+            "GNU ld does not support x86_64 on this platform. Install lld."
+        )
+
+    cmd.extend([
+        "-o", str(exe_path),
+        str(obj_path),
+    ])
+
+    if not libs:
+        cmd.extend(["-nostdlib", "-static"])
+
+    if libs:
+        cmd.extend([
+            "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+        ])
+        for lib in libs:
+            cmd.append(f"-l:{lib}" if ".so" in lib else f"-l{lib}")
+
+    if debug:
+        cmd.append("-g")
+
+    subprocess.run(cmd, check=True)
 
 
 def cli(argv: Sequence[str]) -> int:

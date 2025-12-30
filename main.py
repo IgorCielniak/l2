@@ -2581,6 +2581,7 @@ class Compiler:
 		in_py_block = False
 		for idx, line in enumerate(contents.splitlines()):
 			stripped = line.strip()
+            # TODO: implement proper depth tracking for {} in py blocks
 			# Detect :py block start/end
 			if stripped.startswith(":py") and "{" in stripped:
 				in_py_block = True

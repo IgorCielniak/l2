@@ -14,3 +14,11 @@ import stdlib/io.sl
     r> 3 + puti
     " numbers printed from the fibonaci sequence" puts
 ;
+
+: main2
+    1 2 while over 100 < do
+        over puti cr
+        swap over +
+    repeat
+;
+

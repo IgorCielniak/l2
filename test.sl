@@ -104,7 +104,7 @@ fn fancy_add(int a, int b){
         111 puti cr
     else
         222 puti cr
-    then
+    end
 ;
 
 : test-else-if
@@ -116,8 +116,8 @@ fn fancy_add(int a, int b){
             60 puti cr
         else
             70 puti cr
-        then
-    then
+        end
+    end
     drop
 ;
 
@@ -125,7 +125,7 @@ fn fancy_add(int a, int b){
     0
     5 for
         1 +
-    next
+    end
     puti cr
 ;
 
@@ -133,7 +133,7 @@ fn fancy_add(int a, int b){
     123
     0 for
         drop
-    next
+    end
     puti cr
 ;
 

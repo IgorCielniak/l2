@@ -7,7 +7,7 @@ import stdlib/io.sl
     dup 0 > if
         write_buf
         0 exit
-    then
+    end
     "read_stdin failed" puts
     exit
 ;

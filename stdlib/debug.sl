@@ -10,7 +10,7 @@
         dup pick
 		puti cr
         1 +
-	next
+	end
     drop
 ;
 

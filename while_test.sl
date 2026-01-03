@@ -8,6 +8,6 @@ import stdlib/io.sl
     do
         dup puti cr
         1 -
-    repeat
+    end
     drop
 ;

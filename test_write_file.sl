@@ -10,7 +10,7 @@ import stdlib/io.sl
         puti cr
         0
         exit
-    then
+    end
     "write failed errno=" puts
     puti cr
     exit

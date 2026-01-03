@@ -59,7 +59,7 @@ import {ROOT / 'stdlib/io.sl'}
     0
     5 for
         1 +
-    next
+    end
     puti cr
     5 5 == puti cr
     5 4 == puti cr

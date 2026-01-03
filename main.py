@@ -258,7 +258,7 @@ class ForBegin(ASTNode):
 
 
 @dataclass
-class ForNext(ASTNode):
+class ForEnd(ASTNode):
     loop_label: str
     end_label: str
 
@@ -396,6 +396,29 @@ class Parser:
     def most_recent_definition(self) -> Optional[Word]:
         return self.last_defined
 
+    def _handle_end_control(self) -> None:
+        """Handle unified 'end' for all block types"""
+        if not self.control_stack:
+            raise ParseError("unexpected 'end' without matching block")
+
+        entry = self.control_stack.pop()
+
+        if entry["type"] == "if":
+            # For if without else
+            if "false" in entry:
+                self._append_node(Label(name=entry["false"]))
+        elif entry["type"] == "else":
+            self._append_node(Label(name=entry["end"]))
+        elif entry["type"] == "while":
+            self._append_node(Jump(target=entry["begin"]))
+            self._append_node(Label(name=entry["end"]))
+        elif entry["type"] == "for":
+            # Emit ForEnd node for loop decrement
+            self._append_node(ForEnd(loop_label=entry["loop"], end_label=entry["end"]))
+        elif entry["type"] == "begin":
+            self._append_node(Jump(target=entry["begin"]))
+            self._append_node(Label(name=entry["end"]))
+
     # Parsing ------------------------------------------------------------------
     def parse(self, tokens: Iterable[Token], source: str) -> Module:
         self.tokens = []
@@ -440,14 +463,8 @@ class Parser:
             if lexeme == "else":
                 self._handle_else_control()
                 continue
-            if lexeme == "then":
-                self._handle_then_control()
-                continue
             if lexeme == "for":
                 self._handle_for_control()
-                continue
-            if lexeme == "next":
-                self._handle_next_control()
                 continue
             if lexeme == "while":
                 self._handle_while_control()
@@ -455,8 +472,8 @@ class Parser:
             if lexeme == "do":
                 self._handle_do_control()
                 continue
-            if lexeme == "repeat":
-                self._handle_repeat_control()
+            if lexeme == "end":
+                self._handle_end_control()
                 continue
             if self._maybe_expand_macro(token):
                 continue
@@ -714,22 +731,11 @@ class Parser:
         self._append_node(Label(name=entry["false"]))
         self._push_control({"type": "else", "end": end_label})
 
-    def _handle_then_control(self) -> None:
-        entry = self._pop_control(("if", "else"))
-        if entry["type"] == "if":
-            self._append_node(Label(name=entry["false"]))
-        else:
-            self._append_node(Label(name=entry["end"]))
-
     def _handle_for_control(self) -> None:
         loop_label = self._new_label("for_loop")
         end_label = self._new_label("for_end")
         self._append_node(ForBegin(loop_label=loop_label, end_label=end_label))
         self._push_control({"type": "for", "loop": loop_label, "end": end_label})
-
-    def _handle_next_control(self) -> None:
-        entry = self._pop_control(("for",))
-        self._append_node(ForNext(loop_label=entry["loop"], end_label=entry["end"]))
 
     def _handle_while_control(self) -> None:
         begin_label = self._new_label("begin")
@@ -741,11 +747,6 @@ class Parser:
         entry = self._pop_control(("begin",))
         self._append_node(BranchZero(target=entry["end"]))
         self._push_control(entry)
-
-    def _handle_repeat_control(self) -> None:
-        entry = self._pop_control(("begin",))
-        self._append_node(Jump(target=entry["begin"]))
-        self._append_node(Label(name=entry["end"]))
 
     def _begin_definition(self, token: Token) -> None:
         if self._eof():
@@ -1300,7 +1301,7 @@ class CompileTimeVM:
                 self.loop_stack.append({"remaining": count, "begin": ip, "initial": count})
                 ip += 1
                 continue
-            if isinstance(node, ForNext):
+            if isinstance(node, ForEnd):
                 if not self.loop_stack:
                     raise ParseError("'next' without matching 'for'")
                 frame = self.loop_stack[-1]
@@ -1326,7 +1327,7 @@ class CompileTimeVM:
         for idx, node in enumerate(nodes):
             if isinstance(node, ForBegin):
                 stack.append(idx)
-            elif isinstance(node, ForNext):
+            elif isinstance(node, ForEnd):
                 if not stack:
                     raise ParseError("'next' without matching 'for'")
                 begin_idx = stack.pop()
@@ -1641,7 +1642,7 @@ class Assembler:
         if isinstance(node, ForBegin):
             self._emit_for_begin(node, builder)
             return
-        if isinstance(node, ForNext):
+        if isinstance(node, ForEnd):
             self._emit_for_next(node, builder)
             return
         raise CompileError(f"unsupported AST node {node!r}")
@@ -1737,7 +1738,7 @@ class Assembler:
         builder.emit("    mov [r13], rax")
         builder.emit(f"{node.loop_label}:")
 
-    def _emit_for_next(self, node: ForNext, builder: FunctionEmitter) -> None:
+    def _emit_for_next(self, node: ForEnd, builder: FunctionEmitter) -> None:
         builder.emit("    mov rax, [r13]")
         builder.emit("    dec rax")
         builder.emit("    mov [r13], rax")
@@ -2463,7 +2464,7 @@ PY_EXEC_GLOBALS: Dict[str, Any] = {
     "Jump": Jump,
     "Label": Label,
     "ForBegin": ForBegin,
-    "ForNext": ForNext,
+    "ForEnd": ForEnd,
     "StructField": StructField,
     "Definition": Definition,
     "Module": Module,

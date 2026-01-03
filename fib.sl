@@ -9,7 +9,7 @@ import stdlib/io.sl
     22 dup >r for
         2dup + dup puti cr
         rot
-    next
+    end
     "-------" puts
     r> 3 + puti
     " numbers printed from the fibonaci sequence" puts
@@ -19,6 +19,6 @@ import stdlib/io.sl
     1 2 while over 100 < do
         over puti cr
         swap over +
-    repeat
+    end
 ;
 

@@ -62,7 +62,7 @@ import stdlib/io.sl
         c!
         drop
         swap
-    next
+    end
     swap
     nip
     r> dup -rot - swap

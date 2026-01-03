@@ -6,5 +6,5 @@ import stdlib/io.sl
         dup
         argv@ dup strlen puts
         1 +
-    next
+    end
 ;

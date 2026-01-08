@@ -215,6 +215,7 @@ class AsmDefinition:
 @dataclass
 class Module:
     forms: List[Any]
+    variables: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -344,6 +345,8 @@ class Parser:
         self.label_counter = 0
         self.token_hook: Optional[str] = None
         self._last_token: Optional[Token] = None
+        self.variable_labels: Dict[str, str] = {}
+        self.variable_words: Dict[str, str] = {}
         self.compile_time_vm = CompileTimeVM(self)
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
@@ -363,6 +366,30 @@ class Parser:
 
     def most_recent_definition(self) -> Optional[Word]:
         return self.last_defined
+
+    def allocate_variable(self, name: str) -> Tuple[str, str]:
+        if name in self.variable_labels:
+            label = self.variable_labels[name]
+        else:
+            base = sanitize_label(f"var_{name}")
+            label = base
+            suffix = 0
+            existing = set(self.variable_labels.values())
+            while label in existing:
+                suffix += 1
+                label = f"{base}_{suffix}"
+            self.variable_labels[name] = label
+        hidden_word = f"__with_{name}"
+        self.variable_words[name] = hidden_word
+        if self.dictionary.lookup(hidden_word) is None:
+            word = Word(name=hidden_word)
+
+            def _intrinsic(builder: FunctionEmitter, target: str = label) -> None:
+                builder.push_label(target)
+
+            word.intrinsic = _intrinsic
+            self.dictionary.register(word)
+        return label, hidden_word
 
     def _handle_end_control(self) -> None:
         """Handle unified 'end' for all block types"""
@@ -394,7 +421,9 @@ class Parser:
         self._token_iter_exhausted = False
         self.source = source
         self.pos = 0
-        self.context_stack = [Module(forms=[])]
+        self.variable_labels = {}
+        self.variable_words = {}
+        self.context_stack = [Module(forms=[], variables=self.variable_labels)]
         self.definition_stack.clear()
         self.last_defined = None
         self.control_stack = []
@@ -463,6 +492,7 @@ class Parser:
         module = self.context_stack.pop()
         if not isinstance(module, Module):  # pragma: no cover - defensive
             raise ParseError("internal parser state corrupt")
+        module.variables = dict(self.variable_labels)
         return module
 
     # Internal helpers ---------------------------------------------------------
@@ -1545,6 +1575,8 @@ class Assembler:
         for definition in runtime_defs:
             self._emit_definition(definition, emission.text)
 
+        self._emit_variables(module.variables)
+
         if self._data_section is not None:
             if not self._data_section:
                 self._data_section.append("data_start:")
@@ -1553,6 +1585,21 @@ class Assembler:
         emission.bss.extend(self._bss_layout())
         self._data_section = None
         return emission
+
+    def _emit_variables(self, variables: Dict[str, str]) -> None:
+        if not variables:
+            return
+        self._ensure_data_start()
+        existing = set()
+        if self._data_section is not None:
+            for line in self._data_section:
+                if ":" in line:
+                    label = line.split(":", 1)[0]
+                    existing.add(label.strip())
+        for label in variables.values():
+            if label in existing:
+                continue
+            self._data_section.append(f"{label}: dq 0")
 
     def _ensure_data_start(self) -> None:
         if self._data_section is None:
@@ -1856,6 +1903,84 @@ def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
     parser.compile_time_vm.invoke(word)
     if isinstance(parser.context_stack[-1], Definition):
         parser.emit_node(Op(op="word", data=name))
+    return None
+
+
+def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+
+    names: List[str] = []
+    template: Optional[Token] = None
+    seen: set[str] = set()
+    while True:
+        if parser._eof():
+            raise ParseError("missing 'in' after 'with'")
+        tok = parser.next_token()
+        template = template or tok
+        if tok.lexeme == "in":
+            break
+        if not _is_identifier(tok.lexeme):
+            raise ParseError("invalid variable name in 'with'")
+        if tok.lexeme in seen:
+            raise ParseError("duplicate variable name in 'with'")
+        seen.add(tok.lexeme)
+        names.append(tok.lexeme)
+    if not names:
+        raise ParseError("'with' requires at least one variable name")
+
+    body: List[Token] = []
+    depth = 0
+    while True:
+        if parser._eof():
+            raise ParseError("unterminated 'with' block (missing 'end')")
+        tok = parser.next_token()
+        if tok.lexeme == "end":
+            if depth == 0:
+                break
+            depth -= 1
+            body.append(tok)
+            continue
+        if tok.lexeme in ("with", "if", "for", "while", "begin", "word"):
+            depth += 1
+        body.append(tok)
+
+    helper_for: Dict[str, str] = {}
+    for name in names:
+        _, helper = parser.allocate_variable(name)
+        helper_for[name] = helper
+
+    emitted: List[str] = []
+
+    # Initialize variables by storing current stack values into their buffers
+    for name in reversed(names):
+        helper = helper_for[name]
+        emitted.append(helper)
+        emitted.append("!")
+
+    i = 0
+    while i < len(body):
+        tok = body[i]
+        name = tok.lexeme
+        helper = helper_for.get(name)
+        if helper is not None:
+            next_tok = body[i + 1] if i + 1 < len(body) else None
+            if next_tok is not None and next_tok.lexeme == "!":
+                emitted.append(helper)
+                emitted.append("!")
+                i += 2
+                continue
+            if next_tok is not None and next_tok.lexeme == "@":
+                emitted.append(helper)
+                i += 1
+                continue
+            emitted.append(helper)
+            emitted.append("@")
+            i += 1
+            continue
+        emitted.append(tok.lexeme)
+        i += 1
+
+    ctx.inject_tokens(emitted, template=template)
     return None
 
 
@@ -2539,6 +2664,7 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
+    dictionary.register(Word(name="with", immediate=True, macro=macro_with))
     dictionary.register(Word(name="macro", immediate=True, macro=macro_begin_text_macro))
     dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
     dictionary.register(Word(name=";struct", immediate=True, macro=macro_struct_end))

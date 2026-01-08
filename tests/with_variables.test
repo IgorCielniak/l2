@@ -1,0 +1,1 @@
+python main.py tests/with_variables.sl -o /tmp/with_variables > /dev/null && /tmp/with_variables

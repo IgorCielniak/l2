@@ -1,0 +1,1 @@
+python main.py tests/arr_dynamic.sl -o /tmp/arr_dynamic > /dev/null && /tmp/arr_dynamic

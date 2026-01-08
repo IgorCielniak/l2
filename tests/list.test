@@ -1,0 +1,1 @@
+python main.py tests/list.sl -o /tmp/list > /dev/null && /tmp/list

@@ -439,10 +439,12 @@ class Parser:
             if self._handle_macro_recording(token):
                 continue
             lexeme = token.lexeme
-            if lexeme == ":":
-                raise ParseError(
-                    f"':' definitions are no longer supported; use 'word <name> ... end' at {token.line}:{token.column}"
-                )
+            if lexeme == "[":
+                self._handle_list_begin()
+                continue
+            if lexeme == "]":
+                self._handle_list_end(token)
+                continue
             if lexeme == "word":
                 self._begin_definition(token, terminator="end")
                 continue
@@ -494,6 +496,16 @@ class Parser:
             raise ParseError("internal parser state corrupt")
         module.variables = dict(self.variable_labels)
         return module
+
+    def _handle_list_begin(self) -> None:
+        label = self._new_label("list")
+        self._append_op(Op(op="list_begin", data=label))
+        self._push_control({"type": "list", "label": label})
+
+    def _handle_list_end(self, token: Token) -> None:
+        entry = self._pop_control(("list",))
+        label = entry["label"]
+        self._append_op(Op(op="list_end", data=label))
 
     # Internal helpers ---------------------------------------------------------
 
@@ -1703,6 +1715,72 @@ class Assembler:
             self._emit_for_next(data, builder)
             return
 
+        if kind == "list_begin":
+            builder.comment("list begin")
+            builder.emit("    mov rax, [rel list_capture_sp]")
+            builder.emit("    lea rdx, [rel list_capture_stack]")
+            builder.emit("    mov [rdx + rax*8], r12")
+            builder.emit("    inc rax")
+            builder.emit("    mov [rel list_capture_sp], rax")
+            return
+
+        if kind == "list_end":
+            base = str(data)
+            loop_label = f"{base}_copy_loop"
+            done_label = f"{base}_copy_done"
+
+            builder.comment("list end")
+            # pop capture start pointer
+            builder.emit("    mov rax, [rel list_capture_sp]")
+            builder.emit("    dec rax")
+            builder.emit("    mov [rel list_capture_sp], rax")
+            builder.emit("    lea r11, [rel list_capture_stack]")
+            builder.emit("    mov rbx, [r11 + rax*8]")
+            # count = (start_r12 - r12) / 8
+            builder.emit("    mov rcx, rbx")
+            builder.emit("    sub rcx, r12")
+            builder.emit("    shr rcx, 3")
+            builder.emit("    mov [rel list_capture_tmp], rcx")
+
+            # bytes = (count + 1) * 8
+            builder.emit("    mov rsi, rcx")
+            builder.emit("    inc rsi")
+            builder.emit("    shl rsi, 3")
+
+            # mmap(NULL, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+            builder.emit("    xor rdi, rdi")
+            builder.emit("    mov rdx, 3")
+            builder.emit("    mov r10, 34")
+            builder.emit("    mov r8, -1")
+            builder.emit("    xor r9, r9")
+            builder.emit("    mov rax, 9")
+            builder.emit("    syscall")
+
+            # store length
+            builder.emit("    mov rdx, [rel list_capture_tmp]")
+            builder.emit("    mov [rax], rdx")
+
+            # copy elements, preserving original push order
+            builder.emit("    xor rcx, rcx")
+            builder.emit(f"{loop_label}:")
+            builder.emit("    cmp rcx, rdx")
+            builder.emit(f"    je {done_label}")
+            builder.emit("    mov r8, rdx")
+            builder.emit("    dec r8")
+            builder.emit("    sub r8, rcx")
+            builder.emit("    shl r8, 3")
+            builder.emit("    mov r9, [r12 + r8]")
+            builder.emit("    mov [rax + 8 + rcx*8], r9")
+            builder.emit("    inc rcx")
+            builder.emit(f"    jmp {loop_label}")
+            builder.emit(f"{done_label}:")
+
+            # drop captured values and push list pointer
+            builder.emit("    mov r12, rbx")
+            builder.emit("    sub r12, 8")
+            builder.emit("    mov [r12], rax")
+            return
+
         raise CompileError(f"unsupported op {node!r}")
 
     def _emit_wordref(self, name: str, builder: FunctionEmitter) -> None:
@@ -1855,6 +1933,10 @@ class Assembler:
             "print_buf_end:",
             "align 16",
             "persistent: resb 64",
+            "align 16",
+            "list_capture_sp: resq 1",
+            "list_capture_tmp: resq 1",
+            "list_capture_stack: resq 1024",
         ]
 
     def write_asm(self, emission: Emission, path: Path) -> None:

@@ -282,6 +282,19 @@
 }
 ;
 
+# : ewrite_buf ( addr len -- )
+:asm ewrite_buf {
+	; data_start (trigger string_mode in compile-time VM)
+	mov rdx, [r12]        ; len
+	mov rsi, [r12 + 8]    ; addr
+	add r12, 16           ; pop len + addr
+	mov rax, 1            ; syscall: write
+	mov rdi, 2            ; fd = stderr
+	syscall
+	ret
+}
+;
+
 # : putc ( char -- )
 :asm putc {
 	mov rax, [r12]
@@ -346,3 +359,5 @@
 word cr 10 putc end
 
 word puts write_buf cr end
+
+word eputs ewrite_buf cr end

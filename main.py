@@ -2760,11 +2760,14 @@ def bootstrap_dictionary() -> Dictionary:
 
 
 class Compiler:
-    def __init__(self) -> None:
+    def __init__(self, include_paths: Optional[Sequence[Path]] = None) -> None:
         self.reader = Reader()
         self.dictionary = bootstrap_dictionary()
         self.parser = Parser(self.dictionary, self.reader)
         self.assembler = Assembler(self.dictionary)
+        if include_paths is None:
+            include_paths = [Path("."), Path("./stdlib")]
+        self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
 
     def compile_source(self, source: str) -> Emission:
         tokens = self.reader.tokenize(source)
@@ -2774,6 +2777,33 @@ class Compiler:
     def compile_file(self, path: Path) -> Emission:
         source = self._load_with_imports(path.resolve())
         return self.compile_source(source)
+
+    def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
+        raw = Path(target)
+        tried: List[Path] = []
+
+        if raw.is_absolute():
+            candidate = raw
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate.resolve()
+
+        candidate = (importing_file.parent / raw).resolve()
+        tried.append(candidate)
+        if candidate.exists():
+            return candidate
+
+        for base in self.include_paths:
+            candidate = (base / raw).resolve()
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate
+
+        tried_str = "\n".join(f"  - {p}" for p in tried)
+        raise ParseError(
+            f"cannot import {target!r} from {importing_file}\n"
+            f"tried:\n{tried_str}"
+        )
 
     def _load_with_imports(self, path: Path, seen: Optional[Set[Path]] = None) -> str:
         if seen is None:
@@ -2847,7 +2877,7 @@ class Compiler:
                 if not target:
                     raise ParseError(f"empty import target in {path}:{idx + 1}")
 
-                target_path = (path.parent / target).resolve()
+                target_path = self._resolve_import_target(path, target)
                 lines.append(self._load_with_imports(target_path, seen))
                 continue
 
@@ -2908,6 +2938,15 @@ def cli(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
     parser.add_argument("-o", dest="output", type=Path, default=Path("a.out"))
+    parser.add_argument(
+        "-I",
+        "--include",
+        dest="include_paths",
+        action="append",
+        default=[],
+        type=Path,
+        help="add import search path (repeatable)",
+    )
     parser.add_argument("--emit-asm", action="store_true", help="stop after generating asm")
     parser.add_argument("--temp-dir", type=Path, default=Path("build"))
     parser.add_argument("--debug", action="store_true", help="compile with debug info")
@@ -2945,7 +2984,7 @@ def cli(argv: Sequence[str]) -> int:
     if args.source is None:
         parser.error("the following arguments are required: source")
 
-    compiler = Compiler()
+    compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
     emission = compiler.compile_file(args.source)
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)

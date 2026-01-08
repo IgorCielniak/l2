@@ -1,0 +1,1 @@
+python main.py tests/alloc.sl -o /tmp/alloc > /dev/null && /tmp/alloc

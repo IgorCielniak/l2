@@ -1,5 +1,5 @@
-import stdlib/stdlib.sl
-import stdlib/io.sl
+import ../stdlib/stdlib.sl
+import ../stdlib/io.sl
 
 : main
     mem 5 swap !

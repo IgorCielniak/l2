@@ -1,0 +1,1 @@
+python main.py tests/loops_and_cmp.sl -o /tmp/loops_and_cmp > /dev/null && /tmp/loops_and_cmp

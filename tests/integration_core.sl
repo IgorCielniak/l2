@@ -1,6 +1,6 @@
-import stdlib/stdlib.sl
-import stdlib/io.sl
-import fn.sl
+import ../stdlib/stdlib.sl
+import ../stdlib/io.sl
+import ../fn.sl
 
 :asm mem-slot {
     lea rax, [rel print_buf]

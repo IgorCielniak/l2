@@ -1,8 +1,12 @@
-import stdlib/stdlib.sl
-import stdlib/io.sl
+import ../stdlib/stdlib.sl
+import ../stdlib/io.sl
 
 : main
-    "/etc/hostname" # (addr len)
+    "/tmp/l2_read_file_test.txt"
+    "read_file works\n"
+    write_file drop
+
+    "/tmp/l2_read_file_test.txt" # (addr len)
     read_file                 # (file_addr file_len)
     dup 0 > if                # if file_len > 0, success
         write_buf             # print file contents (file_len file_addr)

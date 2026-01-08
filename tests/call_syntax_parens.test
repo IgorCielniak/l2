@@ -1,0 +1,1 @@
+python main.py tests/call_syntax_parens.sl -o /tmp/call_syntax_parens > /dev/null && /tmp/call_syntax_parens

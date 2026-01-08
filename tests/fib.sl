@@ -1,5 +1,6 @@
-import stdlib/stdlib.sl
-import stdlib/io.sl
+import ../stdlib/stdlib.sl
+import ../stdlib/io.sl
+import ../stdlib/debug.sl
 
 : main
     1 1 2dup 2dup puti cr puti cr
@@ -13,6 +14,7 @@ import stdlib/io.sl
     "-------" puts
     r> 3 + puti
     " numbers printed from the fibonaci sequence" puts
+    0
 ;
 
 : main2

@@ -1,0 +1,1 @@
+python main.py tests/string_puts.sl -o /tmp/string_puts > /dev/null && /tmp/string_puts

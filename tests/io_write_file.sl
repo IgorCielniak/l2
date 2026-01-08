@@ -1,9 +1,9 @@
-import stdlib/stdlib.sl
-import stdlib/io.sl
+import ../stdlib/stdlib.sl
+import ../stdlib/io.sl
 
 : main
-    "/tmp/l2_test_write.txt" # push path (addr len)
-    "hello from write_file test\n" # push buf (addr len)
+    "/tmp/l2_write_file_test.txt"  # path
+    "hello from write_file test\n" # buffer
     write_file
     dup 0 > if
         "wrote bytes: " puts

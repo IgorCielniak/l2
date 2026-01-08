@@ -1,0 +1,1 @@
+python main.py tests/loop_while.sl -o /tmp/loop_while > /dev/null && /tmp/loop_while

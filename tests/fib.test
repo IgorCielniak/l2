@@ -1,0 +1,1 @@
+python main.py tests/fib.sl -o /tmp/fib > /dev/null && /tmp/fib

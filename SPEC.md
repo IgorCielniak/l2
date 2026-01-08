@@ -102,7 +102,9 @@ struct: Point
 - **Error handling**: The runtime never inspects `errno`; users can read/write the TLS slot through provided helper words.
 
 ## 10. Syscalls & OS Integration
-- **Primitive syscall**: `syscall ( args... nr -- ret )` expects the syscall number at the top of stack, maps previous values to `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, runs `syscall`, and returns `rax`.
+- **Primitive syscall**: `syscall ( args... nr count -- ret )` expects the syscall number beneath an explicit argument count. It clamps the count to `0..6`, maps the top-most values to `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (oldest argument in `rdi`), executes `syscall`, and pushes `rax`.
+- **Convenience macros**: `stdlib/linux.sl` exports `syscall1`..`syscall6`, each expanding to `<n> syscall`, so a typical call looks like `... syscall.write syscall3`.
+- **Named constants**: The same module defines `syscall.<name>` (alias for `syscall.<name>.num`) plus `syscall.<name>.argc`, letting programs reference both the numeric ID and Linux-reported argument count at compile time.
 - **Wrappers**: The standard library layers ergonomic words (`open`, `mmap`, `clone`, etc.) over the primitive but exposes hooks to override or extend them.
 - **Process bootstrap**: Entry stub captures `argc`, `argv`, `envp`, stores them in global cells (`argc`, `argv-base`), and pushes them on the data stack before invoking the user `main` word.
 

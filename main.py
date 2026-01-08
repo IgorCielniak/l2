@@ -2788,6 +2788,8 @@ class Compiler:
     def __init__(self, include_paths: Optional[Sequence[Path]] = None) -> None:
         self.reader = Reader()
         self.dictionary = bootstrap_dictionary()
+        self._syscall_label_counter = 0
+        self._register_syscall_words()
         self.parser = Parser(self.dictionary, self.reader)
         self.assembler = Assembler(self.dictionary)
         if include_paths is None:
@@ -2830,6 +2832,49 @@ class Compiler:
             f"cannot import {target!r} from {importing_file}\n"
             f"tried:\n{tried_str}"
         )
+
+    def _register_syscall_words(self) -> None:
+        word = self.dictionary.lookup("syscall")
+        if word is None:
+            word = Word(name="syscall")
+        word.intrinsic = self._emit_syscall_intrinsic
+        self.dictionary.register(word)
+
+    def _emit_syscall_intrinsic(self, builder: FunctionEmitter) -> None:
+        label_id = self._syscall_label_counter
+        self._syscall_label_counter += 1
+
+        def lbl(suffix: str) -> str:
+            return f"syscall_{label_id}_{suffix}"
+
+        builder.pop_to("rax")  # syscall number
+        builder.pop_to("rcx")  # arg count
+        builder.emit("    ; clamp arg count to [0, 6]")
+        builder.emit("    cmp rcx, 0")
+        builder.emit(f"    jge {lbl('count_nonneg')}")
+        builder.emit("    xor rcx, rcx")
+        builder.emit(f"{lbl('count_nonneg')}:")
+        builder.emit("    cmp rcx, 6")
+        builder.emit(f"    jle {lbl('count_clamped')}")
+        builder.emit("    mov rcx, 6")
+        builder.emit(f"{lbl('count_clamped')}:")
+
+        checks = [
+            (6, "r9"),
+            (5, "r8"),
+            (4, "r10"),
+            (3, "rdx"),
+            (2, "rsi"),
+            (1, "rdi"),
+        ]
+        for threshold, reg in checks:
+            builder.emit(f"    cmp rcx, {threshold}")
+            builder.emit(f"    jl {lbl(f'skip_{reg}')}")
+            builder.pop_to(reg)
+            builder.emit(f"{lbl(f'skip_{reg}')}:")
+
+        builder.emit("    syscall")
+        builder.push_from("rax")
 
     def _load_with_imports(self, path: Path, seen: Optional[Set[Path]] = None) -> Tuple[str, List[FileSpan]]:
         if seen is None:

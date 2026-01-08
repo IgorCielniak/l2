@@ -347,7 +347,15 @@ class Parser:
         self._last_token: Optional[Token] = None
         self.variable_labels: Dict[str, str] = {}
         self.variable_words: Dict[str, str] = {}
+        self.file_spans: List[FileSpan] = []
         self.compile_time_vm = CompileTimeVM(self)
+
+    def location_for_token(self, token: Token) -> Tuple[str, int, int]:
+        for span in self.file_spans:
+            if span.start_line <= token.line < span.end_line:
+                local_line = span.local_start_line + (token.line - span.start_line)
+                return (span.path.name, local_line, token.column)
+        return ("<source>", token.line, token.column)
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
@@ -2741,11 +2749,20 @@ def macro_struct_end(ctx: MacroContext) -> Optional[List[Op]]:
     raise ParseError("';struct' must follow a 'struct:' block")
 
 
+def macro_here(ctx: MacroContext) -> Optional[List[Op]]:
+    tok = ctx.parser._last_token
+    if tok is None:
+        return [Op(op="literal", data="<source>:0:0")]
+    file_name, line, col = ctx.parser.location_for_token(tok)
+    return [Op(op="literal", data=f"{file_name}:{line}:{col}")]
+
+
 def bootstrap_dictionary() -> Dictionary:
     dictionary = Dictionary()
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
+    dictionary.register(Word(name="here", immediate=True, macro=macro_here))
     dictionary.register(Word(name="with", immediate=True, macro=macro_with))
     dictionary.register(Word(name="macro", immediate=True, macro=macro_begin_text_macro))
     dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
@@ -2759,6 +2776,14 @@ def bootstrap_dictionary() -> Dictionary:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FileSpan:
+    path: Path
+    start_line: int  # inclusive (global line number in expanded source, 1-based)
+    end_line: int    # exclusive
+    local_start_line: int  # 1-based line in the original file
+
+
 class Compiler:
     def __init__(self, include_paths: Optional[Sequence[Path]] = None) -> None:
         self.reader = Reader()
@@ -2769,14 +2794,15 @@ class Compiler:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
 
-    def compile_source(self, source: str) -> Emission:
+    def compile_source(self, source: str, spans: Optional[List[FileSpan]] = None) -> Emission:
+        self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
         return self.assembler.emit(module)
 
     def compile_file(self, path: Path) -> Emission:
-        source = self._load_with_imports(path.resolve())
-        return self.compile_source(source)
+        source, spans = self._load_with_imports(path.resolve())
+        return self.compile_source(source, spans=spans)
 
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
         raw = Path(target)
@@ -2805,13 +2831,24 @@ class Compiler:
             f"tried:\n{tried_str}"
         )
 
-    def _load_with_imports(self, path: Path, seen: Optional[Set[Path]] = None) -> str:
+    def _load_with_imports(self, path: Path, seen: Optional[Set[Path]] = None) -> Tuple[str, List[FileSpan]]:
         if seen is None:
             seen = set()
+        out_lines: List[str] = []
+        spans: List[FileSpan] = []
+        self._append_file_with_imports(path.resolve(), out_lines, spans, seen)
+        return "\n".join(out_lines) + "\n", spans
 
+    def _append_file_with_imports(
+        self,
+        path: Path,
+        out_lines: List[str],
+        spans: List[FileSpan],
+        seen: Set[Path],
+    ) -> None:
         path = path.resolve()
         if path in seen:
-            return ""
+            return
         seen.add(path)
 
         try:
@@ -2819,14 +2856,36 @@ class Compiler:
         except FileNotFoundError as exc:
             raise ParseError(f"cannot import {path}: {exc}") from exc
 
-        lines: List[str] = []
-
         in_py_block = False
         brace_depth = 0
-        string_char = None   # "'" or '"'
+        string_char = None
         escape = False
 
-        def scan_line(line: str):
+        segment_start_global: Optional[int] = None
+        segment_start_local: int = 1
+        file_line_no = 1
+
+        def begin_segment_if_needed() -> None:
+            nonlocal segment_start_global, segment_start_local
+            if segment_start_global is None:
+                segment_start_global = len(out_lines) + 1
+                segment_start_local = file_line_no
+
+        def close_segment_if_open() -> None:
+            nonlocal segment_start_global
+            if segment_start_global is None:
+                return
+            spans.append(
+                FileSpan(
+                    path=path,
+                    start_line=segment_start_global,
+                    end_line=len(out_lines) + 1,
+                    local_start_line=segment_start_local,
+                )
+            )
+            segment_start_global = None
+
+        def scan_line(line: str) -> None:
             nonlocal brace_depth, string_char, escape
             for ch in line:
                 if string_char:
@@ -2847,43 +2906,48 @@ class Compiler:
         for idx, line in enumerate(contents.splitlines()):
             stripped = line.strip()
 
-            # Detect :py { block start
             if not in_py_block and stripped.startswith(":py") and "{" in stripped:
                 in_py_block = True
                 brace_depth = 0
                 string_char = None
                 escape = False
                 scan_line(line)
-
-                # Edge case: empty block on same line
+                begin_segment_if_needed()
+                out_lines.append(line)
+                file_line_no += 1
                 if brace_depth == 0:
                     in_py_block = False
-
-                lines.append(line)
                 continue
 
             if in_py_block:
                 scan_line(line)
-
+                begin_segment_if_needed()
+                out_lines.append(line)
+                file_line_no += 1
                 if brace_depth == 0:
                     in_py_block = False
-
-                lines.append(line)
                 continue
 
-            # Process imports only outside python blocks
             if stripped.startswith("import "):
                 target = stripped.split(None, 1)[1].strip()
                 if not target:
                     raise ParseError(f"empty import target in {path}:{idx + 1}")
 
+                # Keep a placeholder line so line numbers in the importing file stay stable.
+                begin_segment_if_needed()
+                out_lines.append("")
+                file_line_no += 1
+                close_segment_if_open()
+
                 target_path = self._resolve_import_target(path, target)
-                lines.append(self._load_with_imports(target_path, seen))
+                self._append_file_with_imports(target_path, out_lines, spans, seen)
                 continue
 
-            lines.append(line)
+            begin_segment_if_needed()
+            out_lines.append(line)
+            file_line_no += 1
 
-        return "\n".join(lines) + "\n"
+        close_segment_if_open()
 
 def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
     cmd = ["nasm", "-f", "elf64"]

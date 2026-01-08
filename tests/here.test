@@ -1,0 +1,1 @@
+python main.py tests/here.sl -o /tmp/here > /dev/null && /tmp/here

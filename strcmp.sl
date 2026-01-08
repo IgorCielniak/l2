@@ -1,14 +1,14 @@
 import stdlib/stdlib.sl
 import stdlib/io.sl
 
-: strcmp
+word strcmp
     3 pick 2 pick @ swap @ ==
-;
+end
 
-: main
+word main
     "g" "g"
     strcmp
     puti cr
     puts
     puts
-;
+end

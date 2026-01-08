@@ -8,9 +8,9 @@ fn foo(int a, int b){
     return a b +;
 }
 
-: main
+word main
     extend-syntax
     foo(3, 2)
     puti cr
     0
-;
+end

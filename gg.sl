@@ -2,6 +2,6 @@ import stdlib/io.sl
 
 extern long labs(long n)
 
-: main
+word main
     -3 labs puti
-;
+end

@@ -201,6 +201,7 @@ class Definition:
     body: List[Op]
     immediate: bool = False
     compile_only: bool = False
+    terminator: str = "end"
 
 
 @dataclass
@@ -410,11 +411,19 @@ class Parser:
                 continue
             lexeme = token.lexeme
             if lexeme == ":":
-                self._begin_definition(token)
+                raise ParseError(
+                    f"':' definitions are no longer supported; use 'word <name> ... end' at {token.line}:{token.column}"
+                )
+            if lexeme == "word":
+                self._begin_definition(token, terminator="end")
                 continue
-            if lexeme == ";":
-                self._end_definition(token)
-                continue
+            if lexeme == "end":
+                if self.control_stack:
+                    self._handle_end_control()
+                    continue
+                if self._try_end_definition(token):
+                    continue
+                raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
             if lexeme == ":asm":
                 self._parse_asm_definition(token)
                 continue
@@ -439,12 +448,12 @@ class Parser:
             if lexeme == "do":
                 self._handle_do_control()
                 continue
-            if lexeme == "end":
-                self._handle_end_control()
-                continue
             if self._maybe_expand_macro(token):
                 continue
             self._handle_token(token)
+
+        if self.macro_recording is not None:
+            raise ParseError("unterminated macro definition (missing ';')")
 
         if len(self.context_stack) != 1:
             raise ParseError("unclosed definition at EOF")
@@ -593,7 +602,7 @@ class Parser:
     def _handle_macro_recording(self, token: Token) -> bool:
         if self.macro_recording is None:
             return False
-        if token.lexeme == ";macro":
+        if token.lexeme == ";":
             self._finish_macro_recording(token)
         else:
             self.macro_recording.tokens.append(token.lexeme)
@@ -638,7 +647,7 @@ class Parser:
 
     def _finish_macro_recording(self, token: Token) -> None:
         if self.macro_recording is None:
-            raise ParseError(f"unexpected ';macro' at {token.line}:{token.column}")
+            raise ParseError(f"unexpected ';' closing a macro at {token.line}:{token.column}")
         macro_def = self.macro_recording
         self.macro_recording = None
         word = Word(name=macro_def.name)
@@ -715,11 +724,24 @@ class Parser:
         self._append_op(Op(op="branch_zero", data=entry["end"]))
         self._push_control(entry)
 
-    def _begin_definition(self, token: Token) -> None:
+    def _try_end_definition(self, token: Token) -> bool:
+        if len(self.context_stack) <= 1:
+            return False
+        ctx = self.context_stack[-1]
+        if not isinstance(ctx, Definition):
+            return False
+        if ctx.terminator != token.lexeme:
+            return False
+        self._end_definition(token)
+        return True
+
+    def _begin_definition(self, token: Token, terminator: str = "end") -> None:
         if self._eof():
-            raise ParseError(f"definition name missing after ':' at {token.line}:{token.column}")
+            raise ParseError(
+                f"definition name missing after '{token.lexeme}' at {token.line}:{token.column}"
+            )
         name_token = self._consume()
-        definition = Definition(name=name_token.lexeme, body=[])
+        definition = Definition(name=name_token.lexeme, body=[], terminator=terminator)
         self.context_stack.append(definition)
         word = self.dictionary.lookup(definition.name)
         if word is None:
@@ -730,10 +752,14 @@ class Parser:
 
     def _end_definition(self, token: Token) -> None:
         if len(self.context_stack) <= 1:
-            raise ParseError(f"unexpected ';' at {token.line}:{token.column}")
+            raise ParseError(f"unexpected '{token.lexeme}' at {token.line}:{token.column}")
         ctx = self.context_stack.pop()
         if not isinstance(ctx, Definition):
-            raise ParseError("';' can only close definitions")
+            raise ParseError(f"'{token.lexeme}' can only close definitions")
+        if ctx.terminator != token.lexeme:
+            raise ParseError(
+                f"definition '{ctx.name}' expects terminator '{ctx.terminator}' but got '{token.lexeme}'"
+            )
         word = self.definition_stack.pop()
         ctx.immediate = word.immediate
         ctx.compile_only = word.compile_only
@@ -1836,7 +1862,7 @@ def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
 def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
     if parser._eof():
-        raise ParseError("macro name missing after 'macro:'")
+        raise ParseError("macro name missing after 'macro'")
     name_token = parser.next_token()
     param_count = 0
     peek = parser.peek_token()
@@ -1850,14 +1876,6 @@ def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
     return None
 
 
-def macro_end_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
-    parser = ctx.parser
-    if parser.macro_recording is None:
-        raise ParseError("';macro' without matching 'macro:'")
-    # Actual closing handled in parser loop when ';macro' token is seen.
-    return None
-
-
 def _struct_emit_definition(tokens: List[Token], template: Token, name: str, body: Sequence[str]) -> None:
     def make_token(lexeme: str) -> Token:
         return Token(
@@ -1868,11 +1886,11 @@ def _struct_emit_definition(tokens: List[Token], template: Token, name: str, bod
             end=template.end,
         )
 
-    tokens.append(make_token(":"))
+    tokens.append(make_token("word"))
     tokens.append(make_token(name))
     for lexeme in body:
         tokens.append(make_token(lexeme))
-    tokens.append(make_token(";"))
+    tokens.append(make_token("end"))
 
 
 class SplitLexer:
@@ -2521,8 +2539,7 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
-    dictionary.register(Word(name="macro:", immediate=True, macro=macro_begin_text_macro))
-    dictionary.register(Word(name=";macro", immediate=True, macro=macro_end_text_macro))
+    dictionary.register(Word(name="macro", immediate=True, macro=macro_begin_text_macro))
     dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
     dictionary.register(Word(name=";struct", immediate=True, macro=macro_struct_end))
     _register_compile_time_primitives(dictionary)

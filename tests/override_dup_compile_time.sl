@@ -1,12 +1,12 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: dup
+word dup
     6
-;
+end
 compile-only
 
-: emit-overridden
+word emit-overridden
     "dup" use-l2-ct
     42
     dup
@@ -17,12 +17,12 @@ compile-only
     swap
     list-append
     inject-tokens
-;
+end
 immediate
 compile-only
 
-: main
+word main
     emit-overridden
     puti cr
     0
-;
+end

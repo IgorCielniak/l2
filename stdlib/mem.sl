@@ -1,6 +1,6 @@
 import stdlib.sl
 
-: alloc
+word alloc
     0      # addr hint (NULL)
     swap   # size
     3      # prot (PROT_READ | PROT_WRITE)
@@ -8,8 +8,8 @@ import stdlib.sl
     -1     # fd
     0      # offset
     mmap
-;
+end
 
-: free
+word free
     munmap drop
-;
+end

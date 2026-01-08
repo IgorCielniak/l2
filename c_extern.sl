@@ -4,10 +4,10 @@ import stdlib/io.sl
 extern long labs(long n)
 extern void exit(int status)
 
-: main
+word main
     # Test C-style extern with implicit ABI handling
     -10 labs puti cr
     
     # Test extern void
     0 exit
-;
+end

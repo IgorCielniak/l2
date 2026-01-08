@@ -1,7 +1,7 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: main
+word main
     10
     while
         dup 0 >
@@ -10,4 +10,4 @@ import ../stdlib/io.sl
         1 -
     end
     drop
-;
+end

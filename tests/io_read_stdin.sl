@@ -1,7 +1,7 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: main
+word main
     1024
     read_stdin   # returns (addr len)
     dup 0 > if
@@ -10,4 +10,4 @@ import ../stdlib/io.sl
     end
     "read_stdin failed" puts
     exit
-;
+end

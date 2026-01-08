@@ -4,7 +4,7 @@ import stdlib/float.sl
 
 extern double atan2(double y, double x)
 
-: main
+word main
     # Basic math
     1.5 2.5 f+ fputln       # Outputs: 4.000000
     
@@ -13,5 +13,5 @@ extern double atan2(double y, double x)
     4.0 f* fputln           # Outputs: 3.141593 (approx pi)
     
     0
-;
+end
 

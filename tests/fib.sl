@@ -2,7 +2,7 @@ import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 import ../stdlib/debug.sl
 
-: main
+word main
     1 1 2dup 2dup puti cr puti cr
     +
     dup puti cr
@@ -15,12 +15,12 @@ import ../stdlib/debug.sl
     r> 3 + puti
     " numbers printed from the fibonaci sequence" puts
     0
-;
+end
 
-: main2
+word main2
     1 2 while over 100 < do
         over puti cr
         swap over +
     end
-;
+end
 

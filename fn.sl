@@ -1,4 +1,4 @@
-: call-syntax-rewrite            # ( fnameToken -- handled )
+word call-syntax-rewrite            # ( fnameToken -- handled )
 	dup token-lexeme identifier? 0 == if drop 0 exit end
 	peek-token dup nil? if drop drop 0 exit end
 	dup token-lexeme "(" string= 0 == if drop drop 0 exit end
@@ -26,34 +26,34 @@ begin
 	# default: append tok to cur
 	list-append
 again
-;
+end
 immediate
 compile-only
 
 
-: extend-syntax
+word extend-syntax
 	"call-syntax-rewrite" set-token-hook
-;
+end
 immediate
 compile-only
 
 
-: fn-op-prec
+word fn-op-prec
 	dup "+" string= if drop 1 exit end
 	dup "-" string= if drop 1 exit end
 	dup "*" string= if drop 2 exit end
 	dup "/" string= if drop 2 exit end
 	dup "%" string= if drop 2 exit end
 	drop 0
-;
+end
 compile-only
 
-: fn-operator?
+word fn-operator?
 	fn-op-prec 0 >
-;
+end
 compile-only
 
-: fn-check-dup
+word fn-check-dup
 	>r                              # params          (r: name)
 	0                               # params idx
 begin
@@ -66,10 +66,10 @@ begin
 	drop                            # drop comparison flag when no error
 	r> 1 +                          # params idx+1
 again
-;
+end
 compile-only
 
-: fn-params
+word fn-params
 	list-new             # lexer params
 	swap                 # params lexer
 	>r                   # params            (r: lexer)
@@ -90,17 +90,17 @@ begin
 	dup ")" string= if drop r> exit end
 	"expected ',' or ')' in parameter list" parse-error
 again
-;
+end
 compile-only
 
-: fn-collect-body
+word fn-collect-body
 	"{" lexer-expect drop          # consume opening brace, keep lexer
 	lexer-collect-brace             # lexer bodyTokens
 	swap drop                       # bodyTokens
-;
+end
 compile-only
 
-: fn-lexemes-from-tokens
+word fn-lexemes-from-tokens
 	>r                   # (r: tokens)
 	list-new             # acc
 begin
@@ -114,10 +114,10 @@ begin
 	token-lexeme          # acc lex
 	list-append           # acc'
 again
-;
+end
 compile-only
 
-: fn-validate-body
+word fn-validate-body
 	dup list-length 0 == if "empty function body" parse-error end
 	dup 0 list-get token-lexeme "return" string= 0 == if "function body must start with 'return'" parse-error end
 	dup list-last ";" string= 0 == if "function body must terminate with ';'" parse-error end
@@ -125,11 +125,11 @@ compile-only
 	list-pop drop                  # body expr' (trim trailing ';')
 	list-pop-front drop            # body expr  (trim leading 'return')
 	dup list-length 0 == if "missing return expression" parse-error end
-;
+end
 compile-only
 
 
-: fn-filter-raw-body             # bodyLexemes -- tokens
+word fn-filter-raw-body             # bodyLexemes -- tokens
 	list-new swap                   # out body
 begin
 	dup list-empty? if
@@ -152,11 +152,11 @@ begin
 	r>                              # out' body'
 	continue
 again
-;
+end
 compile-only
 
 
-: fn-body->tokens                # bodyLexemes -- tokens
+word fn-body->tokens                # bodyLexemes -- tokens
 	dup list-length 0 == if "empty function body" parse-error end
 	dup 0 list-get token-lexeme "return" string= if
 		fn-validate-body              # expr
@@ -165,10 +165,10 @@ compile-only
 	end
 	fn-filter-raw-body
 	dup list-length 0 == if "empty function body" parse-error end
-;
+end
 compile-only
 
-: fn-emit-prologue             # params out -- params out
+word fn-emit-prologue             # params out -- params out
 	over list-length              # params out n
 begin
 	dup 0 > if
@@ -181,10 +181,10 @@ begin
 	drop                         # params out
 	exit
 again
-;
+end
 compile-only
 
-: fn-emit-epilogue             # params out -- out
+word fn-emit-epilogue             # params out -- out
 	over list-length >r           # params out   (r: n)
 begin
 	r> dup 0 > if
@@ -196,30 +196,30 @@ begin
 	swap drop                     # out
 	exit
 again
-;
+end
 compile-only
 
-: fn-translate-prologue-loop   # count --
+word fn-translate-prologue-loop   # count --
 	dup 0 > if
 		1 -
 		0 rpick ">r" list-append drop
 		fn-translate-prologue-loop
 		end
 	drop
-;
+end
 compile-only
 
-: fn-translate-epilogue-loop   # count --
+word fn-translate-epilogue-loop   # count --
 	dup 0 > if
 		1 -
 		0 rpick "rdrop" list-append drop
 		fn-translate-epilogue-loop
 		end
 	drop
-;
+end
 compile-only
 
-: fn-param-index                # params name -- params idx flag
+word fn-param-index                # params name -- params idx flag
 	>r                             # params        (r: name)
 	0                              # params idx
 
@@ -238,11 +238,11 @@ begin
 	drop                          # params idx
 	1 +                           # params idx+1
 again
-;
+end
 compile-only
 
 
-: fn-build-param-map            # params -- params map
+word fn-build-param-map            # params -- params map
 	map-new                         # params map
 	0                               # params map idx
 	begin
@@ -258,11 +258,11 @@ compile-only
 		r> 1 +                         # params map' idx'
 		continue
 	again
-;
+end
 compile-only
 
 
-: fn-translate-token            # out map tok -- out map
+word fn-translate-token            # out map tok -- out map
 	# number?
 	dup string>number              # out map tok num ok
 	if
@@ -299,11 +299,11 @@ compile-only
 	swap >r                        # out tok            (r: map)
 	list-append                    # out'
 	r>                             # out' map
-;
+end
 compile-only
 
 
-: fn-translate-postfix-loop     # map out postfix -- map out
+word fn-translate-postfix-loop     # map out postfix -- map out
 	begin
 		dup list-empty? if
 			drop
@@ -317,11 +317,11 @@ compile-only
 		r>                           # map out postfix'
 		continue
 	again
-;
+end
 compile-only
 
 
-: fn-translate-postfix          # postfix params -- out
+word fn-translate-postfix          # postfix params -- out
 	swap                             # params postfix
 	list-new                         # params postfix out
 
@@ -341,15 +341,15 @@ compile-only
 	# drop map, emit epilogue
 	swap drop                         # params out
 	fn-emit-epilogue                   # out
-;
+end
 compile-only
 
-: fn-build-body
+word fn-build-body
 	fn-translate-postfix   # words
-;
+end
 compile-only
 
-: fn
+word fn
 	"(),{};+-*/%," lexer-new         # lexer
 	dup lexer-pop                     # lexer nameTok
 	dup >r                            # save nameTok
@@ -368,6 +368,6 @@ compile-only
 	r> drop                           # drop name string
 	r>                                # name token
 	swap emit-definition
-;
+end
 immediate
 compile-only

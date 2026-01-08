@@ -4,15 +4,15 @@
 # and prints that much consequent elements
 # from the stack while not modifying it
 
-: dump
-    1 swap
+word dump
+	1 swap
 	for
-        dup pick
+		dup pick
 		puti cr
-        1 +
+		1 +
 	end
-    drop
-;
+	drop
+end
 
 # : int3 ( -- )
 :asm int3 {

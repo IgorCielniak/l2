@@ -1,8 +1,8 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: main
+word main
     "hello from write_buf test\n"
     write_buf
     0
-;
+end

@@ -23,6 +23,8 @@
   - `read-token`: splits the byte stream; default is whitespace delimited with numeric/string literal recognizers.
   - `on-token`: user code decides whether to interpret, compile, or treat the token as syntax.
   - `lookup`: resolves token → word entry; can be replaced to build new namespaces or module systems.
+- **Definition form**: `word <name> ... end` is the required way to declare high-level words. Legacy `: <name> ... ;` definitions are no longer accepted.
+- **Text macros**: `macro <name> [param_count] ... ;` records tokens until the closing `;` and registers a macro that performs positional substitution (`$1`, `$2`, ...). The old `macro: ... ;macro` form is removed.
 - **Compile vs interpret**: Each word advertises stack effect + immediacy. Immediate words execute during compilation (macro behavior). Others emit code or inline asm.
 - **Syntax morphing**: Provide primitives `set-reader`, `with-reader`, and word-lists so layers (e.g., Lisp-like forms) can be composed.
 - **Inline Python hooks**: `:py name { ... } ;` executes the enclosed Python block immediately, then registers `name` as a word whose behavior is provided by that block. Define a `macro(ctx)` function to intercept compilation (receiving a `MacroContext` with helpers like `next_token`, `emit_literal`, `new_label`, `inject_tokens`, and direct access to the active parser), and/or an `intrinsic(builder)` function to emit custom assembly. This lets end users extend the language—parsing source, manipulating AST nodes, or writing NASM—without touching the bootstrap source. The standard library’s `extend-syntax` and `fn` forms are ordinary `:py` blocks built with these APIs, so users can clone or replace them entirely from L2 source files.
@@ -122,7 +124,7 @@ struct: Point
 ## 14. Standard Library Sketch
 - **Core words**: Arithmetic, logic, stack ops, comparison, memory access, control flow combinators.
 - **Return-stack helpers**: `>r`, `r>`, `rdrop`, and `rpick` shuffle values between the data stack and the return stack. They’re used by the `fn` sugar but also available to user code for building custom control constructs.
-- **Meta words**: Reader management, dictionary inspection, definition forms (`:`, `:noninline`, `:asm`, `immediate`).
+- **Meta words**: Reader management, dictionary inspection, definition forms (`word ... end`, `:noninline`, `:asm`, `immediate`).
 - **Allocators**: Default bump allocator, arena allocator, and hook to install custom malloc/free pairs.
 - **FFI/syscalls**: Thin wrappers plus convenience words for POSIX-level APIs.
 - **Diagnostics**: Minimal `type`, `emit`, `cr`, `dump`, and tracing hooks for debugging emitted asm.

@@ -86,10 +86,10 @@
 # Output
 extern int printf(char* fmt, double x)
 
-: fput 
+word fput
     "%f" drop swap printf drop
-;
+end
 
-: fputln 
+word fputln
     "%f\n" drop swap printf drop
-;
+end

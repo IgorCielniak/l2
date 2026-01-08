@@ -1,7 +1,7 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: main
+word main
     "/tmp/l2_read_file_test.txt"
     "read_file works\n"
     write_file drop
@@ -33,4 +33,4 @@ import ../stdlib/io.sl
     "unknown read_file failure" puts
     dup                       # file_len file_len file_addr
     exit                       # Exit with returned file_len as the program exit code (debug)
-;
+end

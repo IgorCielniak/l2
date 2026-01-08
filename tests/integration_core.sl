@@ -9,21 +9,21 @@ import ../fn.sl
 }
 ;
 
-macro: square
+macro square
     dup *
-;macro
+;
 
-macro: defconst 2
-    : $1
+macro defconst 2
+    word $1
         $2
-    ;
-;macro
+    end
+;
 
-macro: defadder 3
-    : $1
+macro defadder 3
+    word $1
         $2 $3 +
-    ;
-;macro
+    end
+;
 
 defconst MAGIC 99
 defadder add13 5 8
@@ -39,46 +39,46 @@ fn fancy_add(int a, int b){
     return (a + b) * b;
 }
 
-: test-add
+word test-add
     5 7 + puti cr
-;
+end
 
-: test-sub
+word test-sub
     10 3 - puti cr
-;
+end
 
-: test-mul
+word test-mul
     6 7 * puti cr
-;
+end
 
-: test-div
+word test-div
     84 7 / puti cr
-;
+end
 
-: test-mod
+word test-mod
     85 7 % puti cr
-;
+end
 
-: test-drop
+word test-drop
     10 20 drop puti cr
-;
+end
 
-: test-dup
+word test-dup
     11 dup + puti cr
-;
+end
 
-: test-swap
+word test-swap
     2 5 swap - puti cr
-;
+end
 
-: test-store
+word test-store
     mem-slot dup
     123 swap !
     @ puti cr
-;
+end
 
 
-: test-mmap
+word test-mmap
     0      # addr hint (NULL)
     4096   # length (page)
     3      # prot (PROT_READ | PROT_WRITE)
@@ -91,23 +91,23 @@ fn fancy_add(int a, int b){
     dup
     @ puti cr
     4096 munmap drop
-;
+end
 
-: test-macro
+word test-macro
     9 square puti cr
     MAGIC puti cr
     add13 puti cr
-;
+end
 
-: test-if
+word test-if
     5 5 == if
         111 puti cr
     else
         222 puti cr
     end
-;
+end
 
-: test-else-if
+word test-else-if
     2
     dup 1 == if
         50 puti cr
@@ -119,34 +119,34 @@ fn fancy_add(int a, int b){
         end
     end
     drop
-;
+end
 
-: test-for
+word test-for
     0
     5 for
         1 +
     end
     puti cr
-;
+end
 
-: test-for-zero
+word test-for-zero
     123
     0 for
         drop
     end
     puti cr
-;
+end
 
-: test-struct
+word test-struct
     mem-slot
     dup 111 swap Point.x!
     dup 222 swap Point.y!
     dup Point.x@ puti cr
     Point.y@ puti cr
     Point.size puti cr
-;
+end
 
-: test-cmp
+word test-cmp
     5 5 == puti cr
     5 4 == puti cr
     5 4 != puti cr
@@ -159,16 +159,16 @@ fn fancy_add(int a, int b){
     6 5 <= puti cr
     5 5 >= puti cr
     4 5 >= puti cr
-;
+end
 
-: test-c-fn
+word test-c-fn
     3
     7
     fancy_add()
     puti cr
-;
+end
 
-: main
+word main
     test-add
     test-sub
     test-mul
@@ -188,4 +188,4 @@ fn fancy_add(int a, int b){
     test-struct
     test-c-fn
     0
-;
+end

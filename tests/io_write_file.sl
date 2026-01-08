@@ -1,7 +1,7 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
-: main
+word main
     "/tmp/l2_write_file_test.txt"  # path
     "hello from write_file test\n" # buffer
     write_file
@@ -14,4 +14,4 @@ import ../stdlib/io.sl
     "write failed errno=" puts
     puti cr
     exit
-;
+end

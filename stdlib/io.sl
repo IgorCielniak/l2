@@ -343,5 +343,6 @@
 }
 ;
 
-: cr 10 putc ;
-: puts write_buf cr ;
+word cr 10 putc end
+
+word puts write_buf cr end

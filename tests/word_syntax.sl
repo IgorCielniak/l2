@@ -1,13 +1,12 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
 
+word add-two
+    +
+end
+
 word main
-    0
-    5 for
-        1 +
-    end
+    3 4 add-two
     puti cr
-    5 5 == puti cr
-    5 4 == puti cr
     0
 end

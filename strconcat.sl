@@ -1,7 +1,7 @@
 import stdlib/stdlib.sl
 import stdlib/io.sl
 
-: strconcat
+word strconcat
     0 pick 3 pick +
     dup
     >r >r >r >r >r >r
@@ -25,9 +25,9 @@ import stdlib/io.sl
     rot
     drop
     rdrop rdrop rdrop
-;
+end
 
-: alloc
+word alloc
     0      # addr hint (NULL)
     swap   # size
     3      # prot (PROT_READ | PROT_WRITE)
@@ -35,13 +35,13 @@ import stdlib/io.sl
     -1     # fd
     0      # offset
     mmap
-;
+end
 
-: free
+word free
     munmap drop
-;
+end
 
-: strcpy #(dst_addr src_addr len -- dst_addr len)
+word strcpy #(dst_addr src_addr len -- dst_addr len)
     dup
     >r
     swap
@@ -66,10 +66,10 @@ import stdlib/io.sl
     swap
     nip
     r> dup -rot - swap
-;
+end
 
-: main
+word main
     "hello world hello world hello " "world hello world hello world"
     strconcat
     puts
-;
+end

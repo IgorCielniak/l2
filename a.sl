@@ -1,7 +1,7 @@
 import stdlib/stdlib.sl
 import stdlib/io.sl
 
-: main
+word main
     "hello world" puts
-;
+end
 compile-time main

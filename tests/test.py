@@ -59,6 +59,8 @@ def run_tests():
                 print_colored(f"Error running {file}: {e}", "red")
                 any_failed = True
 
+    print("All tests passed." if not any_failed else "Some tests failed.")
+
     return 1 if any_failed else 0
 
 if __name__ == "__main__":

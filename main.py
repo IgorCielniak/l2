@@ -1579,6 +1579,7 @@ class Assembler:
         self._data_section: Optional[List[str]] = None
         self._inline_stack: List[str] = []
         self._inline_counter: int = 0
+        self._emit_stack: List[str] = []
 
     def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]]) -> Set[str]:
         edges: Dict[str, Set[str]] = {}
@@ -1705,19 +1706,25 @@ class Assembler:
         label = sanitize_label(definition.name)
         text.append(f"{label}:")
         builder = FunctionEmitter(text)
-        if isinstance(definition, Definition):
-            for node in definition.body:
-                self._emit_node(node, builder)
-        elif isinstance(definition, AsmDefinition):
-            self._emit_asm_body(definition, builder)
-        else:  # pragma: no cover - defensive
-            raise CompileError("unknown definition type")
-        builder.emit("    ret")
+        self._emit_stack.append(definition.name)
+        try:
+            if isinstance(definition, Definition):
+                for node in definition.body:
+                    self._emit_node(node, builder)
+            elif isinstance(definition, AsmDefinition):
+                self._emit_asm_body(definition, builder)
+            else:  # pragma: no cover - defensive
+                raise CompileError("unknown definition type")
+            builder.emit("    ret")
+        finally:
+            self._emit_stack.pop()
 
     def _emit_inline_definition(self, word: Word, builder: FunctionEmitter) -> None:
         definition = word.definition
         if not isinstance(definition, Definition):
             raise CompileError(f"inline word '{word.name}' requires a high-level definition")
+
+        self._emit_stack.append(f"{word.name} (inline)")
 
         suffix = self._inline_counter
         self._inline_counter += 1
@@ -1764,6 +1771,8 @@ class Assembler:
                 continue
             self._emit_node(node, builder)
 
+        self._emit_stack.pop()
+
     def _emit_asm_body(self, definition: AsmDefinition, builder: FunctionEmitter) -> None:
         body = definition.body.strip("\n")
         if not body:
@@ -1778,6 +1787,9 @@ class Assembler:
         kind = node.op
         data = node.data
 
+        def ctx() -> str:
+            return f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+
         if kind == "literal":
             if isinstance(data, int):
                 builder.push_literal(data)
@@ -1791,7 +1803,7 @@ class Assembler:
                 builder.push_label(label)
                 builder.push_literal(length)
                 return
-            raise CompileError(f"unsupported literal type {type(data)!r}")
+            raise CompileError(f"unsupported literal type {type(data)!r}{ctx()}")
 
         if kind == "word":
             self._emit_wordref(str(data), builder)
@@ -1888,12 +1900,15 @@ class Assembler:
     def _emit_wordref(self, name: str, builder: FunctionEmitter) -> None:
         word = self.dictionary.lookup(name)
         if word is None:
-            raise CompileError(f"unknown word '{name}'")
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"unknown word '{name}'{suffix}")
         if word.compile_only:
-            raise CompileError(f"word '{name}' is compile-time only")
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"word '{name}' is compile-time only{suffix}")
         if getattr(word, "inline", False) and isinstance(word.definition, Definition):
             if word.name in self._inline_stack:
-                raise CompileError(f"recursive inline expansion for '{word.name}'")
+                suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+                raise CompileError(f"recursive inline expansion for '{word.name}'{suffix}")
             self._inline_stack.append(word.name)
             self._emit_inline_definition(word, builder)
             self._inline_stack.pop()
@@ -1914,7 +1929,8 @@ class Assembler:
                 ret_type = signature[1] if signature else None
 
                 if len(arg_types) != inputs and signature:
-                    raise CompileError(f"extern '{name}' mismatch: {inputs} inputs vs {len(arg_types)} types")
+                    suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+                    raise CompileError(f"extern '{name}' mismatch: {inputs} inputs vs {len(arg_types)} types{suffix}")
 
                 int_idx = 0
                 xmm_idx = 0

@@ -1567,6 +1567,28 @@ class Assembler:
         self._float_literals: Dict[float, str] = {}
         self._data_section: Optional[List[str]] = None
 
+    def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]]) -> Set[str]:
+        edges: Dict[str, Set[str]] = {}
+        for definition in runtime_defs:
+            refs: Set[str] = set()
+            if isinstance(definition, Definition):
+                for node in definition.body:
+                    if node.op == "word":
+                        refs.add(str(node.data))
+            edges[definition.name] = refs
+
+        reachable: Set[str] = set()
+        stack: List[str] = ["main"]
+        while stack:
+            name = stack.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            for dep in edges.get(name, ()):
+                if dep not in reachable and dep in edges:
+                    stack.append(dep)
+        return reachable
+
     def _emit_externs(self, text: List[str]) -> None:
         externs = sorted([w.name for w in self.dictionary.words.values() if getattr(w, "is_extern", False)])
         for name in externs:
@@ -1591,6 +1613,10 @@ class Assembler:
         ]
         if not any(defn.name == "main" for defn in runtime_defs):
             raise CompileError("missing 'main' definition")
+
+        reachable = self._reachable_runtime_defs(runtime_defs)
+        if len(reachable) != len(runtime_defs):
+            runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
 
         for definition in runtime_defs:
             self._emit_definition(definition, emission.text)

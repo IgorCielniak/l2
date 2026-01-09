@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import ctypes
 import mmap
+import os
+import shlex
 import subprocess
 import sys
 import shutil
@@ -308,7 +310,7 @@ class Word:
     compile_time_intrinsic: Optional[Callable[["CompileTimeVM"], None]] = None
     compile_only: bool = False
     compile_time_override: bool = False
-    is_extern: bool = False  # New: mark as extern
+    is_extern: bool = False
     extern_inputs: int = 0
     extern_outputs: int = 0
     extern_signature: Optional[Tuple[List[str], str]] = None  # (arg_types, ret_type)
@@ -1648,7 +1650,8 @@ class Assembler:
         self._data_section = emission.data
 
         valid_defs = (Definition, AsmDefinition)
-        definitions = [form for form in module.forms if isinstance(form, valid_defs)]
+        raw_defs = [form for form in module.forms if isinstance(form, valid_defs)]
+        definitions = self._dedup_definitions(raw_defs)
         stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
         if stray_forms:
             raise CompileError("top-level literals or word references are not supported yet")
@@ -1680,6 +1683,17 @@ class Assembler:
         emission.bss.extend(bss_lines)
         self._data_section = None
         return emission
+
+    def _dedup_definitions(self, definitions: Sequence[Union[Definition, AsmDefinition]]) -> List[Union[Definition, AsmDefinition]]:
+        seen: Set[str] = set()
+        ordered: List[Union[Definition, AsmDefinition]] = []
+        for defn in reversed(definitions):
+            if defn.name in seen:
+                continue
+            seen.add(defn.name)
+            ordered.append(defn)
+        ordered.reverse()
+        return ordered
 
     def _emit_variables(self, variables: Dict[str, str]) -> None:
         if not variables:
@@ -3281,6 +3295,319 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
     subprocess.run(cmd, check=True)
 
 
+def run_repl(
+    compiler: Compiler,
+    temp_dir: Path,
+    libs: Sequence[str],
+    debug: bool = False,
+    initial_source: Optional[Path] = None,
+) -> int:
+    def _block_defines_main(block: str) -> bool:
+        stripped_lines = [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        for idx, stripped in enumerate(stripped_lines):
+            for prefix in ("word", ":asm", ":py", "extern"):
+                if stripped.startswith(f"{prefix} "):
+                    rest = stripped[len(prefix):].lstrip()
+                    if rest.startswith("main"):
+                        return True
+            if stripped == "word" and idx + 1 < len(stripped_lines):
+                if stripped_lines[idx + 1].startswith("main"):
+                    return True
+        return False
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    asm_path = temp_dir / "repl.asm"
+    obj_path = temp_dir / "repl.o"
+    exe_path = temp_dir / "repl.out"
+    src_path = temp_dir / "repl.sl"
+    editor_cmd = os.environ.get("EDITOR") or "vim"
+
+    default_imports = ["import stdlib/stdlib.sl", "import stdlib/io.sl"]
+    imports: List[str] = list(default_imports)
+    user_defs_files: List[str] = []
+    user_defs_repl: List[str] = []
+    main_body: List[str] = []
+    has_user_main = False
+
+    if initial_source is not None:
+        try:
+            initial_text = initial_source.read_text()
+            user_defs_files.append(initial_text)
+            has_user_main = has_user_main or _block_defines_main(initial_text)
+            if has_user_main:
+                main_body.clear()
+            print(f"[repl] loaded {initial_source}")
+        except Exception as exc:
+            print(f"[repl] failed to load {initial_source}: {exc}")
+
+    def _print_help() -> None:
+        print("[repl] commands:")
+        print("  :help              show this help")
+        print("  :show              display current session source (with synthetic main if pending snippet)")
+        print("  :reset             clear session imports/defs")
+        print("  :load <file>       load a source file into the session")
+        print("  :call <word>       compile and run a program that calls <word>")
+        print("  :edit [file]       open session file or given file in editor")
+        print("  :seteditor [cmd]   show/set editor command (default from $EDITOR or vim)")
+        print("  :quit | :q         exit the REPL")
+        print("[repl] free-form input:")
+        print("  definitions (word/:asm/:py/extern/macro/struct:) extend the session")
+        print("  imports add to session imports")
+        print("  other lines run immediately in an isolated temp program (not saved)")
+        print("  multiline: end lines with \\ to continue; finish with a non-\\ line")
+
+    print("[repl] type L2 code; :help for commands; :quit to exit")
+    print("[repl] enter multiline with trailing \\; finish with a line without \\")
+
+    pending_block: List[str] = []
+    snippet_counter = 0
+
+    while True:
+        try:
+            line = input("l2> ")
+        except EOFError:
+            print()
+            break
+
+        stripped = line.strip()
+        if stripped in {":quit", ":q"}:
+            break
+        if stripped == ":help":
+            _print_help()
+            continue
+        if stripped == ":reset":
+            imports = list(default_imports)
+            user_defs_files.clear()
+            user_defs_repl.clear()
+            main_body.clear()
+            has_user_main = False
+            pending_block.clear()
+            print("[repl] session cleared")
+            continue
+        if stripped.startswith(":seteditor"):
+            parts = stripped.split(None, 1)
+            if len(parts) == 1 or not parts[1].strip():
+                print(f"[repl] editor: {editor_cmd}")
+            else:
+                editor_cmd = parts[1].strip()
+                print(f"[repl] editor set to: {editor_cmd}")
+            continue
+        if stripped.startswith(":edit"):
+            arg = stripped.split(None, 1)[1].strip() if " " in stripped else ""
+            target_path = Path(arg) if arg else src_path
+            try:
+                current_source = _repl_build_source(
+                    imports,
+                    user_defs_files,
+                    user_defs_repl,
+                    main_body,
+                    has_user_main,
+                    force_synthetic=bool(main_body),
+                )
+                src_path.write_text(current_source)
+            except Exception as exc:
+                print(f"[repl] failed to sync source before edit: {exc}")
+            try:
+                if not target_path.exists():
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.touch()
+                cmd_parts = shlex.split(editor_cmd)
+                subprocess.run([*cmd_parts, str(target_path)])
+                if target_path.resolve() == src_path.resolve():
+                    try:
+                        updated = target_path.read_text()
+                        new_imports: List[str] = []
+                        non_import_lines: List[str] = []
+                        for ln in updated.splitlines():
+                            stripped_ln = ln.strip()
+                            if stripped_ln.startswith("import "):
+                                new_imports.append(stripped_ln)
+                            else:
+                                non_import_lines.append(ln)
+                        imports = new_imports if new_imports else list(default_imports)
+                        new_body = "\n".join(non_import_lines).strip()
+                        user_defs_files = [new_body] if new_body else []
+                        user_defs_repl.clear()
+                        main_body.clear()
+                        has_user_main = _block_defines_main(new_body)
+                        print("[repl] reloaded session source from editor")
+                    except Exception as exc:
+                        print(f"[repl] failed to reload edited source: {exc}")
+            except Exception as exc:
+                print(f"[repl] failed to launch editor: {exc}")
+            continue
+        if stripped == ":show":
+            source = _repl_build_source(imports, user_defs_files, user_defs_repl, main_body, has_user_main, force_synthetic=True)
+            print(source.rstrip())
+            continue
+        if stripped.startswith(":load "):
+            path_text = stripped.split(None, 1)[1].strip()
+            target_path = Path(path_text)
+            if not target_path.exists():
+                print(f"[repl] file not found: {target_path}")
+                continue
+            try:
+                loaded_text = target_path.read_text()
+                user_defs_files.append(loaded_text)
+                if _block_defines_main(loaded_text):
+                    has_user_main = True
+                    main_body.clear()
+                print(f"[repl] loaded {target_path}")
+            except Exception as exc:
+                print(f"[repl] failed to load {target_path}: {exc}")
+            continue
+        if stripped.startswith(":call "):
+            word_name = stripped.split(None, 1)[1].strip()
+            if not word_name:
+                print("[repl] usage: :call <word>")
+                continue
+            try:
+                if word_name == "main" and not has_user_main:
+                    print("[repl] cannot call main; no user-defined main present")
+                    continue
+                if word_name == "main" and has_user_main:
+                    builder_source = _repl_build_source(imports, user_defs_files, user_defs_repl, [], True, force_synthetic=False)
+                else:
+                    # Override entrypoint with a tiny wrapper that calls the target word.
+                    temp_defs_repl = [*user_defs_repl, f"word main\n    {word_name}\nend"]
+                    builder_source = _repl_build_source(imports, user_defs_files, temp_defs_repl, [], True, force_synthetic=False)
+                src_path.write_text(builder_source)
+                emission = compiler.compile_file(src_path)
+                compiler.assembler.write_asm(emission, asm_path)
+                run_nasm(asm_path, obj_path, debug=debug)
+                run_linker(obj_path, exe_path, debug=debug, libs=list(libs))
+                result = subprocess.run([str(exe_path)])
+                if result.returncode != 0:
+                    print(f"[warn] program exited with code {result.returncode}")
+            except (ParseError, CompileError, CompileTimeError) as exc:
+                print(f"[error] {exc}")
+            except Exception as exc:
+                print(f"[error] build failed: {exc}")
+            continue
+        if not stripped:
+            continue
+
+        # Multiline handling via trailing backslash
+        if line.endswith("\\"):
+            pending_block.append(line[:-1])
+            continue
+
+        if pending_block:
+            pending_block.append(line)
+            block = "\n".join(pending_block)
+            pending_block.clear()
+        else:
+            block = line
+
+        block_stripped = block.lstrip()
+        first_tok = block_stripped.split(None, 1)[0] if block_stripped else ""
+        is_definition = first_tok in {"word", ":asm", ":py", "extern", "macro", "struct:"}
+        is_import = first_tok == "import"
+
+        if is_import:
+            imports.append(block_stripped)
+        elif is_definition:
+            if _block_defines_main(block):
+                user_defs_repl = [d for d in user_defs_repl if not _block_defines_main(d)]
+                has_user_main = True
+                main_body.clear()
+            user_defs_repl.append(block)
+        else:
+            # Run arbitrary snippet in an isolated temp program without touching session files.
+            snippet_counter += 1
+            snippet_id = snippet_counter
+            snippet_src = temp_dir / f"repl_snippet_{snippet_id}.sl"
+            snippet_asm = temp_dir / f"repl_snippet_{snippet_id}.asm"
+            snippet_obj = temp_dir / f"repl_snippet_{snippet_id}.o"
+            snippet_exe = temp_dir / f"repl_snippet_{snippet_id}.out"
+
+            snippet_source = _repl_build_source(
+                imports,
+                user_defs_files,
+                user_defs_repl,
+                block.splitlines(),
+                has_user_main,
+                force_synthetic=True,
+            )
+            try:
+                snippet_src.write_text(snippet_source)
+                emission = compiler.compile_file(snippet_src)
+                compiler.assembler.write_asm(emission, snippet_asm)
+                run_nasm(snippet_asm, snippet_obj, debug=debug)
+                run_linker(snippet_obj, snippet_exe, debug=debug, libs=list(libs))
+            except (ParseError, CompileError, CompileTimeError) as exc:
+                print(f"[error] {exc}")
+                for p in (snippet_src, snippet_asm, snippet_obj, snippet_exe):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                continue
+            except Exception as exc:
+                print(f"[error] build failed: {exc}")
+                for p in (snippet_src, snippet_asm, snippet_obj, snippet_exe):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                continue
+
+            try:
+                result = subprocess.run([str(snippet_exe)])
+                if result.returncode != 0:
+                    print(f"[warn] program exited with code {result.returncode}")
+            except Exception as exc:
+                print(f"[error] execution failed: {exc}")
+            finally:
+                for p in (snippet_src, snippet_asm, snippet_obj, snippet_exe):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            continue
+
+        source = _repl_build_source(imports, user_defs_files, user_defs_repl, main_body, has_user_main, force_synthetic=bool(main_body))
+
+        try:
+            src_path.write_text(source)
+            emission = compiler.compile_file(src_path)
+        except (ParseError, CompileError, CompileTimeError) as exc:
+            print(f"[error] {exc}")
+            continue
+        try:
+            compiler.assembler.write_asm(emission, asm_path)
+            run_nasm(asm_path, obj_path, debug=debug)
+            run_linker(obj_path, exe_path, debug=debug, libs=list(libs))
+        except Exception as exc:
+            print(f"[error] build failed: {exc}")
+            continue
+
+    return 0
+
+
+def _repl_build_source(
+    imports: Sequence[str],
+    file_defs: Sequence[str],
+    repl_defs: Sequence[str],
+    main_body: Sequence[str],
+    has_user_main: bool,
+    force_synthetic: bool = False,
+) -> str:
+    lines: List[str] = []
+    lines.extend(imports)
+    lines.extend(file_defs)
+    lines.extend(repl_defs)
+    if (force_synthetic or not has_user_main) and main_body:
+        lines.append("word main")
+        for ln in main_body:
+            if ln:
+                lines.append(f"    {ln}")
+            else:
+                lines.append("")
+        lines.append("end")
+    return "\n".join(lines) + "\n"
+
+
 def cli(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
@@ -3300,6 +3627,7 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--run", action="store_true", help="run the built binary after successful build")
     parser.add_argument("--dbg", action="store_true", help="launch gdb on the built binary after successful build")
     parser.add_argument("--clean", action="store_true", help="remove the temp build directory and exit")
+    parser.add_argument("--repl", action="store_true", help="interactive REPL; source file is optional")
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
 
     # Parse known and unknown args to allow -l flags anywhere
@@ -3328,11 +3656,14 @@ def cli(argv: Sequence[str]) -> int:
             return 1
         return 0
 
-    if args.source is None:
+    if args.source is None and not args.repl:
         parser.error("the following arguments are required: source")
 
     compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
     try:
+        if args.repl:
+            return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)
+
         emission = compiler.compile_file(args.source)
     except (ParseError, CompileError, CompileTimeError) as exc:
         print(f"[error] {exc}")

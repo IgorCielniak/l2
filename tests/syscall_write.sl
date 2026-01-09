@@ -31,3 +31,10 @@ word main
 
     0
 end
+
+# simplest version, works without any libraries:
+# 1
+# "hello"
+# 3
+# 1
+# syscall

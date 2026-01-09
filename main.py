@@ -2080,6 +2080,40 @@ def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     return None
 
 
+def _require_definition_context(parser: "Parser", word_name: str) -> Definition:
+    if not parser.context_stack or not isinstance(parser.context_stack[-1], Definition):
+        raise ParseError(f"'{word_name}' can only appear inside a definition")
+    return parser.context_stack[-1]
+
+
+def macro_label(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+    if parser._eof():
+        raise ParseError("label name missing after 'label'")
+    tok = parser.next_token()
+    name = tok.lexeme
+    if not _is_identifier(name):
+        raise ParseError(f"invalid label name '{name}'")
+    definition = _require_definition_context(parser, "label")
+    if any(node.op == "label" and node.data == name for node in definition.body):
+        raise ParseError(f"duplicate label '{name}' in definition '{definition.name}'")
+    parser.emit_node(Op(op="label", data=name))
+    return None
+
+
+def macro_goto(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+    if parser._eof():
+        raise ParseError("label name missing after 'goto'")
+    tok = parser.next_token()
+    name = tok.lexeme
+    if not _is_identifier(name):
+        raise ParseError(f"invalid label name '{name}'")
+    _require_definition_context(parser, "goto")
+    parser.emit_node(Op(op="jump", data=name))
+    return None
+
+
 def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
     """Run the next word at compile time and still emit it for runtime."""
     parser = ctx.parser
@@ -2864,6 +2898,8 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
     dictionary.register(Word(name="inline", immediate=True, macro=macro_inline))
+    dictionary.register(Word(name="label", immediate=True, macro=macro_label))
+    dictionary.register(Word(name="goto", immediate=True, macro=macro_goto))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
     dictionary.register(Word(name="here", immediate=True, macro=macro_here))
     dictionary.register(Word(name="with", immediate=True, macro=macro_with))

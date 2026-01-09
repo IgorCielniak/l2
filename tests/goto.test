@@ -1,0 +1,1 @@
+python main.py tests/goto.sl -o /tmp/goto > /dev/null && /tmp/goto

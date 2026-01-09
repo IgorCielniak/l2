@@ -217,6 +217,8 @@ class AsmDefinition:
 class Module:
     forms: List[Any]
     variables: Dict[str, str] = field(default_factory=dict)
+    prelude: Optional[List[str]] = None
+    bss: Optional[List[str]] = None
 
 
 @dataclass
@@ -351,6 +353,8 @@ class Parser:
         self.variable_words: Dict[str, str] = {}
         self.file_spans: List[FileSpan] = []
         self.compile_time_vm = CompileTimeVM(self)
+        self.custom_prelude: Optional[List[str]] = None
+        self.custom_bss: Optional[List[str]] = None
 
     def location_for_token(self, token: Token) -> Tuple[str, int, int]:
         for span in self.file_spans:
@@ -440,6 +444,8 @@ class Parser:
         self.label_counter = 0
         self.token_hook = None
         self._last_token = None
+        self.custom_prelude = None
+        self.custom_bss = None
 
         while not self._eof():
             token = self._consume()
@@ -505,6 +511,8 @@ class Parser:
         if not isinstance(module, Module):  # pragma: no cover - defensive
             raise ParseError("internal parser state corrupt")
         module.variables = dict(self.variable_labels)
+        module.prelude = self.custom_prelude
+        module.bss = self.custom_bss
         return module
 
     def _handle_list_begin(self) -> None:
@@ -1602,7 +1610,8 @@ class Assembler:
     def emit(self, module: Module) -> Emission:
         emission = Emission()
         self._emit_externs(emission.text)
-        emission.text.extend(self._runtime_prelude())
+        prelude_lines = module.prelude if module.prelude is not None else self._runtime_prelude()
+        emission.text.extend(prelude_lines)
         self._string_literals = {}
         self._float_literals = {}
         self._data_section = emission.data
@@ -1636,7 +1645,8 @@ class Assembler:
                 self._data_section.append("data_start:")
             if not self._data_section or self._data_section[-1] != "data_end:":
                 self._data_section.append("data_end:")
-        emission.bss.extend(self._bss_layout())
+        bss_lines = module.bss if module.bss is not None else self._bss_layout()
+        emission.bss.extend(bss_lines)
         self._data_section = None
         return emission
 
@@ -2432,6 +2442,42 @@ def _ct_list_push_front(vm: CompileTimeVM) -> None:
     vm.push(lst)
 
 
+def _ct_prelude_clear(vm: CompileTimeVM) -> None:
+    vm.parser.custom_prelude = []
+
+
+def _ct_prelude_append(vm: CompileTimeVM) -> None:
+    line = vm.pop_str()
+    if vm.parser.custom_prelude is None:
+        vm.parser.custom_prelude = []
+    vm.parser.custom_prelude.append(line)
+
+
+def _ct_prelude_set(vm: CompileTimeVM) -> None:
+    lines = _ensure_list(vm.pop())
+    if not all(isinstance(item, str) for item in lines):
+        raise ParseError("prelude-set expects list of strings")
+    vm.parser.custom_prelude = list(lines)
+
+
+def _ct_bss_clear(vm: CompileTimeVM) -> None:
+    vm.parser.custom_bss = []
+
+
+def _ct_bss_append(vm: CompileTimeVM) -> None:
+    line = vm.pop_str()
+    if vm.parser.custom_bss is None:
+        vm.parser.custom_bss = []
+    vm.parser.custom_bss.append(line)
+
+
+def _ct_bss_set(vm: CompileTimeVM) -> None:
+    lines = _ensure_list(vm.pop())
+    if not all(isinstance(item, str) for item in lines):
+        raise ParseError("bss-set expects list of strings")
+    vm.parser.custom_bss = list(lines)
+
+
 def _ct_list_reverse(vm: CompileTimeVM) -> None:
     lst = _ensure_list(vm.pop())
     lst.reverse()
@@ -2773,6 +2819,13 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("list-extend", _ct_list_extend, compile_only=True)
     register("list-last", _ct_list_last, compile_only=True)
     register("i", _ct_loop_index, compile_only=True)
+
+    register("prelude-clear", _ct_prelude_clear, compile_only=True)
+    register("prelude-append", _ct_prelude_append, compile_only=True)
+    register("prelude-set", _ct_prelude_set, compile_only=True)
+    register("bss-clear", _ct_bss_clear, compile_only=True)
+    register("bss-append", _ct_bss_append, compile_only=True)
+    register("bss-set", _ct_bss_set, compile_only=True)
 
     register("map-new", _ct_map_new, compile_only=True)
     register("map-set", _ct_map_set, compile_only=True)

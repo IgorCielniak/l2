@@ -202,6 +202,7 @@ class Definition:
     immediate: bool = False
     compile_only: bool = False
     terminator: str = "end"
+    inline: bool = False
 
 
 @dataclass
@@ -305,6 +306,7 @@ class Word:
     extern_inputs: int = 0
     extern_outputs: int = 0
     extern_signature: Optional[Tuple[List[str], str]] = None  # (arg_types, ret_type)
+    inline: bool = False
 
 
 @dataclass
@@ -813,6 +815,7 @@ class Parser:
         word = self.definition_stack.pop()
         ctx.immediate = word.immediate
         ctx.compile_only = word.compile_only
+        ctx.inline = word.inline
         if word.compile_only or word.immediate:
             word.compile_time_override = True
             word.compile_time_intrinsic = None
@@ -1566,6 +1569,8 @@ class Assembler:
         self._string_literals: Dict[str, Tuple[str, int]] = {}
         self._float_literals: Dict[float, str] = {}
         self._data_section: Optional[List[str]] = None
+        self._inline_stack: List[str] = []
+        self._inline_counter: int = 0
 
     def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]]) -> Set[str]:
         edges: Dict[str, Set[str]] = {}
@@ -1617,6 +1622,9 @@ class Assembler:
         reachable = self._reachable_runtime_defs(runtime_defs)
         if len(reachable) != len(runtime_defs):
             runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
+
+        # Inline-only definitions are expanded at call sites; skip emitting standalone labels.
+        runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
 
         for definition in runtime_defs:
             self._emit_definition(definition, emission.text)
@@ -1695,6 +1703,56 @@ class Assembler:
         else:  # pragma: no cover - defensive
             raise CompileError("unknown definition type")
         builder.emit("    ret")
+
+    def _emit_inline_definition(self, word: Word, builder: FunctionEmitter) -> None:
+        definition = word.definition
+        if not isinstance(definition, Definition):
+            raise CompileError(f"inline word '{word.name}' requires a high-level definition")
+
+        suffix = self._inline_counter
+        self._inline_counter += 1
+
+        label_map: Dict[str, str] = {}
+
+        def remap(label: str) -> str:
+            if label not in label_map:
+                label_map[label] = f"{label}__inl{suffix}"
+            return label_map[label]
+
+        for node in definition.body:
+            kind = node.op
+            data = node.data
+            if kind == "label":
+                mapped = remap(str(data))
+                self._emit_node(Op(op="label", data=mapped), builder)
+                continue
+            if kind == "jump":
+                mapped = remap(str(data))
+                self._emit_node(Op(op="jump", data=mapped), builder)
+                continue
+            if kind == "branch_zero":
+                mapped = remap(str(data))
+                self._emit_node(Op(op="branch_zero", data=mapped), builder)
+                continue
+            if kind == "for_begin":
+                mapped = {
+                    "loop": remap(data["loop"]),
+                    "end": remap(data["end"]),
+                }
+                self._emit_node(Op(op="for_begin", data=mapped), builder)
+                continue
+            if kind == "for_end":
+                mapped = {
+                    "loop": remap(data["loop"]),
+                    "end": remap(data["end"]),
+                }
+                self._emit_node(Op(op="for_end", data=mapped), builder)
+                continue
+            if kind in ("list_begin", "list_end"):
+                mapped = remap(str(data))
+                self._emit_node(Op(op=kind, data=mapped), builder)
+                continue
+            self._emit_node(node, builder)
 
     def _emit_asm_body(self, definition: AsmDefinition, builder: FunctionEmitter) -> None:
         body = definition.body.strip("\n")
@@ -1823,6 +1881,13 @@ class Assembler:
             raise CompileError(f"unknown word '{name}'")
         if word.compile_only:
             raise CompileError(f"word '{name}' is compile-time only")
+        if getattr(word, "inline", False) and isinstance(word.definition, Definition):
+            if word.name in self._inline_stack:
+                raise CompileError(f"recursive inline expansion for '{word.name}'")
+            self._inline_stack.append(word.name)
+            self._emit_inline_definition(word, builder)
+            self._inline_stack.pop()
+            return
         if word.intrinsic:
             word.intrinsic(builder)
             return
@@ -2001,6 +2066,17 @@ def macro_compile_only(ctx: MacroContext) -> Optional[List[Op]]:
     word.compile_only = True
     if word.definition is not None:
         word.definition.compile_only = True
+    return None
+
+
+def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+    word = parser.most_recent_definition()
+    if word is None:
+        raise ParseError("'inline' must follow a definition")
+    word.inline = True
+    if word.definition is not None:
+        word.definition.inline = True
     return None
 
 
@@ -2787,6 +2863,7 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary = Dictionary()
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
+    dictionary.register(Word(name="inline", immediate=True, macro=macro_inline))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
     dictionary.register(Word(name="here", immediate=True, macro=macro_here))
     dictionary.register(Word(name="with", immediate=True, macro=macro_with))

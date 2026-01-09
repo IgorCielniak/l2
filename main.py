@@ -37,6 +37,10 @@ class CompileError(Exception):
     """Raised when IR cannot be turned into assembly."""
 
 
+class CompileTimeError(ParseError):
+    """Raised when a compile-time word fails with context."""
+
+
 # ---------------------------------------------------------------------------
 # Tokenizer / Reader
 # ---------------------------------------------------------------------------
@@ -447,57 +451,67 @@ class Parser:
         self.custom_prelude = None
         self.custom_bss = None
 
-        while not self._eof():
-            token = self._consume()
-            self._last_token = token
-            if self._run_token_hook(token):
-                continue
-            if self._handle_macro_recording(token):
-                continue
-            lexeme = token.lexeme
-            if lexeme == "[":
-                self._handle_list_begin()
-                continue
-            if lexeme == "]":
-                self._handle_list_end(token)
-                continue
-            if lexeme == "word":
-                self._begin_definition(token, terminator="end")
-                continue
-            if lexeme == "end":
-                if self.control_stack:
-                    self._handle_end_control()
+        try:
+            while not self._eof():
+                token = self._consume()
+                self._last_token = token
+                if self._run_token_hook(token):
                     continue
-                if self._try_end_definition(token):
+                if self._handle_macro_recording(token):
                     continue
-                raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
-            if lexeme == ":asm":
-                self._parse_asm_definition(token)
-                continue
-            if lexeme == ":py":
-                self._parse_py_definition(token)
-                continue
-            if lexeme == "extern":
-                self._parse_extern(token)
-                continue
-            if lexeme == "if":
-                self._handle_if_control()
-                continue
-            if lexeme == "else":
-                self._handle_else_control()
-                continue
-            if lexeme == "for":
-                self._handle_for_control()
-                continue
-            if lexeme == "while":
-                self._handle_while_control()
-                continue
-            if lexeme == "do":
-                self._handle_do_control()
-                continue
-            if self._maybe_expand_macro(token):
-                continue
-            self._handle_token(token)
+                lexeme = token.lexeme
+                if lexeme == "[":
+                    self._handle_list_begin()
+                    continue
+                if lexeme == "]":
+                    self._handle_list_end(token)
+                    continue
+                if lexeme == "word":
+                    self._begin_definition(token, terminator="end")
+                    continue
+                if lexeme == "end":
+                    if self.control_stack:
+                        self._handle_end_control()
+                        continue
+                    if self._try_end_definition(token):
+                        continue
+                    raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
+                if lexeme == ":asm":
+                    self._parse_asm_definition(token)
+                    continue
+                if lexeme == ":py":
+                    self._parse_py_definition(token)
+                    continue
+                if lexeme == "extern":
+                    self._parse_extern(token)
+                    continue
+                if lexeme == "if":
+                    self._handle_if_control()
+                    continue
+                if lexeme == "else":
+                    self._handle_else_control()
+                    continue
+                if lexeme == "for":
+                    self._handle_for_control()
+                    continue
+                if lexeme == "while":
+                    self._handle_while_control()
+                    continue
+                if lexeme == "do":
+                    self._handle_do_control()
+                    continue
+                if self._maybe_expand_macro(token):
+                    continue
+                self._handle_token(token)
+        except ParseError:
+            raise
+        except Exception as exc:
+            tok = self._last_token
+            if tok is None:
+                raise ParseError(f"unexpected error during parse: {exc}") from None
+            raise ParseError(
+                f"unexpected error near '{tok.lexeme}' at {tok.line}:{tok.column}: {exc}"
+            ) from None
 
         if self.macro_recording is not None:
             raise ParseError("unterminated macro definition (missing ';')")
@@ -654,10 +668,12 @@ class Parser:
     def _execute_immediate_word(self, word: Word) -> None:
         try:
             self.compile_time_vm.invoke(word)
+        except CompileTimeError:
+            raise
         except ParseError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
-            raise ParseError(f"compile-time word '{word.name}' failed: {exc}") from exc
+            raise CompileTimeError(f"compile-time word '{word.name}' failed: {exc}") from None
 
     def _handle_macro_recording(self, token: Token) -> bool:
         if self.macro_recording is None:
@@ -981,12 +997,14 @@ class CompileTimeVM:
         self.return_stack: List[Any] = []
         self.loop_stack: List[Dict[str, Any]] = []
         self._handles = _CTHandleTable()
+        self.call_stack: List[str] = []
 
     def reset(self) -> None:
         self.stack.clear()
         self.return_stack.clear()
         self.loop_stack.clear()
         self._handles.clear()
+        self.call_stack.clear()
 
     def push(self, value: Any) -> None:
         self.stack.append(value)
@@ -1057,17 +1075,29 @@ class CompileTimeVM:
         self._call_word(word)
 
     def _call_word(self, word: Word) -> None:
-        definition = word.definition
-        prefer_definition = word.compile_time_override or (isinstance(definition, Definition) and (word.immediate or word.compile_only))
-        if not prefer_definition and word.compile_time_intrinsic is not None:
-            word.compile_time_intrinsic(self)
-            return
-        if definition is None:
-            raise ParseError(f"word '{word.name}' has no compile-time definition")
-        if isinstance(definition, AsmDefinition):
-            self._run_asm_definition(word)
-            return
-        self._execute_nodes(definition.body)
+        self.call_stack.append(word.name)
+        try:
+            definition = word.definition
+            prefer_definition = word.compile_time_override or (isinstance(definition, Definition) and (word.immediate or word.compile_only))
+            if not prefer_definition and word.compile_time_intrinsic is not None:
+                word.compile_time_intrinsic(self)
+                return
+            if definition is None:
+                raise ParseError(f"word '{word.name}' has no compile-time definition")
+            if isinstance(definition, AsmDefinition):
+                self._run_asm_definition(word)
+                return
+            self._execute_nodes(definition.body)
+        except CompileTimeError:
+            raise
+        except ParseError as exc:
+            raise CompileTimeError(f"{exc}\ncompile-time stack: {' -> '.join(self.call_stack)}") from None
+        except Exception as exc:
+            raise CompileTimeError(
+                f"compile-time failure in '{word.name}': {exc}\ncompile-time stack: {' -> '.join(self.call_stack)}"
+            ) from None
+        finally:
+            self.call_stack.pop()
 
     def _run_asm_definition(self, word: Word) -> None:
         definition = word.definition
@@ -1895,7 +1925,7 @@ class Assembler:
             builder.emit("    mov [r12], rax")
             return
 
-        raise CompileError(f"unsupported op {node!r}")
+        raise CompileError(f"unsupported op {node!r}{ctx()}")
 
     def _emit_wordref(self, name: str, builder: FunctionEmitter) -> None:
         word = self.dictionary.lookup(name)
@@ -3302,7 +3332,14 @@ def cli(argv: Sequence[str]) -> int:
         parser.error("the following arguments are required: source")
 
     compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
-    emission = compiler.compile_file(args.source)
+    try:
+        emission = compiler.compile_file(args.source)
+    except (ParseError, CompileError, CompileTimeError) as exc:
+        print(f"[error] {exc}")
+        return 1
+    except Exception as exc:
+        print(f"[error] unexpected failure: {exc}")
+        return 1
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")

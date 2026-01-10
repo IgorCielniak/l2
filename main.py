@@ -361,6 +361,7 @@ class Parser:
         self.compile_time_vm = CompileTimeVM(self)
         self.custom_prelude: Optional[List[str]] = None
         self.custom_bss: Optional[List[str]] = None
+        self._pending_inline_definition: bool = False
 
     def location_for_token(self, token: Token) -> Tuple[str, int, int]:
         for span in self.file_spans:
@@ -452,6 +453,7 @@ class Parser:
         self._last_token = None
         self.custom_prelude = None
         self.custom_bss = None
+        self._pending_inline_definition = False
 
         try:
             while not self._eof():
@@ -469,7 +471,8 @@ class Parser:
                     self._handle_list_end(token)
                     continue
                 if lexeme == "word":
-                    self._begin_definition(token, terminator="end")
+                    inline_def = self._consume_pending_inline()
+                    self._begin_definition(token, terminator="end", inline=inline_def)
                     continue
                 if lexeme == "end":
                     if self.control_stack:
@@ -813,19 +816,30 @@ class Parser:
         self._end_definition(token)
         return True
 
-    def _begin_definition(self, token: Token, terminator: str = "end") -> None:
+    def _consume_pending_inline(self) -> bool:
+        pending = self._pending_inline_definition
+        self._pending_inline_definition = False
+        return pending
+
+    def _begin_definition(self, token: Token, terminator: str = "end", inline: bool = False) -> None:
         if self._eof():
             raise ParseError(
                 f"definition name missing after '{token.lexeme}' at {token.line}:{token.column}"
             )
         name_token = self._consume()
-        definition = Definition(name=name_token.lexeme, body=[], terminator=terminator)
+        definition = Definition(
+            name=name_token.lexeme,
+            body=[],
+            terminator=terminator,
+            inline=inline,
+        )
         self.context_stack.append(definition)
         word = self.dictionary.lookup(definition.name)
         if word is None:
             word = Word(name=definition.name)
             self.dictionary.register(word)
         word.definition = definition
+        word.inline = inline
         self.definition_stack.append(word)
 
     def _end_definition(self, token: Token) -> None:
@@ -2141,12 +2155,12 @@ def macro_compile_only(ctx: MacroContext) -> Optional[List[Op]]:
 
 def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
-    word = parser.most_recent_definition()
-    if word is None:
-        raise ParseError("'inline' must follow a definition")
-    word.inline = True
-    if word.definition is not None:
-        word.definition.inline = True
+    next_tok = parser.peek_token()
+    if next_tok is None or next_tok.lexeme != "word":
+        raise ParseError("'inline' must be followed by 'word'")
+    if parser._pending_inline_definition:
+        raise ParseError("duplicate 'inline' before 'word'")
+    parser._pending_inline_definition = True
     return None
 
 

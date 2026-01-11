@@ -13,3 +13,30 @@ end
 word free
     munmap drop
 end
+
+word memcpy #(dst_addr src_addr len -- dst_addr len)
+    dup
+    >r
+    swap
+    dup c@
+    3 pick swap
+    c!
+    drop
+    swap
+    for
+        1 + dup
+        c@
+        swap
+        -rot
+        swap
+        1 +
+        dup
+        rot
+        c!
+        drop
+        swap
+    end
+    swap
+    nip
+    r> dup -rot - swap
+end

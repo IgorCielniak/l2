@@ -1,5 +1,5 @@
 import nob.sl
 
 word main
-    "echo gg" sh
+    "ls" sh
 end

@@ -62,7 +62,7 @@ word tostr
         2 pick
         2 + pick
         3 pick rot +
-        swap 48 + c!
+        swap 48 + swap 1 - swap c!
         drop
         swap
         1 +
@@ -74,11 +74,12 @@ word tostr
     over for
     rot drop
     end drop
-    swap 1 + swap puts
 end
 
 word main
     "1234" toint 1 + dup puti cr
     tostr
+    2dup
     puts
+    free
 end

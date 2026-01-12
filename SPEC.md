@@ -32,7 +32,7 @@ This document reflects the implementation that ships in this repository today (`
 ## 5. Definitions, Control Flow, and Syntax Sugar
 - **Word definitions** – Always `word name ... end`. Redefinitions overwrite the previous entry (a warning prints to stderr). `inline word name ... end` marks the definition for inline expansion; recursive inline calls are rejected. `immediate` and `compile-only` apply to the most recently defined word.
 - **Control forms** – Built-in tokens drive code emission:
-  - `if ... end` and `if ... else ... end` (conditions consume the flag on top of the stack).
+  - `if ... end` and `if ... else ... end`. To express additional branches, place `if` on the same line as the preceding `else` (e.g., `else <condition> if ...`); the reader treats that form as an implicit chained clause, so each inline `if` consumes one flag and jumps past later clauses on success.
   - `while <condition> do <body> end`; the conditional block lives between `while` and `do` and re-runs every iteration.
   - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros.
   - `label name` / `goto name` perform local jumps within a definition.

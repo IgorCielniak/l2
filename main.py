@@ -419,10 +419,12 @@ class Parser:
 
         entry = self.control_stack.pop()
 
-        if entry["type"] == "if":
-            # For if without else
+        if entry["type"] in ("if", "elif"):
+            # For if/elif without a trailing else
             if "false" in entry:
                 self._append_op(Op(op="label", data=entry["false"]))
+            if "end" in entry:
+                self._append_op(Op(op="label", data=entry["end"]))
         elif entry["type"] == "else":
             self._append_op(Op(op="label", data=entry["end"]))
         elif entry["type"] == "while":
@@ -777,13 +779,30 @@ class Parser:
         return bool(handled)
 
     def _handle_if_control(self) -> None:
+        token = self._last_token
+        if (
+            self.control_stack
+            and self.control_stack[-1]["type"] == "else"
+            and token is not None
+            and self.control_stack[-1].get("line") == token.line
+        ):
+            entry = self.control_stack.pop()
+            end_label = entry.get("end")
+            if end_label is None:
+                end_label = self._new_label("if_end")
+            false_label = self._new_label("if_false")
+            self._append_op(Op(op="branch_zero", data=false_label))
+            self._push_control({"type": "elif", "false": false_label, "end": end_label})
+            return
         false_label = self._new_label("if_false")
         self._append_op(Op(op="branch_zero", data=false_label))
         self._push_control({"type": "if", "false": false_label})
 
     def _handle_else_control(self) -> None:
-        entry = self._pop_control(("if",))
-        end_label = self._new_label("if_end")
+        entry = self._pop_control(("if", "elif"))
+        end_label = entry.get("end")
+        if end_label is None:
+            end_label = self._new_label("if_end")
         self._append_op(Op(op="jump", data=end_label))
         self._append_op(Op(op="label", data=entry["false"]))
         self._push_control({"type": "else", "end": end_label})

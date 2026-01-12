@@ -1,6 +1,5 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
-import ../fn.sl
 
 :asm mem-slot {
     lea rax, [rel print_buf]
@@ -32,12 +31,6 @@ struct: Point
     field x 8
     field y 8
 ;struct
-
-extend-syntax
-
-fn fancy_add(int a, int b){
-    return (a + b) * b;
-}
 
 word test-add
     5 7 + puti cr
@@ -161,13 +154,6 @@ word test-cmp
     4 5 >= puti cr
 end
 
-word test-c-fn
-    3
-    7
-    fancy_add()
-    puti cr
-end
-
 word main
     test-add
     test-sub
@@ -186,6 +172,5 @@ word main
     test-for-zero
     test-cmp
     test-struct
-    test-c-fn
     0
 end

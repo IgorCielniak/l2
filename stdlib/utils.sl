@@ -1,6 +1,55 @@
-import stdlib.sl
-import io.sl
-import mem.sl
+
+# : strcmp ( addr len addr len -- bool addr len addr len)
+word strcmp
+    3 pick 2 pick @ swap @ ==
+end
+
+# : strconcat ( addr len addr len -- addr len)
+word strconcat
+    0 pick 3 pick +
+    dup
+    >r >r >r >r >r >r
+    5 rpick
+    alloc
+    r> r>
+    dup >r
+    memcpy
+    swap
+    r> dup -rot +
+    r> r>
+    memcpy
+    swap
+    3 pick
+    -
+    swap
+    drop
+    swap
+    0 rpick
+    nip
+    rot
+    drop
+    rdrop rdrop rdrop
+end
+
+# : strlen ( addr -- len )
+# for null terminated strings
+
+:asm strlen {
+	mov rsi, [r12]      ; address
+	xor rcx, rcx        ; length counter
+.strlen_loop:
+	mov al, [rsi]
+	test al, al
+	jz .strlen_done
+	inc rcx
+	inc rsi
+	jmp .strlen_loop
+.strlen_done:
+	mov rax, rcx
+	mov [r12], rax      ; store length on stack
+	ret
+}
+;
 
 word digitsN>num  # ( d_{n-1} ... d0 n -- value ), digits bottom=MSD, top=LSD, length on top (MSD-most significant digit, LSD-least significant digit)
     0 swap        # place accumulator below length
@@ -12,7 +61,7 @@ word digitsN>num  # ( d_{n-1} ... d0 n -- value ), digits bottom=MSD, top=LSD, l
     end
 end
 
-
+# : toint (addr len -- int ) converts a string to an int
 word toint
     swap
     over 0 swap
@@ -35,6 +84,7 @@ word toint
     rdrop
 end
 
+# : count_digits ( int -- int) returns the amount of digits of an int
 word count_digits
     0
     swap
@@ -44,6 +94,7 @@ word count_digits
     drop
 end
 
+# : tostr ( int -- addr len ) the function allocates a buffer to remember to free it
 word tostr
     dup
     count_digits
@@ -74,12 +125,4 @@ word tostr
     over for
     rot drop
     end drop
-end
-
-word main
-    "1234" toint 1 + dup puti cr
-    tostr
-    2dup
-    puts
-    free
 end

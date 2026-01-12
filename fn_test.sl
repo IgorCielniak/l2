@@ -8,9 +8,14 @@ fn foo(int a, int b){
     return a b +;
 }
 
+fn bar(int a, int b){
+    return a + b;
+}
+
 word main
     extend-syntax
     foo(3, 2)
     puti cr
-    0
+    bar(1, 2)
+    puti cr
 end

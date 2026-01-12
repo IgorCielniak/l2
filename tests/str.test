@@ -1,0 +1,1 @@
+python main.py tests/str.sl -o /tmp/str > /dev/null && /tmp/str

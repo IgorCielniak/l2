@@ -1,0 +1,1 @@
+python main.py tests/typeconversion.sl -o /tmp/typeconversion > /dev/null && /tmp/typeconversion

@@ -1,1 +1,0 @@
-python main.py tests/word_syntax.sl -o /tmp/word_syntax > /dev/null && /tmp/word_syntax

@@ -1,5 +1,4 @@
 import stdlib/stdlib.sl
-import stdlib/io.sl
 
 word main
     0 argc for

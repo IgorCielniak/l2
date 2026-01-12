@@ -1,144 +1,81 @@
-# L2 Language Specification (Draft)
+# L2 Language Specification (January 2026)
 
-## 1. Design Goals
-- **Meta-language first**: L2 is a minimal core designed to be reshaped into other languages at runtime, matching Forth's malleability with modern tooling.
-- **Native code generation**: Source compiles directly to NASM-compatible x86-64 assembly, enabling both AOT binaries and JIT-style pipelines.
-- **Runtime self-modification**: Parsers, macro expanders, and the execution pipeline are ordinary user-defined words that can be swapped or rewritten on demand.
-- **Total control**: Provide unchecked memory access, inline assembly, and ABI-level hooks for syscalls/FFI, leaving safety policies to user space.
-- **Self-hosting path**: The bootstrap reference implementation lives in Python, but the language must be able to reimplement its toolchain using its own facilities plus inline asm.
+This document reflects the implementation that ships in this repository today (`main.py`, `stdlib`, and `tests`). It replaces the previous aspirational draft with the behavior exercised by the compiler, runtime, and automated samples.
 
-## 2. Program Model
-- **Execution units (words)**: Everything is a word. Words can be defined in high-level L2, inline asm, or as parser/runtime hooks.
-- **Compilation pipeline**:
-  1. Source stream tokenized via active reader (user-overridable).
-  2. Tokens dispatched to interpreter or compiler hooks (also user-overridable).
-  3. Resulting IR is a threaded list of word references.
-  4. Code generator emits NASM `.text` with helper macros.
-  5. `nasm` + `ld` (or custom linker) build an ELF64 executable.
-- **Interpreted mode**: For REPLs or rapid experimentation, the compiler can emit temporary asm, assemble to an object in memory, and `dlopen` or `execve` it.
-- **Bootstrapping**: `main.py` orchestrates tokenizer, dictionary, IR, and final asm emission.
+## 1. Scope and Principles
+- **Stack-based core** – All user code manipulates a 64-bit data stack plus a separate return stack. Every definition is a “word.”
+- **Ahead-of-time native output** – `main.py` always emits NASM-compatible x86-64 assembly, assembles it with `nasm -f elf64`, and links it with `ld`/`ld.lld` into an ELF64 executable. There is no JIT; the REPL repeatedly rebuilds and executes small binaries.
+- **Meta-programmable front-end** – Parsing, macro expansion, and syntax sugar live in user space via immediate words, text macros, compile-time intrinsics, and `:py` blocks. Users can reshape syntax without touching the Python host.
+- **Unsafe by design** – Memory, syscalls, inline assembly, and FFI expose raw machine power. The standard library is intentionally thin and policy-free.
 
-## 3. Parsing & Macro System
-- **Reader hooks**:
-  - `read-token`: splits the byte stream; default is whitespace delimited with numeric/string literal recognizers.
-  - `on-token`: user code decides whether to interpret, compile, or treat the token as syntax.
-  - `lookup`: resolves token → word entry; can be replaced to build new namespaces or module systems.
-- **Definition form**: `word <name> ... end` is the required way to declare high-level words. Legacy `: <name> ... ;` definitions are no longer accepted.
-- **Text macros**: `macro <name> [param_count] ... ;` records tokens until the closing `;` and registers a macro that performs positional substitution (`$1`, `$2`, ...). The old `macro: ... ;macro` form is removed.
-- **Lexical stack aliases**: `with a b in ... end` rewrites the body so `a`/`b` expand to stable `rpick` accesses. Values are moved to the return stack on entry and released with `rdrop` on exit, giving cheap locally named slots while keeping the data stack free for intermediate results.
-- **Compile vs interpret**: Each word advertises stack effect + immediacy. Immediate words execute during compilation (macro behavior). Others emit code or inline asm.
-- **Syntax morphing**: Provide primitives `set-reader`, `with-reader`, and word-lists so layers (e.g., Lisp-like forms) can be composed.
-- **Inline Python hooks**: `:py name { ... } ;` executes the enclosed Python block immediately, then registers `name` as a word whose behavior is provided by that block. Define a `macro(ctx)` function to intercept compilation (receiving a `MacroContext` with helpers like `next_token`, `emit_literal`, `new_label`, `inject_tokens`, and direct access to the active parser), and/or an `intrinsic(builder)` function to emit custom assembly. This lets end users extend the language—parsing source, manipulating AST nodes, or writing NASM—without touching the bootstrap source. The standard library’s `extend-syntax` and `fn` forms are ordinary `:py` blocks built with these APIs, so users can clone or replace them entirely from L2 source files.
+## 2. Toolchain and Repository Layout
+- **Driver (`main.py`)** – Supports `python main.py source.sl -o a.out`, `--emit-asm`, `--run`, `--dbg`, `--repl`, `--temp-dir`, `--clean`, repeated `-I/--include` paths, and repeated `-l` linker flags (either `-lfoo` or `-l libc.so.6`). Unknown `-l` flags are collected and forwarded to the linker.
+- **REPL** – `--repl` launches a stateful session with commands such as `:help`, `:reset`, `:load`, `:call <word>`, `:edit`, and `:show`. The REPL still emits/links entire programs for each run; it simply manages the session source for you.
+- **Imports** – `import relative/or/absolute/path.sl` inserts the referenced file textually. Resolution order: (1) absolute path, (2) relative to the importing file, (3) each include path (defaults: project root and `./stdlib`). Each file is included at most once per compilation unit. Import lines leave blank placeholders so error spans stay meaningful.
+- **Workspace** – `stdlib/` holds library modules, `tests/` contains executable samples with `.expected` outputs, and top-level `.sl` files (e.g., `fn.sl`, `nob.sl`) exercise advanced features.
 
-## 4. Core Types & Data Model
-- **Cells**: 64-bit signed integers; all stack operations use cells.
-- **Double cells**: 128-bit values formed by two cells; used for addresses or 128-bit arithmetic.
-- **Typed views**: Optional helper words interpret memory as bytes, half-words, floats, or structs but core semantics stay cell-based.
-- **User-defined types**: `struct`, `union`, and `enum` builders produce layout descriptors plus accessor words that expand to raw loads/stores.
+## 3. Lexical Structure
+- **Reader** – Whitespace-delimited; `#` starts a line comment. String literals honor `\"`, `\\`, `\n`, `\r`, `\t`, and `\0`. Numbers default to signed 64-bit integers via `int(token, 0)` (so `0x`, `0o`, `0b` all work). Tokens containing `.` or `e` parse as floats.
+- **Identifiers** – `[A-Za-z_][A-Za-z0-9_]*`. Everything else is treated as punctuation or literal.
+- **String representation** – At runtime each literal pushes `(addr len)` with the length on top. The assembler stores literals in `section .data` with a trailing `NULL` for convenience.
+- **Lists** – `[` begins a list literal, `]` ends it. The compiler captures the intervening stack segment into a freshly `mmap`'d buffer that stores `(len followed by qword items)`, drops the captured values, and pushes the buffer address. Users must `munmap` the buffer when done.
+- **Token customization** – Immediate words can call `add-token` or `add-token-chars` to teach the reader about new multi-character tokens. `fn.sl` uses this in combination with token hooks to recognize `foo(1, 2)` syntax.
 
-### 4.1 Struct Builder
+## 4. Runtime Model
+- **Stacks** – `r12` holds the data stack pointer, `r13` the return stack pointer. Both live in `.bss` buffers sized by `DSTK_BYTES`/`RSTK_BYTES` (default 64 KiB each). `stdlib/core.sl` implements all standard stack shuffles, arithmetic, comparisons, boolean ops, `@`/`!`, `c@`/`c!`, and return-stack transfers (`>r`, `r>`, `rdrop`, `rpick`).
+- **Calling convention** – Words call each other using the System V ABI. `extern` words marshal arguments into registers before `call symbol`, then push results back onto the data stack. Integer results come from `rax`; floating results come from `xmm0` and are copied into a qword slot.
+- **Memory helpers** – `mem` returns the address of the `persistent` buffer (default 64 bytes). `argc`, `argv`, and `argv@` expose process arguments. `alloc`/`free` wrap `mmap`/`munmap` for general-purpose buffers, while `memcpy` performs byte-wise copies.
+- **BSS customization** – Compile-time words may call `bss-clear` followed by `bss-append`/`bss-set` to replace the default `.bss` layout (e.g., `tests/bss_override.sl` enlarges `persistent`).
+- **Strings & buffers** – IO helpers consume explicit `(addr len)` pairs only; there is no implicit NULL contract except for stored literals.
+- **Structured data** – `struct:` blocks expand into constants and accessor words (`Foo.bar@`, `Foo.bar!`). Dynamic arrays in `stdlib/arr.sl` allocate `[len, cap, data_ptr, data...]` records via `mmap` and expose `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`.
 
-```
-struct: Point
-    field x 8
-    field y 8
-;struct
-```
+## 5. Definitions, Control Flow, and Syntax Sugar
+- **Word definitions** – Always `word name ... end`. Redefinitions overwrite the previous entry (a warning prints to stderr). `inline word name ... end` marks the definition for inline expansion; recursive inline calls are rejected. `immediate` and `compile-only` apply to the most recently defined word.
+- **Control forms** – Built-in tokens drive code emission:
+  - `if ... end` and `if ... else ... end` (conditions consume the flag on top of the stack).
+  - `while <condition> do <body> end`; the conditional block lives between `while` and `do` and re-runs every iteration.
+  - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros.
+  - `label name` / `goto name` perform local jumps within a definition.
+- **Text macros** – `macro name [param_count] ... ;` records raw tokens until `;`. `$1`, `$2`, ... expand to positional arguments. Macro definitions cannot nest (attempting to start another `macro` while recording raises a parse error).
+- **Struct builder** – `struct: Foo ... ;struct` emits `<Foo>.size`, `<Foo>.field.size`, `<Foo>.field.offset`, `<Foo>.field@`, and `<Foo>.field!` helpers. Layout is tightly packed with no implicit padding.
+- **With-blocks** – `with a b in ... end` rewrites occurrences of `a`/`b` into accesses against hidden global cells (`__with_a`). On entry the block pops the named values and stores them in those cells; reads compile to `@`, writes to `!`. Because the cells live in `.data`, the slots persist across calls and are not re-entrant.
+- **List literals** – `[ values ... ]` capture the current stack slice, allocate storage (`mmap`), copy the elements, and push the pointer. The record stores `len` at offset 0 and items afterwards so user code can fetch length via `@` and iterate.
+- **Compile-time execution** – `compile-time foo` runs `foo` immediately but still emits it (if inside a definition). Immediate words always execute during parsing; ordinary words emit `word` ops for later code generation.
 
-- `struct:` is an immediate word. It consumes field declarations until the matching `;struct` token.
-- Each `field <name> <bytes>` line appends a member with byte size `<bytes>`; fields are laid out sequentially without implicit padding.
-- The builder expands into ordinary word definitions:
-  - `<Struct>.size` plus `<Struct>.<field>.size` and `<Struct>.<field>.offset` constants.
-  - `<Struct>.<field>@ ( addr -- value )` loads a field by computing `addr + offset` and applying `@`.
-  - `<Struct>.<field>! ( value addr -- )` stores a field via `addr + offset !`.
-- Because the output is plain L2 code, users can inspect or override any generated word, and additional helpers (e.g., pointer arithmetic or iterators) can be layered on top with regular macros.
+## 6. Compile-Time Facilities
+- **Virtual machine** – Immediate words run inside `CompileTimeVM`, which keeps its own stacks and exposes helpers registered in `bootstrap_dictionary()`:
+  - Lists/maps: `list-new`, `list-append`, `list-pop`, `list-pop-front`, `list-length`, `list-empty?`, `list-get`, `list-set`, `list-extend`, `list-last`, `map-new`, `map-set`, `map-get`, `map-has?`.
+  - Strings/numbers: `string=`, `string-length`, `string-append`, `string>number`, `int>string`.
+  - Lexer utilities: `lexer-new`, `lexer-pop`, `lexer-peek`, `lexer-expect`, `lexer-collect-brace`, `lexer-push-back` (used by `fn.sl` to parse signatures and infix expressions).
+  - Token management: `next-token`, `peek-token`, `inject-tokens`, `token-lexeme`, `token-from-lexeme`.
+  - Reader hooks: `set-token-hook` installs a word that receives each token (pushed as a `Token` object) and must leave a truthy handled flag; `clear-token-hook` disables it. `fn.sl`'s `extend-syntax` demonstrates rewriting `foo(1, 2)` into ordinary word calls.
+  - Prelude/BSS control: `prelude-clear`, `prelude-append`, `prelude-set`, `bss-clear`, `bss-append`, `bss-set` let user code override the `_start` stub or `.bss` layout.
+  - Definition helpers: `emit-definition` injects a `word ... end` definition on the fly (used by the struct macro). `parse-error` raises a custom diagnostic.
+- **Text macros** – `macro` is an immediate word implemented in Python; it prevents nesting by tracking active recordings and registers expansion tokens with `$n` substitution.
+- **Python bridges** – `:py name { ... } ;` executes once during parsing. The body may define `macro(ctx: MacroContext)` (with helpers such as `next_token`, `emit_literal`, `inject_tokens`, `new_label`, and direct `parser` access) and/or `intrinsic(builder: FunctionEmitter)` to emit assembly directly. The `fn` DSL (`fn.sl`) and other syntax layers are ordinary `:py` blocks.
 
-### 4.2 Lightweight C-style Sugar
+## 7. Foreign Code, Inline Assembly, and Syscalls
+- **`:asm name { ... } ;`** – Defines a word entirely in NASM syntax. The body is copied verbatim into the output and terminated with `ret`. If `keystone-engine` is installed, `:asm` words also execute at compile time; the VM marshals `(addr len)` string pairs by scanning for `data_start`/`data_end` references.
+- **`:py` intrinsics** – As above, `intrinsic(builder)` can emit custom assembly without going through the normal AST.
+- **`extern`** – Two forms:
+  - Raw: `extern foo 2 1` marks `foo` as taking two stack arguments and returning one value. The emitter simply emits `call foo`.
+  - C-style: `extern double atan2(double y, double x)` parses the signature, loads integer arguments into `rdi..r9`, floating arguments into `xmm0..xmm7`, aligns `rsp`, sets `al` to the number of SSE arguments, and pushes the result from `xmm0` or `rax`. Only System V register slots are supported.
+- **Syscalls** – The built-in word `syscall` expects `(argN ... arg0 count nr -- ret)`. It clamps the count to `[0, 6]`, loads arguments into `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, executes `syscall`, and pushes `rax`. `stdlib/linux.sl` auto-generates macros of the form `syscall.write` → `3 1` plus `.num`/`.argc` helpers, and provides assembly-only `syscall1`–`syscall6` macros so the module works without the rest of the stdlib. `tests/syscall_write.sl` demonstrates the intended usage.
 
-- `extend-syntax` is implemented as a `:py` macro that toggles a reader mode where identifiers suffixed with `()` (e.g., `foo()`) are rewritten as ordinary word calls. The call still obeys data-stack calling conventions; the parentheses are purely syntactic sugar.
-- The same user-defined macro stack unlocks a compact function form:
+## 8. Standard Library Overview (`stdlib/`)
+- **`core.sl`** – Stack shuffles, integer arithmetic, comparisons, boolean ops, memory access, syscall stubs (`mmap`, `munmap`, `exit`), argument helpers (`argc`, `argv`, `argv@`), and pointer helpers (`mem`).
+- **`mem.sl`** – `alloc`/`free` wrappers around `mmap`/`munmap` plus a byte-wise `memcpy` used by higher-level utilities.
+- **`io.sl`** – `read_file`, `write_file`, `read_stdin`, `write_buf`, `ewrite_buf`, `putc`, `puti`, `puts`, `eputs`, and a smart `print` that detects `(addr,len)` pairs located inside the default `.data` region.
+- **`utils.sl`** – String and number helpers (`strcmp`, `strconcat`, `strlen`, `digitsN>num`, `toint`, `count_digits`, `tostr`).
+- **`arr.sl`** – Dynamically sized qword arrays with `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`.
+- **`float.sl`** – SSE-based double-precision arithmetic (`f+`, `f-`, `f*`, `f/`, `fneg`, comparisons, `int>float`, `float>int`, `fput`, `fputln`).
+- **`linux.sl`** – Auto-generated syscall macros (one constant block per entry in `syscall_64.tbl`) plus the `syscallN` helpers implemented purely in assembly so the file can be used in isolation.
+- **`debug.sl`** – Diagnostics such as `dump`, `rdump`, and `int3`.
+- **`stdlib.sl`** – Convenience aggregator that imports `core`, `mem`, `io`, and `utils` so most programs can simply `import stdlib/stdlib.sl`.
 
-  ```
-  fn add(int left, int right){
-      return (left + right) * right;
-  }
-  ```
-
-  expands into a normal colon definition which consumes two stack arguments (`left` and `right`), mirrors them onto the return stack, evaluates the infix expression, and cleans up the temporary frame before returning.
-- Current limitations:
-  - Only `int` parameters are recognized.
-  - Function bodies must be a single `return <expr>;` statement. `<expr>` may contain parameter names, integer literals, parentheses, and the binary operators `+ - * / %`.
-  - Parameter names become available by index via `rpick`, so advanced bodies can still drop into raw L2 code if needed.
-- Since the generated code uses the return stack to store arguments, it happily composes with loops/conditionals—the frame lives beneath any subsequent `for` counters and is explicitly released before the word returns. Because `fn` lives in user space, nothing stops you from swapping it out for a completely different parser (pattern matching, keyword arguments, etc.) using the same `:py` facility.
-
-## 5. Stacks & Calling Convention
-- **Data stack**: Unlimited (up to memory). Manipulated via standard words (`dup`, `swap`, `rot`, `over`). Compiled code keeps top-of-stack in registers when possible for performance.
-- **Return stack**: Used for control flow. Directly accessible for meta-programming; users must avoid corrupting call frames unless intentional.
-- **Control stack**: Optional third stack for advanced flow transformations (e.g., continuations) implemented in the standard library.
-- **Call ABI**: Compiled words follow System V: arguments mapped from data stack into registers before `call`, results pushed back afterward.
-
-## 6. Memory & Allocation
-- **Linear memory primitives**: `@` (fetch), `!` (store), `+!`, `-!`, `memcpy`, `memset` translate to plain loads/stores without checks.
-- **Address spaces**: Single flat 64-bit space; no segmentation. Users may map devices via `mmap` or syscalls.
-- **Allocators**:
-  - Default bump allocator in the runtime prelude.
-  - `install-allocator` allows swapping malloc/free pairs at runtime.
-  - Allocators are just words; nothing prevents multiple domains.
-
-## 7. Control Flow
-- **Branching**: `if ... else ... then`, `begin ... until`, `case ... endcase` compile to standard conditional jumps. Users can redefine the parsing words to create new control forms.
-- **Tail calls**: `tail` word emits `jmp` instead of `call`, enabling explicit TCO.
-- **Exceptions**: Not baked in; provide optional libraries that implement condition stacks via return-stack manipulation.
-
-## 8. Inline Assembly & Low-Level Hooks
-- **Asm blocks**: `asm { ... }` injects raw NASM inside a word. The compiler preserves stack/register invariants by letting asm declare its stack effect signature.
-- **Asm-defined words**: `:asm name ( in -- out ) { ... } ;` generates a label and copies the block verbatim, wrapping prologue/epilogue helpers.
-- **Macro assembler helpers**: Provide macros for stack slots (`.tos`, `.nos`), temporary registers, and calling runtime helpers.
-
-## 9. Foreign Function Interface
-- **Symbol import**: `c-import "libc.so" clock_gettime` loads a symbol and records its address as a constant word. Multiple libraries can be opened and cached.
-- **Call sites**: `c-call ( in -- out ) symbol` pops arguments, loads System V argument registers, issues `call symbol`, then pushes return values. Variadic calls require the user to manage `al` for arg count.
-- **Struct marshalling**: Helper words `with-struct` and `field` macros emit raw loads/stores so C structs can be passed by pointer without extra runtime support.
-- **Error handling**: The runtime never inspects `errno`; users can read/write the TLS slot through provided helper words.
-
-## 10. Syscalls & OS Integration
-- **Primitive syscall**: `syscall ( args... nr count -- ret )` expects the syscall number beneath an explicit argument count. It clamps the count to `0..6`, maps the top-most values to `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (oldest argument in `rdi`), executes `syscall`, and pushes `rax`.
-- **Convenience macros**: `stdlib/linux.sl` exports `syscall1`..`syscall6`, each expanding to `<n> syscall`, so a typical call looks like `... syscall.write syscall3`.
-- **Named constants**: The same module defines `syscall.<name>` (alias for `syscall.<name>.num`) plus `syscall.<name>.argc`, letting programs reference both the numeric ID and Linux-reported argument count at compile time.
-- **Wrappers**: The standard library layers ergonomic words (`open`, `mmap`, `clone`, etc.) over the primitive but exposes hooks to override or extend them.
-- **Process bootstrap**: Entry stub captures `argc`, `argv`, `envp`, stores them in global cells (`argc`, `argv-base`), and pushes them on the data stack before invoking the user `main` word.
-
-## 11. Module & Namespace System
-- **Wordlists**: Dictionaries can be stacked; `within wordlist ... end` temporarily searches a specific namespace.
-- **Sealing**: Wordlists may be frozen to prevent redefinition, but the default remains open-world recompilation.
-- **Import forms**: `use module-name` copies references into the active wordlist; advanced loaders can be authored entirely in L2.
-
-## 12. Build & Tooling Pipeline
-- **Compiler driver**: `main.py` exposes modes: `build <src> -o a.out`, `repl`, `emit-asm`, `emit-obj`.
-- **External tools**: Default path is `nasm -f elf64` then `ld`; flags pass-through so users can link against custom CRT or libc replacements.
-- **Incremental/JIT**: Driver may pipe asm into `nasm` via stdin and `dlopen` the resulting shared object for REPL-like workflows.
-- **Configuration**: A manifest (TOML or `.sl`) records include paths, default allocators, and target triples for future cross-compilation.
-
-## 13. Self-Hosting Strategy
-- **Phase 1**: Python host provides tokenizer, parser hooks, dictionary, and code emitter.
-- **Phase 2**: Re-implement tokenizer + dictionary in L2 using inline asm for hot paths; Python shrinks to a thin driver.
-- **Phase 3**: Full self-host—compiler, assembler helpers, and driver written in L2, requiring only `nasm`/`ld`.
-
-## 14. Standard Library Sketch
-- **Core words**: Arithmetic, logic, stack ops, comparison, memory access, control flow combinators.
-- **Return-stack helpers**: `>r`, `r>`, `rdrop`, and `rpick` shuffle values between the data stack and the return stack. They’re used by the `fn` sugar but also available to user code for building custom control constructs.
-- **Meta words**: Reader management, dictionary inspection, definition forms (`word ... end`, `:noninline`, `:asm`, `immediate`).
-- **Allocators**: Default bump allocator, arena allocator, and hook to install custom malloc/free pairs.
-- **FFI/syscalls**: Thin wrappers plus convenience words for POSIX-level APIs.
-- **Diagnostics**: Minimal `type`, `emit`, `cr`, `dump`, and tracing hooks for debugging emitted asm.
-
-## 15. Command-Line & Environment
-- **Entry contract**: `main` receives `argc argv -- exit-code` on the data stack. Programs push the desired exit code before invoking `exit` or returning to runtime epilogue.
-- **Environment access**: `envp` pointer stored in `.data`; helper words convert entries to counted strings or key/value maps.
-- **Args parsing**: Library combinators transform `argv` into richer domain structures, though raw pointer arithmetic remains available.
-
-## 16. Extensibility & Safety Considerations
-- **Hot reload**: Redefining a word overwrites its dictionary entry and emits fresh asm. Users must relink or patch call sites if binaries are already running.
-- **Sandboxing**: None by default. Documented patterns show how to wrap memory/syscall words to build capability subsets without touching the core.
-- **Testing hooks**: Interpreter-mode trace prints emitted asm per word to aid verification.
-- **Portability**: Spec targets x86-64 System V for now but the abstraction layers (stack macros, calling helpers) permit future backends.
+## 9. Testing and Usage Patterns
+- **Automated coverage** – `tests/*.sl` exercise allocations, dynamic arrays, IO (file/stdin/stdout/stderr), struct accessors, inline words, label/goto, macros, syscall wrappers, fn-style syntax, return-stack locals (`tests/with_variables.sl`), and compile-time overrides. Each test has a `.test` driver command and a `.expected` file to verify output.
+- **Common commands** –
+  - `python main.py tests/hello.sl -o build/hello && ./build/hello`
+  - `python main.py program.sl --emit-asm --temp-dir build`
+  - `python main.py --repl`

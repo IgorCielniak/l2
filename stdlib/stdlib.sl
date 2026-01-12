@@ -474,6 +474,17 @@
 }
 ;
 
+# : abs ( x -- |x| )
+:asm abs {
+	mov rax, [r12]   ; get value
+	test rax, rax    ; check sign
+	jge .done        ; keep if non-negative
+	neg rax          ; flip sign when negative
+.done:
+	mov [r12], rax   ; store result
+}
+;
+
 # : bitnot ( 0|1 -- 1|0 )
 :asm bitnot {
     mov rax, [r12]   ; get value

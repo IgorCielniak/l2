@@ -15,6 +15,7 @@ struct: Point
 
 word main
     32 alloc           # allocate 32 bytes (enough for a Point struct)
+    dup
     dup 111 swap Point.x!
     dup 222 swap Point.y!
     dup Point.x@ puti cr

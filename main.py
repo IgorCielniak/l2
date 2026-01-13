@@ -556,104 +556,143 @@ class Parser:
         if self._eof():
             raise ParseError(f"extern missing name at {token.line}:{token.column}")
 
-        # Heuristic: check if the first token is a likely C type
-        c_types = {"void", "int", "long", "char", "bool", "size_t", "float", "double"}
-        
-        # Peek at tokens to decide mode
-        t1 = self._consume()
-        is_c_decl = False
-        
-        # If t1 is a type (or type*), and next is name, and next is '(', it's C-style.
-        # But since we already consumed t1, we have to proceed carefully.
-        
-        # Check if t1 looks like a type
-        base_type = t1.lexeme.rstrip("*")
-        if base_type in c_types:
-            # Likely C-style, but let's confirm next token is not a number (which would mean t1 was the name in raw mode)
-            peek = self.peek_token()
-            if peek is not None and peek.lexeme != "(" and not peek.lexeme.isdigit():
-                # t1=type, peek=name. Confirm peek2='('?
-                # Actually, if t1 is "int", it's extremely unlikely to be a function name in L2.
-                is_c_decl = True
+        first_token = self._consume()
+        if self._try_parse_c_extern(first_token):
+            return
+        self._parse_legacy_extern(first_token)
 
-        if is_c_decl:
-            # C-Style Parsing
-            ret_type = t1.lexeme
-            if self._eof():
-                raise ParseError("extern missing name after return type")
-            name_token = self._consume()
-            name = name_token.lexeme
-            
-            # Handle pointers in name token if tokenizer didn't split them (e.g. *name)
-            while name.startswith("*"):
-                name = name[1:]
-            
-            if self._eof() or self._consume().lexeme != "(":
-                raise ParseError(f"expected '(' after extern function name '{name}'")
-            
-            inputs = 0
-            arg_types: List[str] = []
-            while True:
-                if self._eof():
-                    raise ParseError("extern unclosed '('")
-                peek = self.peek_token()
-                if peek.lexeme == ")":
-                    self._consume()
-                    break
-                
-                # Parse argument type
-                arg_type_tok = self._consume()
-                arg_type = arg_type_tok.lexeme
-                
-                # Handle "type *" sequence
-                peek_ptr = self.peek_token()
-                while peek_ptr and peek_ptr.lexeme == "*":
-                    self._consume()
-                    arg_type += "*"
-                    peek_ptr = self.peek_token()
+    def _parse_legacy_extern(self, name_token: Token) -> None:
+        name = name_token.lexeme
+        word = self.dictionary.lookup(name)
+        if word is None:
+            word = Word(name=name)
+            self.dictionary.register(word)
+        word.is_extern = True
 
-                if arg_type != "void":
-                    inputs += 1
-                    arg_types.append(arg_type)
-                    # Optional argument name
-                    peek_name = self.peek_token()
-                    if peek_name and peek_name.lexeme not in (",", ")"):
-                        self._consume() # Consume arg name
-
-                peek_sep = self.peek_token()
-                if peek_sep and peek_sep.lexeme == ",":
-                    self._consume()
-            
-            outputs = 0 if ret_type == "void" else 1
-            
-            word = self.dictionary.lookup(name)
-            if word is None:
-                word = Word(name=name)
-                self.dictionary.register(word)
-            word.is_extern = True
-            word.extern_inputs = inputs
-            word.extern_outputs = outputs
-            word.extern_signature = (arg_types, ret_type)
-            
-        else:
-            # Raw/Legacy Parsing
-            name = t1.lexeme
-            word = self.dictionary.lookup(name)
-            if word is None:
-                word = Word(name=name)
-                self.dictionary.register(word)
-            word.is_extern = True
-
-            # Check for optional inputs/outputs
+        peek = self.peek_token()
+        if peek is not None and peek.lexeme.isdigit():
+            word.extern_inputs = int(self._consume().lexeme)
             peek = self.peek_token()
             if peek is not None and peek.lexeme.isdigit():
-                word.extern_inputs = int(self._consume().lexeme)
-                peek = self.peek_token()
-                if peek is not None and peek.lexeme.isdigit():
-                    word.extern_outputs = int(self._consume().lexeme)
+                word.extern_outputs = int(self._consume().lexeme)
             else:
-                word.extern_inputs = 0
                 word.extern_outputs = 0
+        else:
+            word.extern_inputs = 0
+            word.extern_outputs = 0
+
+    def _try_parse_c_extern(self, first_token: Token) -> bool:
+        saved_pos = self.pos
+        prefix_tokens: List[str] = [first_token.lexeme]
+
+        while True:
+            if self._eof():
+                self.pos = saved_pos
+                return False
+            lookahead = self._consume()
+            if lookahead.lexeme == "(":
+                break
+            if lookahead.lexeme.isdigit():
+                self.pos = saved_pos
+                return False
+            prefix_tokens.append(lookahead.lexeme)
+
+        if not prefix_tokens:
+            raise ParseError("extern missing return type/name before '('")
+
+        name_lexeme = prefix_tokens.pop()
+        if not _is_identifier(name_lexeme):
+            prefix_name, suffix_name = _split_trailing_identifier(name_lexeme)
+            if suffix_name is None:
+                raise ParseError(f"extern expected identifier before '(' but got '{name_lexeme}'")
+            name_lexeme = suffix_name
+            if prefix_name:
+                prefix_tokens.append(prefix_name)
+
+        if not _is_identifier(name_lexeme):
+            raise ParseError(f"extern expected identifier before '(' but got '{name_lexeme}'")
+
+        ret_type = _normalize_c_type_tokens(prefix_tokens, allow_default=True)
+        inputs, arg_types = self._parse_c_param_list()
+        outputs = 0 if ret_type == "void" else 1
+        self._register_c_extern(name_lexeme, inputs, outputs, arg_types, ret_type)
+        return True
+
+    def _parse_c_param_list(self) -> Tuple[int, List[str]]:
+        inputs = 0
+        arg_types: List[str] = []
+
+        if self._eof():
+            raise ParseError("extern unclosed '('")
+        peek = self.peek_token()
+        if peek.lexeme == ")":
+            self._consume()
+            return inputs, arg_types
+
+        while True:
+            lexemes = self._collect_c_param_lexemes()
+            arg_type = _normalize_c_type_tokens(lexemes, allow_default=False)
+            if arg_type == "void" and inputs == 0:
+                if self._eof():
+                    raise ParseError("extern unclosed '(' after 'void'")
+                closing = self._consume()
+                if closing.lexeme != ")":
+                    raise ParseError("expected ')' after 'void' in extern parameter list")
+                return 0, []
+            inputs += 1
+            arg_types.append(arg_type)
+            if self._eof():
+                raise ParseError("extern unclosed '('")
+            separator = self._consume()
+            if separator.lexeme == ")":
+                break
+            if separator.lexeme != ",":
+                raise ParseError(
+                    f"expected ',' or ')' in extern parameter list, got '{separator.lexeme}'"
+                )
+        return inputs, arg_types
+
+    def _collect_c_param_lexemes(self) -> List[str]:
+        lexemes: List[str] = []
+        while True:
+            if self._eof():
+                raise ParseError("extern unclosed '('")
+            peek = self.peek_token()
+            if peek.lexeme in (",", ")"):
+                break
+            lexemes.append(self._consume().lexeme)
+
+        if not lexemes:
+            raise ParseError("missing parameter type in extern declaration")
+
+        if len(lexemes) > 1 and _is_identifier(lexemes[-1]):
+            lexemes.pop()
+            return lexemes
+
+        prefix, suffix = _split_trailing_identifier(lexemes[-1])
+        if suffix is not None:
+            if prefix:
+                lexemes[-1] = prefix
+            else:
+                lexemes.pop()
+        return lexemes
+
+    def _register_c_extern(
+        self,
+        name: str,
+        inputs: int,
+        outputs: int,
+        arg_types: List[str],
+        ret_type: str,
+    ) -> None:
+        word = self.dictionary.lookup(name)
+        if word is None:
+            word = Word(name=name)
+            self.dictionary.register(word)
+        word.is_extern = True
+        word.extern_inputs = inputs
+        word.extern_outputs = outputs
+        word.extern_signature = (arg_types, ret_type)
 
     def _handle_token(self, token: Token) -> None:
         if self._try_literal(token):
@@ -1576,6 +1615,70 @@ def _is_identifier(text: str) -> bool:
     return all(ch.isalnum() or ch == "_" for ch in text)
 
 
+_C_TYPE_IGNORED_QUALIFIERS = {
+    "const",
+    "volatile",
+    "register",
+    "restrict",
+    "static",
+    "extern",
+    "_Atomic",
+}
+
+
+def _split_trailing_identifier(text: str) -> Tuple[str, Optional[str]]:
+    if not text:
+        return text, None
+    idx = len(text)
+    while idx > 0 and (text[idx - 1].isalnum() or text[idx - 1] == "_"):
+        idx -= 1
+    if idx == 0 or idx == len(text):
+        return text, None
+    prefix = text[:idx]
+    suffix = text[idx:]
+    if any(not ch.isalnum() and ch != "_" for ch in prefix):
+        return prefix, suffix
+    return text, None
+
+
+def _normalize_c_type_tokens(tokens: Sequence[str], *, allow_default: bool) -> str:
+    pointer_count = 0
+    parts: List[str] = []
+    for raw in tokens:
+        text = raw.strip()
+        if not text:
+            continue
+        if set(text) == {"*"}:
+            pointer_count += len(text)
+            continue
+        while text.startswith("*"):
+            pointer_count += 1
+            text = text[1:]
+        while text.endswith("*"):
+            pointer_count += 1
+            text = text[:-1]
+        if not text:
+            continue
+        if text in _C_TYPE_IGNORED_QUALIFIERS:
+            continue
+        parts.append(text)
+    if not parts:
+        if allow_default:
+            base = "int"
+        else:
+            raise ParseError("expected C type before parameter name")
+    else:
+        base = " ".join(parts)
+    return base + ("*" * pointer_count)
+
+
+def _ctype_uses_sse(type_name: Optional[str]) -> bool:
+    if type_name is None:
+        return False
+    base = type_name.rstrip("*")
+    return base in {"float", "double"}
+
+
 def _parse_string_literal(token: Token) -> Optional[str]:
     text = token.lexeme
     if len(text) < 2 or text[0] != '"' or text[-1] != '"':
@@ -1998,7 +2101,7 @@ class Assembler:
             outputs = getattr(word, "extern_outputs", 0)
             signature = getattr(word, "extern_signature", None)
 
-            if inputs > 0 or outputs > 0:
+            if signature is not None or inputs > 0 or outputs > 0:
                 regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
                 xmm_regs = [f"xmm{i}" for i in range(8)]
 
@@ -2048,7 +2151,7 @@ class Assembler:
                 builder.emit("    leave")
 
                 # Handle Return Value
-                if ret_type in ("float", "double"):
+                if _ctype_uses_sse(ret_type):
                     # Result in xmm0, move to stack
                     builder.emit("    sub r12, 8")
                     builder.emit("    movq rax, xmm0")
@@ -3320,7 +3423,25 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
             "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
         ])
         for lib in libs:
-            cmd.append(f"-l:{lib}" if ".so" in lib else f"-l{lib}")
+            if not lib:
+                continue
+            lib = str(lib)
+            if lib.startswith(("-L", "-l", "-Wl,")):
+                cmd.append(lib)
+                continue
+            if lib.startswith(":"):
+                cmd.append(f"-l{lib}")
+                continue
+            if os.path.isabs(lib) or lib.startswith("./") or lib.startswith("../"):
+                cmd.append(lib)
+                continue
+            if os.path.sep in lib or lib.endswith(".a"):
+                cmd.append(lib)
+                continue
+            if ".so" in lib:
+                cmd.append(f"-l:{lib}")
+                continue
+            cmd.append(f"-l{lib}")
 
     if debug:
         cmd.append("-g")

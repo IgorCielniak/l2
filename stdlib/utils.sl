@@ -81,7 +81,7 @@ word toint
     for
         swap drop
     end
-    rdrop
+    rdrop rdrop
 end
 
 # : count_digits ( int -- int) returns the amount of digits of an int

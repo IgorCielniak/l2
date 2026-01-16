@@ -191,8 +191,7 @@
 }
 ;
 
-:asm print {
-	; detects string if top is len>=0 and next is a pointer in [data_start, data_end]
+:asm print (effects string-io) {
 	mov rax, [r12]      ; len or int value
 	mov rbx, [r12 + 8]  ; possible address
 	cmp rax, 0
@@ -270,8 +269,7 @@
 ;
 
 # : write_buf ( addr len -- )
-:asm write_buf {
-	; data_start (trigger string_mode in compile-time VM)
+:asm write_buf (effects string-io) {
 	mov rdx, [r12]        ; len
 	mov rsi, [r12 + 8]    ; addr
 	add r12, 16           ; pop len + addr
@@ -283,8 +281,7 @@
 ;
 
 # : ewrite_buf ( addr len -- )
-:asm ewrite_buf {
-	; data_start (trigger string_mode in compile-time VM)
+:asm ewrite_buf (effects string-io) {
 	mov rdx, [r12]        ; len
 	mov rsi, [r12 + 8]    ; addr
 	add r12, 16           ; pop len + addr

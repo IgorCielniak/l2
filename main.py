@@ -217,6 +217,7 @@ class AsmDefinition:
     body: str
     immediate: bool = False
     compile_only: bool = False
+    effects: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -296,6 +297,20 @@ class MacroContext:
 
 MacroHandler = Callable[[MacroContext], Optional[List[Op]]]
 IntrinsicEmitter = Callable[["FunctionEmitter"], None]
+
+
+# Word effects ---------------------------------------------------------------
+
+
+WORD_EFFECT_STRING_IO = "string-io"
+_WORD_EFFECT_ALIASES: Dict[str, str] = {
+    "string": WORD_EFFECT_STRING_IO,
+    "strings": WORD_EFFECT_STRING_IO,
+    "string-io": WORD_EFFECT_STRING_IO,
+    "string_io": WORD_EFFECT_STRING_IO,
+    "strings-io": WORD_EFFECT_STRING_IO,
+    "strings_io": WORD_EFFECT_STRING_IO,
+}
 
 
 @dataclass
@@ -923,10 +938,51 @@ class Parser:
         module.forms.append(ctx)
         self.last_defined = word
 
+    def _parse_effect_annotations(self) -> List[str]:
+        """Parse a '(effects ...)' clause that follows a :asm name."""
+        open_tok = self._consume()
+        if open_tok.lexeme != "(":  # pragma: no cover - defensive
+            raise ParseError("internal parser error: effect clause must start with '('")
+        tokens: List[Token] = []
+        while True:
+            if self._eof():
+                raise ParseError("unterminated effect clause in asm definition")
+            tok = self._consume()
+            if tok.lexeme == ")":
+                break
+            tokens.append(tok)
+        if not tokens:
+            raise ParseError("effect clause must include 'effect' or 'effects'")
+        keyword = tokens.pop(0)
+        if keyword.lexeme.lower() not in {"effect", "effects"}:
+            raise ParseError(
+                f"effect clause must start with 'effect' or 'effects', got '{keyword.lexeme}'"
+            )
+        effect_names: List[str] = []
+        for tok in tokens:
+            if tok.lexeme == ",":
+                continue
+            normalized = tok.lexeme.lower().replace("_", "-")
+            canonical = _WORD_EFFECT_ALIASES.get(normalized)
+            if canonical is None:
+                raise ParseError(
+                    f"unknown effect '{tok.lexeme}' at {tok.line}:{tok.column}"
+                )
+            if canonical not in effect_names:
+                effect_names.append(canonical)
+        if not effect_names:
+            raise ParseError("effect clause missing effect names")
+        return effect_names
+
     def _parse_asm_definition(self, token: Token) -> None:
         if self._eof():
             raise ParseError(f"definition name missing after ':asm' at {token.line}:{token.column}")
         name_token = self._consume()
+        effect_names: Optional[List[str]] = None
+        if not self._eof():
+            next_token = self.peek_token()
+            if next_token is not None and next_token.lexeme == "(":
+                effect_names = self._parse_effect_annotations()
         brace_token = self._consume()
         if brace_token.lexeme != "{":
             raise ParseError(f"expected '{{' after asm name at {brace_token.line}:{brace_token.column}")
@@ -941,6 +997,8 @@ class Parser:
             raise ParseError("missing '}' to terminate asm body")
         asm_body = self.source[block_start:block_end]
         definition = AsmDefinition(name=name_token.lexeme, body=asm_body)
+        if effect_names is not None:
+            definition.effects = set(effect_names)
         word = self.dictionary.lookup(definition.name)
         if word is None:
             word = Word(name=definition.name)
@@ -1181,15 +1239,8 @@ class CompileTimeVM:
             raise ParseError(f"word '{word.name}' has no asm body")
         asm_body = definition.body.strip("\n")
 
-        # Determine whether this asm uses string semantics (len,addr pairs)
-        # by scanning the asm body for string-related labels. This avoids
-        # hardcoding a specific word name (like 'puts') and lets any word
-        # that expects (len, addr) work the same way.
-        string_mode = False
-        if asm_body:
-            lowered = asm_body.lower()
-            if any(k in lowered for k in ("data_start", "data_end", "print_buf", "print_buf_end")):
-                string_mode = True
+        # Determine whether this asm expects string semantics via declared effects.
+        string_mode = WORD_EFFECT_STRING_IO in definition.effects
 
         handles = self._handles
 

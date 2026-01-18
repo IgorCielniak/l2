@@ -60,6 +60,13 @@ class Token:
         return f"Token({self.lexeme!r}@{self.line}:{self.column})"
 
 
+@dataclass(frozen=True)
+class SourceLocation:
+    path: Path
+    line: int
+    column: int
+
+
 class Reader:
     """Default reader; users can swap implementations at runtime."""
 
@@ -199,6 +206,7 @@ class Op:
 
     op: str
     data: Any = None
+    loc: Optional[SourceLocation] = None
 
 
 @dataclass
@@ -378,12 +386,12 @@ class Parser:
         self.custom_bss: Optional[List[str]] = None
         self._pending_inline_definition: bool = False
 
-    def location_for_token(self, token: Token) -> Tuple[str, int, int]:
+    def location_for_token(self, token: Token) -> SourceLocation:
         for span in self.file_spans:
             if span.start_line <= token.line < span.end_line:
                 local_line = span.local_start_line + (token.line - span.start_line)
-                return (span.path.name, local_line, token.column)
-        return ("<source>", token.line, token.column)
+                return SourceLocation(span.path, local_line, token.column)
+        return SourceLocation(Path("<source>"), token.line, token.column)
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
@@ -1061,7 +1069,11 @@ class Parser:
     def _py_exec_namespace(self) -> Dict[str, Any]:
         return dict(PY_EXEC_GLOBALS)
 
-    def _append_op(self, node: Op) -> None:
+    def _append_op(self, node: Op, token: Optional[Token] = None) -> None:
+        if node.loc is None:
+            tok = token or self._last_token
+            if tok is not None:
+                node.loc = self.location_for_token(tok)
         target = self.context_stack[-1]
         if isinstance(target, Module):
             target.forms.append(node)
@@ -1602,8 +1614,29 @@ class Emission:
 class FunctionEmitter:
     """Utility for emitting per-word assembly."""
 
-    def __init__(self, text: List[str]) -> None:
+    def __init__(self, text: List[str], debug_enabled: bool = False) -> None:
         self.text = text
+        self.debug_enabled = debug_enabled
+        self._current_loc: Optional[SourceLocation] = None
+        self._generated_debug_path = "<generated>"
+
+    def _emit_line_directive(self, line: int, path: str, increment: int) -> None:
+        escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+        self.text.append(f'%line {line}+{increment} "{escaped}"')
+
+    def set_location(self, loc: Optional[SourceLocation]) -> None:
+        if not self.debug_enabled:
+            return
+        if loc is None:
+            if self._current_loc is None:
+                return
+            self._emit_line_directive(1, self._generated_debug_path, increment=1)
+            self._current_loc = None
+            return
+        if self._current_loc == loc:
+            return
+        self._emit_line_directive(loc.line, str(loc.path), increment=0)
+        self._current_loc = loc
 
     def emit(self, line: str) -> None:
         self.text.append(line)
@@ -1827,7 +1860,7 @@ class Assembler:
         for name in externs:
             text.append(f"extern {name}")
 
-    def emit(self, module: Module) -> Emission:
+    def emit(self, module: Module, debug: bool = False) -> Emission:
         emission = Emission()
         self._emit_externs(emission.text)
         prelude_lines = module.prelude if module.prelude is not None else self._runtime_prelude()
@@ -1857,7 +1890,7 @@ class Assembler:
         runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
 
         for definition in runtime_defs:
-            self._emit_definition(definition, emission.text)
+            self._emit_definition(definition, emission.text, debug=debug)
 
         self._emit_variables(module.variables)
 
@@ -1933,10 +1966,16 @@ class Assembler:
         self._float_literals[value] = label
         return label
 
-    def _emit_definition(self, definition: Union[Definition, AsmDefinition], text: List[str]) -> None:
+    def _emit_definition(
+        self,
+        definition: Union[Definition, AsmDefinition],
+        text: List[str],
+        *,
+        debug: bool = False,
+    ) -> None:
         label = sanitize_label(definition.name)
         text.append(f"{label}:")
-        builder = FunctionEmitter(text)
+        builder = FunctionEmitter(text, debug_enabled=debug)
         self._emit_stack.append(definition.name)
         try:
             if isinstance(definition, Definition):
@@ -2017,6 +2056,7 @@ class Assembler:
     def _emit_node(self, node: Op, builder: FunctionEmitter) -> None:
         kind = node.op
         data = node.data
+        builder.set_location(node.loc)
 
         def ctx() -> str:
             return f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
@@ -3189,8 +3229,8 @@ def macro_here(ctx: MacroContext) -> Optional[List[Op]]:
     tok = ctx.parser._last_token
     if tok is None:
         return [Op(op="literal", data="<source>:0:0")]
-    file_name, line, col = ctx.parser.location_for_token(tok)
-    return [Op(op="literal", data=f"{file_name}:{line}:{col}")]
+    loc = ctx.parser.location_for_token(tok)
+    return [Op(op="literal", data=f"{loc.path.name}:{loc.line}:{loc.column}")]
 
 
 def bootstrap_dictionary() -> Dictionary:
@@ -3235,15 +3275,21 @@ class Compiler:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
 
-    def compile_source(self, source: str, spans: Optional[List[FileSpan]] = None) -> Emission:
+    def compile_source(
+        self,
+        source: str,
+        spans: Optional[List[FileSpan]] = None,
+        *,
+        debug: bool = False,
+    ) -> Emission:
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
-        return self.assembler.emit(module)
+        return self.assembler.emit(module, debug=debug)
 
-    def compile_file(self, path: Path) -> Emission:
+    def compile_file(self, path: Path, *, debug: bool = False) -> Emission:
         source, spans = self._load_with_imports(path.resolve())
-        return self.compile_source(source, spans=spans)
+        return self.compile_source(source, spans=spans, debug=debug)
 
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
         raw = Path(target)
@@ -3436,7 +3482,7 @@ class Compiler:
 def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
     cmd = ["nasm", "-f", "elf64"]
     if debug:
-        cmd.append("-g")
+        cmd.extend(["-g", "-F", "dwarf"])
     cmd += ["-o", str(obj_path), str(asm_path)]
     subprocess.run(cmd, check=True)
 
@@ -3677,7 +3723,7 @@ def run_repl(
                     temp_defs_repl = [*user_defs_repl, f"word main\n    {word_name}\nend"]
                     builder_source = _repl_build_source(imports, user_defs_files, temp_defs_repl, [], True, force_synthetic=False)
                 src_path.write_text(builder_source)
-                emission = compiler.compile_file(src_path)
+                emission = compiler.compile_file(src_path, debug=debug)
                 compiler.assembler.write_asm(emission, asm_path)
                 run_nasm(asm_path, obj_path, debug=debug)
                 run_linker(obj_path, exe_path, debug=debug, libs=list(libs))
@@ -3736,7 +3782,7 @@ def run_repl(
             )
             try:
                 snippet_src.write_text(snippet_source)
-                emission = compiler.compile_file(snippet_src)
+                emission = compiler.compile_file(snippet_src, debug=debug)
                 compiler.assembler.write_asm(emission, snippet_asm)
                 run_nasm(snippet_asm, snippet_obj, debug=debug)
                 run_linker(snippet_obj, snippet_exe, debug=debug, libs=list(libs))
@@ -3775,7 +3821,7 @@ def run_repl(
 
         try:
             src_path.write_text(source)
-            emission = compiler.compile_file(src_path)
+            emission = compiler.compile_file(src_path, debug=debug)
         except (ParseError, CompileError, CompileTimeError) as exc:
             print(f"[error] {exc}")
             continue
@@ -3869,7 +3915,7 @@ def cli(argv: Sequence[str]) -> int:
         if args.repl:
             return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)
 
-        emission = compiler.compile_file(args.source)
+        emission = compiler.compile_file(args.source, debug=args.debug)
     except (ParseError, CompileError, CompileTimeError) as exc:
         print(f"[error] {exc}")
         return 1

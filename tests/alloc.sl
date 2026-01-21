@@ -8,10 +8,10 @@ word test-mem-alloc
     4096 free                    # free the memory
 end
 
-struct: Point
+struct Point
     field x 8
     field y 8
-;struct
+end
 
 word main
     32 alloc           # allocate 32 bytes (enough for a Point struct)

@@ -3169,19 +3169,21 @@ PY_EXEC_GLOBALS: Dict[str, Any] = {
 def macro_struct_begin(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
     if parser._eof():
-        raise ParseError("struct name missing after 'struct:'")
+        raise ParseError("struct name missing after 'struct'")
     name_token = parser.next_token()
     struct_name = name_token.lexeme
     fields: List[StructField] = []
     current_offset = 0
     while True:
         if parser._eof():
-            raise ParseError("unterminated struct definition (missing ';struct')")
+            raise ParseError("unterminated struct definition (missing 'end')")
         token = parser.next_token()
-        if token.lexeme == ";struct":
+        if token.lexeme == "end":
             break
         if token.lexeme != "field":
-            raise ParseError(f"expected 'field' or ';struct' in struct '{struct_name}' definition")
+            raise ParseError(
+                f"expected 'field' or 'end' in struct '{struct_name}' definition"
+            )
         if parser._eof():
             raise ParseError("field name missing in struct definition")
         field_name_token = parser.next_token()
@@ -3220,11 +3222,6 @@ def macro_struct_begin(ctx: MacroContext) -> Optional[List[Op]]:
     parser.tokens[parser.pos:parser.pos] = generated
     return None
 
-
-def macro_struct_end(ctx: MacroContext) -> Optional[List[Op]]:
-    raise ParseError("';struct' must follow a 'struct:' block")
-
-
 def macro_here(ctx: MacroContext) -> Optional[List[Op]]:
     tok = ctx.parser._last_token
     if tok is None:
@@ -3244,8 +3241,7 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="here", immediate=True, macro=macro_here))
     dictionary.register(Word(name="with", immediate=True, macro=macro_with))
     dictionary.register(Word(name="macro", immediate=True, macro=macro_begin_text_macro))
-    dictionary.register(Word(name="struct:", immediate=True, macro=macro_struct_begin))
-    dictionary.register(Word(name=";struct", immediate=True, macro=macro_struct_end))
+    dictionary.register(Word(name="struct", immediate=True, macro=macro_struct_begin))
     _register_compile_time_primitives(dictionary)
     return dictionary
 
@@ -3602,7 +3598,7 @@ def run_repl(
         print("  :seteditor [cmd]   show/set editor command (default from $EDITOR or vim)")
         print("  :quit | :q         exit the REPL")
         print("[repl] free-form input:")
-        print("  definitions (word/:asm/:py/extern/macro/struct:) extend the session")
+        print("  definitions (word/:asm/:py/extern/macro/struct) extend the session")
         print("  imports add to session imports")
         print("  other lines run immediately in an isolated temp program (not saved)")
         print("  multiline: end lines with \\ to continue; finish with a non-\\ line")
@@ -3752,7 +3748,7 @@ def run_repl(
 
         block_stripped = block.lstrip()
         first_tok = block_stripped.split(None, 1)[0] if block_stripped else ""
-        is_definition = first_tok in {"word", ":asm", ":py", "extern", "macro", "struct:"}
+        is_definition = first_tok in {"word", ":asm", ":py", "extern", "macro", "struct"}
         is_import = first_tok == "import"
 
         if is_import:

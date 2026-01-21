@@ -27,10 +27,10 @@ macro defadder 3
 defconst MAGIC 99
 defadder add13 5 8
 
-struct: Point
+struct Point
     field x 8
     field y 8
-;struct
+end
 
 word test-add
     5 7 + puti cr

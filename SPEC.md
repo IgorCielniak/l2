@@ -27,7 +27,7 @@ This document reflects the implementation that ships in this repository today (`
 - **Memory helpers** – `mem` returns the address of the `persistent` buffer (default 64 bytes). `argc`, `argv`, and `argv@` expose process arguments. `alloc`/`free` wrap `mmap`/`munmap` for general-purpose buffers, while `memcpy` performs byte-wise copies.
 - **BSS customization** – Compile-time words may call `bss-clear` followed by `bss-append`/`bss-set` to replace the default `.bss` layout (e.g., `tests/bss_override.sl` enlarges `persistent`).
 - **Strings & buffers** – IO helpers consume explicit `(addr len)` pairs only; there is no implicit NULL contract except for stored literals.
-- **Structured data** – `struct:` blocks expand into constants and accessor words (`Foo.bar@`, `Foo.bar!`). Dynamic arrays in `stdlib/arr.sl` allocate `[len, cap, data_ptr, data...]` records via `mmap` and expose `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`.
+- **Structured data** – `struct` blocks expand into constants and accessor words (`Foo.bar@`, `Foo.bar!`). Dynamic arrays in `stdlib/arr.sl` allocate `[len, cap, data_ptr, data...]` records via `mmap` and expose `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`.
 
 ## 5. Definitions, Control Flow, and Syntax Sugar
 - **Word definitions** – Always `word name ... end`. Redefinitions overwrite the previous entry (a warning prints to stderr). `inline word name ... end` marks the definition for inline expansion; recursive inline calls are rejected. `immediate` and `compile-only` apply to the most recently defined word.
@@ -37,7 +37,7 @@ This document reflects the implementation that ships in this repository today (`
   - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros.
   - `label name` / `goto name` perform local jumps within a definition.
 - **Text macros** – `macro name [param_count] ... ;` records raw tokens until `;`. `$1`, `$2`, ... expand to positional arguments. Macro definitions cannot nest (attempting to start another `macro` while recording raises a parse error).
-- **Struct builder** – `struct: Foo ... ;struct` emits `<Foo>.size`, `<Foo>.field.size`, `<Foo>.field.offset`, `<Foo>.field@`, and `<Foo>.field!` helpers. Layout is tightly packed with no implicit padding.
+- **Struct builder** – `struct Foo ... end` emits `<Foo>.size`, `<Foo>.field.size`, `<Foo>.field.offset`, `<Foo>.field@`, and `<Foo>.field!` helpers. Layout is tightly packed with no implicit padding.
 - **With-blocks** – `with a b in ... end` rewrites occurrences of `a`/`b` into accesses against hidden global cells (`__with_a`). On entry the block pops the named values and stores them in those cells; reads compile to `@`, writes to `!`. Because the cells live in `.data`, the slots persist across calls and are not re-entrant.
 - **List literals** – `[ values ... ]` capture the current stack slice, allocate storage (`mmap`), copy the elements, and push the pointer. The record stores `len` at offset 0 and items afterwards so user code can fetch length via `@` and iterate.
 - **Compile-time execution** – `compile-time foo` runs `foo` immediately but still emits it (if inside a definition). Immediate words always execute during parsing; ordinary words emit `word` ops for later code generation.

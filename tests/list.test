@@ -1,1 +1,1 @@
-python main.py tests/list.sl -o /tmp/list > /dev/null && /tmp/list
+python main.py tests/list.sl -o ./build/list > /dev/null && ./build/list

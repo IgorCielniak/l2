@@ -1,1 +1,1 @@
-python main.py tests/bss_override.sl -o /tmp/bss_override > /dev/null && /tmp/bss_override
+python main.py tests/bss_override.sl -o ./build/bss_override > /dev/null && ./build/bss_override

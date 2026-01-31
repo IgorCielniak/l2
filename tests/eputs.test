@@ -1,1 +1,1 @@
-python main.py tests/eputs.sl -o /tmp/eputs > /dev/null && /tmp/eputs 2>&1
+python main.py tests/eputs.sl -o ./build/eputs > /dev/null && ./build/eputs 2>&1

@@ -1,1 +1,1 @@
-python main.py tests/fib.sl -o /tmp/fib > /dev/null && /tmp/fib
+python main.py tests/fib.sl -o ./build/fib > /dev/null && ./build/fib

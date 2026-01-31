@@ -1,1 +1,1 @@
-python main.py tests/goto.sl -o /tmp/goto > /dev/null && /tmp/goto
+python main.py tests/goto.sl -o ./build/goto > /dev/null && ./build/goto

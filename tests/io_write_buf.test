@@ -1,1 +1,1 @@
-python main.py tests/io_write_buf.sl -o /tmp/io_write_buf > /dev/null && /tmp/io_write_buf
+python main.py tests/io_write_buf.sl -o ./build/io_write_buf > /dev/null && ./build/io_write_buf

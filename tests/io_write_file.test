@@ -1,1 +1,1 @@
-python main.py tests/io_write_file.sl -o /tmp/io_write_file > /dev/null && /tmp/io_write_file
+python main.py tests/io_write_file.sl -o ./build/io_write_file > /dev/null && ./build/io_write_file

@@ -1,1 +1,1 @@
-python main.py tests/here.sl -o /tmp/here > /dev/null && /tmp/here
+python main.py tests/here.sl -o ./build/here > /dev/null && ./build/here

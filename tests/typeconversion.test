@@ -1,1 +1,1 @@
-python main.py tests/typeconversion.sl -o /tmp/typeconversion > /dev/null && /tmp/typeconversion
+python main.py tests/typeconversion.sl -o ./build/typeconversion > /dev/null && ./build/typeconversion

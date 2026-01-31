@@ -1,1 +1,1 @@
-python main.py tests/alloc.sl -o /tmp/alloc > /dev/null && /tmp/alloc
+python main.py tests/alloc.sl -o ./build/alloc > /dev/null && ./build/alloc

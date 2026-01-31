@@ -2690,12 +2690,6 @@ def _ct_list_append(vm: CompileTimeVM) -> None:
     vm.push(lst)
 
 
-def _ct_drop(vm: CompileTimeVM) -> None:
-    if not vm.stack:
-        return
-    vm.pop()
-
-
 def _ct_list_pop(vm: CompileTimeVM) -> None:
     lst = _ensure_list(vm.pop())
     if not lst:
@@ -3036,8 +3030,6 @@ def _ct_emit_definition(vm: CompileTimeVM) -> None:
 def _ct_parse_error(vm: CompileTimeVM) -> None:
     message = vm.pop_str()
     raise ParseError(message)
-
-
 
 
 def _ct_lexer_new(vm: CompileTimeVM) -> None:

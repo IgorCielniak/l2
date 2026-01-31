@@ -1,1 +1,1 @@
-python main.py tests/mem.sl -o /tmp/mem > /dev/null && /tmp/mem
+python main.py tests/mem.sl -o ./build/mem > /dev/null && ./build/mem

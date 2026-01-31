@@ -1,1 +1,1 @@
-python main.py tests/hello.sl -o /tmp/hello > /dev/null && /tmp/hello
+python main.py tests/hello.sl -o ./build/hello > /dev/null && ./build/hello

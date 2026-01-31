@@ -1,1 +1,1 @@
-python main.py tests/else_if_shorthand.sl -o /tmp/else_if_shorthand > /dev/null && /tmp/else_if_shorthand
+python main.py tests/else_if_shorthand.sl -o ./build/else_if_shorthand > /dev/null && ./build/else_if_shorthand

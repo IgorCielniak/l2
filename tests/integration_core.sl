@@ -66,7 +66,7 @@ end
 
 word test-store
     mem-slot dup
-    123 swap !
+    123 !
     @ puti cr
 end
 
@@ -80,7 +80,7 @@ word test-mmap
     0      # offset
     mmap
     dup
-    1337 swap !
+    1337 !
     dup
     @ puti cr
     4096 munmap drop
@@ -132,10 +132,10 @@ end
 
 word test-struct
     mem-slot
-    dup 111 swap Point.x!
-    dup 222 swap Point.y!
-    dup Point.x@ puti cr
-    Point.y@ puti cr
+    dup 111 !       # Point.x = 111
+    dup 8 + 222 !   # Point.y = 222
+    dup @ puti cr        # print Point.x
+    dup 8 + @ puti cr    # print Point.y
     Point.size puti cr
 end
 

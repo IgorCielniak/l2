@@ -2290,18 +2290,18 @@ class Assembler:
             "%define RSTK_BYTES 65536",
             "%define PRINT_BUF_BYTES 128",
             "global _start",
-            "global argc",
-            "global argv",
+            "global sys_argc",
+            "global sys_argv",
             "section .data",
-            "argc: dq 0",
-            "argv: dq 0",
+            "sys_argc: dq 0",
+            "sys_argv: dq 0",
             "section .text",
             "_start:",
             "    ; Linux x86-64 startup: argc/argv from stack",
             "    mov rdi, [rsp]",         # argc
             "    lea rsi, [rsp+8]",      # argv
-            "    mov [rel argc], rdi",
-            "    mov [rel argv], rsi",
+            "    mov [rel sys_argc], rdi",
+            "    mov [rel sys_argv], rsi",
             "    ; initialize data/return stack pointers",
             "    lea r12, [rel dstack_top]",
             "    mov r15, r12",
@@ -2480,6 +2480,7 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
     for name in reversed(names):
         helper = helper_for[name]
         emitted.append(helper)
+        emitted.append("swap")
         emitted.append("!")
 
     i = 0
@@ -2491,6 +2492,7 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
             next_tok = body[i + 1] if i + 1 < len(body) else None
             if next_tok is not None and next_tok.lexeme == "!":
                 emitted.append(helper)
+                emitted.append("swap")
                 emitted.append("!")
                 i += 2
                 continue
@@ -3210,7 +3212,7 @@ def macro_struct_begin(ctx: MacroContext) -> Optional[List[Op]]:
             generated,
             name_token,
             f"{struct_name}.{field.name}!",
-            [offset_word, "+", "!"],
+            ["swap", offset_word, "+", "swap", "!"],
         )
 
     parser.tokens[parser.pos:parser.pos] = generated

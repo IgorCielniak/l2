@@ -8,6 +8,7 @@ word alloc
     -1     # fd
     0      # offset
     mmap
+    swap drop
 end
 
 word free
@@ -21,7 +22,6 @@ word memcpy #(dst_addr src_addr len -- dst_addr len)
     dup c@
     3 pick swap
     c!
-    drop
     swap
     for
         1 + dup
@@ -33,10 +33,30 @@ word memcpy #(dst_addr src_addr len -- dst_addr len)
         dup
         rot
         c!
-        drop
         swap
     end
     swap
     nip
     r> dup -rot - swap
+end
+
+word memset #( value len addr -- )
+    swap
+    0 swap for
+        -rot swap 2 pick + 2dup swap ! 1 + -rot swap
+    end
+    2drop drop
+end
+
+word memdump #( len addr -- addr )
+    for
+        dup c@ puti cr 1 +
+    end
+end
+
+word realloc #( addr old_len new_len -- new_addr )
+    2 pick swap alloc
+    rot rot swap
+    memcpy
+    swap -rot free
 end

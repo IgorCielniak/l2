@@ -11,8 +11,8 @@
 
 # : argc ( -- n )
 :asm argc {
-	extern argc
-	mov rax, [rel argc]
+	extern sys_argc
+	mov rax, [rel sys_argc]
 	sub r12, 8
 	mov [r12], rax
 	ret
@@ -21,8 +21,8 @@
 
 # : argv ( -- ptr )
 :asm argv {
-	extern argv
-	mov rax, [rel argv]
+	extern sys_argv
+	mov rax, [rel sys_argv]
 	sub r12, 8
 	mov [r12], rax
 	ret
@@ -31,9 +31,9 @@
 
 # : argv@ ( n -- ptr )
 :asm argv@ {
-	extern argv
+	extern sys_argv
 	mov rbx, [r12]      ; n
-	mov rax, [rel argv]
+	mov rax, [rel sys_argv]
 	mov rax, [rax + rbx*8]
 	mov [r12], rax
 	ret
@@ -54,6 +54,7 @@
 	mov rax, [r12]         ; get address from stack
 	add r12, 8             ; pop address
 	mov rbx, [r12]         ; get byte value
+	add r12, 8
 	mov [rbx], al          ; store byte at address
 	ret
 }
@@ -310,11 +311,11 @@
 
 # : ! ( x addr -- )
 :asm ! {
-	mov rax, [r12]         ; get address
-	add r12, 8             ; pop address
-	mov rbx, [r12]         ; get value
-	mov [rax], rbx         ; store value at address
+	mov rax, [r12]         ; get value (TOS)
 	add r12, 8             ; pop value
+	mov rbx, [r12]         ; get addr (NOS)
+	add r12, 8			   ; pop addr
+	mov [rbx], rax         ; store value at address
 }
 ;
 

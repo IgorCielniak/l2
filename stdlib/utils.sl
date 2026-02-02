@@ -99,7 +99,7 @@ word tostr
     dup
     count_digits
     2dup >r alloc
-    nip swap rot swap
+    swap rot swap
     for
         dup 10 % swap 10 /
     end
@@ -114,7 +114,6 @@ word tostr
         2 + pick
         3 pick rot +
         swap 48 + swap 1 - swap c!
-        drop
         swap
         1 +
         swap

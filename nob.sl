@@ -31,25 +31,20 @@ word sh
         0
         c!
 
+        mem
         "/bin/sh" drop
-        0
-        mem +
         !
+        mem 8 +
         "-c" drop
-        8
-        mem +
         !
+        mem 16 +
         0 rpick
-        16
-        mem +
         !
+        mem 24 +
         0
-        24
-        mem +
         !
+        mem 32 +
         0
-        32
-        mem +
         !
 
         syscall.fork

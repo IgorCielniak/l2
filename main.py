@@ -1687,7 +1687,9 @@ def sanitize_label(name: str) -> str:
         else:
             parts.append(f"_{ord(ch):02x}")
     safe = "".join(parts) or "anon"
-    return f"word_{safe}"
+    if safe[0].isdigit():
+        safe = "_" + safe
+    return f"{safe}"
 
 
 def _is_identifier(text: str) -> bool:
@@ -2304,7 +2306,7 @@ class Assembler:
             "    lea r12, [rel dstack_top]",
             "    mov r15, r12",
             "    lea r13, [rel rstack_top]",
-            "    call word_main",
+            "    call main",
             "    mov rax, 0",
             "    cmp r12, r15",
             "    je .no_exit_value",

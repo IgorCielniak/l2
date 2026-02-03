@@ -1,0 +1,1 @@
+python main.py tests/rule110.sl -o ./build/rule110 > /dev/null && ./build/rule110

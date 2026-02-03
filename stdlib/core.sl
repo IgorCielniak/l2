@@ -473,3 +473,165 @@
     mov [r12], rax   ; store result
 }
 ;
+
+# : band ( x1 x2 -- x3 )
+:asm band {
+	mov rax, [r12]         ; get top
+	add r12, 8             ; pop
+	and qword [r12], rax   ; bitwise and
+}
+;
+
+# : bor ( x1 x2 -- x3 )
+:asm bor {
+	mov rax, [r12]         ; get top
+	add r12, 8             ; pop
+	or qword [r12], rax    ; bitwise or
+}
+;
+
+# : bxor ( x1 x2 -- x3 )
+:asm bxor {
+	mov rax, [r12]         ; get top
+	add r12, 8             ; pop
+	xor qword [r12], rax   ; bitwise xor
+}
+;
+
+# : bnot ( x -- x )
+:asm bnot {
+	not qword [r12]        ; bitwise not
+}
+;
+
+# : shl ( x1 x2 -- x3 )
+:asm shl {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	shl qword [r12], cl    ; logical left shift
+}
+;
+
+# : sal ( x1 x2 -- x3 )
+:asm sal {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	sal qword [r12], cl    ; arithmetic left shift (same as shl)
+}
+;
+
+# : shr ( x1 x2 -- x3 )
+:asm shr {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	shr qword [r12], cl    ; logical right shift
+}
+;
+
+# : sar ( x1 x2 -- x3 )
+:asm sar {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	sar qword [r12], cl    ; arithmetic right shift
+}
+;
+
+# : rol ( x1 x2 -- x3 )
+:asm rol {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	rol qword [r12], cl    ; rotate left
+}
+;
+
+# : ror ( x1 x2 -- x3 )
+:asm ror {
+	mov rcx, [r12]         ; shift count
+	add r12, 8             ; pop
+	ror qword [r12], cl    ; rotate right
+}
+;
+
+# : inc ( x -- x+1 )
+:asm inc {
+	inc qword [r12]
+}
+;
+
+# : dec ( x -- x-1 )
+:asm dec {
+	dec qword [r12]
+}
+;
+
+# : min ( x1 x2 -- x3 )
+:asm min {
+	mov rax, [r12]         ; x2
+	add r12, 8             ; pop
+	mov rbx, [r12]         ; x1
+	cmp rbx, rax
+	cmovg rbx, rax         ; if x1 > x2, pick x2
+	mov [r12], rbx
+}
+;
+
+# : max ( x1 x2 -- x3 )
+:asm max {
+	mov rax, [r12]         ; x2
+	add r12, 8             ; pop
+	mov rbx, [r12]         ; x1
+	cmp rbx, rax
+	cmovl rbx, rax         ; if x1 < x2, pick x2
+	mov [r12], rbx
+}
+;
+
+# : clamp ( x lo hi -- y )
+:asm clamp {
+	mov rax, [r12]         ; hi
+	mov rbx, [r12 + 8]     ; lo
+	mov rcx, [r12 + 16]    ; x
+	cmp rcx, rbx
+	cmovl rcx, rbx         ; if x < lo -> lo
+	cmp rcx, rax
+	cmovg rcx, rax         ; if x > hi -> hi
+	mov [r12 + 16], rcx
+	add r12, 16            ; drop lo, hi
+}
+;
+
+# : time ( -- t )
+:asm time {
+	mov rax, 201           ; syscall: time
+	xor rdi, rdi
+	syscall
+	sub r12, 8
+	mov [r12], rax
+	ret
+}
+;
+
+# : rand ( -- n )
+:asm rand {
+	lea rbx, [rel persistent]
+	mov rax, [rbx]         ; state
+	test rax, rax
+	jne .seeded
+	; seed with time()
+	mov rax, 201           ; syscall: time
+	xor rdi, rdi
+	syscall
+	mov [rbx], rax
+.seeded:
+	mov rax, [rbx]
+	mov rcx, 1103515245
+	imul rax, rcx
+	add rax, 12345
+	mov [rbx], rax
+	shr rax, 16
+	and rax, 0x7fff
+	sub r12, 8
+	mov [r12], rax
+	ret
+}
+;

@@ -33,23 +33,14 @@ end
 
 # : strlen ( addr -- len )
 # for null terminated strings
-
-:asm strlen {
-	mov rsi, [r12]      ; address
-	xor rcx, rcx        ; length counter
-.strlen_loop:
-	mov al, [rsi]
-	test al, al
-	jz .strlen_done
-	inc rcx
-	inc rsi
-	jmp .strlen_loop
-.strlen_done:
-	mov rax, rcx
-	mov [r12], rax      ; store length on stack
-	ret
-}
-;
+word strlen
+    0 swap                  # len addr
+    while dup c@ 0 != do
+        1 +                 # addr++
+        swap 1 + swap       # len++
+    end
+    drop                    # drop addr, leave len
+end
 
 word digitsN>num  # ( d_{n-1} ... d0 n -- value ), digits bottom=MSD, top=LSD, length on top (MSD-most significant digit, LSD-least significant digit)
     0 swap        # place accumulator below length

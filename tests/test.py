@@ -2,6 +2,8 @@
 import sys
 import os
 import subprocess
+import platform
+import re
 
 COLORS = {
     "red": "\033[91m",
@@ -13,6 +15,22 @@ COLORS = {
 
 def print_colored(text, color):
     print(COLORS.get(color, "") + text + COLORS["reset"], end="")
+
+def _is_arm_host():
+    machine = platform.machine().lower()
+    return machine.startswith("arm") or machine.startswith("aarch")
+
+def _wrap_qemu_for_arm(command):
+    if "qemu-x86_64" in command:
+        return command
+    pattern = re.compile(r"(^|\s*(?:&&|;)\s*)(\./\S+)")
+
+    def _repl(match):
+        prefix = match.group(1)
+        binary = match.group(2)
+        return f"{prefix}qemu-x86_64 {binary}"
+
+    return pattern.sub(_repl, command)
 
 def run_tests():
     test_dir = "tests"
@@ -39,7 +57,8 @@ def run_tests():
                 expected_output = expected_file.read().strip()
 
             try:
-                result = subprocess.run(command, shell=True, text=True, capture_output=True)
+                run_command = _wrap_qemu_for_arm(command) if _is_arm_host() else command
+                result = subprocess.run(run_command, shell=True, text=True, capture_output=True)
                 actual_output = result.stdout.strip()
                 stderr_output = result.stderr.strip()
 

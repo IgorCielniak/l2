@@ -1454,95 +1454,99 @@ class CompileTimeVM:
         label_positions = self._label_positions(nodes)
         loop_pairs = self._for_pairs(nodes)
         begin_pairs = self._begin_pairs(nodes)
+        prev_loop_stack = self.loop_stack
         self.loop_stack = []
         begin_stack: List[Dict[str, int]] = []
         ip = 0
-        while ip < len(nodes):
-            node = nodes[ip]
-            kind = node.op
-            data = node.data
+        try:
+            while ip < len(nodes):
+                node = nodes[ip]
+                kind = node.op
+                data = node.data
 
-            if kind == "literal":
-                self.push(data)
-                ip += 1
-                continue
-
-            if kind == "word":
-                name = str(data)
-                if name == "begin":
-                    end_idx = begin_pairs.get(ip)
-                    if end_idx is None:
-                        raise ParseError("'begin' without matching 'again'")
-                    begin_stack.append({"begin": ip, "end": end_idx})
+                if kind == "literal":
+                    self.push(data)
                     ip += 1
                     continue
-                if name == "again":
-                    if not begin_stack or begin_stack[-1]["end"] != ip:
-                        raise ParseError("'again' without matching 'begin'")
-                    ip = begin_stack[-1]["begin"] + 1
-                    continue
-                if name == "continue":
-                    if not begin_stack:
-                        raise ParseError("'continue' outside begin/again loop")
-                    ip = begin_stack[-1]["begin"] + 1
-                    continue
-                if name == "exit":
-                    if begin_stack:
-                        frame = begin_stack.pop()
-                        ip = frame["end"] + 1
+
+                if kind == "word":
+                    name = str(data)
+                    if name == "begin":
+                        end_idx = begin_pairs.get(ip)
+                        if end_idx is None:
+                            raise ParseError("'begin' without matching 'again'")
+                        begin_stack.append({"begin": ip, "end": end_idx})
+                        ip += 1
                         continue
-                    return
-                self._call_word_by_name(name)
-                ip += 1
-                continue
-
-            if kind == "branch_zero":
-                condition = self.pop()
-                if isinstance(condition, bool):
-                    flag = condition
-                elif isinstance(condition, int):
-                    flag = condition != 0
-                else:
-                    raise ParseError("branch expects integer or boolean condition")
-                if not flag:
-                    ip = self._jump_to_label(label_positions, str(data))
-                else:
+                    if name == "again":
+                        if not begin_stack or begin_stack[-1]["end"] != ip:
+                            raise ParseError("'again' without matching 'begin'")
+                        ip = begin_stack[-1]["begin"] + 1
+                        continue
+                    if name == "continue":
+                        if not begin_stack:
+                            raise ParseError("'continue' outside begin/again loop")
+                        ip = begin_stack[-1]["begin"] + 1
+                        continue
+                    if name == "exit":
+                        if begin_stack:
+                            frame = begin_stack.pop()
+                            ip = frame["end"] + 1
+                            continue
+                        return
+                    self._call_word_by_name(name)
                     ip += 1
-                continue
-
-            if kind == "jump":
-                ip = self._jump_to_label(label_positions, str(data))
-                continue
-
-            if kind == "label":
-                ip += 1
-                continue
-
-            if kind == "for_begin":
-                count = self.pop_int()
-                if count <= 0:
-                    match = loop_pairs.get(ip)
-                    if match is None:
-                        raise ParseError("internal loop bookkeeping error")
-                    ip = match + 1
                     continue
-                self.loop_stack.append({"remaining": count, "begin": ip, "initial": count})
-                ip += 1
-                continue
 
-            if kind == "for_end":
-                if not self.loop_stack:
-                    raise ParseError("'next' without matching 'for'")
-                frame = self.loop_stack[-1]
-                frame["remaining"] -= 1
-                if frame["remaining"] > 0:
-                    ip = frame["begin"] + 1
+                if kind == "branch_zero":
+                    condition = self.pop()
+                    if isinstance(condition, bool):
+                        flag = condition
+                    elif isinstance(condition, int):
+                        flag = condition != 0
+                    else:
+                        raise ParseError("branch expects integer or boolean condition")
+                    if not flag:
+                        ip = self._jump_to_label(label_positions, str(data))
+                    else:
+                        ip += 1
                     continue
-                self.loop_stack.pop()
-                ip += 1
-                continue
 
-            raise ParseError(f"unsupported compile-time op {node!r}")
+                if kind == "jump":
+                    ip = self._jump_to_label(label_positions, str(data))
+                    continue
+
+                if kind == "label":
+                    ip += 1
+                    continue
+
+                if kind == "for_begin":
+                    count = self.pop_int()
+                    if count <= 0:
+                        match = loop_pairs.get(ip)
+                        if match is None:
+                            raise ParseError("internal loop bookkeeping error")
+                        ip = match + 1
+                        continue
+                    self.loop_stack.append({"remaining": count, "begin": ip, "initial": count})
+                    ip += 1
+                    continue
+
+                if kind == "for_end":
+                    if not self.loop_stack:
+                        raise ParseError("'next' without matching 'for'")
+                    frame = self.loop_stack[-1]
+                    frame["remaining"] -= 1
+                    if frame["remaining"] > 0:
+                        ip = frame["begin"] + 1
+                        continue
+                    self.loop_stack.pop()
+                    ip += 1
+                    continue
+
+                raise ParseError(f"unsupported compile-time op {node!r}")
+        finally:
+            self.loop_stack = prev_loop_stack
 
     def _label_positions(self, nodes: Sequence[Op]) -> Dict[str, int]:
         positions: Dict[str, int] = {}

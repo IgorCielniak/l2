@@ -1,10 +1,10 @@
 
-# : strcmp ( addr len addr len -- bool addr len addr len)
+#strcmp [*, addr, len, addr | len] -> [*, addr, len, addr, len | bool]
 word strcmp
     3 pick 2 pick @ swap @ ==
 end
 
-# : strconcat ( addr len addr len -- addr len)
+#strconcat [*, addr, len, addr | len] -> [*, addr | len]
 word strconcat
     0 pick 3 pick +
     dup
@@ -31,7 +31,7 @@ word strconcat
     rdrop rdrop rdrop
 end
 
-# : strlen ( addr -- len )
+#strlen [* | addr] -> [* | len]
 # for null terminated strings
 word strlen
     0 swap                  # len addr
@@ -42,7 +42,8 @@ word strlen
     drop                    # drop addr, leave len
 end
 
-word digitsN>num  # ( d_{n-1} ... d0 n -- value ), digits bottom=MSD, top=LSD, length on top (MSD-most significant digit, LSD-least significant digit)
+#digitsN>num [*, d_{n-1}, d0 | n] -> [* | value]
+word digitsN>num  # digits bottom=MSD, top=LSD, length on top (MSD-most significant digit, LSD-least significant digit)
     0 swap        # place accumulator below length
     for           # loop n times using the length on top
         r@ pick   # fetch next digit starting from MSD (uses loop counter as index)
@@ -52,7 +53,8 @@ word digitsN>num  # ( d_{n-1} ... d0 n -- value ), digits bottom=MSD, top=LSD, l
     end
 end
 
-# : toint (addr len -- int ) converts a string to an int
+#toint [*, addr | len] -> [* | int]
+# converts a string to an int
 word toint
     swap
     over 0 swap
@@ -75,7 +77,8 @@ word toint
     rdrop rdrop
 end
 
-# : count_digits ( int -- int) returns the amount of digits of an int
+#count_digits [* | int] -> [* | int]
+# returns the amount of digits of an int
 word count_digits
     0
     swap
@@ -85,7 +88,8 @@ word count_digits
     drop
 end
 
-# : tostr ( int -- addr len ) the function allocates a buffer to remember to free it
+#tostr [* | int] -> [*, addr | len]
+# the function allocates a buffer, remember to free it
 word tostr
     dup
     count_digits

@@ -1,4 +1,5 @@
-word call-syntax-rewrite            # ( fnameToken -- handled )
+#call-syntax-rewrite [* | fnameToken] -> [* | handled]
+word call-syntax-rewrite
 	dup token-lexeme identifier? 0 == if drop 0 exit end
 	peek-token dup nil? if drop drop 0 exit end
 	dup token-lexeme "(" string= 0 == if drop drop 0 exit end

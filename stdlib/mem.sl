@@ -1,5 +1,6 @@
 import stdlib.sl
 
+#alloc [* | size] -> [* | addr]
 word alloc
     0      # addr hint (NULL)
     swap   # size
@@ -11,11 +12,13 @@ word alloc
     swap drop
 end
 
+#free [*, addr | size] -> [*]
 word free
     munmap drop
 end
 
-word memcpy #(dst_addr src_addr len -- dst_addr len)
+#memcpy [*, dst_addr, src_addr | len] -> [*, dst_addr | len]
+word memcpy
     dup
     >r
     swap
@@ -40,7 +43,8 @@ word memcpy #(dst_addr src_addr len -- dst_addr len)
     r> dup -rot - swap
 end
 
-word memset #( value len addr -- )
+#memset [*, value, len | addr] -> [*]
+word memset
     swap
     0 swap for
         -rot swap 2 pick + 2dup swap ! 1 + -rot swap
@@ -48,13 +52,15 @@ word memset #( value len addr -- )
     2drop drop
 end
 
-word memdump #( len addr -- addr )
+#memdump [*, len | addr] -> [* | addr]
+word memdump
     for
         dup c@ puti cr 1 +
     end
 end
 
-word realloc #( addr old_len new_len -- new_addr )
+#realloc [*, addr, old_len | new_len] -> [* | new_addr]
+word realloc
     2 pick swap alloc
     rot rot swap
     memcpy

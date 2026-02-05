@@ -21,6 +21,13 @@ This document reflects the implementation that ships in this repository today (`
 - **Lists** – `[` begins a list literal, `]` ends it. The compiler captures the intervening stack segment into a freshly `mmap`'d buffer that stores `(len followed by qword items)`, drops the captured values, and pushes the buffer address. Users must `munmap` the buffer when done.
 - **Token customization** – Immediate words can call `add-token` or `add-token-chars` to teach the reader about new multi-character tokens. `fn.sl` uses this in combination with token hooks to recognize `foo(1, 2)` syntax.
 
+### Stack-effect comments
+- **Location and prefix** – Public words in `stdlib/` (and most user code should) document its stack effect with a line comment directly above the definition: `#word_name …`.
+- **Before/after form** – Use `[before] -> [after]`, where each side is a comma-separated list. Items sitting to the left of `|` are deeper in the stack; the segment to the right of `|` runs all the way to the current top-of-stack. Omit the `|` only when a side is empty (`[*]`).
+- **Tail sentinel** – `*` represents the untouched rest of the stack. By convention it is always the first entry on each side so readers can quickly see which values are consumed/produced.
+- **Alternatives** – Separate multiple outcomes with `||`. Each branch repeats the `[before] -> [after]` structure (e.g., `#read_file [*, path | len] -> [*, addr | len] || [*, tag | neg_errno]`).
+- **Examples** – `#dup [* | x] -> [*, x | x]` means a word consumes the top value `x` and returns two copies with the newest copy at TOS; `#arr_pop [* | arr] -> [*, arr | x]` states that the array pointer remains just below the popped element. This notation keeps stack order resonably easy to read and grep.
+
 ## 4. Runtime Model
 - **Stacks** – `r12` holds the data stack pointer, `r13` the return stack pointer. Both live in `.bss` buffers sized by `DSTK_BYTES`/`RSTK_BYTES` (default 64 KiB each). `stdlib/core.sl` implements all standard stack shuffles, arithmetic, comparisons, boolean ops, `@`/`!`, `c@`/`c!`, and return-stack transfers (`>r`, `r>`, `rdrop`, `rpick`).
 - **Calling convention** – Words call each other using the System V ABI. `extern` words marshal arguments into registers before `call symbol`, then push results back onto the data stack. Integer results come from `rax`; floating results come from `xmm0` and are copied into a qword slot.

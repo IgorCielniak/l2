@@ -11,7 +11,7 @@
 
 import mem.sl
 
-# : arr_new ( cap -- arr )
+#arr_new [* | cap] -> [* | arr]
 # Create a new array with given initial capacity (minimum 1)
 word arr_new
     dup 1 < if drop 1 end
@@ -22,21 +22,21 @@ word arr_new
     nip
 end
 
-# : arr_len ( arr -- len )
+#arr_len [* | arr] -> [* | len]
 word arr_len @ end
 
-# : arr_cap ( arr -- cap )
+#arr_cap [* | arr] -> [* | cap]
 word arr_cap 8 + @ end
 
-# : arr_data ( arr -- ptr )
+#arr_data [* | arr] -> [* | ptr]
 word arr_data 16 + @ end
 
-# : arr_free ( arr -- )
+#arr_free [* | arr] -> [*]
 word arr_free
     dup arr_cap 8 * 24 + free
 end
 
-# Helper: copy n qwords from src to dst (dst src n --)
+# Helper: copy n qwords from src to dst [*, dst, src | n] -> [*]
 word arr_copy_elements
     while dup 0 > do
         over @ 3 pick swap !   # dst = *src
@@ -47,7 +47,7 @@ word arr_copy_elements
     drop 2drop
 end
 
-# : arr_reserve ( cap arr -- arr )
+#arr_reserve [*, cap | arr] -> [* | arr]
 # Ensures capacity >= cap; returns (possibly moved) arr pointer.
 word arr_reserve
     swap dup 1 < if drop 1 end swap   # reqcap arr
@@ -77,7 +77,7 @@ word arr_reserve
     end
 end
 
-# : arr_push ( x arr -- arr )
+#arr_push [*, x | arr] -> [* | arr]
 # Push element onto array, growing if needed
 word arr_push
     dup arr_len over arr_cap >= if
@@ -94,27 +94,26 @@ word arr_push
     dup @ 1 + over swap !
 end
 
-# : arr_pop ( arr -- x arr )
+#arr_pop [* | arr] -> [*, arr | x]
 # Pop element from array (returns 0 if empty)
 word arr_pop
     dup arr_len 0 == if
-        0 swap
+        0
     else
         # Decrement len
         dup @ 1 - over swap !
         # Get element at new len position
         dup arr_data over arr_len 8 * + @
-        swap
     end
 end
 
-# : arr_get ( i arr -- x )
+#arr_get [*, i | arr] -> [* | x]
 # Get element at index i
 word arr_get
     arr_data swap 8 * + @
 end
 
-# : arr_set ( x i arr -- )
+#arr_set [*, x, i | arr] -> [*]
 # Set element at index i to x
 word arr_set
     arr_data swap 8 * + swap !

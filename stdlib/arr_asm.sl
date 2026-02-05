@@ -9,7 +9,7 @@
 # Allocation: mmap; free: munmap.
 # Growth: allocate new block, copy elements, munmap old block.
 
-# : arr_new ( cap -- arr )
+#arr_new [* | cap] -> [* | arr]
 :asm arr_new {
 	mov r14, [r12]        ; requested cap
 	cmp r14, 1
@@ -42,7 +42,7 @@
 }
 ;
 
-# : arr_len ( arr -- len )
+#arr_len [* | arr] -> [* | len]
 :asm arr_len {
 	mov rax, [r12]
 	mov rax, [rax]
@@ -51,7 +51,7 @@
 }
 ;
 
-# : arr_cap ( arr -- cap )
+#arr_cap [* | arr] -> [* | cap]
 :asm arr_cap {
 	mov rax, [r12]
 	mov rax, [rax + 8]
@@ -60,7 +60,7 @@
 }
 ;
 
-# : arr_data ( arr -- ptr )
+#arr_data [* | arr] -> [* | ptr]
 :asm arr_data {
 	mov rax, [r12]
 	mov rax, [rax + 16]
@@ -69,7 +69,7 @@
 }
 ;
 
-# : arr_free ( arr -- )
+#arr_free [* | arr] -> [*]
 :asm arr_free {
 	mov rbx, [r12]        ; base
 	mov rcx, [rbx + 8]    ; cap
@@ -84,7 +84,7 @@
 }
 ;
 
-# : arr_reserve ( cap arr -- arr )
+#arr_reserve [*, cap | arr] -> [* | arr]
 # Ensures capacity >= cap; returns (possibly moved) arr pointer.
 :asm arr_reserve {
 	mov rbx, [r12]        ; arr
@@ -151,7 +151,7 @@
 }
 ;
 
-# : arr_push ( x arr -- arr )
+#arr_push [*, x | arr] -> [* | arr]
 :asm arr_push {
 	mov rbx, [r12]        ; arr
 	mov rcx, [rbx]        ; len
@@ -227,7 +227,7 @@
 }
 ;
 
-# : arr_pop ( arr -- x arr )
+#arr_pop [* | arr] -> [*, arr | x]
 :asm arr_pop {
 	mov rbx, [r12]        ; arr
 	mov rcx, [rbx]        ; len

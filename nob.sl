@@ -2,7 +2,7 @@ import stdlib/stdlib.sl
 import stdlib/linux.sl
 import stdlib/mem.sl
 
-# sh ( cmd_addr cmd_len -- exit_code | neg_errno )
+# sh  [*, cmd_addr | cmd_len ] -> [* | exit_code ]
 word sh
     swap
     >r                       # save cmd_addr

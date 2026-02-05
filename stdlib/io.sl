@@ -1,8 +1,8 @@
 # L2 IO Primitives
 
-# : read_file ( path_addr path_len -- addr len | 0 0 )
+#read_file [*, path_addr | path_len] -> [*, addr | len] || [*, tag | neg_errno]
 #   Reads the file at the given path (pointer+length, not null-terminated),
-#   returns (addr len) of mapped file, or (0 0) on error.
+#   returns (addr len) of mapped file, or (tag neg_errno) on error.
 
 :asm read_file {
 	; stack: path_addr (NOS), path_len (TOS)
@@ -79,7 +79,7 @@
 }
 ;
 
-# : write_file ( path_ptr path_len buf_ptr buf_len -- bytes_written | neg_errno )
+#write_file [*, path_ptr, path_len, buf_ptr | buf_len] -> [* | bytes_written] || [* | neg_errno]
 :asm write_file {
 	; stack: path_addr, path_len, buf_addr, buf_len (TOS)
 	mov r13, [r12]        ; buf_len
@@ -132,7 +132,7 @@
 }
 ;
 
-# : read_stdin ( max_len -- addr len | neg_errno 0 )
+#read_stdin [* | max_len] -> [*, addr | len] || [*, tag | neg_errno]
 :asm read_stdin {
 	; stack: max_len
 	mov r14, [r12]        ; max_len
@@ -268,7 +268,7 @@
 }
 ;
 
-# : write_buf ( addr len -- )
+#write_buf [*, addr | len] -> [*]
 :asm write_buf (effects string-io) {
 	mov rdx, [r12]        ; len
 	mov rsi, [r12 + 8]    ; addr
@@ -280,7 +280,7 @@
 }
 ;
 
-# : ewrite_buf ( addr len -- )
+#ewrite_buf [*, addr | len] -> [*]
 :asm ewrite_buf (effects string-io) {
 	mov rdx, [r12]        ; len
 	mov rsi, [r12 + 8]    ; addr
@@ -292,7 +292,7 @@
 }
 ;
 
-# : putc ( char -- )
+#putc [* | char] -> [*]
 :asm putc {
 	mov rax, [r12]
 	add r12, 8
@@ -306,7 +306,7 @@
 }
 ;
 
-# : puti ( int -- )
+#puti [* | int] -> [*]
 :asm puti {
 	mov rax, [r12]      ; get int
 	add r12, 8          ; pop

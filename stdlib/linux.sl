@@ -2,7 +2,7 @@
 # Provides syscall constants and helpers for L2 programs
 
 # swap impl is provided so this can be used without the need for stdlib
-# : ___linux_swap ( x1 x2 -- x2 x1 )
+#___linux_swap [*, x1 | x2] -> [*, x2 | x1]
 :asm ___linux_swap {
 	mov rax, [r12]         ; get top
 	mov rbx, [r12 + 8]     ; get second

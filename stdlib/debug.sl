@@ -1,7 +1,7 @@
 import stdlib.sl
 import io.sl
 
-# : dump ( n -- )
+#dump [* | n] -> [*]
 
 # dump takes the firts element from the stack
 # and prints that much consequent elements
@@ -28,7 +28,7 @@ word rdump
 	drop
 end
 
-# : int3 ( -- )
+#int3 [*] -> [*]
 :asm int3 {
 	int3
 }

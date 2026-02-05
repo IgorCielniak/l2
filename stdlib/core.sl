@@ -2,6 +2,7 @@
 # persistent: resb 64
 # push the addr of it
 
+#mem [*] -> [* | ptr]
 :asm mem {
 	lea rax, [rel persistent]
 	sub r12, 8
@@ -9,7 +10,7 @@
 }
 ;
 
-# : argc ( -- n )
+#argc [*] -> [* | n]
 :asm argc {
 	extern sys_argc
 	mov rax, [rel sys_argc]
@@ -19,7 +20,7 @@
 }
 ;
 
-# : argv ( -- ptr )
+#argv [*] -> [* | ptr]
 :asm argv {
 	extern sys_argv
 	mov rax, [rel sys_argv]
@@ -29,7 +30,7 @@
 }
 ;
 
-# : argv@ ( n -- ptr )
+#argv@ [* | n] -> [* | ptr]
 :asm argv@ {
 	extern sys_argv
 	mov rbx, [r12]      ; n
@@ -40,7 +41,7 @@
 }
 ;
 
-# : c@ ( addr -- byte )
+#c@ [* | addr] -> [* | byte]
 :asm c@ {
 	mov rax, [r12]         ; get address from stack
 	movzx rax, byte [rax]  ; load byte at address, zero-extend to rax
@@ -49,7 +50,7 @@
 }
 ;
 
-# : c! ( byte addr -- )
+#c! [*, byte | addr] -> [*]
 :asm c! {
 	mov rax, [r12]         ; get address from stack
 	add r12, 8             ; pop address
@@ -60,7 +61,7 @@
 }
 ;
 
-# : r@ ( -- x )
+#r@ [*] -> [* | x]
 :asm r@ {
 	mov rax, [r13]         ; get value from return stack
 	sub r12, 8             ; make room on data stack
@@ -69,7 +70,7 @@
 }
 ;
 
-# : dup ( x -- x x )
+#dup [* | x] -> [*, x | x]
 :asm dup {
 	mov rax, [r12]         ; get top of stack
 	sub r12, 8             ; make room
@@ -77,13 +78,13 @@
 }
 ;
 
-# : drop ( x -- )
+#drop [* | x] -> [*]
 :asm drop {
 	add r12, 8             ; remove top of stack
 }
 ;
 
-# : over ( x1 x2 -- x1 x2 x1 )
+#over [*, x1 | x2] -> [*, x1, x2 | x1]
 :asm over {
 	mov rax, [r12 + 8]     ; get second item
 	sub r12, 8              ; make room
@@ -91,7 +92,7 @@
 }
 ;
 
-# : swap ( x1 x2 -- x2 x1 )
+#swap [*, x1 | x2] -> [*, x2 | x1]
 :asm swap {
 	mov rax, [r12]         ; get top
 	mov rbx, [r12 + 8]     ; get second
@@ -100,7 +101,7 @@
 }
 ;
 
-# : rot ( x1 x2 x3 -- x2 x3 x1 )
+#rot [*, x1, x2 | x3] -> [*, x2, x3 | x1]
 :asm rot {
 	mov rax, [r12]         ; x3 (top)
 	mov rbx, [r12 + 8]     ; x2
@@ -111,7 +112,7 @@
 }
 ;
 
-# : -rot ( x1 x2 x3 -- x3 x1 x2 )
+#-rot [*, x1, x2 | x3] -> [*, x3, x1 | x2]
 :asm -rot {
 	mov rax, [r12]         ; x3 (top)
 	mov rbx, [r12 + 8]     ; x2
@@ -122,7 +123,7 @@
 }
 ;
 
-# : nip ( x1 x2 -- x2 )
+#nip [*, x1 | x2] -> [* | x2]
 :asm nip {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; drop lower
@@ -130,7 +131,7 @@
 }
 ;
 
-# : tuck ( x1 x2 -- x2 x1 x2 )
+#tuck [*, x1 | x2] -> [*, x2, x1 | x2]
 :asm tuck {
 	mov rax, [r12]         ; x2 (top)
 	mov rbx, [r12 + 8]     ; x1
@@ -141,7 +142,7 @@
 }
 ;
 
-# : 2dup ( x1 x2 -- x1 x2 x1 x2 )
+#2dup [*, x1 | x2] -> [*, x1, x2, x1 | x2]
 :asm 2dup {
 	mov rax, [r12]         ; b (top)
 	mov rbx, [r12 + 8]     ; a
@@ -152,13 +153,13 @@
 }
 ;
 
-# : 2drop ( x1 x2 -- )
+#2drop [*, x1 | x2] -> [*]
 :asm 2drop {
 	add r12, 16            ; remove two items
 }
 ;
 
-# : 2swap ( x1 x2 x3 x4 -- x3 x4 x1 x2 )
+#2swap [*, x1, x2, x3 | x4] -> [*, x3, x4, x1 | x2]
 :asm 2swap {
 	mov rax, [r12]         ; d (top)
 	mov rbx, [r12 + 8]     ; c
@@ -171,7 +172,7 @@
 }
 ;
 
-# : 2over ( x1 x2 x3 x4 -- x3 x4 x1 x2 x3 x4 )
+#2over [*, x1, x2, x3 | x4] -> [*, x3, x4, x1, x2, x3 | x4]
 :asm 2over {
 	mov rax, [r12 + 16]    ; b
 	mov rbx, [r12 + 24]    ; a
@@ -182,7 +183,7 @@
 }
 ;
 
-# : + ( x1 x2 -- x3 )
+#+ [*, x1 | x2] -> [* | x3]
 :asm + {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -190,7 +191,7 @@
 }
 ;
 
-# : - ( x1 x2 -- x3 )
+#- [*, x1 | x2] -> [* | x3]
 :asm - {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -198,7 +199,7 @@
 }
 ;
 
-# : * ( x1 x2 -- x3 )
+#* [*, x1 | x2] -> [* | x3]
 :asm * {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -207,7 +208,7 @@
 }
 ;
 
-# : / ( x1 x2 -- x3 )
+#/ [*, x1 | x2] -> [* | x3]
 :asm / {
 	mov rbx, [r12]         ; divisor
 	add r12, 8             ; pop
@@ -218,7 +219,7 @@
 }
 ;
 
-# : % ( x1 x2 -- x3 )
+#% [*, x1 | x2] -> [* | x3]
 :asm % {
 	mov rbx, [r12]         ; divisor
 	add r12, 8             ; pop
@@ -229,7 +230,7 @@
 }
 ;
 
-# : == ( x1 x2 -- flag )
+#== [*, x1 | x2] -> [* | flag]
 :asm == {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -241,7 +242,7 @@
 }
 ;
 
-# : != ( x1 x2 -- flag )
+#!= [*, x1 | x2] -> [* | flag]
 :asm != {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -253,7 +254,7 @@
 }
 ;
 
-# : < ( x1 x2 -- flag )
+#< [*, x1 | x2] -> [* | flag]
 :asm < {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -265,7 +266,7 @@
 }
 ;
 
-# : > ( x1 x2 -- flag )
+#> [*, x1 | x2] -> [* | flag]
 :asm > {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -277,7 +278,7 @@
 }
 ;
 
-# : <= ( x1 x2 -- flag )
+#<= [*, x1 | x2] -> [* | flag]
 :asm <= {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -289,7 +290,7 @@
 }
 ;
 
-# : >= ( x1 x2 -- flag )
+#>= [*, x1 | x2] -> [* | flag]
 :asm >= {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -301,7 +302,7 @@
 }
 ;
 
-# : @ ( addr -- x )
+#@ [* | addr] -> [* | x]
 :asm @ {
 	mov rax, [r12]         ; get address
 	mov rax, [rax]         ; load value
@@ -309,7 +310,7 @@
 }
 ;
 
-# : ! ( x addr -- )
+#! [*, x | addr] -> [*]
 :asm ! {
 	mov rax, [r12]         ; get value (TOS)
 	add r12, 8             ; pop value
@@ -319,7 +320,7 @@
 }
 ;
 
-# : mmap ( addr len prot flags fd offset -- addr )
+#mmap [*, addr, len, prot, flags, fd | offset] -> [* | addr]
 :asm mmap {
 	mov r9, [r12]          ; offset
 	add r12, 8
@@ -339,7 +340,7 @@
 }
 ;
 
-# : munmap ( addr len -- res )
+#munmap [*, addr | len] -> [* | res]
 :asm munmap {
 	mov rsi, [r12]         ; len
 	add r12, 8
@@ -352,7 +353,7 @@
 }
 ;
 
-# : exit ( code -- )
+#exit [* | code] -> [*]
 :asm exit {
 	mov rdi, [r12]         ; exit code
 	add r12, 8
@@ -361,7 +362,7 @@
 }
 ;
 
-# : and ( x1 x2 -- flag )
+#and [*, x1 | x2] -> [* | flag]
 :asm and {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -377,7 +378,7 @@
 }
 ;
 
-# : or ( x1 x2 -- flag )
+#or [*, x1 | x2] -> [* | flag]
 :asm or {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -393,7 +394,7 @@
 }
 ;
 
-# : not ( x -- flag )
+#not [* | x] -> [* | flag]
 :asm not {
 	mov rax, [r12]         ; get value
 	test rax, rax
@@ -403,7 +404,7 @@
 }
 ;
 
-# : >r ( x -- )
+#>r [* | x] -> [*]
 :asm >r {
 	mov rax, [r12]         ; get value
 	add r12, 8             ; pop
@@ -412,7 +413,7 @@
 }
 ;
 
-# : r> ( -- x )
+#r> [*] -> [* | x]
 :asm r> {
 	mov rax, [r13]         ; get value from return stack
 	add r13, 8             ; pop return stack
@@ -421,13 +422,13 @@
 }
 ;
 
-# : rdrop ( -- )
+#rdrop [*] -> [*]
 :asm rdrop {
 	add r13, 8             ; pop return stack
 }
 ;
 
-# : pick ( n -- x )
+#pick [* | n] -> [* | x]
 :asm pick {
 	mov rcx, [r12]         ; get index
 	add r12, 8             ; pop
@@ -437,7 +438,7 @@
 }
 ;
 
-# : rpick ( n -- x )
+#rpick [* | n] -> [* | x]
 :asm rpick {
 	mov rcx, [r12]         ; get index
 	add r12, 8             ; pop
@@ -447,7 +448,7 @@
 }
 ;
 
-# : neg ( x -- -x )
+#neg [* | x] -> [* | -x]
 :asm neg {
     mov rax, [r12]   ; get value
     neg rax          ; arithmetic negation
@@ -455,7 +456,7 @@
 }
 ;
 
-# : abs ( x -- |x| )
+#abs [* | x] -> [* | |x|]
 :asm abs {
 	mov rax, [r12]   ; get value
 	test rax, rax    ; check sign
@@ -466,7 +467,7 @@
 }
 ;
 
-# : bitnot ( 0|1 -- 1|0 )
+#bitnot [* | bool] -> [* | bool]
 :asm bitnot {
     mov rax, [r12]   ; get value
     xor rax, 1       ; flip lowest bit
@@ -474,7 +475,7 @@
 }
 ;
 
-# : band ( x1 x2 -- x3 )
+#band [*, x1 | x2] -> [* | x3]
 :asm band {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -482,7 +483,7 @@
 }
 ;
 
-# : bor ( x1 x2 -- x3 )
+#bor [*, x1 | x2] -> [* | x3]
 :asm bor {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -490,7 +491,7 @@
 }
 ;
 
-# : bxor ( x1 x2 -- x3 )
+#bxor [*, x1 | x2] -> [* | x3]
 :asm bxor {
 	mov rax, [r12]         ; get top
 	add r12, 8             ; pop
@@ -498,13 +499,13 @@
 }
 ;
 
-# : bnot ( x -- x )
+#bnot [* | x] -> [* | x]
 :asm bnot {
 	not qword [r12]        ; bitwise not
 }
 ;
 
-# : shl ( x1 x2 -- x3 )
+#shl [*, x1 | x2] -> [* | x3]
 :asm shl {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -512,7 +513,7 @@
 }
 ;
 
-# : sal ( x1 x2 -- x3 )
+#sal [*, x1 | x2] -> [* | x3]
 :asm sal {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -520,7 +521,7 @@
 }
 ;
 
-# : shr ( x1 x2 -- x3 )
+#shr [*, x1 | x2] -> [* | x3]
 :asm shr {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -528,7 +529,7 @@
 }
 ;
 
-# : sar ( x1 x2 -- x3 )
+#sar [*, x1 | x2] -> [* | x3]
 :asm sar {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -536,7 +537,7 @@
 }
 ;
 
-# : rol ( x1 x2 -- x3 )
+#rol [*, x1 | x2] -> [* | x3]
 :asm rol {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -544,7 +545,7 @@
 }
 ;
 
-# : ror ( x1 x2 -- x3 )
+#ror [*, x1 | x2] -> [* | x3]
 :asm ror {
 	mov rcx, [r12]         ; shift count
 	add r12, 8             ; pop
@@ -552,19 +553,19 @@
 }
 ;
 
-# : inc ( x -- x+1 )
+#inc [* | x] -> [* | x+1]
 :asm inc {
 	inc qword [r12]
 }
 ;
 
-# : dec ( x -- x-1 )
+#dec [* | x] -> [* | x-1]
 :asm dec {
 	dec qword [r12]
 }
 ;
 
-# : min ( x1 x2 -- x3 )
+#min [*, x1 | x2] -> [* | x3]
 :asm min {
 	mov rax, [r12]         ; x2
 	add r12, 8             ; pop
@@ -575,7 +576,7 @@
 }
 ;
 
-# : max ( x1 x2 -- x3 )
+#max [*, x1 | x2] -> [* | x3]
 :asm max {
 	mov rax, [r12]         ; x2
 	add r12, 8             ; pop
@@ -586,7 +587,7 @@
 }
 ;
 
-# : clamp ( x lo hi -- y )
+#clamp [*, x, lo | hi] -> [* | y]
 :asm clamp {
 	mov rax, [r12]         ; hi
 	mov rbx, [r12 + 8]     ; lo
@@ -600,7 +601,7 @@
 }
 ;
 
-# : time ( -- t )
+#time [*] -> [* | t]
 :asm time {
 	mov rax, 201           ; syscall: time
 	xor rdi, rdi
@@ -611,7 +612,7 @@
 }
 ;
 
-# : rand ( -- n )
+#rand [*] -> [* | n]
 :asm rand {
 	lea rbx, [rel persistent]
 	mov rax, [rbx]         ; state

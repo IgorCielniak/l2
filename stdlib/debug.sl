@@ -6,6 +6,7 @@ import io.sl
 # dump takes the firts element from the stack
 # and prints that much consequent elements
 # from the stack while not modifying it
+# all variations have the same stack effect
 
 word dump
 	1 swap
@@ -17,7 +18,7 @@ word dump
 	drop
 end
 
-# same but for return stack
+# dump return stack
 word rdump
 	1 swap
 	for
@@ -26,6 +27,38 @@ word rdump
 		1 +
 	end
 	drop
+end
+
+word fdump
+	"[*, " write_buf
+	1 swap 1 +
+	while dup 3 > do
+		dup pick
+		puti
+		1 -
+		", " write_buf
+	end
+	1 - pick puti
+	" | " write_buf
+	1 - pick puti
+	"]\n" write_buf
+end
+
+word frdump
+	"[*, " write_buf
+	1 swap 1 -
+	while dup 2 > do
+		dup rpick
+		puti
+		1 -
+		", " write_buf
+	end
+	rpick puti
+	", " write_buf
+	rpick puti
+	" | " write_buf
+	rpick puti
+	"]\n" write_buf
 end
 
 #int3 [*] -> [*]

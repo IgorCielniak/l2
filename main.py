@@ -1612,6 +1612,7 @@ class Emission:
             parts.extend(["section .data", *self.data])
         if self.bss:
             parts.extend(["section .bss", *self.bss])
+        parts.append("section .note.GNU-stack noalloc noexec nowrite")
         return "\n".join(parts)
 
 
@@ -1838,6 +1839,7 @@ class Assembler:
         self._inline_stack: List[str] = []
         self._inline_counter: int = 0
         self._emit_stack: List[str] = []
+        self._export_all_defs: bool = False
 
     def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]]) -> Set[str]:
         edges: Dict[str, Set[str]] = {}
@@ -1866,49 +1868,60 @@ class Assembler:
         for name in externs:
             text.append(f"extern {name}")
 
-    def emit(self, module: Module, debug: bool = False) -> Emission:
+    def emit(self, module: Module, debug: bool = False, entry_mode: str = "program") -> Emission:
+        if entry_mode not in {"program", "library"}:
+            raise CompileError(f"unknown entry mode '{entry_mode}'")
+        is_program = entry_mode == "program"
         emission = Emission()
-        self._emit_externs(emission.text)
-        prelude_lines = module.prelude if module.prelude is not None else self._runtime_prelude()
-        emission.text.extend(prelude_lines)
-        self._string_literals = {}
-        self._float_literals = {}
-        self._data_section = emission.data
+        self._export_all_defs = not is_program
+        try:
+            self._emit_externs(emission.text)
+            prelude_lines = module.prelude if module.prelude is not None else self._runtime_prelude(entry_mode)
+            emission.text.extend(prelude_lines)
+            self._string_literals = {}
+            self._float_literals = {}
+            self._data_section = emission.data
 
-        valid_defs = (Definition, AsmDefinition)
-        raw_defs = [form for form in module.forms if isinstance(form, valid_defs)]
-        definitions = self._dedup_definitions(raw_defs)
-        stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
-        if stray_forms:
-            raise CompileError("top-level literals or word references are not supported yet")
+            valid_defs = (Definition, AsmDefinition)
+            raw_defs = [form for form in module.forms if isinstance(form, valid_defs)]
+            definitions = self._dedup_definitions(raw_defs)
+            stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
+            if stray_forms:
+                raise CompileError("top-level literals or word references are not supported yet")
 
-        runtime_defs = [
-            defn for defn in definitions if not getattr(defn, "compile_only", False)
-        ]
-        if not any(defn.name == "main" for defn in runtime_defs):
-            raise CompileError("missing 'main' definition")
+            runtime_defs = [
+                defn for defn in definitions if not getattr(defn, "compile_only", False)
+            ]
+            if is_program:
+                if not any(defn.name == "main" for defn in runtime_defs):
+                    raise CompileError("missing 'main' definition")
+                reachable = self._reachable_runtime_defs(runtime_defs)
+                if len(reachable) != len(runtime_defs):
+                    runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
+            elif self._export_all_defs:
+                exported = sorted({sanitize_label(defn.name) for defn in runtime_defs})
+                for label in exported:
+                    emission.text.append(f"global {label}")
 
-        reachable = self._reachable_runtime_defs(runtime_defs)
-        if len(reachable) != len(runtime_defs):
-            runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
+            # Inline-only definitions are expanded at call sites; skip emitting standalone labels.
+            runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
 
-        # Inline-only definitions are expanded at call sites; skip emitting standalone labels.
-        runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
+            for definition in runtime_defs:
+                self._emit_definition(definition, emission.text, debug=debug)
 
-        for definition in runtime_defs:
-            self._emit_definition(definition, emission.text, debug=debug)
+            self._emit_variables(module.variables)
 
-        self._emit_variables(module.variables)
-
-        if self._data_section is not None:
-            if not self._data_section:
-                self._data_section.append("data_start:")
-            if not self._data_section or self._data_section[-1] != "data_end:":
-                self._data_section.append("data_end:")
-        bss_lines = module.bss if module.bss is not None else self._bss_layout()
-        emission.bss.extend(bss_lines)
-        self._data_section = None
-        return emission
+            if self._data_section is not None:
+                if not self._data_section:
+                    self._data_section.append("data_start:")
+                if not self._data_section or self._data_section[-1] != "data_end:":
+                    self._data_section.append("data_end:")
+            bss_lines = module.bss if module.bss is not None else self._bss_layout()
+            emission.bss.extend(bss_lines)
+            return emission
+        finally:
+            self._data_section = None
+            self._export_all_defs = False
 
     def _dedup_definitions(self, definitions: Sequence[Union[Definition, AsmDefinition]]) -> List[Union[Definition, AsmDefinition]]:
         seen: Set[str] = set()
@@ -2288,42 +2301,57 @@ class Assembler:
         builder.emit("    add r13, 8")
         builder.emit(f"{end_label}:")
 
-    def _runtime_prelude(self) -> List[str]:
-        return [
+    def _runtime_prelude(self, entry_mode: str) -> List[str]:
+        lines: List[str] = [
             "%define DSTK_BYTES 65536",
             "%define RSTK_BYTES 65536",
             "%define PRINT_BUF_BYTES 128",
-            "global _start",
+        ]
+        if entry_mode == "program":
+            lines.append("global _start")
+        lines.extend([
             "global sys_argc",
             "global sys_argv",
             "section .data",
             "sys_argc: dq 0",
             "sys_argv: dq 0",
             "section .text",
-            "_start:",
-            "    ; Linux x86-64 startup: argc/argv from stack",
-            "    mov rdi, [rsp]",         # argc
-            "    lea rsi, [rsp+8]",      # argv
-            "    mov [rel sys_argc], rdi",
-            "    mov [rel sys_argv], rsi",
-            "    ; initialize data/return stack pointers",
-            "    lea r12, [rel dstack_top]",
-            "    mov r15, r12",
-            "    lea r13, [rel rstack_top]",
-            "    call main",
-            "    mov rax, 0",
-            "    cmp r12, r15",
-            "    je .no_exit_value",
-            "    mov rax, [r12]",
-            "    add r12, 8",
-            ".no_exit_value:",
-            "    mov rdi, rax",
-            "    mov rax, 60",
-            "    syscall",
-        ]
+        ])
+
+        if entry_mode == "program":
+            lines.extend([
+                "_start:",
+                "    ; Linux x86-64 startup: argc/argv from stack",
+                "    mov rdi, [rsp]",         # argc
+                "    lea rsi, [rsp+8]",      # argv
+                "    mov [rel sys_argc], rdi",
+                "    mov [rel sys_argv], rsi",
+                "    ; initialize data/return stack pointers",
+                "    lea r12, [rel dstack_top]",
+                "    mov r15, r12",
+                "    lea r13, [rel rstack_top]",
+                "    call main",
+                "    mov rax, 0",
+                "    cmp r12, r15",
+                "    je .no_exit_value",
+                "    mov rax, [r12]",
+                "    add r12, 8",
+                ".no_exit_value:",
+                "    mov rdi, rax",
+                "    mov rax, 60",
+                "    syscall",
+            ])
+        else:
+            lines.append("    ; library build: provide your own entry point")
+
+        return lines
 
     def _bss_layout(self) -> List[str]:
         return [
+            "global dstack",
+            "global dstack_top",
+            "global rstack",
+            "global rstack_top",
             "align 16",
             "dstack: resb DSTK_BYTES",
             "dstack_top:",
@@ -3277,15 +3305,16 @@ class Compiler:
         spans: Optional[List[FileSpan]] = None,
         *,
         debug: bool = False,
+        entry_mode: str = "program",
     ) -> Emission:
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
-        return self.assembler.emit(module, debug=debug)
+        return self.assembler.emit(module, debug=debug, entry_mode=entry_mode)
 
-    def compile_file(self, path: Path, *, debug: bool = False) -> Emission:
+    def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
         source, spans = self._load_with_imports(path.resolve())
-        return self.compile_source(source, spans=spans, debug=debug)
+        return self.compile_source(source, spans=spans, debug=debug, entry_mode=entry_mode)
 
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
         raw = Path(target)
@@ -3483,7 +3512,7 @@ def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
     subprocess.run(cmd, check=True)
 
 
-def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
+def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *, shared: bool = False):
     libs = libs or []
 
     lld = shutil.which("ld.lld")
@@ -3503,18 +3532,22 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
     if use_lld:
         cmd.extend(["-m", "elf_x86_64"])
 
+    if shared:
+        cmd.append("-shared")
+
     cmd.extend([
         "-o", str(exe_path),
         str(obj_path),
     ])
 
-    if not libs:
+    if not shared and not libs:
         cmd.extend(["-nostdlib", "-static"])
 
     if libs:
-        cmd.extend([
-            "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
-        ])
+        if not shared:
+            cmd.extend([
+                "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+            ])
         for lib in libs:
             if not lib:
                 continue
@@ -3540,6 +3573,13 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None):
         cmd.append("-g")
 
     subprocess.run(cmd, check=True)
+
+
+def build_static_library(obj_path: Path, archive_path: Path) -> None:
+    parent = archive_path.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ar", "rcs", str(archive_path), str(obj_path)], check=True)
 
 
 def run_repl(
@@ -3858,7 +3898,7 @@ def _repl_build_source(
 def cli(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
-    parser.add_argument("-o", dest="output", type=Path, default=Path("a.out"))
+    parser.add_argument("-o", dest="output", type=Path, default=None, help="output path (defaults vary by artifact)")
     parser.add_argument(
         "-I",
         "--include",
@@ -3868,6 +3908,7 @@ def cli(argv: Sequence[str]) -> int:
         type=Path,
         help="add import search path (repeatable)",
     )
+    parser.add_argument("--artifact", choices=["exe", "shared", "static", "obj"], default="exe", help="choose final artifact type")
     parser.add_argument("--emit-asm", action="store_true", help="stop after generating asm")
     parser.add_argument("--temp-dir", type=Path, default=Path("build"))
     parser.add_argument("--debug", action="store_true", help="compile with debug info")
@@ -3891,6 +3932,11 @@ def cli(argv: Sequence[str]) -> int:
         else:
             i += 1
 
+    artifact_kind = args.artifact
+
+    if artifact_kind != "exe" and (args.run or args.dbg):
+        parser.error("--run/--dbg are only available when --artifact exe is selected")
+
     if args.clean:
         try:
             if args.temp_dir.exists():
@@ -3906,12 +3952,26 @@ def cli(argv: Sequence[str]) -> int:
     if args.source is None and not args.repl:
         parser.error("the following arguments are required: source")
 
+    if not args.repl and args.output is None:
+        stem = args.source.stem
+        default_outputs = {
+            "exe": Path("a.out"),
+            "shared": Path(f"lib{stem}.so"),
+            "static": Path(f"lib{stem}.a"),
+            "obj": Path(f"{stem}.o"),
+        }
+        args.output = default_outputs[artifact_kind]
+
+    if not args.repl and artifact_kind in {"static", "obj"} and args.libs:
+        print("[warn] --libs ignored for static/object outputs")
+
     compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
     try:
         if args.repl:
             return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)
 
-        emission = compiler.compile_file(args.source, debug=args.debug)
+        entry_mode = "program" if artifact_kind == "exe" else "library"
+        emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
     except (ParseError, CompileError, CompileTimeError) as exc:
         print(f"[error] {exc}")
         return 1
@@ -3929,13 +3989,32 @@ def cli(argv: Sequence[str]) -> int:
         return 0
 
     run_nasm(asm_path, obj_path, debug=args.debug)
-    run_linker(obj_path, args.output, debug=args.debug, libs=args.libs)
+    if args.output.parent and not args.output.parent.exists():
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    if artifact_kind == "obj":
+        dest = args.output
+        if obj_path.resolve() != dest.resolve():
+            shutil.copy2(obj_path, dest)
+    elif artifact_kind == "static":
+        build_static_library(obj_path, args.output)
+    else:
+        run_linker(
+            obj_path,
+            args.output,
+            debug=args.debug,
+            libs=args.libs,
+            shared=(artifact_kind == "shared"),
+        )
+
     print(f"[info] built {args.output}")
-    exe_path = Path(args.output).resolve()
-    if args.dbg:
-        subprocess.run(["gdb", str(exe_path)])
-    elif args.run:
-        subprocess.run([str(exe_path)])
+
+    if artifact_kind == "exe":
+        exe_path = Path(args.output).resolve()
+        if args.dbg:
+            subprocess.run(["gdb", str(exe_path)])
+        elif args.run:
+            subprocess.run([str(exe_path)])
     return 0
 
 

@@ -353,8 +353,8 @@
 }
 ;
 
-word cr 10 putc end
+inline word cr 10 putc end
 
-word puts write_buf cr end
+inline word puts write_buf cr end
 
-word eputs ewrite_buf cr end
+inline   word eputs ewrite_buf cr end

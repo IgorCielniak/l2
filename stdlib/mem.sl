@@ -55,7 +55,7 @@ end
 #memdump [*, len | addr] -> [* | addr]
 word memdump
     for
-        dup c@ puti cr 1 +
+        dup @ puti cr 8 +
     end
 end
 

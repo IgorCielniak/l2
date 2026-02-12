@@ -1,3 +1,17 @@
+#get_addr [*] -> [* | addr]
+:asm get_addr {
+    mov rax, [rsp]
+    sub r12, 8
+    mov [r12], rax
+};
+
+#jmp [* | addr] -> [*]
+:asm jmp {
+    mov rax, [r12]
+    add r12, 8
+    jmp rax
+};
+
 # Reserve 64 bytes in .bss
 # persistent: resb 64
 # push the addr of it

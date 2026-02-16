@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -79,12 +80,30 @@ def is_arm_host() -> bool:
     return machine.startswith("arm") or machine.startswith("aarch")
 
 
+def qemu_emulator() -> str:
+    return os.environ.get("L2_QEMU", "qemu-x86_64")
+
+
+def ensure_arm_runtime_support() -> None:
+    if not is_arm_host():
+        return
+    emulator = qemu_emulator()
+    if shutil.which(emulator):
+        return
+    print(f"[error] {emulator} not found; install qemu-user or set L2_QEMU", file=sys.stderr)
+    sys.exit(1)
+
+
 def wrap_runtime_command(cmd: List[str]) -> List[str]:
     if not is_arm_host():
         return cmd
-    if cmd and cmd[0].endswith("qemu-x86_64"):
+    emulator = qemu_emulator()
+    if not emulator:
         return cmd
-    return ["qemu-x86_64", *cmd]
+    first = Path(cmd[0]).name if cmd else ""
+    if first == Path(emulator).name:
+        return cmd
+    return [emulator, *cmd]
 
 
 def read_json(meta_path: Path) -> Dict[str, Any]:
@@ -588,6 +607,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    ensure_arm_runtime_support()
     runner = TestRunner(Path(__file__).resolve().parent, args)
     return runner.run()
 

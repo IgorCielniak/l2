@@ -1,0 +1,4 @@
+{
+  "description": "compile-time hello world demo",
+  "requires": ["keystone"]
+}

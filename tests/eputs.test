@@ -1,1 +1,0 @@
-python main.py tests/eputs.sl -o ./build/eputs > /dev/null && ./build/eputs 2>&1

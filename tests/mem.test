@@ -1,1 +1,0 @@
-python main.py tests/mem.sl -o ./build/mem > /dev/null && ./build/mem

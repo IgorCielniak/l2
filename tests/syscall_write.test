@@ -1,1 +1,0 @@
-python main.py tests/syscall_write.sl -o ./build/syscall_write > /dev/null && ./build/syscall_write

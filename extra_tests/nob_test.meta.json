@@ -1,0 +1,4 @@
+{
+  "description": "shell wrapper demo; compile-only to avoid nondeterministic ls output",
+  "compile_only": true
+}

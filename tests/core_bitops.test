@@ -1,1 +1,0 @@
-python main.py tests/core_bitops.sl -o ./build/core_bitops > /dev/null && ./build/core_bitops

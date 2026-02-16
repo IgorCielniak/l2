@@ -12,14 +12,14 @@ This document reflects the implementation that ships in this repository today (`
 - **Driver (`main.py`)** – Supports `python main.py source.sl -o a.out`, `--emit-asm`, `--run`, `--dbg`, `--repl`, `--temp-dir`, `--clean`, repeated `-I/--include` paths, and repeated `-l` linker flags (either `-lfoo` or `-l libc.so.6`). Unknown `-l` flags are collected and forwarded to the linker.
 - **REPL** – `--repl` launches a stateful session with commands such as `:help`, `:reset`, `:load`, `:call <word>`, `:edit`, and `:show`. The REPL still emits/links entire programs for each run; it simply manages the session source for you.
 - **Imports** – `import relative/or/absolute/path.sl` inserts the referenced file textually. Resolution order: (1) absolute path, (2) relative to the importing file, (3) each include path (defaults: project root and `./stdlib`). Each file is included at most once per compilation unit. Import lines leave blank placeholders so error spans stay meaningful.
-- **Workspace** – `stdlib/` holds library modules, `tests/` contains executable samples with `.expected` outputs, and top-level `.sl` files (e.g., `fn.sl`, `nob.sl`) exercise advanced features.
+- **Workspace** – `stdlib/` holds library modules, `tests/` contains executable samples with `.expected` outputs, `extra_tests/` houses standalone integration demos, and `libs/` collects opt-in extensions such as `libs/fn.sl` and `libs/nob.sl`.
 
 ## 3. Lexical Structure
 - **Reader** – Whitespace-delimited; `#` starts a line comment. String literals honor `\"`, `\\`, `\n`, `\r`, `\t`, and `\0`. Numbers default to signed 64-bit integers via `int(token, 0)` (so `0x`, `0o`, `0b` all work). Tokens containing `.` or `e` parse as floats.
 - **Identifiers** – `[A-Za-z_][A-Za-z0-9_]*`. Everything else is treated as punctuation or literal.
 - **String representation** – At runtime each literal pushes `(addr len)` with the length on top. The assembler stores literals in `section .data` with a trailing `NULL` for convenience.
 - **Lists** – `[` begins a list literal, `]` ends it. The compiler captures the intervening stack segment into a freshly `mmap`'d buffer that stores `(len followed by qword items)`, drops the captured values, and pushes the buffer address. Users must `munmap` the buffer when done.
-- **Token customization** – Immediate words can call `add-token` or `add-token-chars` to teach the reader about new multi-character tokens. `fn.sl` uses this in combination with token hooks to recognize `foo(1, 2)` syntax.
+- **Token customization** – Immediate words can call `add-token` or `add-token-chars` to teach the reader about new multi-character tokens. `libs/fn.sl` uses this in combination with token hooks to recognize `foo(1, 2)` syntax.
 
 ### Stack-effect comments
 - **Location and prefix** – Public words in `stdlib/` (and most user code should) document its stack effect with a line comment directly above the definition: `#word_name …`.
@@ -53,13 +53,13 @@ This document reflects the implementation that ships in this repository today (`
 - **Virtual machine** – Immediate words run inside `CompileTimeVM`, which keeps its own stacks and exposes helpers registered in `bootstrap_dictionary()`:
   - Lists/maps: `list-new`, `list-append`, `list-pop`, `list-pop-front`, `list-length`, `list-empty?`, `list-get`, `list-set`, `list-extend`, `list-last`, `map-new`, `map-set`, `map-get`, `map-has?`.
   - Strings/numbers: `string=`, `string-length`, `string-append`, `string>number`, `int>string`.
-  - Lexer utilities: `lexer-new`, `lexer-pop`, `lexer-peek`, `lexer-expect`, `lexer-collect-brace`, `lexer-push-back` (used by `fn.sl` to parse signatures and infix expressions).
+  - Lexer utilities: `lexer-new`, `lexer-pop`, `lexer-peek`, `lexer-expect`, `lexer-collect-brace`, `lexer-push-back` (used by `libs/fn.sl` to parse signatures and infix expressions).
   - Token management: `next-token`, `peek-token`, `inject-tokens`, `token-lexeme`, `token-from-lexeme`.
-  - Reader hooks: `set-token-hook` installs a word that receives each token (pushed as a `Token` object) and must leave a truthy handled flag; `clear-token-hook` disables it. `fn.sl`'s `extend-syntax` demonstrates rewriting `foo(1, 2)` into ordinary word calls.
+  - Reader hooks: `set-token-hook` installs a word that receives each token (pushed as a `Token` object) and must leave a truthy handled flag; `clear-token-hook` disables it. `libs/fn.sl`'s `extend-syntax` demonstrates rewriting `foo(1, 2)` into ordinary word calls.
   - Prelude/BSS control: `prelude-clear`, `prelude-append`, `prelude-set`, `bss-clear`, `bss-append`, `bss-set` let user code override the `_start` stub or `.bss` layout.
   - Definition helpers: `emit-definition` injects a `word ... end` definition on the fly (used by the struct macro). `parse-error` raises a custom diagnostic.
 - **Text macros** – `macro` is an immediate word implemented in Python; it prevents nesting by tracking active recordings and registers expansion tokens with `$n` substitution.
-- **Python bridges** – `:py name { ... } ;` executes once during parsing. The body may define `macro(ctx: MacroContext)` (with helpers such as `next_token`, `emit_literal`, `inject_tokens`, `new_label`, and direct `parser` access) and/or `intrinsic(builder: FunctionEmitter)` to emit assembly directly. The `fn` DSL (`fn.sl`) and other syntax layers are ordinary `:py` blocks.
+- **Python bridges** – `:py name { ... } ;` executes once during parsing. The body may define `macro(ctx: MacroContext)` (with helpers such as `next_token`, `emit_literal`, `inject_tokens`, `new_label`, and direct `parser` access) and/or `intrinsic(builder: FunctionEmitter)` to emit assembly directly. The `fn` DSL (`libs/fn.sl`) and other syntax layers are ordinary `:py` blocks.
 
 ## 7. Foreign Code, Inline Assembly, and Syscalls
 - **`:asm name { ... } ;`** – Defines a word entirely in NASM syntax. The body is copied verbatim into the output and terminated with `ret`. If `keystone-engine` is installed, `:asm` words also execute at compile time; the VM marshals `(addr len)` string pairs by scanning for `data_start`/`data_end` references.
@@ -81,8 +81,10 @@ This document reflects the implementation that ships in this repository today (`
 - **`stdlib.sl`** – Convenience aggregator that imports `core`, `mem`, `io`, and `utils` so most programs can simply `import stdlib/stdlib.sl`.
 
 ## 9. Testing and Usage Patterns
-- **Automated coverage** – `tests/*.sl` exercise allocations, dynamic arrays, IO (file/stdin/stdout/stderr), struct accessors, inline words, label/goto, macros, syscall wrappers, fn-style syntax, return-stack locals (`tests/with_variables.sl`), and compile-time overrides. Each test has a `.test` driver command and a `.expected` file to verify output.
+- **Automated coverage** – `python test.py` compiles every `tests/*.sl`, runs the generated binary, and compares stdout against `<name>.expected`. Optional companions include `<name>.stdin` (piped to the process), `<name>.args` (extra CLI args parsed with `shlex`), `<name>.stderr` (expected stderr), and `<name>.meta.json` (per-test knobs such as `expected_exit`, `expect_compile_error`, or `env`). The `extra_tests/` folder ships with curated demos (`extra_tests/ct_test.sl`, `extra_tests/args.sl`, `extra_tests/c_extern.sl`, `extra_tests/fn_test.sl`, `extra_tests/nob_test.sl`) that run alongside the core suite; pass `--extra path/to/foo.sl` to cover more standalone files. Use `python test.py --list` to see descriptions and `python test.py --update foo` to bless outputs after intentional changes.
 - **Common commands** –
+  - `python test.py` (run the whole suite)
+  - `python test.py hello --update` (re-bless a single test)
   - `python main.py tests/hello.sl -o build/hello && ./build/hello`
   - `python main.py program.sl --emit-asm --temp-dir build`
   - `python main.py --repl`

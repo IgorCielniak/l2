@@ -1,1 +1,0 @@
-python main.py tests/list.sl -o ./build/list > /dev/null && ./build/list

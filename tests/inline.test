@@ -1,1 +1,0 @@
-python main.py tests/inline.sl -o ./build/inline > /dev/null && ./build/inline

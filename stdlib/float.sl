@@ -85,11 +85,14 @@
 
 # Output
 extern int printf(char* fmt, double x)
+extern int fflush(void* stream)
 
 word fput
     "%f" drop swap printf drop
+    0 fflush drop
 end
 
 word fputln
     "%f\n" drop swap printf drop
+    0 fflush drop
 end

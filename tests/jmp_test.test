@@ -1,1 +1,0 @@
-python main.py tests/jmp_test.sl -o ./build/jmp_test > /dev/null && ./build/jmp_test

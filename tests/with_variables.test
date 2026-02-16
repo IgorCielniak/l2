@@ -1,1 +1,0 @@
-python main.py tests/with_variables.sl -o ./build/with_variables > /dev/null && ./build/with_variables

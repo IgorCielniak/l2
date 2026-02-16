@@ -1,1 +1,0 @@
-python main.py tests/integration_core.sl -o ./build/integration_core > /dev/null && ./build/integration_core

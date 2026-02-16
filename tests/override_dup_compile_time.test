@@ -1,1 +1,0 @@
-python main.py tests/override_dup_compile_time.sl -o ./build/override_dup_compile_time > /dev/null && ./build/override_dup_compile_time

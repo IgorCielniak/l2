@@ -1,0 +1,4 @@
+{
+  "description": "fn DSL lowering smoke test",
+  "requires": ["keystone"]
+}

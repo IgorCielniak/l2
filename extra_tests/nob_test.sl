@@ -1,4 +1,4 @@
-import nob.sl
+import libs/nob.sl
 
 word main
     "ls" sh

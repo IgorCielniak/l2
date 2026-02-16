@@ -1,1 +1,0 @@
-python main.py tests/str.sl -o ./build/str > /dev/null && ./build/str

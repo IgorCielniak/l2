@@ -1,6 +1,6 @@
 import stdlib/stdlib.sl
 import stdlib/io.sl
-import fn.sl
+import libs/fn.sl
 
 fn foo(int a, int b){
     1

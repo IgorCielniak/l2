@@ -1,1 +1,0 @@
-python main.py tests/io_read_stdin.sl -o ./build/io_read_stdin > /dev/null && printf 'stdin via test\n' | ./build/io_read_stdin

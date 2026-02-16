@@ -1,1 +1,0 @@
-python main.py tests/bss_override.sl -o ./build/bss_override > /dev/null && ./build/bss_override

@@ -10,16 +10,13 @@ word main
     # Test C-style extern with implicit ABI handling
     -10 labs puti cr
 
-    # Basic math (scaled to avoid libc printf dependency)
     1.5 2.5 f+              # 4.0
-    1000000.0 f*
-    float>int puti cr       # Prints 4000000 (6 decimal places of 4.0)
+    fputln
 
     # External math library (libm)
     10.0 10.0 atan2         # Result is pi/4
     4.0 f*                  # Approx pi
-    1000000.0 f*
-    float>int puti cr       # Prints scaled pi value
+    fputln
 
     # Test extern void
     0 exit

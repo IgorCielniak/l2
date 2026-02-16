@@ -9,7 +9,7 @@ This document reflects the implementation that ships in this repository today (`
 - **Unsafe by design** – Memory, syscalls, inline assembly, and FFI expose raw machine power. The standard library is intentionally thin and policy-free.
 
 ## 2. Toolchain and Repository Layout
-- **Driver (`main.py`)** – Supports `python main.py source.sl -o a.out`, `--emit-asm`, `--run`, `--dbg`, `--repl`, `--temp-dir`, `--clean`, repeated `-I/--include` paths, and repeated `-l` linker flags (either `-lfoo` or `-l libc.so.6`). Unknown `-l` flags are collected and forwarded to the linker.
+- **Driver (`main.py`)** – Supports `python main.py source.sl -o a.out`, `--emit-asm`, `--run`, `--dbg`, `--repl`, `--temp-dir`, `--clean`, repeated `-I/--include` paths, and repeated `-l` linker flags (either `-lfoo` or `-l libc.so.6`). Unknown `-l` flags are collected and forwarded to the linker. Pass `--ct-run-main` to run the program's `main` word on the compile-time VM before NASM/ld run, which surfaces discrepancies between compile-time and runtime semantics.
 - **REPL** – `--repl` launches a stateful session with commands such as `:help`, `:reset`, `:load`, `:call <word>`, `:edit`, and `:show`. The REPL still emits/links entire programs for each run; it simply manages the session source for you.
 - **Imports** – `import relative/or/absolute/path.sl` inserts the referenced file textually. Resolution order: (1) absolute path, (2) relative to the importing file, (3) each include path (defaults: project root and `./stdlib`). Each file is included at most once per compilation unit. Import lines leave blank placeholders so error spans stay meaningful.
 - **Workspace** – `stdlib/` holds library modules, `tests/` contains executable samples with `.expected` outputs, `extra_tests/` houses standalone integration demos, and `libs/` collects opt-in extensions such as `libs/fn.sl` and `libs/nob.sl`.
@@ -81,10 +81,11 @@ This document reflects the implementation that ships in this repository today (`
 - **`stdlib.sl`** – Convenience aggregator that imports `core`, `mem`, `io`, and `utils` so most programs can simply `import stdlib/stdlib.sl`.
 
 ## 9. Testing and Usage Patterns
-- **Automated coverage** – `python test.py` compiles every `tests/*.sl`, runs the generated binary, and compares stdout against `<name>.expected`. Optional companions include `<name>.stdin` (piped to the process), `<name>.args` (extra CLI args parsed with `shlex`), `<name>.stderr` (expected stderr), and `<name>.meta.json` (per-test knobs such as `expected_exit`, `expect_compile_error`, or `env`). The `extra_tests/` folder ships with curated demos (`extra_tests/ct_test.sl`, `extra_tests/args.sl`, `extra_tests/c_extern.sl`, `extra_tests/fn_test.sl`, `extra_tests/nob_test.sl`) that run alongside the core suite; pass `--extra path/to/foo.sl` to cover more standalone files. Use `python test.py --list` to see descriptions and `python test.py --update foo` to bless outputs after intentional changes.
+- **Automated coverage** – `python test.py` compiles every `tests/*.sl`, runs the generated binary, and compares stdout against `<name>.expected`. Optional companions include `<name>.stdin` (piped to the process), `<name>.args` (extra CLI args parsed with `shlex`), `<name>.stderr` (expected stderr), and `<name>.meta.json` (per-test knobs such as `expected_exit`, `expect_compile_error`, or `env`). The `extra_tests/` folder ships with curated demos (`extra_tests/ct_test.sl`, `extra_tests/args.sl`, `extra_tests/c_extern.sl`, `extra_tests/fn_test.sl`, `extra_tests/nob_test.sl`) that run alongside the core suite; pass `--extra path/to/foo.sl` to cover more standalone files. Use `python test.py --list` to see descriptions and `python test.py --update foo` to bless outputs after intentional changes. Add `--ct-run-main` when invoking the harness to run each test's `main` at compile time as well; capture that stream with `<name>.compile.expected` if you want automated comparisons.
 - **Common commands** –
   - `python test.py` (run the whole suite)
   - `python test.py hello --update` (re-bless a single test)
+  - `python test.py --ct-run-main hello` (compile/run a single test while also exercising `main` on the compile-time VM)
   - `python main.py tests/hello.sl -o build/hello && ./build/hello`
   - `python main.py program.sl --emit-asm --temp-dir build`
   - `python main.py --repl`

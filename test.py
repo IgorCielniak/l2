@@ -418,6 +418,8 @@ class TestRunner:
         cmd = [sys.executable, str(self.main_py), str(case.source), "-o", str(case.binary_path)]
         for lib in case.config.libs:
             cmd.extend(["-l", lib])
+        if self.args.ct_run_main:
+            cmd.append("--ct-run-main")
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
         return subprocess.run(
@@ -601,6 +603,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="list tests and exit")
     parser.add_argument("--update", action="store_true", help="update expectation files with actual output")
     parser.add_argument("--stop-on-fail", action="store_true", help="stop after the first failure")
+    parser.add_argument("--ct-run-main", action="store_true", help="execute each test's 'main' via the compile-time VM during compilation")
     parser.add_argument("-v", "--verbose", action="store_true", help="show compiler/runtime commands")
     return parser.parse_args(argv)
 

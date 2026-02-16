@@ -3518,6 +3518,12 @@ class Compiler:
         source, spans = self._load_with_imports(path.resolve())
         return self.compile_source(source, spans=spans, debug=debug, entry_mode=entry_mode)
 
+    def run_compile_time_word(self, name: str) -> None:
+        word = self.dictionary.lookup(name)
+        if word is None:
+            raise CompileTimeError(f"word '{name}' not defined; cannot run at compile time")
+        self.parser.compile_time_vm.invoke(word)
+
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
         raw = Path(target)
         tried: List[Path] = []
@@ -4120,6 +4126,7 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--repl", action="store_true", help="interactive REPL; source file is optional")
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
     parser.add_argument("--no-folding", action="store_true", help="disable constant folding optimization")
+    parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
 
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
@@ -4137,6 +4144,9 @@ def cli(argv: Sequence[str]) -> int:
 
     artifact_kind = args.artifact
     folding_enabled = not args.no_folding
+
+    if args.ct_run_main and artifact_kind != "exe":
+        parser.error("--ct-run-main requires --artifact exe")
 
     if artifact_kind != "exe" and (args.run or args.dbg):
         parser.error("--run/--dbg are only available when --artifact exe is selected")
@@ -4177,6 +4187,13 @@ def cli(argv: Sequence[str]) -> int:
 
         entry_mode = "program" if artifact_kind == "exe" else "library"
         emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
+
+        if args.ct_run_main:
+            try:
+                compiler.run_compile_time_word("main")
+            except CompileTimeError as exc:
+                print(f"[error] compile-time execution of 'main' failed: {exc}")
+                return 1
     except (ParseError, CompileError, CompileTimeError) as exc:
         print(f"[error] {exc}")
         return 1

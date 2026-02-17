@@ -445,13 +445,18 @@ class TestRunner:
         runtime_cmd = wrap_runtime_command(runtime_cmd)
         if self.args.verbose:
             print(f"{format_status('CMD', 'blue')} {quote_cmd(runtime_cmd)}")
-        return subprocess.run(
+        proc = subprocess.run(
             runtime_cmd,
             cwd=self.root,
             capture_output=True,
-            text=True,
             env=self._env_for(case),
-            input=case.stdin_data(),
+            input=case.stdin_data().encode("utf-8") if case.stdin_data() is not None else None,
+        )
+        return subprocess.CompletedProcess(
+            args=proc.args,
+            returncode=proc.returncode,
+            stdout=proc.stdout.decode("utf-8", errors="replace"),
+            stderr=proc.stderr.decode("utf-8", errors="replace"),
         )
 
     def _runtime_entry(self, case: TestCase) -> str:

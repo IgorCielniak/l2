@@ -28,7 +28,7 @@ word strconcat
     nip
     rot
     drop
-    rdrop rdrop rdrop
+    rdrop rdrop
 end
 
 #strlen [* | addr] -> [* | len]
@@ -119,4 +119,264 @@ word tostr
     over for
     rot drop
     end drop
+end
+
+# ---------------------------------------------------------------------------
+#  String search helpers
+# ---------------------------------------------------------------------------
+
+#indexof [*, addr, len | char] -> [* | index]
+# Finds the index of the first occurrence of char in the string.
+# Returns -1 if not found. Consumes addr, len, and char.
+word indexof
+    >r                                      # char -> rstack
+    -1 0                                    # result=-1, i=0
+    while dup 3 pick < 2 pick -1 == band do # while i < len && result == -1
+        dup 4 pick + c@                     # byte = addr[i]
+        r@ == if                            # byte == char?
+            swap drop dup                   # result = i
+        end
+        1 +                                 # i++
+    end
+    drop nip nip                            # drop i, addr, len -> leave result
+    rdrop                                   # clean char from rstack
+end
+
+#count_char_in_str [*, addr, len | char] -> [*, addr, len | count]
+# Counts the number of occurrences of char in the string.
+# Preserves addr and len on stack; pushes count on top.
+word count_char_in_str
+    >r                          # char -> rstack
+    0                           # count = 0
+    1 pick                      # push len (for loop count)
+    for
+        # for counter r@ goes len..1; char is at 1 rpick
+        # byte index = len - r@  (0 .. len-1)
+        1 pick r@ - 3 pick + c@ # byte at addr[len - r@]
+        1 rpick ==              # byte == char?
+        if 1 + end              # increment count
+    end
+    rdrop                       # clean char from rstack
+end
+
+# ---------------------------------------------------------------------------
+#  Single-substitution helpers
+# ---------------------------------------------------------------------------
+
+#format1s [*, arg_addr, arg_len, fmt_addr | fmt_len] -> [*, result_addr | result_len]
+# Replaces the first '%' in fmt with the arg string.
+# Allocates a new result string (caller should free it).
+# If no '%' is found, returns fmt as-is (NOT newly allocated).
+word format1s
+    2dup 37 indexof                 # find first '%'
+    dup -1 == if
+        # no '%' — drop pos, drop arg, return fmt unchanged
+        drop 2swap 2drop
+    else
+        # pos is on TOS; save pos, fmt_addr, fmt_len to rstack
+        >r                         # rstack: [pos]
+        over >r                    # rstack: [pos, fmt_addr]
+        dup >r                     # rstack: [pos, fmt_addr, fmt_len]
+        # rpick 0=fmt_len  1=fmt_addr  2=pos
+        # stack: arg_addr, arg_len, fmt_addr, fmt_len
+        drop                       # drop fmt_len (we have it on rstack)
+        2 rpick                    # push pos
+        # stack: arg_addr, arg_len, fmt_addr, pos  (= prefix pair)
+        2swap                      # stack: fmt_addr, pos, arg_addr, arg_len
+        strconcat                  # tmp = prefix + arg
+        # save tmp for later freeing
+        2dup >r >r
+        # rpick 0=tmp_addr 1=tmp_len 2=fmt_len 3=fmt_addr 4=pos
+        # build suffix: (fmt_addr + pos + 1, fmt_len - pos - 1)
+        3 rpick 4 rpick + 1 +     # suffix_addr
+        2 rpick 4 rpick - 1 -     # suffix_len
+        strconcat                  # result = tmp + suffix
+        # free tmp
+        r> r> free
+        # clean saved pos, fmt_addr, fmt_len
+        rdrop rdrop rdrop
+    end
+end
+
+#format1i [*, int_arg, fmt_addr | fmt_len] -> [*, result_addr | result_len]
+# Replaces the first '%' in fmt with the decimal representation of int_arg.
+# Allocates a new result string (caller should free it).
+word format1i
+    rot tostr                      # convert int to string (allocates)
+    2dup >r >r                     # save tostr result for freeing
+    2swap                          # bring fmt on top
+    format1s                       # substitute
+    r> r> free                     # free the tostr buffer
+end
+
+# ---------------------------------------------------------------------------
+#  Multi-substitution format words
+# ---------------------------------------------------------------------------
+
+#formats [*, sN_addr, sN_len, ..., s1_addr, s1_len, fmt_addr | fmt_len]
+#     -> [*, result_addr | result_len]
+# Replaces each '%' in fmt with the corresponding string argument.
+# s1 (just below fmt) maps to the first '%', s2 to the second, etc.
+# The number of string-pair args must equal the number of '%' markers.
+# Returns a newly allocated string, or fmt as-is when there are no '%'.
+word formats
+    2dup 37 count_char_in_str nip nip  # count '%' -> n
+    dup 0 == if
+        drop                       # no substitutions needed
+    else
+        1 - >r                     # remaining = n - 1
+        format1s                   # first substitution
+        while r@ 0 > do
+            2dup >r >r             # save current result for freeing
+            format1s               # next substitution
+            r> r> free             # free previous result
+            r> 1 - >r             # remaining--
+        end
+        rdrop                      # clean counter
+    end
+end
+
+#formati [*, iN, ..., i1, fmt_addr | fmt_len]
+#     -> [*, result_addr | result_len]
+# Replaces each '%' in fmt with the decimal string of the corresponding
+# integer argument.  i1 (just below fmt) maps to the first '%', etc.
+# The number of int args must equal the number of '%' markers.
+# Returns a newly allocated string, or fmt as-is when there are no '%'.
+word formati
+    2dup 37 count_char_in_str nip nip  # count '%' -> n
+    dup 0 == if
+        drop                       # no substitutions needed
+    else
+        1 - >r                     # remaining = n - 1
+        format1i                   # first substitution
+        while r@ 0 > do
+            2dup >r >r             # save current result for freeing
+            format1i               # next substitution
+            r> r> free             # free previous result
+            r> 1 - >r             # remaining--
+        end
+        rdrop                      # clean counter
+    end
+end
+
+# ---------------------------------------------------------------------------
+#  Mixed-type printf-style format (with %i and %s specifiers)
+# ---------------------------------------------------------------------------
+
+#find_fmt [*, addr | len] -> [* | pos, type]
+# Scans for the first %i or %s placeholder in the string.
+# Returns position of '%' and the type byte (105='i' or 115='s').
+# Returns -1, 0 if no placeholder is found.
+word find_fmt
+    over >r dup >r           # rstack: 0=len, 1=addr
+    -1 0 0                    # pos=-1, type=0, i=0
+    while dup 0 rpick 1 - < 2 pick 0 == band do
+        1 rpick over + c@    # addr[i]
+        37 == if              # '%'
+            1 rpick over + 1 + c@  # addr[i+1]
+            dup 105 == over 115 == bor if
+                rot drop rot drop over  # pos=i, type=char, keep i
+            else
+                drop
+            end
+        end
+        1 +
+    end
+    drop                      # drop i
+    rdrop rdrop
+    2swap 2drop               # remove addr, len copies; leave pos, type
+end
+
+#count_fmt [*, addr | len] -> [*, addr, len | count]
+# Counts the number of %i and %s placeholders in a string.
+word count_fmt
+    over >r dup >r            # rstack: 0=len, 1=addr
+    0 0                        # count=0, i=0
+    while dup 0 rpick 1 - < do
+        1 rpick over + c@
+        37 == if
+            1 rpick over + 1 + c@
+            dup 105 == over 115 == bor if
+                drop
+                swap 1 + swap
+                1 +
+            else
+                drop
+            end
+        end
+        1 +
+    end
+    drop                       # drop i
+    rdrop rdrop
+end
+
+#fmt_splice [*, repl_addr, repl_len, fmt_addr, fmt_len | pos] -> [*, result_addr | result_len]
+# Replaces the 2-char placeholder at pos in fmt with repl.
+# Allocates a new result string (caller should free it).
+word fmt_splice
+    >r >r >r                  # rstack: [pos, fmt_len, fmt_addr]
+    # rpick: 0=fmt_addr, 1=fmt_len, 2=pos
+    0 rpick 2 rpick           # push fmt_addr, pos (= prefix pair)
+    2swap                      # stack: fmt_addr, pos, repl_addr, repl_len
+    strconcat                  # tmp = prefix + repl
+    2dup >r >r                 # save tmp for freeing
+    # rpick: 0=tmp_addr, 1=tmp_len, 2=fmt_addr, 3=fmt_len, 4=pos
+    2 rpick 4 rpick + 2 +     # suffix_addr = fmt_addr + pos + 2
+    3 rpick 4 rpick - 2 -     # suffix_len  = fmt_len - pos - 2
+    strconcat                  # result = tmp + suffix
+    r> r> free                 # free tmp
+    rdrop rdrop rdrop          # clean fmt_addr, fmt_len, pos
+end
+
+#format1 [*, arg(s), fmt_addr | fmt_len] -> [*, result_addr | result_len]
+# Replaces the first %i or %s placeholder in fmt.
+# For %i: consumes one int from below fmt and converts via tostr.
+# For %s: consumes one (addr, len) string pair from below fmt.
+# Allocates a new result string (caller should free it).
+word format1
+    2dup find_fmt              # stack: ..., fmt_addr, fmt_len, pos, type
+    dup 105 == if
+        # %i
+        drop                   # drop type
+        >r >r >r               # save pos, fmt_len, fmt_addr
+        tostr                  # convert int arg to string
+        2dup >r >r             # save istr for freeing
+        r> r> r> r> r>         # restore: istr_addr, istr_len, fmt_addr, fmt_len, pos
+        fmt_splice
+        2swap free             # free tostr buffer
+    else 115 == if
+        # %s: stack already has repl_addr, repl_len, fmt_addr, fmt_len, pos
+        fmt_splice
+    else
+        drop                   # no placeholder, drop pos
+    end
+end
+
+#format [*, args..., fmt_addr | fmt_len] -> [*, result_addr | result_len]
+# Printf-style formatting with %i (integer) and %s (string) placeholders.
+# Arguments are consumed left-to-right: the closest arg to the format
+# string maps to the first placeholder.
+#
+# Example:  "bar" 123 "foo" "%s: %i and %s" format
+#           -> "foo: 123 and bar"
+#
+# Returns a newly allocated string (caller should free it), or the
+# original format string unchanged if there are no placeholders.
+word format
+    2dup count_fmt nip nip     # n = placeholder count
+    dup 0 == if
+        drop
+    else
+        >r
+        format1                # first substitution
+        r> 1 -
+        while dup 0 > do
+            >r
+            2dup >r >r         # save current result for freeing
+            format1            # next substitution
+            r> r> free         # free previous result
+            r> 1 -
+        end
+        drop                   # drop counter (0)
+    end
 end

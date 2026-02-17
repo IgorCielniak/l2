@@ -64,13 +64,13 @@
 }
 ;
 
-#c! [*, byte | addr] -> [*]
+#c! [*, addr | byte] -> [*]
 :asm c! {
-	mov rax, [r12]         ; get address from stack
+	mov rax, [r12]         ; get byte value (TOS)
+	add r12, 8             ; pop byte
+	mov rbx, [r12]         ; get address (NOS)
 	add r12, 8             ; pop address
-	mov rbx, [r12]         ; get byte value
-	add r12, 8
-	mov [rbx], al          ; store byte at address
+	mov [rbx], al          ; store low byte at address
 	ret
 }
 ;
@@ -324,7 +324,7 @@
 }
 ;
 
-#! [*, x | addr] -> [*]
+#! [*, addr | x] -> [*]
 :asm ! {
 	mov rax, [r12]         ; get value (TOS)
 	add r12, 8             ; pop value

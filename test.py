@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import shlex
+import re
 import shutil
 import subprocess
 import sys
@@ -390,7 +391,16 @@ class TestRunner:
             message = f"expected exit {case.config.expected_exit}, got {run_proc.returncode}"
             details = self._format_process_output(run_proc)
             return CaseResult(case, "failed", "run", message, details, duration)
-        status, note, details = self._compare_stream(case, "stdout", case.expected_stdout, run_proc.stdout, create_on_update=True)
+        if case.source.stem == "nob_test":
+            status, note, details = self._compare_nob_test_stdout(case, run_proc.stdout)
+        else:
+            status, note, details = self._compare_stream(
+                case,
+                "stdout",
+                case.expected_stdout,
+                run_proc.stdout,
+                create_on_update=True,
+            )
         if status == "failed":
             duration = time.perf_counter() - start
             return CaseResult(case, status, "stdout", note, details, duration)
@@ -508,6 +518,7 @@ class TestRunner:
         ignore_when_missing: bool = False,
     ) -> Tuple[str, str, Optional[str]]:
         normalized_actual = normalize_text(actual_text)
+        normalized_actual = self._normalize_case_output(case, label, normalized_actual)
         actual_clean = normalized_actual.rstrip("\n")
         if not expected_path.exists():
             if ignore_when_missing:
@@ -518,6 +529,7 @@ class TestRunner:
             details = normalized_actual or None
             return "failed", f"missing expectation {expected_path.name}", details
         expected_text = normalize_text(expected_path.read_text(encoding="utf-8"))
+        expected_text = self._normalize_case_output(case, label, expected_text)
         expected_clean = expected_text.rstrip("\n")
         if expected_clean == actual_clean:
             return "passed", "", None
@@ -538,6 +550,50 @@ class TestRunner:
                 parts.append("\n")
             parts.append(proc.stderr)
         return "".join(parts)
+
+    def _compare_nob_test_stdout(
+        self,
+        case: TestCase,
+        actual_text: str,
+    ) -> Tuple[str, str, Optional[str]]:
+        proc = subprocess.run(
+            ["ls"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=self._env_for(case),
+        )
+        if proc.returncode != 0:
+            details = self._format_process_output(proc)
+            return "failed", f"ls exited {proc.returncode}", details
+        expected_sorted = self._sort_lines(normalize_text(proc.stdout))
+        actual_sorted = self._sort_lines(normalize_text(actual_text))
+        if expected_sorted.rstrip("\n") == actual_sorted.rstrip("\n"):
+            return "passed", "", None
+        diff = diff_text(expected_sorted, actual_sorted, "stdout")
+        if not diff:
+            diff = f"expected:\n{expected_sorted}\nactual:\n{actual_sorted}"
+        return "failed", "stdout mismatch", diff
+
+    def _normalize_case_output(self, case: TestCase, label: str, text: str) -> str:
+        if case.source.stem == "nob_test" and label == "stdout":
+            return self._sort_lines(text)
+        if case.source.stem == "ct_test" and label == "compile":
+            return self._mask_build_path(text, case.binary_stub)
+        return text
+
+    def _sort_lines(self, text: str) -> str:
+        lines = text.splitlines()
+        if not lines:
+            return text
+        suffix = "\n" if text.endswith("\n") else ""
+        return "\n".join(sorted(lines)) + suffix
+
+    def _mask_build_path(self, text: str, binary_stub: str) -> str:
+        build_dir = str(self.build_dir.resolve())
+        masked = text.replace(build_dir, "<build>")
+        pattern = rf"/\S*/build/{re.escape(binary_stub)}"
+        return re.sub(pattern, f"<build>/{binary_stub}", masked)
 
     def _env_for(self, case: TestCase) -> Dict[str, str]:
         env = dict(self.base_env)

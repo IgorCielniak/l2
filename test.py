@@ -432,11 +432,17 @@ class TestRunner:
             cmd.append("--ct-run-main")
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
+        # When --ct-run-main is used, the compiler executes main at compile time,
+        # so it may need stdin data that would normally go to the binary.
+        compile_input = None
+        if self.args.ct_run_main and case.stdin_data() is not None:
+            compile_input = case.stdin_data()
         return subprocess.run(
             cmd,
             cwd=self.root,
             capture_output=True,
             text=True,
+            input=compile_input,
             env=self._env_for(case),
         )
 

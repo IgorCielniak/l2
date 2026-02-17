@@ -1,2 +1,3 @@
 hello world
-[info] built /home/igor/programming/IgorCielniak/l2/build/ct_test
+[info] built <build>/ct_test
+[warn] redefining word syscall

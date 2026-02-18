@@ -43,6 +43,7 @@ This document reflects the implementation that ships in this repository today (`
   - `while <condition> do <body> end`; the conditional block lives between `while` and `do` and re-runs every iteration.
   - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros.
   - `label name` / `goto name` perform local jumps within a definition.
+  - `&name` pushes a pointer to word `name` (its callable code label). This is intended for indirect control flow; `&name jmp` performs a tail jump to that word and is compatible with `--ct-run-main`.
 - **Text macros** – `macro name [param_count] ... ;` records raw tokens until `;`. `$0`, `$1`, ... expand to positional arguments. Macro definitions cannot nest (attempting to start another `macro` while recording raises a parse error).
 - **Struct builder** – `struct Foo ... end` emits `<Foo>.size`, `<Foo>.field.size`, `<Foo>.field.offset`, `<Foo>.field@`, and `<Foo>.field!` helpers. Layout is tightly packed with no implicit padding.
 - **With-blocks** – `with a b in ... end` rewrites occurrences of `a`/`b` into accesses against hidden global cells (`__with_a`). On entry the block pops the named values and stores them in those cells; reads compile to `@`, writes to `!`. Because the cells live in `.data`, the slots persist across calls and are not re-entrant.

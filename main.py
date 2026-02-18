@@ -742,6 +742,13 @@ class Parser:
         if self._try_literal(token):
             return
 
+        if token.lexeme.startswith("&"):
+            target_name = token.lexeme[1:]
+            if not target_name:
+                raise ParseError(f"missing word name after '&' at {token.line}:{token.column}")
+            self._append_op(Op(op="word_ptr", data=target_name))
+            return
+
         word = self.dictionary.lookup(token.lexeme)
         if word and word.immediate:
             if word.macro:
@@ -1172,6 +1179,10 @@ class _CTVMJump(Exception):
 
     def __init__(self, target_ip: int) -> None:
         self.target_ip = target_ip
+
+
+class _CTVMReturn(Exception):
+    """Raised to return from the current word frame in _execute_nodes."""
 
 
 class _CTVMExit(Exception):
@@ -1708,7 +1719,7 @@ class CompileTimeVM:
             self._execute_nodes(definition.body, _defn=definition)
         except CompileTimeError:
             raise
-        except (_CTVMJump, _CTVMExit):
+        except (_CTVMJump, _CTVMExit, _CTVMReturn):
             raise
         except ParseError as exc:
             raise CompileTimeError(f"{exc}\ncompile-time stack: {' -> '.join(self.call_stack)}") from None
@@ -2341,6 +2352,9 @@ class CompileTimeVM:
                                     self.call_stack.pop()
                                     ip = jmp.target_ip
                                     continue
+                                except _CTVMReturn:
+                                    self.call_stack.pop()
+                                    return
                                 finally:
                                     if self.call_stack and self.call_stack[-1] == word.name:
                                         self.call_stack.pop()
@@ -2365,6 +2379,8 @@ class CompileTimeVM:
                         except _CTVMJump as jmp:
                             ip = jmp.target_ip
                             continue
+                        except _CTVMReturn:
+                            return
                         ip += 1
                         continue
 
@@ -2406,6 +2422,19 @@ class CompileTimeVM:
                     except _CTVMJump as jmp:
                         ip = jmp.target_ip
                         continue
+                    except _CTVMReturn:
+                        return
+                    ip += 1
+                    continue
+
+                if kind == "word_ptr":
+                    target_name = str(node.data)
+                    target_word = _dict_lookup(target_name)
+                    if target_word is None:
+                        raise ParseError(
+                            f"unknown word '{target_name}' referenced by pointer during compile-time execution"
+                        )
+                    _push(self._handles.store(target_word))
                     ip += 1
                     continue
 
@@ -3002,7 +3031,7 @@ class Assembler:
             refs: Set[str] = set()
             if isinstance(definition, Definition):
                 for node in definition.body:
-                    if node.op == "word":
+                    if node.op in {"word", "word_ptr"}:
                         refs.add(str(node.data))
             edges[definition.name] = refs
 
@@ -3261,6 +3290,10 @@ class Assembler:
             self._emit_wordref(str(data), builder)
             return
 
+        if kind == "word_ptr":
+            self._emit_wordptr(str(data), builder)
+            return
+
         if kind == "branch_zero":
             self._emit_branch_zero(str(data), builder)
             return
@@ -3437,6 +3470,16 @@ class Assembler:
                 builder.emit(f"    call {name}")
         else:
             builder.emit(f"    call {sanitize_label(name)}")
+
+    def _emit_wordptr(self, name: str, builder: FunctionEmitter) -> None:
+        word = self.dictionary.lookup(name)
+        if word is None:
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"unknown word '{name}'{suffix}")
+        if getattr(word, "is_extern", False):
+            builder.push_label(name)
+            return
+        builder.push_label(sanitize_label(name))
 
     def _emit_branch_zero(self, target: str, builder: FunctionEmitter) -> None:
         builder.pop_to("rax")
@@ -4279,8 +4322,18 @@ def _rt_exit(vm: CompileTimeVM) -> None:
 
 
 def _rt_jmp(vm: CompileTimeVM) -> None:
-    target_ip = vm.pop_int()
-    raise _CTVMJump(target_ip)
+    target = vm.pop()
+    resolved = vm._resolve_handle(target)
+    if isinstance(resolved, Word):
+        vm._call_word(resolved)
+        raise _CTVMReturn()
+    if isinstance(resolved, bool):
+        raise _CTVMJump(int(resolved))
+    if not isinstance(resolved, int):
+        raise ParseError(
+            f"jmp expects an address or word pointer, got {type(resolved).__name__}: {resolved!r}"
+        )
+    raise _CTVMJump(resolved)
 
 
 def _rt_syscall(vm: CompileTimeVM) -> None:

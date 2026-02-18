@@ -38,6 +38,7 @@ This document reflects the implementation that ships in this repository today (`
 
 ## 5. Definitions, Control Flow, and Syntax Sugar
 - **Word definitions** – Always `word name ... end`. Redefinitions overwrite the previous entry (a warning prints to stderr). `inline word name ... end` marks the definition for inline expansion; recursive inline calls are rejected. `immediate` and `compile-only` apply to the most recently defined word.
+- **Priority-based redefinition** – Use `priority <int>` before `word`, `:asm`, `:py`, or `extern` to control conflicts for the same name. Higher priority wins; lower-priority definitions are ignored. Equal priority keeps last definition (with a redefinition warning). The compiler prints a note indicating which priority was selected.
 - **Control forms** – Built-in tokens drive code emission:
   - `if ... end` and `if ... else ... end`. To express additional branches, place `if` on the same line as the preceding `else` (e.g., `else <condition> if ...`); the reader treats that form as an implicit chained clause, so each inline `if` consumes one flag and jumps past later clauses on success.
   - `while <condition> do <body> end`; the conditional block lives between `while` and `do` and re-runs every iteration.

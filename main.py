@@ -333,6 +333,7 @@ _WORD_EFFECT_ALIASES: Dict[str, str] = {
 @dataclass
 class Word:
     name: str
+    priority: int = 0
     immediate: bool = False
     definition: Optional[Union[Definition, AsmDefinition]] = None
     macro: Optional[MacroHandler] = None
@@ -354,10 +355,39 @@ class Word:
 class Dictionary:
     words: Dict[str, Word] = field(default_factory=dict)
 
-    def register(self, word: Word) -> None:
-        if word.name in self.words:
-            sys.stderr.write(f"[warn] redefining word {word.name}\n")
+    def register(self, word: Word) -> Word:
+        existing = self.words.get(word.name)
+        if existing is None:
+            self.words[word.name] = word
+            return word
+
+        # Preserve existing intrinsic handlers unless explicitly replaced.
+        if word.runtime_intrinsic is None and existing.runtime_intrinsic is not None:
+            word.runtime_intrinsic = existing.runtime_intrinsic
+        if word.compile_time_intrinsic is None and existing.compile_time_intrinsic is not None:
+            word.compile_time_intrinsic = existing.compile_time_intrinsic
+
+        if word.priority > existing.priority:
+            self.words[word.name] = word
+            sys.stderr.write(
+                f"[note] word {word.name}: using priority {word.priority} over {existing.priority}\n"
+            )
+            return word
+
+        if word.priority < existing.priority:
+            sys.stderr.write(
+                f"[note] word {word.name}: keeping priority {existing.priority}, ignored {word.priority}\n"
+            )
+            return existing
+
+        # Same priority: allow replacing placeholder bootstrap words silently.
+        if existing.definition is None and word.definition is not None:
+            self.words[word.name] = word
+            return word
+
+        sys.stderr.write(f"[warn] redefining word {word.name} (priority {word.priority})\n")
         self.words[word.name] = word
+        return word
 
     def lookup(self, name: str) -> Optional[Word]:
         return self.words.get(name)
@@ -380,7 +410,7 @@ class Parser:
         self._token_iter_exhausted = True
         self.pos = 0
         self.context_stack: List[Context] = []
-        self.definition_stack: List[Word] = []
+        self.definition_stack: List[Tuple[Word, bool]] = []
         self.last_defined: Optional[Word] = None
         self.source: str = ""
         self.macro_recording: Optional[MacroDefinition] = None
@@ -395,6 +425,7 @@ class Parser:
         self.custom_prelude: Optional[List[str]] = None
         self.custom_bss: Optional[List[str]] = None
         self._pending_inline_definition: bool = False
+        self._pending_priority: Optional[int] = None
 
     def location_for_token(self, token: Token) -> SourceLocation:
         for span in self.file_spans:
@@ -501,6 +532,7 @@ class Parser:
         self.custom_prelude = None
         self.custom_bss = None
         self._pending_inline_definition = False
+        self._pending_priority = None
 
         try:
             while not self._eof():
@@ -511,6 +543,17 @@ class Parser:
                 if self._handle_macro_recording(token):
                     continue
                 lexeme = token.lexeme
+                if self._pending_priority is not None and lexeme not in {
+                    "word",
+                    ":asm",
+                    ":py",
+                    "extern",
+                    "inline",
+                    "priority",
+                }:
+                    raise ParseError(
+                        f"priority {self._pending_priority} must be followed by definition/extern"
+                    )
                 if lexeme == "[":
                     self._handle_list_begin()
                     continue
@@ -536,6 +579,9 @@ class Parser:
                     continue
                 if lexeme == "extern":
                     self._parse_extern(token)
+                    continue
+                if lexeme == "priority":
+                    self._parse_priority_directive(token)
                     continue
                 if lexeme == "if":
                     self._handle_if_control()
@@ -567,6 +613,8 @@ class Parser:
 
         if self.macro_recording is not None:
             raise ParseError("unterminated macro definition (missing ';')")
+        if self._pending_priority is not None:
+            raise ParseError(f"dangling priority {self._pending_priority} without following definition")
 
         if len(self.context_stack) != 1:
             raise ParseError("unclosed definition at EOF")
@@ -591,6 +639,25 @@ class Parser:
         label = entry["label"]
         self._append_op(Op(op="list_end", data=label))
 
+    def _parse_priority_directive(self, token: Token) -> None:
+        if self._eof():
+            raise ParseError(f"priority value missing at {token.line}:{token.column}")
+        value_tok = self._consume()
+        try:
+            value = int(value_tok.lexeme, 0)
+        except ValueError:
+            raise ParseError(
+                f"invalid priority '{value_tok.lexeme}' at {value_tok.line}:{value_tok.column}"
+            )
+        self._pending_priority = value
+
+    def _consume_pending_priority(self) -> int:
+        if self._pending_priority is None:
+            return 0
+        value = self._pending_priority
+        self._pending_priority = None
+        return value
+
     # Internal helpers ---------------------------------------------------------
 
     def _parse_extern(self, token: Token) -> None:
@@ -601,17 +668,18 @@ class Parser:
         if self._eof():
             raise ParseError(f"extern missing name at {token.line}:{token.column}")
 
+        priority = self._consume_pending_priority()
         first_token = self._consume()
-        if self._try_parse_c_extern(first_token):
+        if self._try_parse_c_extern(first_token, priority=priority):
             return
-        self._parse_legacy_extern(first_token)
+        self._parse_legacy_extern(first_token, priority=priority)
 
-    def _parse_legacy_extern(self, name_token: Token) -> None:
+    def _parse_legacy_extern(self, name_token: Token, *, priority: int = 0) -> None:
         name = name_token.lexeme
-        word = self.dictionary.lookup(name)
-        if word is None:
-            word = Word(name=name)
-            self.dictionary.register(word)
+        candidate = Word(name=name, priority=priority)
+        word = self.dictionary.register(candidate)
+        if word is not candidate:
+            return
         word.is_extern = True
 
         peek = self.peek_token()
@@ -626,7 +694,7 @@ class Parser:
             word.extern_inputs = 0
             word.extern_outputs = 0
 
-    def _try_parse_c_extern(self, first_token: Token) -> bool:
+    def _try_parse_c_extern(self, first_token: Token, *, priority: int = 0) -> bool:
         saved_pos = self.pos
         prefix_tokens: List[str] = [first_token.lexeme]
 
@@ -660,7 +728,7 @@ class Parser:
         ret_type = _normalize_c_type_tokens(prefix_tokens, allow_default=True)
         inputs, arg_types = self._parse_c_param_list()
         outputs = 0 if ret_type == "void" else 1
-        self._register_c_extern(name_lexeme, inputs, outputs, arg_types, ret_type)
+        self._register_c_extern(name_lexeme, inputs, outputs, arg_types, ret_type, priority=priority)
         return True
 
     def _parse_c_param_list(self) -> Tuple[int, List[str]]:
@@ -729,11 +797,13 @@ class Parser:
         outputs: int,
         arg_types: List[str],
         ret_type: str,
+        *,
+        priority: int = 0,
     ) -> None:
-        word = self.dictionary.lookup(name)
-        if word is None:
-            word = Word(name=name)
-            self.dictionary.register(word)
+        candidate = Word(name=name, priority=priority)
+        word = self.dictionary.register(candidate)
+        if word is not candidate:
+            return
         word.is_extern = True
         word.extern_inputs = inputs
         word.extern_outputs = outputs
@@ -937,6 +1007,7 @@ class Parser:
                 f"definition name missing after '{token.lexeme}' at {token.line}:{token.column}"
             )
         name_token = self._consume()
+        priority = self._consume_pending_priority()
         definition = Definition(
             name=name_token.lexeme,
             body=[],
@@ -944,13 +1015,12 @@ class Parser:
             inline=inline,
         )
         self.context_stack.append(definition)
-        word = self.dictionary.lookup(definition.name)
-        if word is None:
-            word = Word(name=definition.name)
-            self.dictionary.register(word)
-        word.definition = definition
-        word.inline = inline
-        self.definition_stack.append(word)
+        candidate = Word(name=definition.name, priority=priority)
+        candidate.definition = definition
+        candidate.inline = inline
+        active_word = self.dictionary.register(candidate)
+        is_active = active_word is candidate
+        self.definition_stack.append((candidate, is_active))
 
     def _end_definition(self, token: Token) -> None:
         if len(self.context_stack) <= 1:
@@ -962,7 +1032,9 @@ class Parser:
             raise ParseError(
                 f"definition '{ctx.name}' expects terminator '{ctx.terminator}' but got '{token.lexeme}'"
             )
-        word = self.definition_stack.pop()
+        word, is_active = self.definition_stack.pop()
+        if not is_active:
+            return
         ctx.immediate = word.immediate
         ctx.compile_only = word.compile_only
         ctx.inline = word.inline
@@ -1033,21 +1105,22 @@ class Parser:
         if block_end is None:
             raise ParseError("missing '}' to terminate asm body")
         asm_body = self.source[block_start:block_end]
+        priority = self._consume_pending_priority()
         definition = AsmDefinition(name=name_token.lexeme, body=asm_body)
         if effect_names is not None:
             definition.effects = set(effect_names)
-        word = self.dictionary.lookup(definition.name)
-        if word is None:
-            word = Word(name=definition.name)
-            self.dictionary.register(word)
-        word.definition = definition
-        definition.immediate = word.immediate
-        definition.compile_only = word.compile_only
+        candidate = Word(name=definition.name, priority=priority)
+        candidate.definition = definition
+        word = self.dictionary.register(candidate)
+        if word is candidate:
+            definition.immediate = word.immediate
+            definition.compile_only = word.compile_only
         module = self.context_stack[-1]
         if not isinstance(module, Module):
             raise ParseError("asm definitions must be top-level forms")
-        module.forms.append(definition)
-        self.last_defined = word
+        if word is candidate:
+            module.forms.append(definition)
+            self.last_defined = word
         if self._eof():
             raise ParseError("asm definition missing terminator ';'")
         terminator = self._consume()
@@ -1071,9 +1144,16 @@ class Parser:
         if block_end is None:
             raise ParseError("missing '}' to terminate py body")
         py_body = textwrap.dedent(self.source[block_start:block_end])
-        word = self.dictionary.lookup(name_token.lexeme)
-        if word is None:
-            word = Word(name=name_token.lexeme)
+        priority = self._consume_pending_priority()
+        candidate = Word(name=name_token.lexeme, priority=priority)
+        word = self.dictionary.register(candidate)
+        if word is not candidate:
+            if self._eof():
+                raise ParseError("py definition missing terminator ';'")
+            terminator = self._consume()
+            if terminator.lexeme != ";":
+                raise ParseError(f"expected ';' after py definition at {terminator.line}:{terminator.column}")
+            return
         namespace = self._py_exec_namespace()
         try:
             exec(py_body, namespace)
@@ -1088,7 +1168,6 @@ class Parser:
             word.immediate = True
         if intrinsic_fn is not None:
             word.intrinsic = intrinsic_fn
-        self.dictionary.register(word)
         if self._eof():
             raise ParseError("py definition missing terminator ';'")
         terminator = self._consume()

@@ -1,13 +1,11 @@
 import stdlib.sl
 import io.sl
 
-#dump [* | n] -> [*]
-
 # dump takes the firts element from the stack
 # and prints that much consequent elements
 # from the stack while not modifying it
-# all variations have the same stack effect
 
+#dump [* | n] -> [*]
 word dump
 	1 swap
 	for
@@ -18,6 +16,7 @@ word dump
 	drop
 end
 
+#rdump [* | n] -> [*]
 # dump return stack
 word rdump
 	1 swap
@@ -29,6 +28,8 @@ word rdump
 	drop
 end
 
+#fdump [* | n] -> [*]
+#dump the stack with additional formatting
 word fdump
 	"[*, " write_buf
 	1 swap 1 +
@@ -44,6 +45,8 @@ word fdump
 	"]\n" write_buf
 end
 
+#frdump [* | n] -> [*]
+#dump the return stack with additional formatting
 word frdump
 	"[*, " write_buf
 	1 swap 1 -

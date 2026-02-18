@@ -213,12 +213,11 @@ end
 #  Multi-substitution format words
 # ---------------------------------------------------------------------------
 
-#formats [*, sN_addr, sN_len, ..., s1_addr, s1_len, fmt_addr | fmt_len]
-#     -> [*, result_addr | result_len]
 # Replaces each '%' in fmt with the corresponding string argument.
 # s1 (just below fmt) maps to the first '%', s2 to the second, etc.
 # The number of string-pair args must equal the number of '%' markers.
 # Returns a newly allocated string, or fmt as-is when there are no '%'.
+#formats [*, sN_addr, sN_len, ..., s1_addr, s1_len, fmt_addr | fmt_len] -> [*, result_addr | result_len]
 word formats
     2dup 37 count_char_in_str nip nip  # count '%' -> n
     dup 0 == if
@@ -236,12 +235,12 @@ word formats
     end
 end
 
-#formati [*, iN, ..., i1, fmt_addr | fmt_len]
-#     -> [*, result_addr | result_len]
+
 # Replaces each '%' in fmt with the decimal string of the corresponding
 # integer argument.  i1 (just below fmt) maps to the first '%', etc.
 # The number of int args must equal the number of '%' markers.
 # Returns a newly allocated string, or fmt as-is when there are no '%'.
+#formati [*, iN, ..., i1, fmt_addr | fmt_len] -> [*, result_addr | result_len]
 word formati
     2dup 37 count_char_in_str nip nip  # count '%' -> n
     dup 0 == if

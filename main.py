@@ -14,6 +14,7 @@ import argparse
 import ctypes
 import mmap
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -2860,6 +2861,7 @@ class Assembler:
         dictionary: Dictionary,
         *,
         enable_constant_folding: bool = True,
+        enable_peephole_optimization: bool = True,
         loop_unroll_threshold: int = 8,
     ) -> None:
         self.dictionary = dictionary
@@ -2872,7 +2874,64 @@ class Assembler:
         self._emit_stack: List[str] = []
         self._export_all_defs: bool = False
         self.enable_constant_folding = enable_constant_folding
+        self.enable_peephole_optimization = enable_peephole_optimization
         self.loop_unroll_threshold = loop_unroll_threshold
+
+    def _peephole_optimize_definition(self, definition: Definition) -> None:
+        # Rewrite short stack-manipulation sequences into canonical forms.
+        # Rules are ordered longest-first by matching logic below.
+        rules: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
+            (("swap", "drop"), ("nip",)),
+            # Stack no-ops
+            (("dup", "drop"), tuple()),
+            (("swap", "swap"), tuple()),
+            (("over", "drop"), tuple()),
+            (("dup", "nip"), tuple()),
+            (("2dup", "2drop"), tuple()),
+            (("2swap", "2swap"), tuple()),
+            (("rot", "rot", "rot"), tuple()),
+            # Canonicalizations
+            (("swap", "over"), ("tuck",)),
+            (("swap", "nip"), ("drop",)),
+            (("nip", "drop"), ("2drop",)),
+            (("tuck", "drop"), ("swap",)),
+        ]
+
+        max_pat_len = max(len(pattern) for pattern, _ in rules)
+
+        nodes = definition.body
+        changed = True
+        while changed:
+            changed = False
+            optimized: List[Op] = []
+            idx = 0
+            while idx < len(nodes):
+                matched = False
+                for window in range(min(max_pat_len, len(nodes) - idx), 1, -1):
+                    segment = nodes[idx:idx + window]
+                    if any(node.op != "word" for node in segment):
+                        continue
+                    names = tuple(str(node.data) for node in segment)
+                    replacement: Optional[Tuple[str, ...]] = None
+                    for pattern, repl in rules:
+                        if names == pattern:
+                            replacement = repl
+                            break
+                    if replacement is None:
+                        continue
+                    base_loc = segment[0].loc
+                    for repl_name in replacement:
+                        optimized.append(Op(op="word", data=repl_name, loc=base_loc))
+                    idx += window
+                    changed = True
+                    matched = True
+                    break
+                if matched:
+                    continue
+                optimized.append(nodes[idx])
+                idx += 1
+            nodes = optimized
+        definition.body = nodes
 
     def _fold_constants_in_definition(self, definition: Definition) -> None:
         optimized: List[Op] = []
@@ -3072,6 +3131,10 @@ class Assembler:
             for defn in definitions:
                 if isinstance(defn, Definition):
                     self._unroll_constant_for_loops(defn)
+            if self.enable_peephole_optimization:
+                for defn in definitions:
+                    if isinstance(defn, Definition):
+                        self._peephole_optimize_definition(defn)
             if self.enable_constant_folding:
                 for defn in definitions:
                     if isinstance(defn, Definition):
@@ -5332,6 +5395,401 @@ def _repl_build_source(
     return "\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True)
+class DocEntry:
+    name: str
+    stack_effect: str
+    description: str
+    kind: str
+    path: Path
+    line: int
+
+
+_DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
+_DOC_WORD_RE = re.compile(r"^\s*word\s+([^\s]+)\b")
+_DOC_ASM_RE = re.compile(r"^\s*:asm\s+([^\s{]+)")
+_DOC_PY_RE = re.compile(r"^\s*:py\s+([^\s{]+)")
+
+
+def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
+    match = _DOC_STACK_RE.match(text)
+    if match is None:
+        return None
+    name = match.group(1).strip()
+    tail = match.group(2).strip()
+    if not name:
+        return None
+    if "->" not in tail:
+        return None
+    return name, tail
+
+
+def _extract_definition_name(text: str) -> Optional[Tuple[str, str]]:
+    for kind, regex in (("word", _DOC_WORD_RE), ("asm", _DOC_ASM_RE), ("py", _DOC_PY_RE)):
+        match = regex.match(text)
+        if match is not None:
+            return kind, match.group(1)
+    return None
+
+
+def _is_doc_symbol_name(name: str, *, include_private: bool = False) -> bool:
+    if not name:
+        return False
+    if not include_private and name.startswith("__"):
+        return False
+    return True
+
+
+def _collect_leading_doc_comments(lines: Sequence[str], def_index: int, name: str) -> Tuple[str, str]:
+    comments: List[str] = []
+    stack_effect = ""
+
+    idx = def_index - 1
+    while idx >= 0:
+        raw = lines[idx]
+        stripped = raw.strip()
+        if not stripped:
+            break
+        if not stripped.startswith("#"):
+            break
+
+        parsed = _extract_stack_comment(raw)
+        if parsed is not None:
+            comment_name, effect = parsed
+            if comment_name == name and not stack_effect:
+                stack_effect = effect
+            idx -= 1
+            continue
+
+        text = stripped[1:].strip()
+        if text:
+            comments.append(text)
+        idx -= 1
+
+    comments.reverse()
+    return stack_effect, " ".join(comments)
+
+
+def _scan_doc_file(
+    path: Path,
+    *,
+    include_undocumented: bool = False,
+    include_private: bool = False,
+) -> List[DocEntry]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    lines = text.splitlines()
+    entries: List[DocEntry] = []
+    defined_names: Set[str] = set()
+
+    for idx, line in enumerate(lines):
+        parsed = _extract_definition_name(line)
+        if parsed is None:
+            continue
+        kind, name = parsed
+        if not _is_doc_symbol_name(name, include_private=include_private):
+            continue
+        defined_names.add(name)
+        stack_effect, description = _collect_leading_doc_comments(lines, idx, name)
+        if not include_undocumented and not stack_effect and not description:
+            continue
+        entries.append(
+            DocEntry(
+                name=name,
+                stack_effect=stack_effect,
+                description=description,
+                kind=kind,
+                path=path,
+                line=idx + 1,
+            )
+        )
+
+    return entries
+
+
+def _iter_doc_files(roots: Sequence[Path], *, include_tests: bool = False) -> List[Path]:
+    seen: Set[Path] = set()
+    files: List[Path] = []
+    skip_parts = {"build", ".git", ".venv", "raylib-5.5_linux_amd64"}
+    if not include_tests:
+        skip_parts.update({"tests", "extra_tests"})
+
+    def _should_skip(candidate: Path) -> bool:
+        parts = set(candidate.parts)
+        return any(part in parts for part in skip_parts)
+
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if not resolved.exists():
+            continue
+        if resolved.is_file() and resolved.suffix == ".sl":
+            if _should_skip(resolved):
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(resolved)
+            continue
+        if not resolved.is_dir():
+            continue
+        for path in resolved.rglob("*.sl"):
+            if _should_skip(path):
+                continue
+            candidate = path.resolve()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            files.append(candidate)
+    files.sort()
+    return files
+
+
+def collect_docs(
+    roots: Sequence[Path],
+    *,
+    include_undocumented: bool = False,
+    include_private: bool = False,
+    include_tests: bool = False,
+) -> List[DocEntry]:
+    entries: List[DocEntry] = []
+    for doc_file in _iter_doc_files(roots, include_tests=include_tests):
+        entries.extend(
+            _scan_doc_file(
+                doc_file,
+                include_undocumented=include_undocumented,
+                include_private=include_private,
+            )
+        )
+    # Deduplicate by symbol name; keep first (roots/files are stable-sorted)
+    dedup: Dict[str, DocEntry] = {}
+    for entry in entries:
+        dedup.setdefault(entry.name, entry)
+    entries = list(dedup.values())
+    entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
+    return entries
+
+
+def _filter_docs(entries: Sequence[DocEntry], query: str) -> List[DocEntry]:
+    q = query.strip().lower()
+    if not q:
+        return list(entries)
+
+    try:
+        raw_terms = [term.lower() for term in shlex.split(q) if term]
+    except Exception:
+        raw_terms = [term.lower() for term in q.split() if term]
+    terms = raw_terms
+    if not terms:
+        return list(entries)
+
+    positive_terms: List[str] = []
+    negative_terms: List[str] = []
+    field_terms: Dict[str, List[str]] = {"name": [], "effect": [], "desc": [], "path": [], "kind": []}
+    for term in terms:
+        if term.startswith("-") and len(term) > 1:
+            negative_terms.append(term[1:])
+            continue
+        if ":" in term:
+            prefix, value = term.split(":", 1)
+            if prefix in field_terms and value:
+                field_terms[prefix].append(value)
+                continue
+        positive_terms.append(term)
+
+    ranked: List[Tuple[int, DocEntry]] = []
+    for entry in entries:
+        name = entry.name.lower()
+        effect = entry.stack_effect.lower()
+        desc = entry.description.lower()
+        path_text = entry.path.as_posix().lower()
+        kind = entry.kind.lower()
+        all_text = " ".join([name, effect, desc, path_text, kind])
+
+        if any(term in all_text for term in negative_terms):
+            continue
+
+        if any(term not in name for term in field_terms["name"]):
+            continue
+        if any(term not in effect for term in field_terms["effect"]):
+            continue
+        if any(term not in desc for term in field_terms["desc"]):
+            continue
+        if any(term not in path_text for term in field_terms["path"]):
+            continue
+        if any(term not in kind for term in field_terms["kind"]):
+            continue
+
+        score = 0
+        matches_all = True
+        for term in positive_terms:
+            term_score = 0
+            if name == term:
+                term_score = 400
+            elif name.startswith(term):
+                term_score = 220
+            elif term in name:
+                term_score = 140
+            elif term in effect:
+                term_score = 100
+            elif term in desc:
+                term_score = 70
+            elif term in path_text:
+                term_score = 40
+            if term_score == 0:
+                matches_all = False
+                break
+            score += term_score
+
+        if not matches_all:
+            continue
+        if len(positive_terms) == 1 and positive_terms[0] in effect and positive_terms[0] not in name:
+            score -= 5
+        if field_terms["name"]:
+            score += 60
+        if field_terms["kind"]:
+            score += 20
+        ranked.append((score, entry))
+
+    ranked.sort(key=lambda item: (-item[0], item[1].name.lower(), str(item[1].path), item[1].line))
+    return [entry for _, entry in ranked]
+
+
+def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
+    if not entries:
+        print("[info] no documentation entries found")
+        return 0
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        filtered = _filter_docs(entries, initial_query)
+        print(f"[info] docs entries: {len(filtered)}/{len(entries)}")
+        for entry in filtered[:200]:
+            effect = entry.stack_effect if entry.stack_effect else "(no stack effect)"
+            print(f"{entry.name:24} {effect}  [{entry.path}:{entry.line}]")
+        if len(filtered) > 200:
+            print(f"[info] ... {len(filtered) - 200} more entries")
+        return 0
+
+    import curses
+
+    def _app(stdscr: Any) -> int:
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
+        stdscr.keypad(True)
+
+        query = initial_query
+        selected = 0
+        scroll = 0
+
+        while True:
+            filtered = _filter_docs(entries, query)
+            if selected >= len(filtered):
+                selected = max(0, len(filtered) - 1)
+
+            height, width = stdscr.getmaxyx()
+            list_height = max(1, height - 4)
+            if selected < scroll:
+                scroll = selected
+            if selected >= scroll + list_height:
+                scroll = selected - list_height + 1
+            max_scroll = max(0, len(filtered) - list_height)
+            if scroll > max_scroll:
+                scroll = max_scroll
+
+            stdscr.erase()
+            header = f"L2 docs {len(filtered)}/{len(entries)}  filter: {query}"
+            stdscr.addnstr(0, 0, header, max(1, width - 1), curses.A_BOLD)
+            stdscr.addnstr(
+                1,
+                0,
+                "Type to search · name:/effect:/desc:/path:/kind: · -term excludes · Up/Down j/k · PgUp/PgDn · q/Esc",
+                max(1, width - 1),
+                0,
+            )
+
+            for row in range(list_height):
+                idx = scroll + row
+                if idx >= len(filtered):
+                    break
+                entry = filtered[idx]
+                effect = entry.stack_effect if entry.stack_effect else "(no stack effect)"
+                line = f"{entry.name:24} {effect}"
+                attr = curses.A_REVERSE if idx == selected else 0
+                stdscr.addnstr(2 + row, 0, line, max(1, width - 1), attr)
+
+            if filtered:
+                current = filtered[selected]
+                detail = f"{current.path}:{current.line} [{current.kind}]"
+                if current.description:
+                    detail += f"  {current.description}"
+                stdscr.addnstr(height - 1, 0, detail, max(1, width - 1), 0)
+            else:
+                stdscr.addnstr(height - 1, 0, "No matches", max(1, width - 1), 0)
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (27, ord("q")):
+                return 0
+            if key in (curses.KEY_UP, ord("k")):
+                if selected > 0:
+                    selected -= 1
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                if selected + 1 < len(filtered):
+                    selected += 1
+                continue
+            if key == curses.KEY_PPAGE:
+                selected = max(0, selected - list_height)
+                continue
+            if key == curses.KEY_NPAGE:
+                selected = min(max(0, len(filtered) - 1), selected + list_height)
+                continue
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                query = query[:-1]
+                selected = 0
+                scroll = 0
+                continue
+            if 32 <= key <= 126:
+                query += chr(key)
+                selected = 0
+                scroll = 0
+                continue
+
+        return 0
+
+    return int(curses.wrapper(_app))
+
+
+def run_docs_explorer(
+    *,
+    source: Optional[Path],
+    include_paths: Sequence[Path],
+    explicit_roots: Sequence[Path],
+    initial_query: str,
+    include_undocumented: bool = False,
+    include_private: bool = False,
+    include_tests: bool = False,
+) -> int:
+    roots: List[Path] = [Path("."), Path("./stdlib"), Path("./libs")]
+    roots.extend(include_paths)
+    roots.extend(explicit_roots)
+    if source is not None:
+        roots.append(source.parent)
+        roots.append(source)
+
+    entries = collect_docs(
+        roots,
+        include_undocumented=include_undocumented,
+        include_private=include_private,
+        include_tests=include_tests,
+    )
+    return _run_docs_tui(entries, initial_query=initial_query)
+
+
 def cli(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
@@ -5355,8 +5813,32 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--repl", action="store_true", help="interactive REPL; source file is optional")
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
     parser.add_argument("--no-folding", action="store_true", help="disable constant folding optimization")
+    parser.add_argument("--no-peephole", action="store_true", help="disable peephole optimizations")
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
+    parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
+    parser.add_argument(
+        "--docs-root",
+        action="append",
+        default=[],
+        type=Path,
+        help="extra file/directory root to scan for docs (repeatable)",
+    )
+    parser.add_argument(
+        "--docs-query",
+        default="",
+        help="initial filter query for --docs mode",
+    )
+    parser.add_argument(
+        "--docs-all",
+        action="store_true",
+        help="include undocumented and private symbols in docs index",
+    )
+    parser.add_argument(
+        "--docs-include-tests",
+        action="store_true",
+        help="include tests/extra_tests in docs index",
+    )
     parser.add_argument(
         "--script",
         action="store_true",
@@ -5383,6 +5865,7 @@ def cli(argv: Sequence[str]) -> int:
 
     artifact_kind = args.artifact
     folding_enabled = not args.no_folding
+    peephole_enabled = not args.no_peephole
 
     if args.ct_run_main and artifact_kind != "exe":
         parser.error("--ct-run-main requires --artifact exe")
@@ -5405,6 +5888,17 @@ def cli(argv: Sequence[str]) -> int:
             return 1
         return 0
 
+    if args.docs:
+        return run_docs_explorer(
+            source=args.source,
+            include_paths=args.include_paths,
+            explicit_roots=args.docs_root,
+            initial_query=str(args.docs_query or ""),
+            include_undocumented=args.docs_all,
+            include_private=args.docs_all,
+            include_tests=args.docs_include_tests,
+        )
+
     if args.source is None and not args.repl:
         parser.error("the following arguments are required: source")
 
@@ -5423,6 +5917,7 @@ def cli(argv: Sequence[str]) -> int:
 
     compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
     compiler.assembler.enable_constant_folding = folding_enabled
+    compiler.assembler.enable_peephole_optimization = peephole_enabled
     try:
         if args.repl:
             return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)

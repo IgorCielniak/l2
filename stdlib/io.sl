@@ -1,9 +1,8 @@
 # L2 IO Primitives
 
+#Reads the file at the given path (pointer+length, not null-terminated),
+#returns (addr len) of mapped file, or (tag neg_errno) on error.
 #read_file [*, path_addr | path_len] -> [*, addr | len] || [*, tag | neg_errno]
-#   Reads the file at the given path (pointer+length, not null-terminated),
-#   returns (addr len) of mapped file, or (tag neg_errno) on error.
-
 :asm read_file {
 	; stack: path_addr (NOS), path_len (TOS)
 	mov rdx, [r12]        ; path_len
@@ -191,6 +190,7 @@
 }
 ;
 
+#print [* | x] -> [*]
 :asm print (effects string-io) {
 	mov rax, [r12]      ; len or int value
 	mov rbx, [r12 + 8]  ; possible address
@@ -353,8 +353,11 @@
 }
 ;
 
+#cr [*] -> [*]
 inline word cr 10 putc end
 
+#puts [* | x] -> [*]
 inline word puts write_buf cr end
 
-inline   word eputs ewrite_buf cr end
+#eputs [* | x] -> [*]
+inline word eputs ewrite_buf cr end

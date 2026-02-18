@@ -31,7 +31,7 @@ end
 immediate
 compile-only
 
-
+#extend-syntax [*] -> [*]
 word extend-syntax
 	"call-syntax-rewrite" set-token-hook
 end

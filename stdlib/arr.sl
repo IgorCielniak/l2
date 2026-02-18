@@ -44,7 +44,8 @@ word arr_free
     dup arr_cap 8 * 24 + free
 end
 
-# Helper: copy n qwords from src to dst [*, dst, src | n] -> [*]
+# Helper: copy n qwords from src to dst
+#arr_copy_elements [*, dst, src | n] -> [*]
 word arr_copy_elements
     while dup 0 > do
         over @ 3 pick swap !   # dst = *src

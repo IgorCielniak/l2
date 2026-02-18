@@ -786,7 +786,7 @@ class Parser:
         replaced: List[str] = []
         for lex in word.macro_expansion or []:
             if lex.startswith("$"):
-                idx = int(lex[1:]) - 1
+                idx = int(lex[1:])
                 if idx < 0 or idx >= len(args):
                     raise ParseError(f"macro {word.name} missing argument for {lex}")
                 replaced.append(args[idx])

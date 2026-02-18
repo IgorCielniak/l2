@@ -13,14 +13,14 @@ macro square
 ;
 
 macro defconst 2
-    word $1
-        $2
+    word $0
+        $1
     end
 ;
 
 macro defadder 3
-    word $1
-        $2 $3 +
+    word $0
+        $1 $2 +
     end
 ;
 

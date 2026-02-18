@@ -4312,7 +4312,9 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
     # Stack protocol (matching _emit_syscall_intrinsic):
     #   TOS:   syscall number → rax
     #   TOS-1: arg count → rcx
-    #   then up to 6 args → rdi, rsi, rdx, r10, r8, r9
+    #   then args on stack as ... arg0 arg1 ... argN (argN is top)
+    #
+
     lines = [
         "_stub_entry:",
         "    push rbx",
@@ -4339,43 +4341,57 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    jle _count_clamped",
         "    mov rcx, 6",
         "_count_clamped:",
-        # Save arg count in r14 and syscall num in r15
-        "    mov r14, rcx",
+        # Save syscall num in r15
         "    mov r15, rax",
-        # Pop args into scratch area on machine stack (up to 6 qwords)
-        # We pop them into rbx, r8-r11 area, then assign to syscall regs after
-        # Pop all args onto machine stack (reverse order)
-        "    sub rsp, 48",           # 6 * 8 bytes for args
-        "    xor rbx, rbx",         # index
-        "_pop_args:",
-        "    cmp rbx, r14",
-        "    jge _pop_done",
-        "    mov rax, [r12]",
-        "    add r12, 8",
-        "    mov [rsp + rbx*8], rax",
-        "    inc rbx",
-        "    jmp _pop_args",
-        "_pop_done:",
         # Check for exit (60) / exit_group (231)
         "    cmp r15, 60",
         "    je _do_exit",
         "    cmp r15, 231",
         "    je _do_exit",
-        # Assign args to syscall registers from the scratch area
-        # arg0 → rdi, arg1 → rsi, arg2 → rdx, arg3 → r10, arg4 → r8, arg5 → r9
-        "    mov rdi, [rsp]",
-        "    mov rsi, [rsp+8]",
-        "    mov rdx, [rsp+16]",
-        "    mov r10, [rsp+24]",
-        "    mov r8,  [rsp+32]",
-        "    mov r9,  [rsp+40]",
+        # Clear syscall arg registers
+        "    xor rdi, rdi",
+        "    xor rsi, rsi",
+        "    xor rdx, rdx",
+        "    xor r10, r10",
+        "    xor r8, r8",
+        "    xor r9, r9",
+        # Pop args in the same order as _emit_syscall_intrinsic
+        "    cmp rcx, 6",
+        "    jl _skip_r9",
+        "    mov r9, [r12]",
+        "    add r12, 8",
+        "_skip_r9:",
+        "    cmp rcx, 5",
+        "    jl _skip_r8",
+        "    mov r8, [r12]",
+        "    add r12, 8",
+        "_skip_r8:",
+        "    cmp rcx, 4",
+        "    jl _skip_r10",
+        "    mov r10, [r12]",
+        "    add r12, 8",
+        "_skip_r10:",
+        "    cmp rcx, 3",
+        "    jl _skip_rdx",
+        "    mov rdx, [r12]",
+        "    add r12, 8",
+        "_skip_rdx:",
+        "    cmp rcx, 2",
+        "    jl _skip_rsi",
+        "    mov rsi, [r12]",
+        "    add r12, 8",
+        "_skip_rsi:",
+        "    cmp rcx, 1",
+        "    jl _skip_rdi",
+        "    mov rdi, [r12]",
+        "    add r12, 8",
+        "_skip_rdi:",
         "    mov rax, r15",          # syscall number
         "    syscall",
         # Push result
         "    sub r12, 8",
         "    mov [r12], rax",
         # Normal return: flag=0
-        "    add rsp, 48",
         "    mov rax, [rsp]",        # output-struct pointer
         "    mov qword [rax], r12",
         "    mov qword [rax+8], r13",
@@ -4384,8 +4400,12 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    jmp _stub_epilogue",
         # Exit path: don't actually call syscall, just report it
         "_do_exit:",
-        "    mov rbx, [rsp]",        # arg0 = exit code
-        "    add rsp, 48",
+        "    xor rbx, rbx",
+        "    cmp rcx, 1",
+        "    jl _exit_code_ready",
+        "    mov rbx, [r12]",        # arg0 = exit code (for exit/exit_group)
+        "    add r12, 8",
+        "_exit_code_ready:",
         "    mov rax, [rsp]",        # output-struct pointer
         "    mov qword [rax], r12",
         "    mov qword [rax+8], r13",
@@ -4711,8 +4731,8 @@ class Compiler:
         word = self.dictionary.lookup("syscall")
         if word is None:
             word = Word(name="syscall")
+            self.dictionary.register(word)
         word.intrinsic = self._emit_syscall_intrinsic
-        self.dictionary.register(word)
 
     def _emit_syscall_intrinsic(self, builder: FunctionEmitter) -> None:
         label_id = self._syscall_label_counter
@@ -5283,6 +5303,12 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
     parser.add_argument("--no-folding", action="store_true", help="disable constant folding optimization")
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
+    parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
+    parser.add_argument(
+        "--script",
+        action="store_true",
+        help="shortcut for --no-artifact --ct-run-main",
+    )
 
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
@@ -5298,6 +5324,10 @@ def cli(argv: Sequence[str]) -> int:
         else:
             i += 1
 
+    if args.script:
+        args.no_artifact = True
+        args.ct_run_main = True
+
     artifact_kind = args.artifact
     folding_enabled = not args.no_folding
 
@@ -5306,6 +5336,9 @@ def cli(argv: Sequence[str]) -> int:
 
     if artifact_kind != "exe" and (args.run or args.dbg):
         parser.error("--run/--dbg are only available when --artifact exe is selected")
+
+    if args.no_artifact and (args.run or args.dbg):
+        parser.error("--run/--dbg are not available with --no-artifact")
 
     if args.clean:
         try:
@@ -5322,7 +5355,7 @@ def cli(argv: Sequence[str]) -> int:
     if args.source is None and not args.repl:
         parser.error("the following arguments are required: source")
 
-    if not args.repl and args.output is None:
+    if not args.repl and args.output is None and not args.no_artifact:
         stem = args.source.stem
         default_outputs = {
             "exe": Path("a.out"),
@@ -5364,6 +5397,10 @@ def cli(argv: Sequence[str]) -> int:
 
     if args.emit_asm:
         print(f"[info] wrote {asm_path}")
+        return 0
+
+    if args.no_artifact:
+        print("[info] skipped artifact generation (--no-artifact)")
         return 0
 
     run_nasm(asm_path, obj_path, debug=args.debug)

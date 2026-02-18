@@ -127,3 +127,112 @@ end
 word arr_set
     arr_data swap 8 * + swap !
 end
+
+#dyn_arr_clone [* | dyn_arr] -> [* | dyn_arr_copy]
+word dyn_arr_clone
+    dup arr_len
+    dup arr_new
+
+    dup arr_data
+    3 pick arr_data
+    3 pick
+    arr_copy_elements
+
+    dup >r
+    swap !
+    drop
+    r>
+end
+
+#arr_item_ptr [*, i | arr] -> [* | ptr]
+word arr_item_ptr
+    swap 8 * swap 8 + +
+end
+
+#arr_get [*, i | arr] -> [* | x]
+# Get element from built-in static array
+word arr_get_static
+    arr_item_ptr @
+end
+
+#arr_set [*, x, i | arr] -> [*]
+# Set element in built-in static array
+word arr_set_static
+    arr_item_ptr swap !
+end
+
+#arr_sort [* | arr] -> [* | arr]
+# Sort built-in static array in-place in ascending order
+word arr_sort
+    dup >r
+    dup arr_to_dyn
+    dyn_arr_sort
+    dup arr_data
+    r@ 8 +
+    swap
+    r@ @
+    arr_copy_elements
+    arr_free
+    rdrop
+end
+
+#dyn_arr_sort [* | dyn_arr] -> [* | dyn_arr]
+:asm dyn_arr_sort {
+    mov rbx, [r12]          ; arr
+    mov rcx, [rbx]          ; len
+    cmp rcx, 1
+    jle .done
+
+    dec rcx                 ; outer = len - 1
+.outer:
+    xor rdx, rdx            ; j = 0
+
+.inner:
+    cmp rdx, rcx
+    jge .next_outer
+
+    mov r8, [rbx + 16]      ; data ptr
+    lea r9, [r8 + rdx*8]    ; &data[j]
+    mov r10, [r9]           ; a = data[j]
+    mov r11, [r9 + 8]       ; b = data[j+1]
+    cmp r10, r11
+    jle .no_swap
+
+    mov [r9], r11
+    mov [r9 + 8], r10
+
+.no_swap:
+    inc rdx
+    jmp .inner
+
+.next_outer:
+    dec rcx
+    jnz .outer
+
+.done:
+    ret
+}
+;
+
+#arr_clone [* | arr] -> [* | arr_copy]
+# Clone built-in static array (len header + payload)
+word arr_clone
+    dup @ 1 +
+    dup 8 * alloc
+    dup >r
+    rot rot
+    arr_copy_elements
+    r>
+end
+
+#arr_sorted [* | arr] -> [* | arr_sorted]
+word arr_sorted
+    arr_clone
+    arr_sort
+end
+
+#dyn_arr_sorted [* | dyn_arr] -> [* | dyn_arr_sorted]
+word dyn_arr_sorted
+    dyn_arr_clone
+    dyn_arr_sort
+end

@@ -56,4 +56,44 @@ word main
 
     # free list allocation: bytes = (len + 1) * 8
     dup @ 1 + 8 * free
+
+    # dyn_arr_sorted (copy) should not mutate source
+    5 arr_new
+    3 swap arr_push
+    1 swap arr_push
+    2 swap arr_push
+
+    dup dyn_arr_sorted
+    dup 0 swap arr_get puti cr
+    dup 1 swap arr_get puti cr
+    dup 2 swap arr_get puti cr
+    arr_free
+
+    dup 0 swap arr_get puti cr
+    dup 1 swap arr_get puti cr
+    dup 2 swap arr_get puti cr
+
+    # dyn_arr_sort (alias) sorts in place
+    dyn_arr_sort
+    dup 0 swap arr_get puti cr
+    dup 1 swap arr_get puti cr
+    dup 2 swap arr_get puti cr
+    arr_free
+
+    # dyn_arr_sorted (alias) returns a sorted copy
+    5 arr_new
+    4 swap arr_push
+    9 swap arr_push
+    6 swap arr_push
+
+    dup dyn_arr_sorted
+    dup 0 swap arr_get puti cr
+    dup 1 swap arr_get puti cr
+    dup 2 swap arr_get puti cr
+    arr_free
+
+    dup 0 swap arr_get puti cr
+    dup 1 swap arr_get puti cr
+    dup 2 swap arr_get puti cr
+    arr_free
 end

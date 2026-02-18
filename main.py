@@ -1433,6 +1433,7 @@ class CompileTimeVM:
         self._dl_handles: List[Any] = []  # ctypes.CDLL handles
         self._dl_func_cache: Dict[str, Any] = {}  # name → ctypes callable
         self._ct_libs: List[str] = []  # library names from -l flags
+        self.current_location: Optional[SourceLocation] = None
 
     def reset(self) -> None:
         self.stack.clear()
@@ -1443,6 +1444,7 @@ class CompileTimeVM:
         self._list_capture_stack.clear()
         self.r12 = 0
         self.r13 = 0
+        self.current_location = None
 
     def invoke(self, word: Word, *, runtime_mode: bool = False, libs: Optional[List[str]] = None) -> None:
         self.reset()
@@ -2194,8 +2196,14 @@ class CompileTimeVM:
         if defn._begin_pairs is None:
             defn._begin_pairs = self._begin_pairs(defn.body)
         self._resolve_words_in_body(defn)
-        if self.runtime_mode and defn._merged_runs is None:
-            defn._merged_runs = self._find_mergeable_runs(defn)
+        if self.runtime_mode:
+            # Merged JIT runs are a performance optimization, but have shown
+            # intermittent instability on some environments. Keep them opt-in.
+            if os.environ.get("L2_CT_MERGED_JIT", "0") == "1":
+                if defn._merged_runs is None:
+                    defn._merged_runs = self._find_mergeable_runs(defn)
+            else:
+                defn._merged_runs = {}
         return defn._label_positions, defn._for_pairs, defn._begin_pairs
 
     def _find_mergeable_runs(self, defn: Definition) -> Dict[int, Tuple[int, str]]:
@@ -2387,9 +2395,11 @@ class CompileTimeVM:
 
         n_nodes = len(nodes)
         ip = 0
+        prev_location = self.current_location
         try:
             while ip < n_nodes:
                 node = nodes[ip]
+                self.current_location = node.loc
                 kind = node.op
 
                 if kind == "word":
@@ -2627,6 +2637,7 @@ class CompileTimeVM:
 
                 raise ParseError(f"unsupported compile-time op {node!r}")
         finally:
+            self.current_location = prev_location
             self.loop_stack = prev_loop_stack
 
     def _label_positions(self, nodes: Sequence[Op]) -> Dict[str, int]:
@@ -4579,6 +4590,23 @@ def _ct_parse_error(vm: CompileTimeVM) -> None:
     raise ParseError(message)
 
 
+def _ct_static_assert(vm: CompileTimeVM) -> None:
+    condition = vm._resolve_handle(vm.pop())
+    if isinstance(condition, bool):
+        ok = condition
+    elif isinstance(condition, int):
+        ok = condition != 0
+    else:
+        raise ParseError(
+            f"static_assert expects integer/boolean condition, got {type(condition).__name__}"
+        )
+    if not ok:
+        loc = vm.current_location
+        if loc is not None:
+            raise ParseError(f"static assertion failed at {loc.path}:{loc.line}:{loc.column}")
+        raise ParseError("static assertion failed")
+
+
 def _ct_lexer_new(vm: CompileTimeVM) -> None:
     separators = vm.pop_str()
     vm.push(SplitLexer(vm.parser, separators))
@@ -4902,6 +4930,7 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
         word_use_l2.immediate = True
     register("emit-definition", _ct_emit_definition, compile_only=True)
     register("parse-error", _ct_parse_error, compile_only=True)
+    register("static_assert", _ct_static_assert, compile_only=True)
 
     register("lexer-new", _ct_lexer_new, compile_only=True)
     register("lexer-pop", _ct_lexer_pop, compile_only=True)

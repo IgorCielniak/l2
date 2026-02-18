@@ -60,6 +60,7 @@ This document reflects the implementation that ships in this repository today (`
   - Reader hooks: `set-token-hook` installs a word that receives each token (pushed as a `Token` object) and must leave a truthy handled flag; `clear-token-hook` disables it. `libs/fn.sl`'s `extend-syntax` demonstrates rewriting `foo(1, 2)` into ordinary word calls.
   - Prelude/BSS control: `prelude-clear`, `prelude-append`, `prelude-set`, `bss-clear`, `bss-append`, `bss-set` let user code override the `_start` stub or `.bss` layout.
   - Definition helpers: `emit-definition` injects a `word ... end` definition on the fly (used by the struct macro). `parse-error` raises a custom diagnostic.
+  - Assertions: `static_assert` is a compile-time-only primitive that pops a condition and raises `ParseError("static assertion failed at <path>:<line>:<column>")` when the value is zero/false.
 - **Text macros** – `macro` is an immediate word implemented in Python; it prevents nesting by tracking active recordings and registers expansion tokens with `$n` substitution.
 - **Python bridges** – `:py name { ... } ;` executes once during parsing. The body may define `macro(ctx: MacroContext)` (with helpers such as `next_token`, `emit_literal`, `inject_tokens`, `new_label`, and direct `parser` access) and/or `intrinsic(builder: FunctionEmitter)` to emit assembly directly. The `fn` DSL (`libs/fn.sl`) and other syntax layers are ordinary `:py` blocks.
 
@@ -76,10 +77,10 @@ This document reflects the implementation that ships in this repository today (`
 - **`mem.sl`** – `alloc`/`free` wrappers around `mmap`/`munmap` plus a byte-wise `memcpy` used by higher-level utilities.
 - **`io.sl`** – `read_file`, `write_file`, `read_stdin`, `write_buf`, `ewrite_buf`, `putc`, `puti`, `puts`, `eputs`, and a smart `print` that detects `(addr,len)` pairs located inside the default `.data` region.
 - **`utils.sl`** – String and number helpers (`strcmp`, `strconcat`, `strlen`, `digitsN>num`, `toint`, `count_digits`, `tostr`).
-- **`arr.sl`** – Dynamically sized qword arrays with `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`.
+- **`arr.sl`** – Dynamically sized qword arrays with `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`; built-in static-array sorting via `arr_sort`/`arr_sorted`; and dynamic-array sorting via `dyn_arr_sort`/`dyn_arr_sorted`.
 - **`float.sl`** – SSE-based double-precision arithmetic (`f+`, `f-`, `f*`, `f/`, `fneg`, comparisons, `int>float`, `float>int`, `fput`, `fputln`).
 - **`linux.sl`** – Auto-generated syscall macros (one constant block per entry in `syscall_64.tbl`) plus the `syscallN` helpers implemented purely in assembly so the file can be used in isolation.
-- **`debug.sl`** – Diagnostics such as `dump`, `rdump`, and `int3`.
+- **`debug.sl`** – Diagnostics and checks such as `dump`, `rdump`, `int3`, runtime `assert` (prints `assertion failed` and exits with code 1), `assert_msg` (message + condition; exits with message when false), `abort` (prints `abort` and exits with code 1), and `abort_msg` (prints caller-provided message and exits with code 1).
 - **`stdlib.sl`** – Convenience aggregator that imports `core`, `mem`, `io`, and `utils` so most programs can simply `import stdlib/stdlib.sl`.
 
 ## 9. Testing and Usage Patterns

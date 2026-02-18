@@ -70,3 +70,32 @@ end
 }
 ;
 
+#abort [*] -> [*]
+word abort
+	"abort" eputs
+	1 exit
+end
+
+#abort_msg [* | msg] -> [*]
+word abort_msg
+	eputs
+	1 exit
+end
+
+#assert [* | cond] -> [*]
+word assert
+	if
+	else
+		"assertion failed" abort_msg
+	end
+end
+
+#assert_msg [*, msg | cond] -> [*]
+word assert_msg
+	if
+		2drop
+	else
+		abort_msg
+	end
+end
+

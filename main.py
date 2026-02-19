@@ -351,6 +351,9 @@ class Word:
     inline: bool = False
 
 
+_suppress_redefine_warnings = False
+
+
 @dataclass
 class Dictionary:
     words: Dict[str, Word] = field(default_factory=dict)
@@ -385,7 +388,8 @@ class Dictionary:
             self.words[word.name] = word
             return word
 
-        sys.stderr.write(f"[warn] redefining word {word.name} (priority {word.priority})\n")
+        if not _suppress_redefine_warnings:
+            sys.stderr.write(f"[warn] redefining word {word.name} (priority {word.priority})\n")
         self.words[word.name] = word
         return word
 
@@ -5374,6 +5378,7 @@ def run_repl(
         return False
 
     temp_dir.mkdir(parents=True, exist_ok=True)
+    global _suppress_redefine_warnings
     asm_path = temp_dir / "repl.asm"
     obj_path = temp_dir / "repl.o"
     exe_path = temp_dir / "repl.out"
@@ -5530,7 +5535,11 @@ def run_repl(
                     temp_defs_repl = [*user_defs_repl, f"word main\n    {word_name}\nend"]
                     builder_source = _repl_build_source(imports, user_defs_files, temp_defs_repl, [], True, force_synthetic=False)
                 src_path.write_text(builder_source)
-                emission = compiler.compile_file(src_path, debug=debug)
+                _suppress_redefine_warnings = True
+                try:
+                    emission = compiler.compile_file(src_path, debug=debug)
+                finally:
+                    _suppress_redefine_warnings = False
                 compiler.assembler.write_asm(emission, asm_path)
                 run_nasm(asm_path, obj_path, debug=debug)
                 run_linker(obj_path, exe_path, debug=debug, libs=list(libs))
@@ -5589,7 +5598,11 @@ def run_repl(
             )
             try:
                 snippet_src.write_text(snippet_source)
-                emission = compiler.compile_file(snippet_src, debug=debug)
+                _suppress_redefine_warnings = True
+                try:
+                    emission = compiler.compile_file(snippet_src, debug=debug)
+                finally:
+                    _suppress_redefine_warnings = False
                 compiler.assembler.write_asm(emission, snippet_asm)
                 run_nasm(snippet_asm, snippet_obj, debug=debug)
                 run_linker(snippet_obj, snippet_exe, debug=debug, libs=list(libs))
@@ -5628,7 +5641,11 @@ def run_repl(
 
         try:
             src_path.write_text(source)
-            emission = compiler.compile_file(src_path, debug=debug)
+            _suppress_redefine_warnings = True
+            try:
+                emission = compiler.compile_file(src_path, debug=debug)
+            finally:
+                _suppress_redefine_warnings = False
         except (ParseError, CompileError, CompileTimeError) as exc:
             print(f"[error] {exc}")
             continue

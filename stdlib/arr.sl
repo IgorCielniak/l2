@@ -161,25 +161,19 @@ word arr_set_static
     arr_item_ptr swap !
 end
 
-#arr_sort [* | arr] -> [* | arr]
-# Sort built-in static array in-place in ascending order
-word arr_sort
-    dup >r
-    dup arr_to_dyn
-    dyn_arr_sort
-    dup arr_data
-    r@ 8 +
-    swap
-    r@ @
-    arr_copy_elements
-    arr_free
-    rdrop
+#arr_static_free [* | arr] -> [*]
+# Free built-in static array allocation produced by list literals.
+word arr_static_free
+    dup @ 1 + 8 * free
 end
 
-#dyn_arr_sort [* | dyn_arr] -> [* | dyn_arr]
-:asm dyn_arr_sort {
-    mov rbx, [r12]          ; arr
-    mov rcx, [rbx]          ; len
+#sort [*, addr | len] -> [*]
+# In-place ascending sort of qword elements at `addr`.
+:asm sort {
+    mov rcx, [r12]          ; len
+    mov rbx, [r12 + 8]      ; addr
+    add r12, 16
+
     cmp rcx, 1
     jle .done
 
@@ -191,15 +185,54 @@ end
     cmp rdx, rcx
     jge .next_outer
 
-    mov r8, [rbx + 16]      ; data ptr
-    lea r9, [r8 + rdx*8]    ; &data[j]
-    mov r10, [r9]           ; a = data[j]
-    mov r11, [r9 + 8]       ; b = data[j+1]
-    cmp r10, r11
+    lea r8, [rbx + rdx*8]   ; &data[j]
+    mov r9, [r8]            ; a = data[j]
+    mov r10, [r8 + 8]       ; b = data[j+1]
+    cmp r9, r10
     jle .no_swap
 
-    mov [r9], r11
-    mov [r9 + 8], r10
+    mov [r8], r10
+    mov [r8 + 8], r9
+
+.no_swap:
+    inc rdx
+    jmp .inner
+
+.next_outer:
+    dec rcx
+    jnz .outer
+
+.done:
+    ret
+}
+;
+
+#sort8 [*, addr | len] -> [*]
+# In-place ascending sort of byte elements at `addr`.
+:asm sort8 {
+    mov rcx, [r12]          ; len
+    mov rbx, [r12 + 8]      ; addr
+    add r12, 16
+
+    cmp rcx, 1
+    jle .done
+
+    dec rcx                 ; outer = len - 1
+.outer:
+    xor rdx, rdx            ; j = 0
+
+.inner:
+    cmp rdx, rcx
+    jge .next_outer
+
+    lea r8, [rbx + rdx]     ; &data[j]
+    movzx r9, byte [r8]     ; a = data[j]
+    movzx r10, byte [r8 + 1] ; b = data[j+1]
+    cmp r9, r10
+    jle .no_swap
+
+    mov byte [r8], r10b
+    mov byte [r8 + 1], r9b
 
 .no_swap:
     inc rdx
@@ -225,10 +258,67 @@ word arr_clone
     r>
 end
 
+#sorted [*, addr | len] -> [* | sorted_addr]
+# Clone qword elements and return sorted copy.
+word sorted
+    dup >r
+    8 * alloc
+    dup >r
+    swap
+    r@
+    arr_copy_elements
+    r>
+    r>
+    over >r
+    sort
+    r>
+end
+
+#sorted8 [*, addr | len] -> [* | sorted_addr]
+# Clone byte elements and return sorted copy.
+word sorted8
+    dup >r
+    alloc
+    dup >r
+    swap
+    r@
+    while dup 0 > do
+        over c@ 3 pick swap c!
+        swap 1 + swap
+        rot 1 + -rot
+        1 -
+    end
+    drop 2drop
+    r>
+    r>
+    over >r
+    sort8
+    r>
+end
+
+#arr_sort [* | arr] -> [* | arr]
+# Sort built-in static array in-place in ascending order.
+word arr_sort
+    dup >r
+    dup 8 +
+    swap @
+    sort
+    r>
+end
+
 #arr_sorted [* | arr] -> [* | arr_sorted]
 word arr_sorted
     arr_clone
     arr_sort
+end
+
+#dyn_arr_sort [* | dyn_arr] -> [* | dyn_arr]
+word dyn_arr_sort
+    dup >r
+    dup arr_data
+    swap arr_len
+    sort
+    r>
 end
 
 #dyn_arr_sorted [* | dyn_arr] -> [* | dyn_arr_sorted]

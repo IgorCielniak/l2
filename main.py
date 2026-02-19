@@ -4649,6 +4649,7 @@ def _ct_lexer_push_back(vm: CompileTimeVM) -> None:
     vm.push(lexer)
 
 
+
 # ---------------------------------------------------------------------------
 # Runtime intrinsics that cannot run as native JIT  (for --ct-run-main)
 # ---------------------------------------------------------------------------
@@ -5694,9 +5695,10 @@ class DocEntry:
 
 
 _DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
-_DOC_WORD_RE = re.compile(r"^\s*word\s+([^\s]+)\b")
+_DOC_WORD_RE = re.compile(r"^\s*(?:inline\s+)?word\s+([^\s]+)\b")
 _DOC_ASM_RE = re.compile(r"^\s*:asm\s+([^\s{]+)")
 _DOC_PY_RE = re.compile(r"^\s*:py\s+([^\s{]+)")
+_DOC_MACRO_RE = re.compile(r"^\s*macro\s+([^\s]+)")
 
 
 def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
@@ -5712,11 +5714,15 @@ def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
     return name, tail
 
 
-def _extract_definition_name(text: str) -> Optional[Tuple[str, str]]:
+def _extract_definition_name(text: str, *, include_macros: bool = False) -> Optional[Tuple[str, str]]:
     for kind, regex in (("word", _DOC_WORD_RE), ("asm", _DOC_ASM_RE), ("py", _DOC_PY_RE)):
         match = regex.match(text)
         if match is not None:
             return kind, match.group(1)
+    if include_macros:
+        match = _DOC_MACRO_RE.match(text)
+        if match is not None:
+            return "macro", match.group(1)
     return None
 
 
@@ -5763,6 +5769,7 @@ def _scan_doc_file(
     *,
     include_undocumented: bool = False,
     include_private: bool = False,
+    include_macros: bool = False,
 ) -> List[DocEntry]:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -5774,7 +5781,7 @@ def _scan_doc_file(
     defined_names: Set[str] = set()
 
     for idx, line in enumerate(lines):
-        parsed = _extract_definition_name(line)
+        parsed = _extract_definition_name(line, include_macros=include_macros)
         if parsed is None:
             continue
         kind, name = parsed
@@ -5839,6 +5846,7 @@ def collect_docs(
     *,
     include_undocumented: bool = False,
     include_private: bool = False,
+    include_macros: bool = False,
     include_tests: bool = False,
 ) -> List[DocEntry]:
     entries: List[DocEntry] = []
@@ -5848,6 +5856,7 @@ def collect_docs(
                 doc_file,
                 include_undocumented=include_undocumented,
                 include_private=include_private,
+                include_macros=include_macros,
             )
         )
     # Deduplicate by symbol name; keep first (roots/files are stable-sorted)
@@ -5944,7 +5953,12 @@ def _filter_docs(entries: Sequence[DocEntry], query: str) -> List[DocEntry]:
     return [entry for _, entry in ranked]
 
 
-def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
+def _run_docs_tui(
+    entries: Sequence[DocEntry],
+    initial_query: str = "",
+    *,
+    reload_fn: Optional[Callable[..., List[DocEntry]]] = None,
+) -> int:
     if not entries:
         print("[info] no documentation entries found")
         return 0
@@ -5961,6 +5975,141 @@ def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
 
     import curses
 
+    _MODE_BROWSE = 0
+    _MODE_SEARCH = 1
+    _MODE_DETAIL = 2
+    _MODE_FILTER = 3
+
+    _FILTER_KINDS = ["all", "word", "asm", "py", "macro"]
+
+    def _parse_sig_counts(effect: str) -> Tuple[int, int]:
+        """Parse stack effect to (n_args, n_returns).
+
+        Counts all named items (excluding ``*``) on each side of ``->``.
+        Items before ``|`` are deeper stack elements; items after are top.
+        Both count as args/returns.
+
+        Handles dual-return with ``||``:
+          ``[* | x] -> [* | y] || [*, x | z]``
+        Takes the first branch for counting.
+        Returns (-1, -1) for unparseable effects.
+        """
+        if not effect or "->" not in effect:
+            return (-1, -1)
+        # Split off dual-return: take first branch
+        main = effect.split("||")[0].strip()
+        parts = main.split("->", 1)
+        if len(parts) != 2:
+            return (-1, -1)
+        lhs, rhs = parts[0].strip(), parts[1].strip()
+
+        def _count_items(side: str) -> int:
+            s = side.strip()
+            if s.startswith("["):
+                s = s[1:]
+            if s.endswith("]"):
+                s = s[:-1]
+            s = s.strip()
+            if not s:
+                return 0
+            # Flatten both sides of pipe and count all non-* items
+            all_items = s.replace("|", ",")
+            return len([x.strip() for x in all_items.split(",")
+                        if x.strip() and x.strip() != "*"])
+
+        return (_count_items(lhs), _count_items(rhs))
+
+    def _safe_addnstr(scr: Any, y: int, x: int, text: str, maxlen: int, attr: int = 0) -> None:
+        h, w = scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        maxlen = min(maxlen, w - x)
+        if maxlen <= 0:
+            return
+        try:
+            scr.addnstr(y, x, text, maxlen, attr)
+        except curses.error:
+            pass
+
+    def _build_detail_lines(entry: DocEntry, width: int) -> List[str]:
+        lines: List[str] = []
+        lines.append(f"{'Name:':<14} {entry.name}")
+        lines.append(f"{'Kind:':<14} {entry.kind}")
+        if entry.stack_effect:
+            lines.append(f"{'Stack effect:':<14} {entry.stack_effect}")
+        else:
+            lines.append(f"{'Stack effect:':<14} (none)")
+        lines.append(f"{'File:':<14} {entry.path}:{entry.line}")
+        lines.append("")
+        if entry.description:
+            lines.append("Description:")
+            # Word-wrap description
+            words = entry.description.split()
+            current: List[str] = []
+            col = 2  # indent
+            for w in words:
+                if current and col + 1 + len(w) > width - 2:
+                    lines.append("  " + " ".join(current))
+                    current = [w]
+                    col = 2 + len(w)
+                else:
+                    current.append(w)
+                    col += 1 + len(w) if current else len(w)
+            if current:
+                lines.append("  " + " ".join(current))
+        else:
+            lines.append("(no description)")
+        lines.append("")
+        # Show source context
+        lines.append("Source context:")
+        try:
+            src_lines = entry.path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            start = max(0, entry.line - 1)
+            if entry.kind == "word":
+                # Depth-tracking: word/if/while/for/begin/with open blocks closed by 'end'
+                _block_openers = {"word", "if", "while", "for", "begin", "with"}
+                depth = 0
+                end = min(len(src_lines), start + 200)
+                for i in range(start, end):
+                    stripped = src_lines[i].strip()
+                    # Strip comments (# to end of line, but not inside strings)
+                    code = stripped.split("#", 1)[0].strip() if "#" in stripped else stripped
+                    # Count all block openers and 'end' tokens on the line
+                    for tok in code.split():
+                        if tok in _block_openers:
+                            depth += 1
+                        elif tok == "end":
+                            depth -= 1
+                    prefix = f"  {i + 1:4d}| "
+                    lines.append(prefix + src_lines[i])
+                    if depth <= 0 and i > start:
+                        break
+            elif entry.kind in ("asm", "py"):
+                # Show until closing brace + a few extra lines of context
+                end = min(len(src_lines), start + 200)
+                found_close = False
+                extra_after = 0
+                for i in range(start, end):
+                    prefix = f"  {i + 1:4d}| "
+                    lines.append(prefix + src_lines[i])
+                    stripped = src_lines[i].strip()
+                    if not found_close and stripped in ("}", "};") and i > start:
+                        found_close = True
+                        extra_after = 0
+                        continue
+                    if found_close:
+                        extra_after += 1
+                        if extra_after >= 3 or not stripped:
+                            break
+            else:
+                end = min(len(src_lines), start + 30)
+                for i in range(start, end):
+                    prefix = f"  {i + 1:4d}| "
+                    lines.append(prefix + src_lines[i])
+        except Exception:
+            lines.append("  (unable to read source)")
+        return lines
+
     def _app(stdscr: Any) -> int:
         try:
             curses.curs_set(0)
@@ -5968,16 +6117,377 @@ def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
             pass
         stdscr.keypad(True)
 
+        nonlocal entries
         query = initial_query
         selected = 0
         scroll = 0
+        mode = _MODE_BROWSE
+
+        # Search mode state
+        search_buf = query
+
+        # Detail mode state
+        detail_scroll = 0
+        detail_lines: List[str] = []
+
+        # Filter mode state
+        filter_kind_idx = 0  # index into _FILTER_KINDS
+        filter_field = 0  # 0=kind, 1=args, 2=returns, 3=show_private, 4=show_macros, 5=extra_path, 6=files
+        filter_file_scroll = 0
+        filter_file_cursor = 0
+        filter_args = -1      # -1 = any
+        filter_returns = -1   # -1 = any
+        filter_extra_path = ""  # text input for adding paths
+        filter_extra_roots: List[str] = []  # accumulated extra paths
+        filter_show_private = False
+        filter_show_macros = False
+
+        # Build unique file list; all enabled by default
+        all_file_paths: List[str] = sorted(set(e.path.as_posix() for e in entries))
+        filter_files_enabled: Dict[str, bool] = {p: True for p in all_file_paths}
+
+        def _rebuild_file_list() -> None:
+            nonlocal all_file_paths, filter_files_enabled
+            new_paths = sorted(set(e.path.as_posix() for e in entries))
+            old = filter_files_enabled
+            filter_files_enabled = {p: old.get(p, True) for p in new_paths}
+            all_file_paths = new_paths
+
+        def _apply_filters(items: List[DocEntry]) -> List[DocEntry]:
+            result = items
+            kind = _FILTER_KINDS[filter_kind_idx]
+            if kind != "all":
+                result = [e for e in result if e.kind == kind]
+            # File toggle filter
+            if not all(filter_files_enabled.get(p, True) for p in all_file_paths):
+                result = [e for e in result if filter_files_enabled.get(e.path.as_posix(), True)]
+            # Signature filters
+            if filter_args >= 0 or filter_returns >= 0:
+                filtered = []
+                for e in result:
+                    n_args, n_rets = _parse_sig_counts(e.stack_effect)
+                    if filter_args >= 0 and n_args != filter_args:
+                        continue
+                    if filter_returns >= 0 and n_rets != filter_returns:
+                        continue
+                    filtered.append(e)
+                result = filtered
+            return result
 
         while True:
-            filtered = _filter_docs(entries, query)
+            filtered = _apply_filters(_filter_docs(entries, query))
             if selected >= len(filtered):
                 selected = max(0, len(filtered) - 1)
 
             height, width = stdscr.getmaxyx()
+            if height < 3 or width < 10:
+                stdscr.erase()
+                _safe_addnstr(stdscr, 0, 0, "terminal too small", width - 1)
+                stdscr.refresh()
+                stdscr.getch()
+                continue
+
+            # -- DETAIL MODE --
+            if mode == _MODE_DETAIL:
+                stdscr.erase()
+                _safe_addnstr(
+                    stdscr, 0, 0,
+                    f" {detail_lines[0] if detail_lines else ''} ",
+                    width - 1, curses.A_BOLD,
+                )
+                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k/Up/Down: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
+                body_height = max(1, height - 3)
+                max_dscroll = max(0, len(detail_lines) - body_height)
+                if detail_scroll > max_dscroll:
+                    detail_scroll = max_dscroll
+                for row in range(body_height):
+                    li = detail_scroll + row
+                    if li >= len(detail_lines):
+                        break
+                    _safe_addnstr(stdscr, 2 + row, 0, detail_lines[li], width - 1)
+                pos_text = f" {detail_scroll + 1}-{min(detail_scroll + body_height, len(detail_lines))}/{len(detail_lines)} "
+                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
+                    mode = _MODE_BROWSE
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    if detail_scroll < max_dscroll:
+                        detail_scroll += 1
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    if detail_scroll > 0:
+                        detail_scroll -= 1
+                    continue
+                if key == curses.KEY_NPAGE:
+                    detail_scroll = min(max_dscroll, detail_scroll + body_height)
+                    continue
+                if key == curses.KEY_PPAGE:
+                    detail_scroll = max(0, detail_scroll - body_height)
+                    continue
+                if key == ord("g"):
+                    detail_scroll = 0
+                    continue
+                if key == ord("G"):
+                    detail_scroll = max_dscroll
+                    continue
+                continue
+
+            # -- FILTER MODE --
+            if mode == _MODE_FILTER:
+                stdscr.erase()
+                _safe_addnstr(stdscr, 0, 0, " Filters ", width - 1, curses.A_BOLD)
+                _safe_addnstr(stdscr, 1, 0, " Tab: next field  Space/Left/Right: change  a: all files  n: none  Enter/Esc: close ", width - 1, curses.A_DIM)
+
+                _N_FILTER_FIELDS = 7  # kind, args, returns, show_private, show_macros, extra_path, files
+                row_y = 3
+
+                # Kind row
+                kind_label = f"  Kind: < {_FILTER_KINDS[filter_kind_idx]:6} >"
+                kind_attr = curses.A_REVERSE if filter_field == 0 else 0
+                _safe_addnstr(stdscr, row_y, 0, kind_label, width - 1, kind_attr)
+                row_y += 1
+
+                # Args row
+                args_val = "any" if filter_args < 0 else str(filter_args)
+                args_label = f"  Args: < {args_val:6} >"
+                args_attr = curses.A_REVERSE if filter_field == 1 else 0
+                _safe_addnstr(stdscr, row_y, 0, args_label, width - 1, args_attr)
+                row_y += 1
+
+                # Returns row
+                rets_val = "any" if filter_returns < 0 else str(filter_returns)
+                rets_label = f"  Rets: < {rets_val:6} >"
+                rets_attr = curses.A_REVERSE if filter_field == 2 else 0
+                _safe_addnstr(stdscr, row_y, 0, rets_label, width - 1, rets_attr)
+                row_y += 1
+
+                # Show private row
+                priv_val = "yes" if filter_show_private else "no"
+                priv_label = f"  Private: < {priv_val:6} >"
+                priv_attr = curses.A_REVERSE if filter_field == 3 else 0
+                _safe_addnstr(stdscr, row_y, 0, priv_label, width - 1, priv_attr)
+                row_y += 1
+
+                # Show macros row
+                macro_val = "yes" if filter_show_macros else "no"
+                macro_label = f"  Macros: < {macro_val:6} >"
+                macro_attr = curses.A_REVERSE if filter_field == 4 else 0
+                _safe_addnstr(stdscr, row_y, 0, macro_label, width - 1, macro_attr)
+                row_y += 1
+
+                # Extra path row
+                if filter_field == 5:
+                    ep_label = f"  Path: {filter_extra_path}_"
+                    ep_attr = curses.A_REVERSE
+                else:
+                    ep_label = f"  Path: {filter_extra_path or '(type path, Enter to add)'}"
+                    ep_attr = 0
+                _safe_addnstr(stdscr, row_y, 0, ep_label, width - 1, ep_attr)
+                row_y += 1
+                for er in filter_extra_roots:
+                    _safe_addnstr(stdscr, row_y, 0, f"    + {er}", width - 1, curses.A_DIM)
+                    row_y += 1
+                row_y += 1
+
+                # Files section
+                files_header = "  Files:"
+                files_header_attr = curses.A_BOLD if filter_field == 6 else curses.A_DIM
+                _safe_addnstr(stdscr, row_y, 0, files_header, width - 1, files_header_attr)
+                row_y += 1
+
+                file_area_top = row_y
+                file_area_height = max(1, height - file_area_top - 2)
+                n_files = len(all_file_paths)
+
+                if filter_field == 6:
+                    # Clamp cursor and scroll
+                    if filter_file_cursor >= n_files:
+                        filter_file_cursor = max(0, n_files - 1)
+                    if filter_file_cursor < filter_file_scroll:
+                        filter_file_scroll = filter_file_cursor
+                    if filter_file_cursor >= filter_file_scroll + file_area_height:
+                        filter_file_scroll = filter_file_cursor - file_area_height + 1
+                    max_fscroll = max(0, n_files - file_area_height)
+                    if filter_file_scroll > max_fscroll:
+                        filter_file_scroll = max_fscroll
+
+                for row in range(file_area_height):
+                    fi = filter_file_scroll + row
+                    if fi >= n_files:
+                        break
+                    fp = all_file_paths[fi]
+                    mark = "[x]" if filter_files_enabled.get(fp, True) else "[ ]"
+                    label = f"    {mark} {fp}"
+                    attr = curses.A_REVERSE if (filter_field == 6 and fi == filter_file_cursor) else 0
+                    _safe_addnstr(stdscr, file_area_top + row, 0, label, width - 1, attr)
+
+                enabled_count = sum(1 for v in filter_files_enabled.values() if v)
+                preview = _apply_filters(_filter_docs(entries, query))
+                status = f" {enabled_count}/{n_files} files  kind={_FILTER_KINDS[filter_kind_idx]}  args={args_val}  rets={rets_val}  {len(preview)} matches "
+                _safe_addnstr(stdscr, height - 1, 0, status, width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == 27:
+                    mode = _MODE_BROWSE
+                    selected = 0
+                    scroll = 0
+                    continue
+                if key in (10, 13, curses.KEY_ENTER) and filter_field != 5:
+                    mode = _MODE_BROWSE
+                    selected = 0
+                    scroll = 0
+                    continue
+                if key == 9:  # Tab
+                    filter_field = (filter_field + 1) % _N_FILTER_FIELDS
+                    continue
+                if filter_field == 0:
+                    # Kind field
+                    if key in (curses.KEY_LEFT, ord("h")):
+                        filter_kind_idx = (filter_kind_idx - 1) % len(_FILTER_KINDS)
+                        continue
+                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
+                        filter_kind_idx = (filter_kind_idx + 1) % len(_FILTER_KINDS)
+                        continue
+                elif filter_field == 1:
+                    # Args field: Left/Right to adjust, -1 = any
+                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
+                        filter_args += 1
+                        if filter_args > 10:
+                            filter_args = -1
+                        continue
+                    if key in (curses.KEY_LEFT, ord("h")):
+                        filter_args -= 1
+                        if filter_args < -1:
+                            filter_args = 10
+                        continue
+                elif filter_field == 2:
+                    # Returns field: Left/Right to adjust
+                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
+                        filter_returns += 1
+                        if filter_returns > 10:
+                            filter_returns = -1
+                        continue
+                    if key in (curses.KEY_LEFT, ord("h")):
+                        filter_returns -= 1
+                        if filter_returns < -1:
+                            filter_returns = 10
+                        continue
+                elif filter_field == 3:
+                    # Show private toggle
+                    if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord(" ")):
+                        filter_show_private = not filter_show_private
+                        if reload_fn is not None:
+                            entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
+                            _rebuild_file_list()
+                        continue
+                elif filter_field == 4:
+                    # Show macros toggle
+                    if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord(" ")):
+                        filter_show_macros = not filter_show_macros
+                        if reload_fn is not None:
+                            entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
+                            _rebuild_file_list()
+                        continue
+                elif filter_field == 5:
+                    # Extra path: text input, Enter adds to roots
+                    if key in (10, 13, curses.KEY_ENTER):
+                        if filter_extra_path.strip():
+                            filter_extra_roots.append(filter_extra_path.strip())
+                            filter_extra_path = ""
+                            if reload_fn is not None:
+                                entries = reload_fn(
+                                    include_private=filter_show_private,
+                                    include_macros=filter_show_macros,
+                                    extra_roots=filter_extra_roots,
+                                )
+                                _rebuild_file_list()
+                        continue
+                    if key in (curses.KEY_BACKSPACE, 127, 8):
+                        filter_extra_path = filter_extra_path[:-1]
+                        continue
+                    if 32 <= key <= 126:
+                        filter_extra_path += chr(key)
+                        continue
+                elif filter_field == 6:
+                    # Files field
+                    if key in (curses.KEY_UP, ord("k")):
+                        if filter_file_cursor > 0:
+                            filter_file_cursor -= 1
+                        continue
+                    if key in (curses.KEY_DOWN, ord("j")):
+                        if filter_file_cursor + 1 < n_files:
+                            filter_file_cursor += 1
+                        continue
+                    if key == ord(" "):
+                        if 0 <= filter_file_cursor < n_files:
+                            fp = all_file_paths[filter_file_cursor]
+                            filter_files_enabled[fp] = not filter_files_enabled.get(fp, True)
+                        continue
+                    if key == ord("a"):
+                        for fp in all_file_paths:
+                            filter_files_enabled[fp] = True
+                        continue
+                    if key == ord("n"):
+                        for fp in all_file_paths:
+                            filter_files_enabled[fp] = False
+                        continue
+                    if key == curses.KEY_PPAGE:
+                        filter_file_cursor = max(0, filter_file_cursor - file_area_height)
+                        continue
+                    if key == curses.KEY_NPAGE:
+                        filter_file_cursor = min(max(0, n_files - 1), filter_file_cursor + file_area_height)
+                        continue
+                continue
+
+            # -- SEARCH MODE --
+            if mode == _MODE_SEARCH:
+                stdscr.erase()
+                prompt = f"/{search_buf}"
+                _safe_addnstr(stdscr, 0, 0, prompt, width - 1, curses.A_BOLD)
+                preview = _apply_filters(_filter_docs(entries, search_buf))
+                _safe_addnstr(stdscr, 1, 0, f" {len(preview)} matches   (Enter: apply  Esc: cancel)", width - 1, curses.A_DIM)
+                preview_height = max(1, height - 3)
+                for row in range(min(preview_height, len(preview))):
+                    e = preview[row]
+                    effect = e.stack_effect if e.stack_effect else "(no stack effect)"
+                    line = f"  {e.name:24} {effect}"
+                    _safe_addnstr(stdscr, 2 + row, 0, line, width - 1)
+                stdscr.refresh()
+                try:
+                    curses.curs_set(1)
+                except Exception:
+                    pass
+                key = stdscr.getch()
+                if key == 27:
+                    # Cancel search, revert
+                    search_buf = query
+                    mode = _MODE_BROWSE
+                    try:
+                        curses.curs_set(0)
+                    except Exception:
+                        pass
+                    continue
+                if key in (10, 13, curses.KEY_ENTER):
+                    query = search_buf
+                    selected = 0
+                    scroll = 0
+                    mode = _MODE_BROWSE
+                    try:
+                        curses.curs_set(0)
+                    except Exception:
+                        pass
+                    continue
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    search_buf = search_buf[:-1]
+                    continue
+                if 32 <= key <= 126:
+                    search_buf += chr(key)
+                    continue
+                continue
+
+            # -- BROWSE MODE --
             list_height = max(1, height - 4)
             if selected < scroll:
                 scroll = selected
@@ -5988,40 +6498,79 @@ def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
                 scroll = max_scroll
 
             stdscr.erase()
-            header = f"L2 docs {len(filtered)}/{len(entries)}  filter: {query}"
-            stdscr.addnstr(0, 0, header, max(1, width - 1), curses.A_BOLD)
-            stdscr.addnstr(
-                1,
-                0,
-                "Type to search · name:/effect:/desc:/path:/kind: · -term excludes · Up/Down j/k · PgUp/PgDn · q/Esc",
-                max(1, width - 1),
-                0,
-            )
+            kind_str = _FILTER_KINDS[filter_kind_idx]
+            enabled_count = sum(1 for v in filter_files_enabled.values() if v)
+            filter_info = ""
+            has_kind_filter = kind_str != "all"
+            has_file_filter = enabled_count < len(all_file_paths)
+            has_sig_filter = filter_args >= 0 or filter_returns >= 0
+            if has_kind_filter or has_file_filter or has_sig_filter or filter_extra_roots or filter_show_private or filter_show_macros:
+                parts = []
+                if has_kind_filter:
+                    parts.append(f"kind={kind_str}")
+                if has_file_filter:
+                    parts.append(f"files={enabled_count}/{len(all_file_paths)}")
+                if filter_args >= 0:
+                    parts.append(f"args={filter_args}")
+                if filter_returns >= 0:
+                    parts.append(f"rets={filter_returns}")
+                if filter_show_private:
+                    parts.append("private")
+                if filter_show_macros:
+                    parts.append("macros")
+                if filter_extra_roots:
+                    parts.append(f"+{len(filter_extra_roots)} paths")
+                filter_info = "  [" + ", ".join(parts) + "]"
+            header = f" L2 docs  {len(filtered)}/{len(entries)}" + (f"  search: {query}" if query else "") + filter_info
+            _safe_addnstr(stdscr, 0, 0, header, width - 1, curses.A_BOLD)
+            hint = " / search  f filters  r reload  Enter detail  j/k nav  q quit"
+            _safe_addnstr(stdscr, 1, 0, hint, width - 1, curses.A_DIM)
 
             for row in range(list_height):
                 idx = scroll + row
                 if idx >= len(filtered):
                     break
                 entry = filtered[idx]
-                effect = entry.stack_effect if entry.stack_effect else "(no stack effect)"
-                line = f"{entry.name:24} {effect}"
+                effect = entry.stack_effect if entry.stack_effect else ""
+                kind_tag = f"[{entry.kind}]"
+                line = f" {entry.name:24} {effect:30} {kind_tag}"
                 attr = curses.A_REVERSE if idx == selected else 0
-                stdscr.addnstr(2 + row, 0, line, max(1, width - 1), attr)
+                _safe_addnstr(stdscr, 2 + row, 0, line, width - 1, attr)
 
             if filtered:
                 current = filtered[selected]
-                detail = f"{current.path}:{current.line} [{current.kind}]"
+                detail = f" {current.path}:{current.line}"
                 if current.description:
                     detail += f"  {current.description}"
-                stdscr.addnstr(height - 1, 0, detail, max(1, width - 1), 0)
+                _safe_addnstr(stdscr, height - 1, 0, detail, width - 1, curses.A_DIM)
             else:
-                stdscr.addnstr(height - 1, 0, "No matches", max(1, width - 1), 0)
+                _safe_addnstr(stdscr, height - 1, 0, " No matches", width - 1, curses.A_DIM)
 
             stdscr.refresh()
             key = stdscr.getch()
 
             if key in (27, ord("q")):
                 return 0
+            if key == ord("/"):
+                search_buf = query
+                mode = _MODE_SEARCH
+                continue
+            if key == ord("f"):
+                mode = _MODE_FILTER
+                continue
+            if key == ord("r"):
+                if reload_fn is not None:
+                    entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
+                    _rebuild_file_list()
+                    selected = 0
+                    scroll = 0
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                if filtered:
+                    detail_lines = _build_detail_lines(filtered[selected], width)
+                    detail_scroll = 0
+                    mode = _MODE_DETAIL
+                continue
             if key in (curses.KEY_UP, ord("k")):
                 if selected > 0:
                     selected -= 1
@@ -6036,15 +6585,12 @@ def _run_docs_tui(entries: Sequence[DocEntry], initial_query: str = "") -> int:
             if key == curses.KEY_NPAGE:
                 selected = min(max(0, len(filtered) - 1), selected + list_height)
                 continue
-            if key in (curses.KEY_BACKSPACE, 127, 8):
-                query = query[:-1]
+            if key == ord("g"):
                 selected = 0
                 scroll = 0
                 continue
-            if 32 <= key <= 126:
-                query += chr(key)
-                selected = 0
-                scroll = 0
+            if key == ord("G"):
+                selected = max(0, len(filtered) - 1)
                 continue
 
         return 0
@@ -6069,13 +6615,46 @@ def run_docs_explorer(
         roots.append(source.parent)
         roots.append(source)
 
-    entries = collect_docs(
-        roots,
+    collect_opts: Dict[str, Any] = dict(
         include_undocumented=include_undocumented,
         include_private=include_private,
         include_tests=include_tests,
+        include_macros=False,
     )
-    return _run_docs_tui(entries, initial_query=initial_query)
+
+    def _reload(**overrides: Any) -> List[DocEntry]:
+        extra = overrides.pop("extra_roots", [])
+        opts = {**collect_opts, **overrides}
+        entries = collect_docs(roots, **opts)
+        # Scan extra roots directly, bypassing _iter_doc_files skip filters
+        # Always include undocumented entries from user-added paths
+        if extra:
+            seen_names = {e.name for e in entries}
+            scan_opts = dict(
+                include_undocumented=True,
+                include_private=True,
+                include_macros=opts.get("include_macros", False),
+            )
+            for p in extra:
+                ep = Path(p).expanduser().resolve()
+                if not ep.exists():
+                    continue
+                if ep.is_file() and ep.suffix == ".sl":
+                    for e in _scan_doc_file(ep, **scan_opts):
+                        if e.name not in seen_names:
+                            seen_names.add(e.name)
+                            entries.append(e)
+                elif ep.is_dir():
+                    for sl in sorted(ep.rglob("*.sl")):
+                        for e in _scan_doc_file(sl.resolve(), **scan_opts):
+                            if e.name not in seen_names:
+                                seen_names.add(e.name)
+                                entries.append(e)
+            entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
+        return entries
+
+    entries = _reload()
+    return _run_docs_tui(entries, initial_query=initial_query, reload_fn=_reload)
 
 
 def cli(argv: Sequence[str]) -> int:
@@ -6213,6 +6792,10 @@ def cli(argv: Sequence[str]) -> int:
         entry_mode = "program" if artifact_kind == "exe" else "library"
         emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
 
+        # Snapshot assembly text *before* ct-run-main JIT execution, which may
+        # corrupt Python heap objects depending on memory layout.
+        asm_text = emission.snapshot()
+
         if args.ct_run_main:
             try:
                 compiler.run_compile_time_word("main", libs=args.libs)
@@ -6229,7 +6812,7 @@ def cli(argv: Sequence[str]) -> int:
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")
     obj_path = args.temp_dir / (args.source.stem + ".o")
-    compiler.assembler.write_asm(emission, asm_path)
+    asm_path.write_text(asm_text)
 
     if args.emit_asm:
         print(f"[info] wrote {asm_path}")

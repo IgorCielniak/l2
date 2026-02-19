@@ -11,30 +11,30 @@ word main
     dup arr_data over 24 + == puti cr
 
     # arr_push
-    10 swap arr_push
-    20 swap arr_push
-    30 swap arr_push
+    dup 10 arr_push
+    dup 20 arr_push
+    dup 30 arr_push
 
     # arr_len / arr_cap after growth
     dup arr_len puti cr
     dup arr_cap puti cr
 
     # arr_get
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
 
     # arr_set
-    dup 99 swap 1 swap arr_set
-    dup 1 swap arr_get puti cr
+    dup 99 1 arr_set
+    dup 1 arr_get puti cr
 
     # arr_reserve (with len > 0 so element copy path is exercised)
-    8 swap arr_reserve
+    dup 8 arr_reserve
     dup arr_cap puti cr
     dup arr_len puti cr
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
 
     # arr_pop (including empty pop)
     arr_pop puti cr
@@ -49,9 +49,9 @@ word main
     [ 7 8 9 ] dup arr_to_dyn
     dup arr_len puti cr
     dup arr_cap puti cr
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
     arr_free
 
     # free list allocation: bytes = (len + 1) * 8
@@ -59,41 +59,41 @@ word main
 
     # dyn_arr_sorted (copy) should not mutate source
     5 arr_new
-    3 swap arr_push
-    1 swap arr_push
-    2 swap arr_push
+    dup 3 arr_push
+    dup 1 arr_push
+    dup 2 arr_push
 
     dup dyn_arr_sorted
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
     arr_free
 
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
 
     # dyn_arr_sort (alias) sorts in place
     dyn_arr_sort
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
     arr_free
 
     # dyn_arr_sorted (alias) returns a sorted copy
     5 arr_new
-    4 swap arr_push
-    9 swap arr_push
-    6 swap arr_push
+    dup 4 arr_push
+    dup 9 arr_push
+    dup 6 arr_push
 
     dup dyn_arr_sorted
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
     arr_free
 
-    dup 0 swap arr_get puti cr
-    dup 1 swap arr_get puti cr
-    dup 2 swap arr_get puti cr
+    dup 0 arr_get puti cr
+    dup 1 arr_get puti cr
+    dup 2 arr_get puti cr
     arr_free
 end

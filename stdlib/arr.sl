@@ -56,10 +56,10 @@ word arr_copy_elements
     drop 2drop
 end
 
-#arr_reserve [*, cap | arr] -> [* | arr]
+#arr_reserve [*, arr | cap] -> [* | arr]
 # Ensures capacity >= cap; returns (possibly moved) arr pointer.
 word arr_reserve
-    swap dup 1 < if drop 1 end swap   # reqcap arr
+    dup 1 < if drop 1 end swap   # stack: [*, reqcap | arr]
 
     # Check: if arr_cap >= reqcap, do nothing
     over over arr_cap swap
@@ -86,13 +86,13 @@ word arr_reserve
     end
 end
 
-#arr_push [*, x | arr] -> [* | arr]
+#arr_push [*, arr | x] -> [* | arr]
 # Push element onto array, growing if needed
 word arr_push
+    swap
     dup arr_len over arr_cap >= if
         dup arr_cap dup 1 < if drop 1 end 2 *
-        over arr_reserve
-        nip
+        arr_reserve
     end
 
     # Store x at data[len]
@@ -116,16 +116,16 @@ word arr_pop
     end
 end
 
-#arr_get [*, i | arr] -> [* | x]
+#arr_get [*, arr | i] -> [* | x]
 # Get element at index i
 word arr_get
-    arr_data swap 8 * + @
+    swap arr_data swap 8 * + @
 end
 
-#arr_set [*, x, i | arr] -> [*]
+#arr_set [*, arr, x | i] -> [*]
 # Set element at index i to x
 word arr_set
-    arr_data swap 8 * + swap !
+    rot arr_data swap 8 * + swap !
 end
 
 #dyn_arr_clone [* | dyn_arr] -> [* | dyn_arr_copy]
@@ -149,16 +149,16 @@ word arr_item_ptr
     swap 8 * swap 8 + +
 end
 
-#arr_get [*, i | arr] -> [* | x]
+#arr_get_static [*, arr | i] -> [* | x]
 # Get element from built-in static array
 word arr_get_static
-    arr_item_ptr @
+    swap arr_item_ptr @
 end
 
-#arr_set [*, x, i | arr] -> [*]
+#arr_set_static [*, arr, x | i] -> [*]
 # Set element in built-in static array
 word arr_set_static
-    arr_item_ptr swap !
+    rot arr_item_ptr swap !
 end
 
 #arr_static_free [* | arr] -> [*]

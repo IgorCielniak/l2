@@ -2349,7 +2349,7 @@ class CompileTimeVM:
                 # Replace all references to local labels with prefixed versions
                 for label in local_labels:
                     # Use word-boundary replacement to avoid partial matches
-                    line = _re.sub(rf'(?<!\w){_re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
+                    line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
 
                 # Patch [rel SYMBOL] → concrete address
                 m = _RE_REL_PAT.search(line)

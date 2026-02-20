@@ -356,8 +356,8 @@
 #cr [*] -> [*]
 inline word cr 10 putc end
 
-#puts [* | x] -> [*]
+#puts [*, addr | len] -> [*]
 inline word puts write_buf cr end
 
-#eputs [* | x] -> [*]
+#eputs [*, addr | len] -> [*]
 inline word eputs ewrite_buf cr end

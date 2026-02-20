@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
+import json
 import mmap
 import os
 import re
@@ -5065,6 +5067,7 @@ class Compiler:
         if include_paths is None:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
+        self._loaded_files: Set[Path] = set()
 
     def compile_source(
         self,
@@ -5168,6 +5171,7 @@ class Compiler:
         out_lines: List[str] = []
         spans: List[FileSpan] = []
         self._append_file_with_imports(path.resolve(), out_lines, spans, seen)
+        self._loaded_files = set(seen)
         return "\n".join(out_lines) + "\n", spans
 
     def _append_file_with_imports(
@@ -5279,6 +5283,110 @@ class Compiler:
             file_line_no += 1
 
         close_segment_if_open()
+
+
+class BuildCache:
+    """Caches compilation artifacts keyed by source content and compiler flags."""
+
+    def __init__(self, cache_dir: Path) -> None:
+        self.cache_dir = cache_dir
+
+    @staticmethod
+    def _hash_bytes(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _hash_str(s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    def _manifest_path(self, source: Path) -> Path:
+        key = self._hash_str(str(source.resolve()))
+        return self.cache_dir / f"{key}.json"
+
+    def flags_hash(self, debug: bool, folding: bool, peephole: bool, entry_mode: str) -> str:
+        return self._hash_str(
+            f"debug={debug},folding={folding},peephole={peephole},entry_mode={entry_mode}"
+        )
+
+    def _file_info(self, path: Path) -> dict:
+        st = path.stat()
+        return {
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+            "hash": self._hash_bytes(path.read_bytes()),
+        }
+
+    def load_manifest(self, source: Path) -> Optional[dict]:
+        mp = self._manifest_path(source)
+        if not mp.exists():
+            return None
+        try:
+            return json.loads(mp.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def check_fresh(self, manifest: dict, fhash: str) -> bool:
+        """Return True if all source files are unchanged and flags match."""
+        if manifest.get("flags_hash") != fhash:
+            return False
+        if manifest.get("has_ct_effects"):
+            return False
+        files = manifest.get("files", {})
+        for path_str, info in files.items():
+            p = Path(path_str)
+            if not p.exists():
+                return False
+            try:
+                st = p.stat()
+            except OSError:
+                return False
+            if st.st_mtime == info.get("mtime") and st.st_size == info.get("size"):
+                continue
+            actual_hash = self._hash_bytes(p.read_bytes())
+            if actual_hash != info.get("hash"):
+                return False
+        return True
+
+    def get_cached_asm(self, manifest: dict) -> Optional[str]:
+        asm_hash = manifest.get("asm_hash")
+        if not asm_hash:
+            return None
+        asm_path = self.cache_dir / f"{asm_hash}.asm"
+        if not asm_path.exists():
+            return None
+        return asm_path.read_text()
+
+    def save(
+        self,
+        source: Path,
+        loaded_files: Set[Path],
+        fhash: str,
+        asm_text: str,
+        has_ct_effects: bool = False,
+    ) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        files: Dict[str, dict] = {}
+        for p in sorted(loaded_files):
+            try:
+                files[str(p)] = self._file_info(p)
+            except OSError:
+                pass
+        asm_hash = self._hash_str(asm_text)
+        asm_path = self.cache_dir / f"{asm_hash}.asm"
+        asm_path.write_text(asm_text)
+        manifest = {
+            "source": str(source.resolve()),
+            "flags_hash": fhash,
+            "files": files,
+            "asm_hash": asm_hash,
+            "has_ct_effects": has_ct_effects,
+        }
+        self._manifest_path(source).write_text(json.dumps(manifest))
+
+    def clean(self) -> None:
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir)
+
 
 def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
     cmd = ["nasm", "-f", "elf64"]
@@ -6681,6 +6789,7 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
     parser.add_argument("--no-folding", action="store_true", help="disable constant folding optimization")
     parser.add_argument("--no-peephole", action="store_true", help="disable peephole optimizations")
+    parser.add_argument("--no-cache", action="store_true", help="disable incremental build cache")
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
     parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
@@ -6785,16 +6894,40 @@ def cli(argv: Sequence[str]) -> int:
     compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
     compiler.assembler.enable_constant_folding = folding_enabled
     compiler.assembler.enable_peephole_optimization = peephole_enabled
+
+    cache: Optional[BuildCache] = None
+    if not args.no_cache:
+        cache = BuildCache(args.temp_dir / ".l2cache")
+
     try:
         if args.repl:
             return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)
 
         entry_mode = "program" if artifact_kind == "exe" else "library"
-        emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
 
-        # Snapshot assembly text *before* ct-run-main JIT execution, which may
-        # corrupt Python heap objects depending on memory layout.
-        asm_text = emission.snapshot()
+        # --- assembly-level cache check ---
+        asm_text: Optional[str] = None
+        fhash = ""
+        if cache and not args.ct_run_main:
+            fhash = cache.flags_hash(args.debug, folding_enabled, peephole_enabled, entry_mode)
+            manifest = cache.load_manifest(args.source)
+            if manifest and cache.check_fresh(manifest, fhash):
+                cached = cache.get_cached_asm(manifest)
+                if cached is not None:
+                    asm_text = cached
+
+        if asm_text is None:
+            emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
+
+            # Snapshot assembly text *before* ct-run-main JIT execution, which may
+            # corrupt Python heap objects depending on memory layout.
+            asm_text = emission.snapshot()
+
+            if cache and not args.ct_run_main:
+                if not fhash:
+                    fhash = cache.flags_hash(args.debug, folding_enabled, peephole_enabled, entry_mode)
+                has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
+                cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
 
         if args.ct_run_main:
             try:
@@ -6812,7 +6945,15 @@ def cli(argv: Sequence[str]) -> int:
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")
     obj_path = args.temp_dir / (args.source.stem + ".o")
-    asm_path.write_text(asm_text)
+
+    # --- incremental: skip nasm if assembly unchanged ---
+    asm_changed = True
+    if asm_path.exists():
+        existing_asm = asm_path.read_text()
+        if existing_asm == asm_text:
+            asm_changed = False
+    if asm_changed:
+        asm_path.write_text(asm_text)
 
     if args.emit_asm:
         print(f"[info] wrote {asm_path}")
@@ -6822,24 +6963,43 @@ def cli(argv: Sequence[str]) -> int:
         print("[info] skipped artifact generation (--no-artifact)")
         return 0
 
-    run_nasm(asm_path, obj_path, debug=args.debug)
+    # --- incremental: skip nasm if .o newer than .asm ---
+    need_nasm = asm_changed or not obj_path.exists()
+    if not need_nasm:
+        try:
+            need_nasm = obj_path.stat().st_mtime < asm_path.stat().st_mtime
+        except OSError:
+            need_nasm = True
+    if need_nasm:
+        run_nasm(asm_path, obj_path, debug=args.debug)
     if args.output.parent and not args.output.parent.exists():
         args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- incremental: skip linker if output newer than .o ---
+    need_link = need_nasm or not args.output.exists()
+    if not need_link:
+        try:
+            need_link = args.output.stat().st_mtime < obj_path.stat().st_mtime
+        except OSError:
+            need_link = True
 
     if artifact_kind == "obj":
         dest = args.output
         if obj_path.resolve() != dest.resolve():
-            shutil.copy2(obj_path, dest)
+            if need_link:
+                shutil.copy2(obj_path, dest)
     elif artifact_kind == "static":
-        build_static_library(obj_path, args.output)
+        if need_link:
+            build_static_library(obj_path, args.output)
     else:
-        run_linker(
-            obj_path,
-            args.output,
-            debug=args.debug,
-            libs=args.libs,
-            shared=(artifact_kind == "shared"),
-        )
+        if need_link:
+            run_linker(
+                obj_path,
+                args.output,
+                debug=args.debug,
+                libs=args.libs,
+                shared=(artifact_kind == "shared"),
+            )
 
     print(f"[info] built {args.output}")
 

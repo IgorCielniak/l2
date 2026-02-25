@@ -2918,6 +2918,11 @@ _sanitize_label_cache: Dict[str, str] = {}
 
 
 def sanitize_label(name: str) -> str:
+    # Keep the special `_start` label unchanged so the program entrypoint
+    # remains a plain `_start` symbol expected by the linker.
+    if name == "_start":
+        _sanitize_label_cache[name] = name
+        return name
     cached = _sanitize_label_cache.get(name)
     if cached is not None:
         return cached
@@ -2930,8 +2935,13 @@ def sanitize_label(name: str) -> str:
     safe = "".join(parts) or "anon"
     if safe[0].isdigit():
         safe = "_" + safe
-    _sanitize_label_cache[name] = safe
-    return safe
+    # Prefix sanitized labels to avoid accidental collisions with
+    # assembler pseudo-ops or common identifiers (e.g. `abs`). The
+    # prefix is applied consistently so all emitted references using
+    # `sanitize_label` remain correct.
+    prefixed = f"w_{safe}"
+    _sanitize_label_cache[name] = prefixed
+    return prefixed
 
 
 def _is_identifier(text: str) -> bool:
@@ -3467,8 +3477,34 @@ class Assembler:
         self._export_all_defs = not is_program
         try:
             self._emit_externs(emission.text)
-            prelude_lines = module.prelude if module.prelude is not None else self._runtime_prelude(entry_mode)
-            emission.text.extend(prelude_lines)
+            # Determine whether user provided a top-level `:asm _start` in
+            # the module forms so the prelude can avoid emitting the
+            # default startup stub.
+            # Detect whether the user supplied a `_start` either as a top-level
+            # AsmDefinition form or as a registered dictionary word (imports
+            # or CT execution may register it). This influences prelude
+            # generation so the default stub is suppressed when present.
+            user_has_start = any(
+                isinstance(f, AsmDefinition) and f.name == "_start" for f in module.forms
+            ) or (
+                (self.dictionary.lookup("_start") is not None)
+                and isinstance(self.dictionary.lookup("_start").definition, AsmDefinition)
+            ) or (
+                (module.prelude is not None) and any(l.strip().startswith("_start:") for l in module.prelude)
+            )
+            # Defer runtime prelude generation until after top-level forms are
+            # parsed into `definitions` so we can accurately detect a user
+            # provided `_start` AsmDefinition and suppress the default stub.
+            # Note: module.prelude was already inspected above when
+            # computing `user_has_start`, so avoid referencing
+            # `prelude_lines` before it's constructed.
+            # Prelude will be generated after definitions are known.
+            # If user provided a raw assembly `_start` via `:asm _start {...}`
+            # inject it verbatim into the text section so it becomes the
+            # program entrypoint. Emit the raw body (no automatic `ret`).
+            # Do not inject `_start` body here; rely on definitions emission
+            # and the earlier `user_has_start` check to suppress the default
+            # startup stub. This avoids emitting `_start` twice.
             self._string_literals = {}
             self._float_literals = {}
             self._data_section = emission.data
@@ -3494,15 +3530,19 @@ class Assembler:
             if stray_forms:
                 raise CompileError("top-level literals or word references are not supported yet")
 
-            runtime_defs = [
-                defn for defn in definitions if not getattr(defn, "compile_only", False)
-            ]
+            runtime_defs = [defn for defn in definitions if not getattr(defn, "compile_only", False)]
             if is_program:
                 if not any(defn.name == "main" for defn in runtime_defs):
                     raise CompileError("missing 'main' definition")
                 reachable = self._reachable_runtime_defs(runtime_defs)
                 if len(reachable) != len(runtime_defs):
                     runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
+                # Always include any top-level assembly definitions so user
+                # provided `:asm` bodies (including `_start`) are emitted even
+                # if they aren't referenced from `main`.
+                for defn in definitions:
+                    if isinstance(defn, AsmDefinition) and defn not in runtime_defs:
+                        runtime_defs.append(defn)
             elif self._export_all_defs:
                 exported = sorted({sanitize_label(defn.name) for defn in runtime_defs})
                 for label in exported:
@@ -3513,6 +3553,80 @@ class Assembler:
 
             for definition in runtime_defs:
                 self._emit_definition(definition, emission.text, debug=debug)
+
+            # --- now generate and emit the runtime prelude ---
+            # Determine whether a user-provided `_start` exists among the
+            # parsed definitions or in a compile-time-injected prelude. If
+            # present, suppress the default startup stub emitted by the
+            # runtime prelude.
+            user_has_start = any(isinstance(d, AsmDefinition) and d.name == "_start" for d in definitions)
+            if module.prelude is not None and not user_has_start:
+                if any(line.strip().startswith("_start:") for line in module.prelude):
+                    user_has_start = True
+            base_prelude = self._runtime_prelude(entry_mode, has_user_start=user_has_start)
+            # Use the generated base prelude. Avoid directly prepending
+            # `module.prelude` which can contain raw, unsanitized assembly
+            # fragments (often sourced from cached stdlib assembly) that
+            # duplicate or conflict with the sanitized definitions the
+            # emitter produces. Prepending `module.prelude` has caused
+            # duplicate `_start` and symbol conflicts; prefer the
+            # canonical `base_prelude` produced by the emitter.
+            prelude_lines = base_prelude
+            if user_has_start and prelude_lines is not None:
+                # Avoid re-declaring the default startup symbol when the
+                # user provided their own `_start`. Do not remove the
+                # user's `_start` body. Only
+                # filter out any stray `global _start` markers.
+                prelude_lines = [l for l in prelude_lines if l.strip() != "global _start"]
+            # Tag any `_start:` occurrences in the prelude with a
+            # provenance comment so generated ASM files make it easy
+            # to see where each `_start` originated. This is
+            # non-destructive (comments only) and helps debug duplicates.
+            if prelude_lines is not None:
+                tagged = []
+                for l in prelude_lines:
+                    if l.strip().startswith("_start:"):
+                        tagged.append("; __ORIGIN__ prelude")
+                        tagged.append(l)
+                    else:
+                        tagged.append(l)
+                prelude_lines = tagged
+            # Prepend prelude lines to any already-emitted text (definitions).
+            emission.text = (prelude_lines if prelude_lines is not None else []) + list(emission.text)
+            try:
+                self._emitted_start = any(l.strip().startswith("_start:") for l in emission.text)
+            except Exception:
+                self._emitted_start = False
+            # If no `_start` has been emitted (either detected in
+            # definitions/module.prelude or already present in the
+            # composed `emission.text`), append the default startup
+            # stub now (after definitions) so the emitter does not
+            # produce duplicate `_start` labels.
+            if is_program and not (user_has_start or getattr(self, "_emitted_start", False)):
+                emission.text.extend([
+                    "; __ORIGIN__ default_stub",
+                    "global _start",
+                    "_start:",
+                    "    ; Linux x86-64 startup: argc/argv from stack",
+                    "    mov rdi, [rsp]",         # argc
+                    "    lea rsi, [rsp+8]",      # argv
+                    "    mov [rel sys_argc], rdi",
+                    "    mov [rel sys_argv], rsi",
+                    "    ; initialize data/return stack pointers",
+                    "    lea r12, [rel dstack_top]",
+                    "    mov r15, r12",
+                    "    lea r13, [rel rstack_top]",
+                    f"    call {sanitize_label('main')}",
+                    "    mov rax, 0",
+                    "    cmp r12, r15",
+                    "    je .no_exit_value",
+                    "    mov rax, [r12]",
+                    "    add r12, 8",
+                    ".no_exit_value:",
+                    "    mov rdi, rax",
+                    "    mov rax, 60",
+                    "    syscall",
+                ])
 
             self._emit_variables(module.variables)
 
@@ -3597,7 +3711,28 @@ class Assembler:
         *,
         debug: bool = False,
     ) -> None:
+        # If a `_start` label has already been emitted in the prelude,
+        # skip emitting a second `_start` definition which would cause
+        # assembler redefinition errors. The prelude-provided `_start`
+        # (if present) is taken to be authoritative.
+        if definition.name == "_start" and getattr(self, "_emitted_start", False):
+            return
+        # If this is a raw assembly definition, tag its origin so the
+        # generated ASM clearly shows the source of the label (helpful
+        # when diagnosing duplicate `_start` occurrences).
+        if isinstance(definition, AsmDefinition):
+            text.append(f"; __ORIGIN__ AsmDefinition {definition.name}")
         label = sanitize_label(definition.name)
+
+        # Record start index so we can write a per-definition snapshot
+        start_index = len(text)
+        # If this definition is the program entry `_start`, ensure it's
+        # exported as a global symbol so the linker sets the process
+        # entry point correctly. Some earlier sanitizer passes may
+        # remove `global _start` from prelude fragments; make sure user
+        # provided `_start` remains globally visible.
+        if label == "_start":
+            text.append("global _start")
         text.append(f"{label}:")
         builder = FunctionEmitter(text, debug_enabled=debug)
         self._emit_stack.append(definition.name)
@@ -3671,11 +3806,25 @@ class Assembler:
         body = definition.body.strip("\n")
         if not body:
             return
+        import re
         for line in body.splitlines():
-            if line.strip():
-                builder.emit(line)
-            else:
-                builder.emit("")
+            if not line.strip():
+                continue
+            # Sanitize symbol references in raw asm bodies so they match
+            # the sanitized labels emitted for high-level definitions.
+            # Handle common patterns: `call NAME`, `global NAME`, `extern NAME`.
+            def repl_sym(m: re.Match) -> str:
+                name = m.group(1)
+                return m.group(0).replace(name, sanitize_label(name))
+
+            # `call NAME`
+            line = re.sub(r"\bcall\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
+            # `global NAME`
+            line = re.sub(r"\bglobal\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
+            # `extern NAME`
+            line = re.sub(r"\bextern\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
+
+            builder.emit(line)
 
     def _emit_node(self, node: Op, builder: FunctionEmitter) -> None:
         kind = node._opcode
@@ -3939,14 +4088,13 @@ class Assembler:
         builder.emit("    add r13, 8")
         builder.emit(f"{end_label}:")
 
-    def _runtime_prelude(self, entry_mode: str) -> List[str]:
+    def _runtime_prelude(self, entry_mode: str, has_user_start: bool = False) -> List[str]:
         lines: List[str] = [
             "%define DSTK_BYTES 65536",
             "%define RSTK_BYTES 65536",
             "%define PRINT_BUF_BYTES 128",
         ]
-        if entry_mode == "program":
-            lines.append("global _start")
+        is_program = entry_mode == "program"
         lines.extend([
             "global sys_argc",
             "global sys_argv",
@@ -3955,32 +4103,9 @@ class Assembler:
             "sys_argv: dq 0",
             "section .text",
         ])
-
-        if entry_mode == "program":
-            lines.extend([
-                "_start:",
-                "    ; Linux x86-64 startup: argc/argv from stack",
-                "    mov rdi, [rsp]",         # argc
-                "    lea rsi, [rsp+8]",      # argv
-                "    mov [rel sys_argc], rdi",
-                "    mov [rel sys_argv], rsi",
-                "    ; initialize data/return stack pointers",
-                "    lea r12, [rel dstack_top]",
-                "    mov r15, r12",
-                "    lea r13, [rel rstack_top]",
-                "    call main",
-                "    mov rax, 0",
-                "    cmp r12, r15",
-                "    je .no_exit_value",
-                "    mov rax, [r12]",
-                "    add r12, 8",
-                ".no_exit_value:",
-                "    mov rdi, rax",
-                "    mov rax, 60",
-                "    syscall",
-            ])
-        else:
-            lines.append("    ; library build: provide your own entry point")
+        # Do not emit the default `_start` stub here; it will be appended
+        # after definitions have been emitted if no user `_start` was
+        # provided. This avoids duplicate or partial `_start` blocks.
 
         return lines
 
@@ -4009,7 +4134,6 @@ class Assembler:
 
     def write_asm(self, emission: Emission, path: Path) -> None:
         path.write_text(emission.snapshot())
-
 
 # ---------------------------------------------------------------------------
 # Built-in macros and intrinsics

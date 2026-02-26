@@ -4002,40 +4002,82 @@ class Assembler:
                 int_idx = 0
                 xmm_idx = 0
 
-                mapping: List[Tuple[str, str]] = [] # (type, target_reg)
+                mapping: List[Tuple[str, str]] = []  # (type, target)
 
+                # Assign registers for first args; overflow goes to stack
                 if not arg_types:
                     # Legacy/Raw mode: assume all ints
-                    if inputs > 6:
-                        raise CompileError(f"extern '{name}' has too many inputs ({inputs} > 6)")
                     for i in range(inputs):
-                        mapping.append(("int", regs[i]))
+                        if int_idx < len(regs):
+                            mapping.append(("int", regs[int_idx]))
+                            int_idx += 1
+                        else:
+                            mapping.append(("int", "stack"))
                 else:
                     for type_name in arg_types:
                         if type_name in ("float", "double"):
-                            if xmm_idx >= 8:
-                                raise CompileError(f"extern '{name}' has too many float inputs")
-                            mapping.append(("float", xmm_regs[xmm_idx]))
-                            xmm_idx += 1
+                            if xmm_idx < len(xmm_regs):
+                                mapping.append(("float", xmm_regs[xmm_idx]))
+                                xmm_idx += 1
+                            else:
+                                mapping.append(("float", "stack"))
                         else:
-                            if int_idx >= 6:
-                                raise CompileError(f"extern '{name}' has too many int inputs")
-                            mapping.append(("int", regs[int_idx]))
-                            int_idx += 1
+                            if int_idx < len(regs):
+                                mapping.append(("int", regs[int_idx]))
+                                int_idx += 1
+                            else:
+                                mapping.append(("int", "stack"))
 
-                for type_name, reg in reversed(mapping):
-                    if type_name == "float":
-                        builder.pop_to("rax")
-                        builder.emit(f"    movq {reg}, rax")
+                # Count stack slots required
+                stack_slots = sum(1 for t, target in mapping if target == "stack")
+                # stack allocation in bytes; make it a multiple of 16 for alignment
+                stack_bytes = ((stack_slots * 8 + 15) // 16) * 16 if stack_slots > 0 else 0
+
+                # Prepare stack-passed arguments: allocate space (16-byte multiple)
+                if stack_bytes:
+                    builder.emit(f"    sub rsp, {stack_bytes}")
+
+                # Read all arguments from the CT stack by indexed addressing
+                # (without advancing r12) and write them to registers or the
+                # prepared spill area. After all reads are emitted we advance
+                # r12 once by the total number of arguments to pop them.
+                total_args = len(mapping)
+                if stack_slots:
+                    stack_write_idx = stack_slots - 1
+                else:
+                    stack_write_idx = 0
+
+                # Iterate over reversed mapping (right-to-left) but use an
+                # index to address the CT stack without modifying r12.
+                for idx, (typ, target) in enumerate(reversed(mapping)):
+                    addr = f"[r12 + {idx * 8}]" if idx > 0 else "[r12]"
+                    if target == "stack":
+                        # Read spilled arg from indexed CT stack slot and store
+                        # it into the caller's spill area at the computed offset.
+                        builder.emit(f"    mov rax, {addr}")
+                        offset = stack_write_idx * 8
+                        builder.emit(f"    mov [rsp + {offset}], rax")
+                        stack_write_idx -= 1
                     else:
-                        builder.pop_to(reg)
+                        if typ == "float":
+                            builder.emit(f"    mov rax, {addr}")
+                            builder.emit(f"    movq {target}, rax")
+                        else:
+                            builder.emit(f"    mov {target}, {addr}")
 
-                builder.emit("    push rbp")
-                builder.emit("    mov rbp, rsp")
-                builder.emit("    and rsp, -16")
+                # Advance the CT stack pointer once to pop all arguments.
+                if total_args:
+                    builder.emit(f"    add r12, {total_args * 8}")
+
+                # Call the external function. We allocated a multiple-of-16
+                # area for spilled args above so `rsp` is already aligned
+                # for the call; set `al` (SSE count) then call directly.
                 builder.emit(f"    mov al, {xmm_idx}")
                 builder.emit(f"    call {name}")
-                builder.emit("    leave")
+
+                # Restore stack after the call
+                if stack_bytes:
+                    builder.emit(f"    add rsp, {stack_bytes}")
 
                 # Handle Return Value
                 if _ctype_uses_sse(ret_type):

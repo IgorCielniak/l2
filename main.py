@@ -3442,7 +3442,7 @@ class Assembler:
 
         definition.body = rebuilt
 
-    def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]]) -> Set[str]:
+    def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]], extra_roots: Optional[Sequence[str]] = None) -> Set[str]:
         edges: Dict[str, Set[str]] = {}
         for definition in runtime_defs:
             refs: Set[str] = set()
@@ -3450,19 +3450,56 @@ class Assembler:
                 for node in definition.body:
                     if node.op in {"word", "word_ptr"}:
                         refs.add(str(node.data))
+            elif isinstance(definition, AsmDefinition):
+                # Collect obvious textual `call` targets from asm bodies so
+                # asm-defined entry points can create edges into the word
+                # graph.  The extractor below will tolerate common call forms
+                # such as `call foo` and `call [rel foo]`.
+                asm_calls = self._extract_called_symbols_from_asm(definition.body)
+                for sym in asm_calls:
+                    refs.add(sym)
             edges[definition.name] = refs
+
+        # Map sanitized labels back to their original definition names so
+        # calls to emitted/sanitized labels (e.g. `w_foo`) can be resolved
+        # to the corresponding word names present in `edges`.
+        sanitized_map: Dict[str, str] = {sanitize_label(n): n for n in edges}
 
         reachable: Set[str] = set()
         stack: List[str] = ["main"]
+        if extra_roots:
+            for r in extra_roots:
+                if r and r not in stack:
+                    stack.append(r)
         while stack:
             name = stack.pop()
             if name in reachable:
                 continue
             reachable.add(name)
-            for dep in edges.get(name, ()):
-                if dep not in reachable and dep in edges:
+            for dep in edges.get(name, ()): 
+                # Direct name hit
+                if dep in edges and dep not in reachable:
                     stack.append(dep)
+                    continue
+                # Possibly a sanitized label; resolve back to original name
+                resolved = sanitized_map.get(dep)
+                if resolved and resolved not in reachable:
+                    stack.append(resolved)
         return reachable
+
+    def _extract_called_symbols_from_asm(self, asm_body: str) -> Set[str]:
+        """Return set of symbol names called from a raw asm body.
+
+        This looks for typical `call <symbol>` forms and also
+        `call [rel <symbol>]` and `call qword [rel <symbol>]`.
+        """
+        calls: Set[str] = set()
+        pattern = re.compile(r"call\s+(?:qword\s+)?(?:\[rel\s+([A-Za-z0-9_.$@]+)\]|([A-Za-z0-9_.$@]+))")
+        for m in pattern.finditer(asm_body):
+            sym = m.group(1) or m.group(2)
+            if sym:
+                calls.add(sym)
+        return calls
 
     def _emit_externs(self, text: List[str]) -> None:
         externs = sorted([w.name for w in self.dictionary.words.values() if getattr(w, "is_extern", False)])
@@ -3534,15 +3571,42 @@ class Assembler:
             if is_program:
                 if not any(defn.name == "main" for defn in runtime_defs):
                     raise CompileError("missing 'main' definition")
-                reachable = self._reachable_runtime_defs(runtime_defs)
+                # Determine if any user-provided `_start` asm calls into
+                # defined words and use those call targets as additional
+                # reachability roots. This avoids unconditionally emitting
+                # every `:asm` body while still preserving functions that
+                # are invoked from a custom `_start` stub.
+                # Build a quick lookup of runtime definition names -> defn
+                name_to_def: Dict[str, Union[Definition, AsmDefinition]] = {d.name: d for d in runtime_defs}
+                # Look for an asm `_start` among parsed definitions (not just runtime_defs)
+                asm_start = next((d for d in definitions if isinstance(d, AsmDefinition) and d.name == "_start"), None)
+                extra_roots: List[str] = []
+                if asm_start is not None:
+                    called = self._extract_called_symbols_from_asm(asm_start.body)
+                    # Resolve called symbols to definition names using both
+                    # raw and sanitized forms.
+                    sanitized_map = {sanitize_label(n): n for n in name_to_def}
+                    for sym in called:
+                        if sym in name_to_def:
+                            extra_roots.append(sym)
+                        else:
+                            resolved = sanitized_map.get(sym)
+                            if resolved:
+                                extra_roots.append(resolved)
+
+                # Ensure a user-provided raw `_start` asm definition is
+                # always emitted (it should override the default stub).
+                if asm_start is not None and asm_start not in runtime_defs:
+                    runtime_defs.append(asm_start)
+
+                reachable = self._reachable_runtime_defs(runtime_defs, extra_roots=extra_roots)
                 if len(reachable) != len(runtime_defs):
                     runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
-                # Always include any top-level assembly definitions so user
-                # provided `:asm` bodies (including `_start`) are emitted even
-                # if they aren't referenced from `main`.
-                for defn in definitions:
-                    if isinstance(defn, AsmDefinition) and defn not in runtime_defs:
-                        runtime_defs.append(defn)
+                # Ensure `_start` is preserved even if not reachable from
+                # `main` or the discovered roots; user-provided `_start`
+                # must override the default stub.
+                if asm_start is not None and asm_start not in runtime_defs:
+                    runtime_defs.append(asm_start)
             elif self._export_all_defs:
                 exported = sorted({sanitize_label(defn.name) for defn in runtime_defs})
                 for label in exported:

@@ -3337,28 +3337,32 @@ class Assembler:
         kind = node._opcode
         data = node.data
         if kind == OP_LITERAL:
-            return f"literal {data!r}"
+            return f"push {data!r}"
         if kind == OP_WORD:
-            return f"word {data}"
+            return str(data)
         if kind == OP_WORD_PTR:
-            return f"word_ptr {data}"
+            return f"&{data}"
         if kind == OP_BRANCH_ZERO:
-            return f"branch_zero {data}"
+            return "branch_zero"
         if kind == OP_JUMP:
-            return f"jump {data}"
+            return "jump"
         if kind == OP_LABEL:
-            return f"label {data}"
+            return f".{data}:"
         if kind == OP_FOR_BEGIN:
-            return f"for_begin loop={data['loop']} end={data['end']}"
+            return "for"
         if kind == OP_FOR_END:
-            return f"for_end loop={data['loop']} end={data['end']}"
+            return "end  (for)"
         if kind == OP_LIST_BEGIN:
-            return f"list_begin {data}"
+            return "list_begin"
         if kind == OP_LIST_END:
-            return f"list_end {data}"
+            return "list_end"
         if kind == OP_LIST_LITERAL:
             return f"list_literal {data}"
-        return f"{node.op} {data!r}"
+        return f"{node.op}" if data is None else f"{node.op} {data!r}"
+
+    @staticmethod
+    def _dot_html_escape(text: str) -> str:
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
     @staticmethod
     def _dot_escape(text: str) -> str:
@@ -3367,6 +3371,11 @@ class Assembler:
     @staticmethod
     def _dot_id(text: str) -> str:
         return re.sub(r"[^A-Za-z0-9_]", "_", text)
+
+    def _cfg_loc_str(self, node: Op) -> str:
+        if node.loc is None:
+            return ""
+        return f"{node.loc.path.name}:{node.loc.line}"
 
     def _definition_cfg_blocks_and_edges(self, definition: Definition) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int, str]]]:
         nodes = definition.body
@@ -3473,44 +3482,150 @@ class Assembler:
                 positions[str(node.data)] = idx
         return positions
 
+    # ---- edge style lookup ----
+    _CFG_EDGE_STYLES: Dict[str, Dict[str, str]] = {
+        "nonzero": {"color": "#2e7d32", "fontcolor": "#2e7d32", "label": "T", "penwidth": "2"},
+        "zero":    {"color": "#c62828", "fontcolor": "#c62828", "label": "F", "style": "dashed", "penwidth": "2"},
+        "jmp":     {"color": "#1565c0", "fontcolor": "#1565c0", "label": "jmp", "penwidth": "1.5"},
+        "next":    {"color": "#616161", "fontcolor": "#616161", "label": ""},
+        "enter":   {"color": "#2e7d32", "fontcolor": "#2e7d32", "label": "enter", "penwidth": "2"},
+        "empty":   {"color": "#c62828", "fontcolor": "#c62828", "label": "empty", "style": "dashed", "penwidth": "1.5"},
+        "loop":    {"color": "#6a1b9a", "fontcolor": "#6a1b9a", "label": "loop", "style": "bold", "penwidth": "2"},
+        "exit":    {"color": "#ef6c00", "fontcolor": "#ef6c00", "label": "exit", "penwidth": "1.5"},
+    }
+
+    def _cfg_edge_attrs(self, label: str) -> str:
+        style = self._CFG_EDGE_STYLES.get(label, {"label": label, "color": "black"})
+        parts = [f'{k}="{v}"' for k, v in style.items()]
+        return ", ".join(parts)
+
     def render_last_cfg_dot(self) -> str:
         lines: List[str] = [
             "digraph l2_cfg {",
-            "    rankdir=LR;",
-            "    node [shape=box, fontname=\"Courier\"];",
-            "    edge [fontname=\"Courier\"];",
+            '    rankdir=TB;',
+            '    newrank=true;',
+            '    compound=true;',
+            '    fontname="Helvetica";',
+            '    node [shape=plaintext, fontname="Courier New", fontsize=10];',
+            '    edge [fontname="Helvetica", fontsize=9];',
         ]
 
         if not self._last_cfg_definitions:
-            lines.append("    empty [label=\"No runtime high-level definitions available for CFG dump\"];")
+            lines.append('    empty [shape=box, label="(no definitions)"];')
             lines.append("}")
             return "\n".join(lines)
 
         for defn in self._last_cfg_definitions:
             cluster_id = self._dot_id(f"cluster_{defn.name}")
-            lines.append(f"    subgraph {cluster_id} {{")
-            lines.append(f"        label=\"{self._dot_escape(defn.name)}\";")
+            prefix = self._dot_id(defn.name)
 
             blocks, edges = self._definition_cfg_blocks_and_edges(defn)
+
+            # Determine which blocks are loop-back targets
+            back_targets: Set[int] = set()
+            for src, dst, elabel in edges:
+                if elabel == "loop" or (elabel == "jmp" and dst <= src):
+                    back_targets.add(dst)
+
+            # Determine exit blocks (no outgoing edges)
+            has_successor: Set[int] = {src for src, _, _ in edges}
+
+            lines.append(f"    subgraph {cluster_id} {{")
+            lines.append(f'        label=<<B>{self._dot_html_escape(defn.name)}</B>>;')
+            lines.append('        labeljust=l;')
+            lines.append('        style=dashed; color="#9e9e9e";')
+            lines.append(f'        fontname="Helvetica"; fontsize=12;')
+
             if not blocks:
                 node_id = self._dot_id(f"{defn.name}_empty")
-                lines.append(f"        {node_id} [label=\"(empty)\"];")
+                lines.append(f'        {node_id} [shape=box, label="(empty)"];')
                 lines.append("    }")
                 continue
 
-            prefix = self._dot_id(defn.name)
             for block_idx, (start, end) in enumerate(blocks):
                 node_id = f"{prefix}_b{block_idx}"
-                op_lines = [f"{ip}: {self._format_cfg_op(defn.body[ip])}" for ip in range(start, end)]
-                label = "\\l".join(self._dot_escape(line) for line in op_lines) + "\\l"
-                lines.append(f"        {node_id} [label=\"{label}\"];")
+                is_entry = block_idx == 0
+                is_exit = block_idx not in has_successor
+                is_loop_head = block_idx in back_targets
+
+                # Pick header colour
+                if is_entry:
+                    hdr_bg = "#c8e6c9"  # green
+                    hdr_fg = "#1b5e20"
+                elif is_exit:
+                    hdr_bg = "#ffcdd2"  # red
+                    hdr_fg = "#b71c1c"
+                elif is_loop_head:
+                    hdr_bg = "#bbdefb"  # blue
+                    hdr_fg = "#0d47a1"
+                else:
+                    hdr_bg = "#e0e0e0"  # grey
+                    hdr_fg = "#212121"
+
+                # Block annotation
+                tag = ""
+                if is_entry:
+                    tag = " (entry)"
+                if is_exit:
+                    tag += " (exit)"
+                if is_loop_head:
+                    tag += " (loop)"
+
+                # Source location from first non-label instruction
+                loc_str = ""
+                for ip in range(start, end):
+                    n = defn.body[ip]
+                    if n._opcode != OP_LABEL:
+                        loc_str = self._cfg_loc_str(n)
+                        break
+                if not loc_str and defn.body[start].loc:
+                    loc_str = self._cfg_loc_str(defn.body[start])
+
+                # Build HTML table label
+                hdr_text = f"BB{block_idx}{tag}"
+                if loc_str:
+                    hdr_text += f"  [{loc_str}]"
+
+                rows: List[str] = []
+                rows.append(f'<TR><TD BGCOLOR="{hdr_bg}" ALIGN="LEFT"><FONT COLOR="{hdr_fg}"><B>{self._dot_html_escape(hdr_text)}</B></FONT></TD></TR>')
+
+                for ip in range(start, end):
+                    n = defn.body[ip]
+                    op_text = self._format_cfg_op(n)
+                    esc = self._dot_html_escape(f"  {ip:3d}  {op_text}")
+                    kind = n._opcode
+                    if kind in (OP_BRANCH_ZERO, OP_JUMP, OP_FOR_BEGIN, OP_FOR_END):
+                        # Highlight control-flow ops
+                        rows.append(f'<TR><TD ALIGN="LEFT" BGCOLOR="#fff9c4"><FONT COLOR="#f57f17" FACE="Courier New">{esc}</FONT></TD></TR>')
+                    elif kind == OP_LABEL:
+                        rows.append(f'<TR><TD ALIGN="LEFT" BGCOLOR="#f5f5f5"><FONT COLOR="#9e9e9e" FACE="Courier New">{esc}</FONT></TD></TR>')
+                    else:
+                        rows.append(f'<TR><TD ALIGN="LEFT"><FONT FACE="Courier New">{esc}</FONT></TD></TR>')
+
+                table = f'<<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="4">{"".join(rows)}</TABLE>>'
+                lines.append(f"        {node_id} [label={table}];")
 
             for src, dst, edge_label in edges:
                 src_id = f"{prefix}_b{src}"
                 dst_id = f"{prefix}_b{dst}"
-                lines.append(f"        {src_id} -> {dst_id} [label=\"{self._dot_escape(edge_label)}\"];")
+                attrs = self._cfg_edge_attrs(edge_label)
+                lines.append(f"        {src_id} -> {dst_id} [{attrs}];")
 
             lines.append("    }")
+
+        # Legend
+        lines.append("    subgraph cluster_legend {")
+        lines.append('        label=<<B>Legend</B>>;')
+        lines.append('        fontname="Helvetica"; fontsize=10;')
+        lines.append('        style=solid; color="#bdbdbd";')
+        lines.append('        node [shape=box, fontname="Helvetica", fontsize=9, width=1.3, height=0.3];')
+        lines.append('        edge [style=invis];')
+        lines.append('        leg_entry [label="entry", style=filled, fillcolor="#c8e6c9", fontcolor="#1b5e20"];')
+        lines.append('        leg_exit  [label="exit",  style=filled, fillcolor="#ffcdd2", fontcolor="#b71c1c"];')
+        lines.append('        leg_loop  [label="loop header", style=filled, fillcolor="#bbdefb", fontcolor="#0d47a1"];')
+        lines.append('        leg_norm  [label="basic block", style=filled, fillcolor="#e0e0e0", fontcolor="#212121"];')
+        lines.append('        leg_entry -> leg_exit -> leg_loop -> leg_norm;')
+        lines.append("    }")
 
         lines.append("}")
         return "\n".join(lines)

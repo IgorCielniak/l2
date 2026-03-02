@@ -25,6 +25,7 @@ DEFAULT_EXTRA_TESTS = [
     "extra_tests/ct_test.sl",
     "extra_tests/args.sl",
     "extra_tests/c_extern.sl",
+    "extra_tests/c_extern_structs.sl",
     "extra_tests/fn_test.sl",
     "extra_tests/nob_test.sl",
 ]
@@ -364,7 +365,11 @@ class TestRunner:
             reason = case.config.skip_reason or "skipped via metadata"
             return CaseResult(case, "skipped", "skip", reason)
         start = time.perf_counter()
-        compile_proc = self._compile(case)
+        try:
+            fixture_libs = self._prepare_case_native_libs(case)
+        except RuntimeError as exc:
+            return CaseResult(case, "failed", "fixture", str(exc))
+        compile_proc = self._compile(case, extra_libs=fixture_libs)
         if case.config.expect_compile_error:
             result = self._handle_expected_compile_failure(case, compile_proc)
             result.duration = time.perf_counter() - start
@@ -424,9 +429,18 @@ class TestRunner:
             return CaseResult(case, "updated", "compare", "; ".join(updated_notes), details=None, duration=duration)
         return CaseResult(case, "passed", "run", "ok", details=None, duration=duration)
 
-    def _compile(self, case: TestCase) -> subprocess.CompletedProcess[str]:
-        cmd = [sys.executable, str(self.main_py), str(case.source), "-o", str(case.binary_path)]
+    def _compile(self, case: TestCase, *, extra_libs: Optional[Sequence[str]] = None) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            sys.executable,
+            str(self.main_py),
+            str(case.source),
+            "-o",
+            str(case.binary_path),
+            "--no-cache",
+        ]
         for lib in case.config.libs:
+            cmd.extend(["-l", lib])
+        for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
         if self.args.ct_run_main:
             cmd.append("--ct-run-main")
@@ -445,6 +459,56 @@ class TestRunner:
             input=compile_input,
             env=self._env_for(case),
         )
+
+    def _prepare_case_native_libs(self, case: TestCase) -> List[str]:
+        """Build optional per-test native C fixtures and return linkable artifacts."""
+        c_source = case.source.with_suffix(".c")
+        if not c_source.exists():
+            return []
+
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if cc is None:
+            raise RuntimeError("no C compiler found (expected one of: cc, gcc, clang)")
+
+        ar = shutil.which("ar")
+        if ar is None:
+            raise RuntimeError("'ar' is required to build static C fixtures")
+
+        obj_path = case.build_dir / f"{case.binary_stub}_fixture.o"
+        archive_path = case.build_dir / f"lib{case.binary_stub}_fixture.a"
+
+        compile_cmd = [cc, "-O2", "-c", str(c_source), "-o", str(obj_path)]
+        archive_cmd = [ar, "rcs", str(archive_path), str(obj_path)]
+
+        if self.args.verbose:
+            print(f"{format_status('CMD', 'blue')} {quote_cmd(compile_cmd)}")
+            print(f"{format_status('CMD', 'blue')} {quote_cmd(archive_cmd)}")
+
+        compile_proc = subprocess.run(
+            compile_cmd,
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=self._env_for(case),
+        )
+        if compile_proc.returncode != 0:
+            raise RuntimeError(
+                "failed to compile C fixture:\n" + self._format_process_output(compile_proc)
+            )
+
+        archive_proc = subprocess.run(
+            archive_cmd,
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=self._env_for(case),
+        )
+        if archive_proc.returncode != 0:
+            raise RuntimeError(
+                "failed to archive C fixture:\n" + self._format_process_output(archive_proc)
+            )
+
+        return [str(archive_path.resolve())]
 
     def _run_binary(self, case: TestCase) -> subprocess.CompletedProcess[str]:
         runtime_cmd = [self._runtime_entry(case), *case.runtime_args()]

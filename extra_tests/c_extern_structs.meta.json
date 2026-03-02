@@ -1,0 +1,4 @@
+{
+  "description": "C extern struct ABI coverage: by-value arg, by-value return, sret return, pointer out",
+  "libs": ["libc.so.6"]
+}

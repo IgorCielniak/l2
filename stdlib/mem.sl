@@ -9,7 +9,7 @@ word alloc
     -1     # fd
     0      # offset
     mmap
-    swap drop
+    nip
 end
 
 #free [*, addr | size] -> [*]
@@ -38,8 +38,7 @@ word memcpy
         c!
         swap
     end
-    swap
-    nip
+    drop
     r> dup -rot - swap
 end
 

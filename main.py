@@ -10,20 +10,11 @@ This file now contains working scaffolding for:
 
 from __future__ import annotations
 
-import argparse
 import bisect
-import ctypes
-import hashlib
-import json
-import mmap
 import os
 import re
-import shlex
 import struct
-import subprocess
 import sys
-import shutil
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
@@ -39,6 +30,7 @@ except Exception:  # pragma: no cover - optional dependency
 _RE_REL_PAT = re.compile(r'\[rel\s+(\w+)\]')
 _RE_LABEL_PAT = re.compile(r'^(\.\w+|\w+):')
 _RE_BSS_PERSISTENT = re.compile(r'persistent:\s*resb\s+(\d+)')
+DEFAULT_MACRO_EXPANSION_LIMIT = 256
 
 
 class ParseError(Exception):
@@ -65,6 +57,7 @@ class Token:
     column: int
     start: int
     end: int
+    expansion_depth: int = 0
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return f"Token({self.lexeme!r}@{self.line}:{self.column})"
@@ -76,6 +69,46 @@ class SourceLocation:
     line: int
     column: int
 
+_READER_REGEX_CACHE: Dict[frozenset, "re.Pattern[str]"] = {}
+
+_STACK_EFFECT_PAREN_RE = re.compile(r'\(([^)]*--[^)]*)\)')
+_STACK_EFFECT_BARE_RE = re.compile(r'#\s*(\S+(?:\s+\S+)*?)\s+--\s')
+
+def _parse_stack_effect_comment(source: str, word_token_start: int) -> Optional[int]:
+    """Extract the input count from a stack-effect comment near a 'word' token.
+
+    Looks for ``# ... (a b -- c)`` or ``# a b -- c`` on the same line as
+    *word_token_start* or on the immediately preceding line.  Returns the
+    number of inputs (names before ``--``) or *None* if no effect comment
+    is found.
+    """
+    # Find the line containing the word token
+    line_start = source.rfind('\n', 0, word_token_start)
+    line_start = 0 if line_start == -1 else line_start + 1
+    line_end = source.find('\n', word_token_start)
+    if line_end == -1:
+        line_end = len(source)
+    lines_to_check = [source[line_start:line_end]]
+    if line_start > 0:
+        prev_end = line_start - 1
+        prev_start = source.rfind('\n', 0, prev_end)
+        prev_start = 0 if prev_start == -1 else prev_start + 1
+        lines_to_check.append(source[prev_start:prev_end])
+
+    for line in lines_to_check:
+        if '#' not in line or '--' not in line:
+            continue
+        # Prefer parenthesized effect: # text (a b -- c)
+        m = _STACK_EFFECT_PAREN_RE.search(line)
+        if m:
+            parts = m.group(1).split('--')
+            inputs_part = parts[0].strip()
+            return len(inputs_part.split()) if inputs_part else 0
+        # Bare effect on same line as word: # a b -- c
+        m = _STACK_EFFECT_BARE_RE.search(line)
+        if m:
+            return len(m.group(1).split())
+    return None
 
 class Reader:
     """Default reader; users can swap implementations at runtime."""
@@ -87,6 +120,7 @@ class Reader:
         self._token_order: List[str] = sorted(self.custom_tokens, key=len, reverse=True)
         self._single_char_tokens: Set[str] = {t for t in self.custom_tokens if len(t) == 1}
         self._multi_char_tokens: List[str] = [t for t in self._token_order if len(t) > 1]
+        self._multi_first_chars: Set[str] = {t[0] for t in self._multi_char_tokens}
 
     def add_tokens(self, tokens: Iterable[str]) -> None:
         updated = False
@@ -100,116 +134,83 @@ class Reader:
             self._token_order = sorted(self.custom_tokens, key=len, reverse=True)
             self._single_char_tokens = {t for t in self.custom_tokens if len(t) == 1}
             self._multi_char_tokens = [t for t in self._token_order if len(t) > 1]
+            self._multi_first_chars = {t[0] for t in self._multi_char_tokens}
+            self._token_re = None  # invalidate cached regex
+            self._multi_char_tokens = [t for t in self._token_order if len(t) > 1]
+            self._multi_first_chars = {t[0] for t in self._multi_char_tokens}
 
     def add_token_chars(self, chars: str) -> None:
         self.add_tokens(chars)
 
-    def tokenize(self, source: str) -> Iterable[Token]:
-        self.line = 1
-        self.column = 0
-        index = 0
-        lexeme: List[str] = []
-        token_start = 0
-        token_line = 1
-        token_column = 0
-        source_len = len(source)
-        while index < source_len:
-            char = source[index]
-            if char == '"':
-                if lexeme:
-                    yield Token("".join(lexeme), token_line, token_column, token_start, index)
-                    lexeme.clear()
-                    token_start = index
-                    token_line = self.line
-                    token_column = self.column
-                index += 1
-                self.column += 1
-                string_parts = ['"']
-                while True:
-                    if index >= source_len:
-                        raise ParseError("unterminated string literal")
-                    ch = source[index]
-                    string_parts.append(ch)
-                    index += 1
-                    if ch == "\n":
-                        self.line += 1
-                        self.column = 0
-                    else:
-                        self.column += 1
-                    if ch == "\\":
-                        if index >= source_len:
-                            raise ParseError("unterminated string literal")
-                        next_ch = source[index]
-                        string_parts.append(next_ch)
-                        index += 1
-                        if next_ch == "\n":
-                            self.line += 1
-                            self.column = 0
-                        else:
-                            self.column += 1
-                        continue
-                    if ch == '"':
-                        yield Token("".join(string_parts), token_line, token_column, token_start, index)
-                        break
-                continue
-            if char == "#":
-                while index < source_len and source[index] != "\n":
-                    index += 1
-                continue
-            if char == ";" and index + 1 < source_len and source[index + 1].isalpha():
-                if not lexeme:
-                    token_start = index
-                    token_line = self.line
-                    token_column = self.column
-                lexeme.append(";")
-                index += 1
-                self.column += 1
-                continue
-            matched_token: Optional[str] = None
-            if char in self._single_char_tokens:
-                matched_token = char
-            elif self._multi_char_tokens:
-                for tok in self._multi_char_tokens:
-                    if source.startswith(tok, index):
-                        matched_token = tok
-                        break
-            if matched_token is not None:
-                if lexeme:
-                    yield Token("".join(lexeme), token_line, token_column, token_start, index)
-                    lexeme.clear()
-                    token_start = index
-                    token_line = self.line
-                    token_column = self.column
-                yield Token(matched_token, self.line, self.column, index, index + len(matched_token))
-                index += len(matched_token)
-                self.column += len(matched_token)
-                token_start = index
-                token_line = self.line
-                token_column = self.column
-                continue
-            if char.isspace():
-                if lexeme:
-                    yield Token("".join(lexeme), token_line, token_column, token_start, index)
-                    lexeme.clear()
-                if char == "\n":
-                    self.line += 1
-                    self.column = 0
-                else:
-                    self.column += 1
-                index += 1
-                token_start = index
-                token_line = self.line
-                token_column = self.column
-                continue
-            if not lexeme:
-                token_start = index
-                token_line = self.line
-                token_column = self.column
-            lexeme.append(char)
-            self.column += 1
-            index += 1
-        if lexeme:
-            yield Token("".join(lexeme), token_line, token_column, token_start, source_len)
+    def _build_token_re(self) -> "re.Pattern[str]":
+        """Build a compiled regex for the current token set."""
+        cache_key = frozenset(self.custom_tokens)
+        cached = _READER_REGEX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        singles_escaped = ''.join(re.escape(t) for t in sorted(self._single_char_tokens))
+        # Word pattern: any non-delimiter char, or ; followed by alpha (;end is one token)
+        if ';' in self._single_char_tokens:
+            word_part = rf'(?:[^\s#"{singles_escaped}]|;(?=[a-zA-Z]))+'
+        else:
+            word_part = rf'[^\s#"{singles_escaped}]+'
+        # Multi-char tokens (longest first)
+        multi_part = ''
+        if self._multi_char_tokens:
+            multi_escaped = '|'.join(re.escape(t) for t in self._multi_char_tokens)
+            multi_part = rf'|{multi_escaped}'
+        pattern = (
+            rf'"(?:[^"\\]|\\.)*"?'       # string literal (possibly unterminated)
+            rf'|#[^\n]*'                  # comment
+            rf'{multi_part}'              # multi-char tokens (if any)
+            rf'|{word_part}'              # word
+            rf'|[{singles_escaped}]'      # single-char tokens
+        )
+        compiled = re.compile(pattern)
+        _READER_REGEX_CACHE[cache_key] = compiled
+        return compiled
+
+    def tokenize(self, source: str) -> List[Token]:
+        # Lazily build/cache the token regex
+        token_re = getattr(self, '_token_re', None)
+        if token_re is None:
+            token_re = self._build_token_re()
+            self._token_re = token_re
+        # Pre-compute line start offsets for O(1) amortized line/column lookup
+        _line_starts = [0]
+        _pos = 0
+        _find = source.find
+        while True:
+            _pos = _find('\n', _pos)
+            if _pos == -1:
+                break
+            _pos += 1
+            _line_starts.append(_pos)
+        _n_lines = len(_line_starts)
+        result: List[Token] = []
+        _append = result.append
+        _Token = Token
+        _src = source
+        # Linear scan: tokens arrive in source order, so line index only advances
+        _cur_li = 0
+        _next_line_start = _line_starts[1] if _n_lines > 1 else 0x7FFFFFFFFFFFFFFF
+        for m in token_re.finditer(source):
+            start, end = m.span()
+            if _src[start] == '#':
+                continue  # skip comment
+            text = _src[start:end]
+            if text[0] == '"':
+                if len(text) < 2 or text[-1] != '"':
+                    raise ParseError("unterminated string literal")
+            # Advance line index to find the correct line for this position
+            while start >= _next_line_start:
+                _cur_li += 1
+                _next_line_start = _line_starts[_cur_li + 1] if _cur_li + 1 < _n_lines else 0x7FFFFFFFFFFFFFFF
+            _append(_Token(text, _cur_li + 1, start - _line_starts[_cur_li], start, end))
+        # Update reader state to end-of-source position
+        self.line = _n_lines
+        self.column = len(source) - _line_starts[_n_lines - 1]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,90 @@ _OP_STR_TO_INT = {
 }
 
 
+def _is_scalar_literal(node: Op) -> bool:
+    return node._opcode == OP_LITERAL and not isinstance(node.data, str)
+
+
+# Pre-computed peephole optimization data structures (avoids rebuilding per definition)
+_PEEPHOLE_WORD_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
+    # --- stack no-ops (cancellation) ---
+    (("dup", "drop"), ()),
+    (("swap", "swap"), ()),
+    (("over", "drop"), ()),
+    (("dup", "nip"), ()),
+    (("2dup", "2drop"), ()),
+    (("2swap", "2swap"), ()),
+    (("rot", "rot", "rot"), ()),
+    (("rot", "-rot"), ()),
+    (("-rot", "rot"), ()),
+    (("drop", "drop"), ("2drop",)),
+    (("over", "over"), ("2dup",)),
+    (("inc", "dec"), ()),
+    (("dec", "inc"), ()),
+    (("neg", "neg"), ()),
+    (("not", "not"), ()),
+    (("bitnot", "bitnot"), ()),
+    (("bnot", "bnot"), ()),
+    (("abs", "abs"), ("abs",)),
+    # --- canonicalizations that merge into single ops ---
+    (("swap", "drop"), ("nip",)),
+    (("swap", "over"), ("tuck",)),
+    (("swap", "nip"), ("drop",)),
+    (("nip", "drop"), ("2drop",)),
+    (("tuck", "drop"), ("swap",)),
+    # --- commutative ops: swap before them is a no-op ---
+    (("swap", "+"), ("+",)),
+    (("swap", "*"), ("*",)),
+    (("swap", "=="), ("==",)),
+    (("swap", "!="), ("!=",)),
+    (("swap", "band"), ("band",)),
+    (("swap", "bor"), ("bor",)),
+    (("swap", "bxor"), ("bxor",)),
+    (("swap", "and"), ("and",)),
+    (("swap", "or"), ("or",)),
+    (("swap", "min"), ("min",)),
+    (("swap", "max"), ("max",)),
+    # --- dup + self-idempotent binary → identity ---
+    (("dup", "bor"), ()),
+    (("dup", "band"), ()),
+    (("dup", "bxor"), ("drop", "literal_0")),
+    (("dup", "=="), ("drop", "literal_1")),
+    (("dup", "-"), ("drop", "literal_0")),
+]
+
+_PEEPHOLE_PLACEHOLDER_RULES: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+_PEEPHOLE_CLEAN_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
+for _pat, _repl in _PEEPHOLE_WORD_RULES:
+    if any(r.startswith("literal_") for r in _repl):
+        _PEEPHOLE_PLACEHOLDER_RULES[_pat] = _repl
+    else:
+        _PEEPHOLE_CLEAN_RULES.append((_pat, _repl))
+
+_PEEPHOLE_MAX_PAT_LEN = max(len(p) for p, _ in _PEEPHOLE_WORD_RULES) if _PEEPHOLE_WORD_RULES else 0
+
+# Unified dict: pattern tuple → replacement tuple (for O(1) lookup)
+_PEEPHOLE_ALL_RULES: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+for _pat, _repl in _PEEPHOLE_WORD_RULES:
+    _PEEPHOLE_ALL_RULES[_pat] = _repl
+
+# Which first-words have *any* rule (quick skip for non-matching heads)
+_PEEPHOLE_FIRST_WORDS: Set[str] = {p[0] for p in _PEEPHOLE_ALL_RULES}
+
+# Length-grouped rules indexed by first word for efficient matching
+_PEEPHOLE_RULE_INDEX: Dict[str, List[Tuple[Tuple[str, ...], Tuple[str, ...]]]] = {}
+for _pattern, _repl in _PEEPHOLE_CLEAN_RULES:
+    _PEEPHOLE_RULE_INDEX.setdefault(_pattern[0], []).append((_pattern, _repl))
+
+_PEEPHOLE_TERMINATORS = frozenset({OP_JUMP})
+
+_PEEPHOLE_CANCEL_PAIRS = frozenset({
+    ("not", "not"), ("neg", "neg"),
+    ("bitnot", "bitnot"), ("bnot", "bnot"),
+    ("inc", "dec"), ("dec", "inc"),
+})
+_PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
+
+
 @dataclass(slots=True)
 class Op:
     """Flat operation used for both compile-time execution and emission."""
@@ -260,6 +345,39 @@ class Op:
         self._opcode = _OP_STR_TO_INT.get(self.op, OP_OTHER)
 
 
+def _make_op(op: str, data: Any = None, loc: Optional[SourceLocation] = None) -> Op:
+    """Fast Op constructor that avoids dict lookup for known opcodes."""
+    node = Op.__new__(Op)
+    node.op = op
+    node.data = data
+    node.loc = loc
+    node._word_ref = None
+    node._opcode = _OP_STR_TO_INT.get(op, OP_OTHER)
+    return node
+
+
+def _make_literal_op(data: Any, loc: Optional[SourceLocation] = None) -> Op:
+    """Specialized Op constructor for 'literal' ops."""
+    node = Op.__new__(Op)
+    node.op = "literal"
+    node.data = data
+    node.loc = loc
+    node._word_ref = None
+    node._opcode = OP_LITERAL
+    return node
+
+
+def _make_word_op(data: str, loc: Optional[SourceLocation] = None) -> Op:
+    """Specialized Op constructor for 'word' ops."""
+    node = Op.__new__(Op)
+    node.op = "word"
+    node.data = data
+    node.loc = loc
+    node._word_ref = None
+    node._opcode = OP_WORD
+    return node
+
+
 @dataclass(slots=True)
 class Definition:
     name: str
@@ -268,6 +386,7 @@ class Definition:
     compile_only: bool = False
     terminator: str = "end"
     inline: bool = False
+    stack_inputs: Optional[int] = None  # From stack-effect comment (e.g. # a b -- c)
     # Cached analysis (populated lazily by CT VM)
     _label_positions: Optional[Dict[str, int]] = field(default=None, repr=False, compare=False)
     _for_pairs: Optional[Dict[int, int]] = field(default=None, repr=False, compare=False)
@@ -283,7 +402,9 @@ class AsmDefinition:
     body: str
     immediate: bool = False
     compile_only: bool = False
+    inline: bool = False
     effects: Set[str] = field(default_factory=set)
+    _inline_lines: Optional[List[str]] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -343,10 +464,10 @@ class MacroContext:
         return self._parser.peek_token()
 
     def emit_literal(self, value: int) -> None:
-        self._parser.emit_node(Op(op="literal", data=value))
+        self._parser.emit_node(_make_literal_op(value))
 
     def emit_word(self, name: str) -> None:
-        self._parser.emit_node(Op(op="word", data=name))
+        self._parser.emit_node(_make_word_op(name))
 
     def emit_node(self, node: Op) -> None:
         self._parser.emit_node(node)
@@ -480,9 +601,18 @@ Context = Union[Module, Definition]
 class Parser:
     EXTERN_DEFAULT_PRIORITY = 1
 
-    def __init__(self, dictionary: Dictionary, reader: Optional[Reader] = None) -> None:
+    def __init__(
+        self,
+        dictionary: Dictionary,
+        reader: Optional[Reader] = None,
+        *,
+        macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
+    ) -> None:
+        if macro_expansion_limit < 1:
+            raise ValueError("macro_expansion_limit must be >= 1")
         self.dictionary = dictionary
         self.reader = reader or Reader()
+        self.macro_expansion_limit = macro_expansion_limit
         self.tokens: List[Token] = []
         self._token_iter: Optional[Iterable[Token]] = None
         self._token_iter_exhausted = True
@@ -499,6 +629,9 @@ class Parser:
         self.variable_labels: Dict[str, str] = {}
         self.variable_words: Dict[str, str] = {}
         self.file_spans: List[FileSpan] = []
+        self._span_starts: List[int] = []
+        self._span_index_len: int = 0
+        self._span_cache_idx: int = -1
         self.compile_time_vm = CompileTimeVM(self)
         self.custom_prelude: Optional[List[str]] = None
         self.custom_bss: Optional[List[str]] = None
@@ -509,17 +642,30 @@ class Parser:
     def _rebuild_span_index(self) -> None:
         """Rebuild bisect index after file_spans changes."""
         self._span_starts: List[int] = [s.start_line for s in self.file_spans]
+        self._span_index_len: int = len(self.file_spans)
 
     def location_for_token(self, token: Token) -> SourceLocation:
-        if not hasattr(self, '_span_starts') or len(self._span_starts) != len(self.file_spans):
+        spans = self.file_spans
+        if not spans:
+            return SourceLocation(Path("<source>"), token.line, token.column)
+        if self._span_index_len != len(spans):
             self._rebuild_span_index()
-        idx = bisect.bisect_right(self._span_starts, token.line) - 1
+            self._span_cache_idx = -1
+        tl = token.line
+        # Fast path: check cached span first (common for sequential access)
+        ci = self._span_cache_idx
+        if ci >= 0:
+            span = spans[ci]
+            if span.start_line <= tl < span.end_line:
+                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
+        span_starts = self._span_starts
+        idx = bisect.bisect_right(span_starts, tl) - 1
         if idx >= 0:
-            span = self.file_spans[idx]
-            if token.line < span.end_line:
-                local_line = span.local_start_line + (token.line - span.start_line)
-                return SourceLocation(span.path, local_line, token.column)
-        return SourceLocation(Path("<source>"), token.line, token.column)
+            span = spans[idx]
+            if tl < span.end_line:
+                self._span_cache_idx = idx
+                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
+        return SourceLocation(Path("<source>"), tl, token.column)
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
@@ -530,8 +676,7 @@ class Parser:
         return self._consume()
 
     def peek_token(self) -> Optional[Token]:
-        self._ensure_tokens(self.pos)
-        return None if self._eof() else self.tokens[self.pos]
+        return None if self.pos >= len(self.tokens) else self.tokens[self.pos]
 
     def emit_node(self, node: Op) -> None:
         self._append_op(node)
@@ -585,26 +730,26 @@ class Parser:
         if entry["type"] in ("if", "elif"):
             # For if/elif without a trailing else
             if "false" in entry:
-                self._append_op(Op(op="label", data=entry["false"]))
+                self._append_op(_make_op("label", entry["false"]))
             if "end" in entry:
-                self._append_op(Op(op="label", data=entry["end"]))
+                self._append_op(_make_op("label", entry["end"]))
         elif entry["type"] == "else":
-            self._append_op(Op(op="label", data=entry["end"]))
+            self._append_op(_make_op("label", entry["end"]))
         elif entry["type"] == "while":
-            self._append_op(Op(op="jump", data=entry["begin"]))
-            self._append_op(Op(op="label", data=entry["end"]))
+            self._append_op(_make_op("jump", entry["begin"]))
+            self._append_op(_make_op("label", entry["end"]))
         elif entry["type"] == "for":
             # Emit ForEnd node for loop decrement
-            self._append_op(Op(op="for_end", data={"loop": entry["loop"], "end": entry["end"]}))
+            self._append_op(_make_op("for_end", {"loop": entry["loop"], "end": entry["end"]}))
         elif entry["type"] == "begin":
-            self._append_op(Op(op="jump", data=entry["begin"]))
-            self._append_op(Op(op="label", data=entry["end"]))
+            self._append_op(_make_op("jump", entry["begin"]))
+            self._append_op(_make_op("label", entry["end"]))
 
     # Parsing ------------------------------------------------------------------
     def parse(self, tokens: Iterable[Token], source: str) -> Module:
-        self.tokens = []
-        self._token_iter = iter(tokens)
-        self._token_iter_exhausted = False
+        self.tokens = tokens if isinstance(tokens, list) else list(tokens)
+        self._token_iter = None
+        self._token_iter_exhausted = True
         self.source = source
         self.pos = 0
         self.variable_labels = {}
@@ -628,23 +773,25 @@ class Parser:
         self._pending_inline_definition = False
         self._pending_priority = None
 
+        _priority_keywords = {
+            "word", ":asm", ":py", "extern", "inline", "priority",
+        }
+        _tokens = self.tokens
         try:
-            while not self._eof():
-                token = self._consume()
+            while self.pos < len(_tokens):
+                token = _tokens[self.pos]
+                self.pos += 1
                 self._last_token = token
-                if self._run_token_hook(token):
+                if self.token_hook and self._run_token_hook(token):
                     continue
-                if self._handle_macro_recording(token):
+                if self.macro_recording is not None:
+                    if token.lexeme == ";":
+                        self._finish_macro_recording(token)
+                    else:
+                        self.macro_recording.tokens.append(token.lexeme)
                     continue
                 lexeme = token.lexeme
-                if self._pending_priority is not None and lexeme not in {
-                    "word",
-                    ":asm",
-                    ":py",
-                    "extern",
-                    "inline",
-                    "priority",
-                }:
+                if self._pending_priority is not None and lexeme not in _priority_keywords:
                     raise ParseError(
                         f"priority {self._pending_priority} must be followed by definition/extern"
                     )
@@ -667,9 +814,11 @@ class Parser:
                     raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
                 if lexeme == ":asm":
                     self._parse_asm_definition(token)
+                    _tokens = self.tokens
                     continue
                 if lexeme == ":py":
                     self._parse_py_definition(token)
+                    _tokens = self.tokens
                     continue
                 if lexeme == "extern":
                     self._parse_extern(token)
@@ -692,9 +841,8 @@ class Parser:
                 if lexeme == "do":
                     self._handle_do_control()
                     continue
-                if self._maybe_expand_macro(token):
-                    continue
-                self._handle_token(token)
+                if self._handle_token(token):
+                    _tokens = self.tokens
         except ParseError:
             raise
         except Exception as exc:
@@ -726,13 +874,13 @@ class Parser:
 
     def _handle_list_begin(self) -> None:
         label = self._new_label("list")
-        self._append_op(Op(op="list_begin", data=label))
+        self._append_op(_make_op("list_begin", label))
         self._push_control({"type": "list", "label": label})
 
     def _handle_list_end(self, token: Token) -> None:
         entry = self._pop_control(("list",))
         label = entry["label"]
-        self._append_op(Op(op="list_end", data=label))
+        self._append_op(_make_op("list_end", label))
 
     def _parse_priority_directive(self, token: Token) -> None:
         if self._eof():
@@ -904,29 +1052,50 @@ class Parser:
         word.extern_outputs = outputs
         word.extern_signature = (arg_types, ret_type)
 
-    def _handle_token(self, token: Token) -> None:
-        if self._try_literal(token):
-            return
+    def _handle_token(self, token: Token) -> bool:
+        """Handle a token. Returns True if the token list was modified (macro expansion)."""
+        lexeme = token.lexeme
+        first = lexeme[0]
+        # Fast-path: inline integer literal parse (most common literal type)
+        if first.isdigit() or first == '-' or first == '+':
+            try:
+                value = int(lexeme, 0)
+                self._append_op(_make_literal_op(value))
+                return False
+            except ValueError:
+                pass
+            # Fall through to float/string check
+            if self._try_literal(token):
+                return False
+        elif first == '"' or first == '.':
+            if self._try_literal(token):
+                return False
 
-        if token.lexeme.startswith("&"):
-            target_name = token.lexeme[1:]
+        if first == '&':
+            target_name = lexeme[1:]
             if not target_name:
                 raise ParseError(f"missing word name after '&' at {token.line}:{token.column}")
-            self._append_op(Op(op="word_ptr", data=target_name))
-            return
+            self._append_op(_make_op("word_ptr", target_name))
+            return False
 
-        word = self.dictionary.lookup(token.lexeme)
-        if word and word.immediate:
-            if word.macro:
-                produced = word.macro(MacroContext(self))
-                if produced:
-                    for node in produced:
-                        self._append_op(node)
-            else:
-                self._execute_immediate_word(word)
-            return
+        word = self.dictionary.lookup(lexeme)
+        if word is not None:
+            if word.macro_expansion is not None:
+                args = self._collect_macro_args(word.macro_params)
+                self._inject_macro_tokens(word, token, args)
+                return True
+            if word.immediate:
+                if word.macro:
+                    produced = word.macro(MacroContext(self))
+                    if produced:
+                        for node in produced:
+                            self._append_op(node)
+                else:
+                    self._execute_immediate_word(word)
+                return False
 
-        self._append_op(Op(op="word", data=token.lexeme))
+        self._append_op(_make_word_op(lexeme))
+        return False
 
     def _execute_immediate_word(self, word: Word) -> None:
         try:
@@ -956,6 +1125,11 @@ class Parser:
         return False
 
     def _inject_macro_tokens(self, word: Word, token: Token, args: List[str]) -> None:
+        next_depth = token.expansion_depth + 1
+        if next_depth > self.macro_expansion_limit:
+            raise ParseError(
+                f"macro expansion depth limit ({self.macro_expansion_limit}) exceeded while expanding '{word.name}'"
+            )
         replaced: List[str] = []
         for lex in word.macro_expansion or []:
             if lex.startswith("$"):
@@ -966,7 +1140,14 @@ class Parser:
             else:
                 replaced.append(lex)
         insertion = [
-            Token(lexeme=lex, line=token.line, column=token.column, start=token.start, end=token.end)
+            Token(
+                lexeme=lex,
+                line=token.line,
+                column=token.column,
+                start=token.start,
+                end=token.end,
+                expansion_depth=next_depth,
+            )
             for lex in replaced
         ]
         self.tokens[self.pos:self.pos] = insertion
@@ -1047,11 +1228,11 @@ class Parser:
             if end_label is None:
                 end_label = self._new_label("if_end")
             false_label = self._new_label("if_false")
-            self._append_op(Op(op="branch_zero", data=false_label))
+            self._append_op(_make_op("branch_zero", false_label))
             self._push_control({"type": "elif", "false": false_label, "end": end_label})
             return
         false_label = self._new_label("if_false")
-        self._append_op(Op(op="branch_zero", data=false_label))
+        self._append_op(_make_op("branch_zero", false_label))
         self._push_control({"type": "if", "false": false_label})
 
     def _handle_else_control(self) -> None:
@@ -1059,25 +1240,25 @@ class Parser:
         end_label = entry.get("end")
         if end_label is None:
             end_label = self._new_label("if_end")
-        self._append_op(Op(op="jump", data=end_label))
-        self._append_op(Op(op="label", data=entry["false"]))
+        self._append_op(_make_op("jump", end_label))
+        self._append_op(_make_op("label", entry["false"]))
         self._push_control({"type": "else", "end": end_label})
 
     def _handle_for_control(self) -> None:
         loop_label = self._new_label("for_loop")
         end_label = self._new_label("for_end")
-        self._append_op(Op(op="for_begin", data={"loop": loop_label, "end": end_label}))
+        self._append_op(_make_op("for_begin", {"loop": loop_label, "end": end_label}))
         self._push_control({"type": "for", "loop": loop_label, "end": end_label})
 
     def _handle_while_control(self) -> None:
         begin_label = self._new_label("begin")
         end_label = self._new_label("end")
-        self._append_op(Op(op="label", data=begin_label))
+        self._append_op(_make_op("label", begin_label))
         self._push_control({"type": "begin", "begin": begin_label, "end": end_label})
 
     def _handle_do_control(self) -> None:
         entry = self._pop_control(("begin",))
-        self._append_op(Op(op="branch_zero", data=entry["end"]))
+        self._append_op(_make_op("branch_zero", entry["end"]))
         self._push_control(entry)
 
     def _try_end_definition(self, token: Token) -> bool:
@@ -1108,6 +1289,7 @@ class Parser:
             body=[],
             terminator=terminator,
             inline=inline,
+            stack_inputs=_parse_stack_effect_comment(self.source, token.start),
         )
         self.context_stack.append(definition)
         candidate = Word(name=definition.name, priority=priority)
@@ -1181,6 +1363,7 @@ class Parser:
     def _parse_asm_definition(self, token: Token) -> None:
         if self._eof():
             raise ParseError(f"definition name missing after ':asm' at {token.line}:{token.column}")
+        inline_def = self._consume_pending_inline()
         name_token = self._consume()
         effect_names: Optional[List[str]] = None
         if not self._eof():
@@ -1192,20 +1375,28 @@ class Parser:
             raise ParseError(f"expected '{{' after asm name at {brace_token.line}:{brace_token.column}")
         block_start = brace_token.end
         block_end: Optional[int] = None
-        while not self._eof():
-            next_token = self._consume()
-            if next_token.lexeme == "}":
-                block_end = next_token.start
+        # Scan for closing brace directly via list indexing (avoid method-call overhead)
+        _tokens = self.tokens
+        _tlen = len(_tokens)
+        _pos = self.pos
+        while _pos < _tlen:
+            nt = _tokens[_pos]
+            _pos += 1
+            if nt.lexeme == "}":
+                block_end = nt.start
                 break
+        self.pos = _pos
         if block_end is None:
             raise ParseError("missing '}' to terminate asm body")
         asm_body = self.source[block_start:block_end]
         priority = self._consume_pending_priority()
-        definition = AsmDefinition(name=name_token.lexeme, body=asm_body)
+        definition = AsmDefinition(name=name_token.lexeme, body=asm_body, inline=inline_def)
         if effect_names is not None:
             definition.effects = set(effect_names)
         candidate = Word(name=definition.name, priority=priority)
         candidate.definition = definition
+        if inline_def:
+            candidate.inline = True
         word = self.dictionary.register(candidate)
         if word is candidate:
             definition.immediate = word.immediate
@@ -1231,13 +1422,19 @@ class Parser:
             raise ParseError(f"expected '{{' after py name at {brace_token.line}:{brace_token.column}")
         block_start = brace_token.end
         block_end: Optional[int] = None
-        while not self._eof():
-            next_token = self._consume()
-            if next_token.lexeme == "}":
-                block_end = next_token.start
+        _tokens = self.tokens
+        _tlen = len(_tokens)
+        _pos = self.pos
+        while _pos < _tlen:
+            nt = _tokens[_pos]
+            _pos += 1
+            if nt.lexeme == "}":
+                block_end = nt.start
                 break
+        self.pos = _pos
         if block_end is None:
             raise ParseError("missing '}' to terminate py body")
+        import textwrap
         py_body = textwrap.dedent(self.source[block_start:block_end])
         priority = self._consume_pending_priority()
         candidate = Word(name=name_token.lexeme, priority=priority)
@@ -1276,14 +1473,40 @@ class Parser:
         if node.loc is None:
             tok = token or self._last_token
             if tok is not None:
-                node.loc = self.location_for_token(tok)
+                # Inlined fast path of location_for_token
+                spans = self.file_spans
+                if spans:
+                    if self._span_index_len != len(spans):
+                        self._rebuild_span_index()
+                        self._span_cache_idx = -1
+                    tl = tok.line
+                    ci = self._span_cache_idx
+                    if ci >= 0:
+                        span = spans[ci]
+                        if span.start_line <= tl < span.end_line:
+                            node.loc = SourceLocation(span.path, span.local_start_line + (tl - span.start_line), tok.column)
+                        else:
+                            node.loc = self._location_for_token_slow(tok, tl)
+                    else:
+                        node.loc = self._location_for_token_slow(tok, tl)
+                else:
+                    node.loc = SourceLocation(Path("<source>"), tok.line, tok.column)
         target = self.context_stack[-1]
-        if isinstance(target, Module):
-            target.forms.append(node)
-        elif isinstance(target, Definition):
+        if target.__class__ is Definition:
             target.body.append(node)
-        else:  # pragma: no cover - defensive
-            raise ParseError("unknown parse context")
+        else:
+            target.forms.append(node)
+
+    def _location_for_token_slow(self, token: Token, tl: int) -> SourceLocation:
+        """Slow path for location_for_token: bisect lookup."""
+        span_starts = self._span_starts
+        idx = bisect.bisect_right(span_starts, tl) - 1
+        if idx >= 0:
+            span = self.file_spans[idx]
+            if tl < span.end_line:
+                self._span_cache_idx = idx
+                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
+        return SourceLocation(Path("<source>"), tl, token.column)
 
     def _try_literal(self, token: Token) -> bool:
         lexeme = token.lexeme
@@ -1291,7 +1514,7 @@ class Parser:
         if first.isdigit() or first == '-' or first == '+':
             try:
                 value = int(lexeme, 0)
-                self._append_op(Op(op="literal", data=value))
+                self._append_op(_make_literal_op(value))
                 return True
             except ValueError:
                 pass
@@ -1301,28 +1524,27 @@ class Parser:
             try:
                 if "." in lexeme or "e" in lexeme.lower():
                     value = float(lexeme)
-                    self._append_op(Op(op="literal", data=value))
+                    self._append_op(_make_literal_op(value))
                     return True
             except ValueError:
                 pass
 
-        string_value = _parse_string_literal(token)
-        if string_value is not None:
-            self._append_op(Op(op="literal", data=string_value))
-            return True
+        if first == '"':
+            string_value = _parse_string_literal(token)
+            if string_value is not None:
+                self._append_op(_make_literal_op(string_value))
+                return True
 
         return False
 
     def _consume(self) -> Token:
-        self._ensure_tokens(self.pos)
-        if self._eof():
+        pos = self.pos
+        if pos >= len(self.tokens):
             raise ParseError("unexpected EOF")
-        token = self.tokens[self.pos]
-        self.pos += 1
-        return token
+        self.pos = pos + 1
+        return self.tokens[pos]
 
     def _eof(self) -> bool:
-        self._ensure_tokens(self.pos)
         return self.pos >= len(self.tokens)
 
     def _ensure_tokens(self, upto: int) -> None:
@@ -1387,6 +1609,8 @@ class CTMemory:
     DATA_SECTION_SIZE = 4 * 1024 * 1024  # 4 MB slab for string literals
 
     def __init__(self, persistent_size: int = 0) -> None:
+        import ctypes as _ctypes
+        globals().setdefault('ctypes', _ctypes)
         self._buffers: List[Any] = []  # prevent GC of ctypes objects
         self._string_cache: Dict[str, Tuple[int, int]] = {}  # cache string literals
 
@@ -1506,8 +1730,8 @@ class CompileTimeVM:
         self.loop_stack: List[Dict[str, Any]] = []
         self._handles = _CTHandleTable()
         self.call_stack: List[str] = []
-        # Runtime-faithful execution state
-        self.memory = CTMemory()
+        # Runtime-faithful execution state — lazily allocated on first use
+        self._memory: Optional[CTMemory] = None
         self.runtime_mode: bool = False
         self._list_capture_stack: List[Any] = []  # for list_begin/list_end (int depth or native r12 addr)
         self._ct_executed: Set[str] = set()  # words already executed at CT
@@ -1521,11 +1745,11 @@ class CompileTimeVM:
         # JIT cache: word name → ctypes callable
         self._jit_cache: Dict[str, Any] = {}
         self._jit_code_pages: List[Any] = []  # keep mmap pages alive
-        # Pre-allocated output structs for JIT calls (avoid per-call allocation)
-        self._jit_out2 = (ctypes.c_int64 * 2)()
-        self._jit_out2_addr = ctypes.addressof(self._jit_out2)
-        self._jit_out4 = (ctypes.c_int64 * 4)()
-        self._jit_out4_addr = ctypes.addressof(self._jit_out4)
+        # Pre-allocated output structs for JIT calls (lazily allocated)
+        self._jit_out2: Optional[Any] = None
+        self._jit_out2_addr: int = 0
+        self._jit_out4: Optional[Any] = None
+        self._jit_out4_addr: int = 0
         # BSS symbol table for JIT patching
         self._bss_symbols: Dict[str, int] = {}
         # dlopen handles for C extern support
@@ -1534,6 +1758,25 @@ class CompileTimeVM:
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ctypes_struct_cache: Dict[str, Any] = {}
         self.current_location: Optional[SourceLocation] = None
+
+    @property
+    def memory(self) -> CTMemory:
+        if self._memory is None:
+            self._memory = CTMemory()
+        return self._memory
+
+    @memory.setter
+    def memory(self, value: CTMemory) -> None:
+        self._memory = value
+
+    def _ensure_jit_out(self) -> None:
+        if self._jit_out2 is None:
+            import ctypes as _ctypes
+            globals().setdefault('ctypes', _ctypes)
+            self._jit_out2 = (_ctypes.c_int64 * 2)()
+            self._jit_out2_addr = _ctypes.addressof(self._jit_out2)
+            self._jit_out4 = (_ctypes.c_int64 * 4)()
+            self._jit_out4_addr = _ctypes.addressof(self._jit_out4)
 
     def reset(self) -> None:
         self.stack.clear()
@@ -1548,6 +1791,7 @@ class CompileTimeVM:
 
     def invoke(self, word: Word, *, runtime_mode: bool = False, libs: Optional[List[str]] = None) -> None:
         self.reset()
+        self._ensure_jit_out()
         prev_mode = self.runtime_mode
         self.runtime_mode = runtime_mode
         if runtime_mode:
@@ -1746,6 +1990,10 @@ class CompileTimeVM:
         import ctypes.util
         # Try as given first (handles absolute paths, "libc.so.6", etc.)
         candidates = [lib_name]
+        # If given a static archive (.a), try .so from the same directory
+        if lib_name.endswith(".a"):
+            so_variant = lib_name[:-2] + ".so"
+            candidates.append(so_variant)
         # Try lib<name>.so
         if not lib_name.startswith("lib") and "." not in lib_name:
             candidates.append(f"lib{lib_name}.so")
@@ -1762,29 +2010,36 @@ class CompileTimeVM:
                 continue
         # Not fatal — the library may not be needed at CT
 
-    _CTYPE_MAP: Dict[str, Any] = {
-        "int": ctypes.c_int,
-        "int8_t": ctypes.c_int8,
-        "uint8_t": ctypes.c_uint8,
-        "int16_t": ctypes.c_int16,
-        "uint16_t": ctypes.c_uint16,
-        "int32_t": ctypes.c_int32,
-        "uint32_t": ctypes.c_uint32,
-        "long": ctypes.c_long,
-        "long long": ctypes.c_longlong,
-        "int64_t": ctypes.c_int64,
-        "unsigned int": ctypes.c_uint,
-        "unsigned long": ctypes.c_ulong,
-        "unsigned long long": ctypes.c_ulonglong,
-        "uint64_t": ctypes.c_uint64,
-        "size_t": ctypes.c_size_t,
-        "ssize_t": ctypes.c_ssize_t,
-        "char": ctypes.c_char,
-        "char*": ctypes.c_void_p,  # use void* so raw integer addrs work
-        "void*": ctypes.c_void_p,
-        "double": ctypes.c_double,
-        "float": ctypes.c_float,
-    }
+    _CTYPE_MAP: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def _get_ctype_map(cls) -> Dict[str, Any]:
+        if cls._CTYPE_MAP is None:
+            import ctypes
+            cls._CTYPE_MAP = {
+                "int": ctypes.c_int,
+                "int8_t": ctypes.c_int8,
+                "uint8_t": ctypes.c_uint8,
+                "int16_t": ctypes.c_int16,
+                "uint16_t": ctypes.c_uint16,
+                "int32_t": ctypes.c_int32,
+                "uint32_t": ctypes.c_uint32,
+                "long": ctypes.c_long,
+                "long long": ctypes.c_longlong,
+                "int64_t": ctypes.c_int64,
+                "unsigned int": ctypes.c_uint,
+                "unsigned long": ctypes.c_ulong,
+                "unsigned long long": ctypes.c_ulonglong,
+                "uint64_t": ctypes.c_uint64,
+                "size_t": ctypes.c_size_t,
+                "ssize_t": ctypes.c_ssize_t,
+                "char": ctypes.c_char,
+                "char*": ctypes.c_void_p,
+                "void*": ctypes.c_void_p,
+                "double": ctypes.c_double,
+                "float": ctypes.c_float,
+            }
+        return cls._CTYPE_MAP
 
     def _resolve_struct_ctype(self, struct_name: str) -> Any:
         cached = self._ctypes_struct_cache.get(struct_name)
@@ -1802,14 +2057,16 @@ class CompileTimeVM:
 
     def _resolve_ctype(self, type_name: str) -> Any:
         """Map a C type name string to a ctypes type."""
+        import ctypes
         t = _canonical_c_type_name(type_name)
         if t.endswith("*"):
             return ctypes.c_void_p
         if t.startswith("struct "):
             return self._resolve_struct_ctype(t[len("struct "):].strip())
         t = t.replace("*", "* ").replace("  ", " ").strip()
-        if t in self._CTYPE_MAP:
-            return self._CTYPE_MAP[t]
+        ctype_map = self._get_ctype_map()
+        if t in ctype_map:
+            return ctype_map[t]
         # Default to c_long (64-bit on Linux x86-64)
         return ctypes.c_long
 
@@ -1934,6 +2191,23 @@ class CompileTimeVM:
                 else:
                     self._run_asm_definition(word)
                 return
+            # Whole-word JIT for regular definitions in runtime mode
+            if self.runtime_mode and isinstance(definition, Definition):
+                ck = f"__defn_jit_{word.name}"
+                jf = self._jit_cache.get(ck)
+                if jf is None and ck + "_miss" not in self._jit_cache:
+                    jf = self._compile_definition_jit(word)
+                    if jf is not None:
+                        self._jit_cache[ck] = jf
+                        self._jit_cache[ck + "_addr"] = ctypes.cast(jf, ctypes.c_void_p).value
+                    else:
+                        self._jit_cache[ck + "_miss"] = True
+                if jf is not None:
+                    out = self._jit_out2
+                    jf(self.r12, self.r13, self._jit_out2_addr)
+                    self.r12 = out[0]
+                    self.r13 = out[1]
+                    return
             self._execute_nodes(definition.body, _defn=definition)
         except CompileTimeError:
             raise
@@ -1950,7 +2224,7 @@ class CompileTimeVM:
 
     # -- Native JIT execution (runtime_mode) --------------------------------
 
-    _JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
+    _JIT_FUNC_TYPE: Optional[Any] = None
 
     def _run_jit(self, word: Word) -> None:
         """JIT-compile (once) and execute an :asm word on the native r12/r13 stacks."""
@@ -2072,8 +2346,330 @@ class CompileTimeVM:
         ctypes.memmove(ptr, code, len(code))
         # Store (ptr, size) so we can munmap later
         self._jit_code_pages.append((ptr, page_size))
+        if CompileTimeVM._JIT_FUNC_TYPE is None:
+            CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
         func = self._JIT_FUNC_TYPE(ptr)
         return func
+
+    # -- Whole-word JIT: compile Definition bodies to native code -----------
+
+    def _compile_definition_jit(self, word: Word) -> Any:
+        """JIT-compile a regular Definition body into native x86-64 code.
+
+        Returns a ctypes callable or None if the definition cannot be JIT'd.
+        """
+        defn = word.definition
+        if not isinstance(defn, Definition):
+            return None
+        if Ks is None:
+            return None
+
+        # Guard against infinite recursion (recursive words)
+        compiling = getattr(self, "_djit_compiling", None)
+        if compiling is None:
+            compiling = set()
+            self._djit_compiling = compiling
+        if word.name in compiling:
+            return None  # recursive word, can't JIT
+        compiling.add(word.name)
+        try:
+            return self._compile_definition_jit_inner(word, defn)
+        finally:
+            compiling.discard(word.name)
+
+    def _compile_definition_jit_inner(self, word: Word, defn: Definition) -> Any:
+        # Ensure word references are resolved
+        self._resolve_words_in_body(defn)
+
+        body = defn.body
+        bss = self._bss_symbols
+
+        # Pre-scan: bail if any op is unsupported
+        for node in body:
+            opc = node._opcode
+            if opc == OP_LITERAL:
+                if isinstance(node.data, str):
+                    return None
+            elif opc == OP_WORD:
+                wref = node._word_ref
+                if wref is None:
+                    name = node.data
+                    if name not in ("begin", "again", "continue", "exit"):
+                        return None
+                elif wref.runtime_intrinsic is not None:
+                    return None
+                elif getattr(wref, "is_extern", False):
+                    return None  # extern words need _call_extern_ct
+                else:
+                    wd = wref.definition
+                    if wd is None:
+                        return None
+                    if not isinstance(wd, (AsmDefinition, Definition)):
+                        return None
+                    if isinstance(wd, Definition):
+                        ck = f"__defn_jit_{wref.name}"
+                        if ck not in self._jit_cache:
+                            sub = self._compile_definition_jit(wref)
+                            if sub is None:
+                                return None
+                            self._jit_cache[ck] = sub
+                            self._jit_cache[ck + "_addr"] = ctypes.cast(sub, ctypes.c_void_p).value
+            elif opc in (OP_FOR_BEGIN, OP_FOR_END, OP_BRANCH_ZERO, OP_JUMP, OP_LABEL):
+                pass
+            else:
+                return None
+
+        uid = id(defn)
+        lc = [0]
+        def _nl(prefix: str) -> str:
+            lc[0] += 1
+            return f"_dj{uid}_{prefix}_{lc[0]}"
+
+        # Build label maps
+        label_map: Dict[str, str] = {}
+        for node in body:
+            if node._opcode == OP_LABEL:
+                ln = str(node.data)
+                if ln not in label_map:
+                    label_map[ln] = _nl("lbl")
+
+        # For-loop pairing
+        for_map: Dict[int, Tuple[str, str]] = {}
+        fstack: List[Tuple[int, str, str]] = []
+        for idx, node in enumerate(body):
+            if node._opcode == OP_FOR_BEGIN:
+                bl, el = _nl("for_top"), _nl("for_end")
+                fstack.append((idx, bl, el))
+            elif node._opcode == OP_FOR_END:
+                if fstack:
+                    bi, bl, el = fstack.pop()
+                    for_map[bi] = (bl, el)
+                    for_map[idx] = (bl, el)
+
+        # begin/again pairing
+        ba_map: Dict[int, Tuple[str, str]] = {}
+        bstack: List[Tuple[int, str, str]] = []
+        for idx, node in enumerate(body):
+            if node._opcode == OP_WORD and node._word_ref is None:
+                nm = node.data
+                if nm == "begin":
+                    bl, al = _nl("begin"), _nl("again")
+                    bstack.append((idx, bl, al))
+                elif nm == "again":
+                    if bstack:
+                        bi, bl, al = bstack.pop()
+                        ba_map[bi] = (bl, al)
+                        ba_map[idx] = (bl, al)
+
+        lines: List[str] = []
+        # Entry wrapper
+        lines.extend([
+            "_ct_entry:",
+            "    push rbx",
+            "    push r12",
+            "    push r13",
+            "    push r14",
+            "    push r15",
+            "    sub rsp, 16",
+            "    mov [rsp], rdx",
+            "    mov r12, rdi",
+            "    mov r13, rsi",
+        ])
+
+        begin_rt: List[Tuple[str, str]] = []
+
+        def _patch_asm_body(asm_body: str, prefix: str) -> List[str]:
+            """Patch an asm body for inlining: uniquify labels, patch [rel]."""
+            result: List[str] = []
+            local_labels: Set[str] = set()
+            for raw_line in asm_body.splitlines():
+                line = raw_line.strip()
+                lm = _RE_LABEL_PAT.match(line)
+                if lm:
+                    local_labels.add(lm.group(1))
+            for raw_line in asm_body.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith(";") or line.startswith("extern"):
+                    continue
+                if line == "ret":
+                    continue  # fall through
+                for label in local_labels:
+                    line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
+                m = _RE_REL_PAT.search(line)
+                if m and m.group(1) in bss:
+                    sym = m.group(1)
+                    addr = bss[sym]
+                    if line.lstrip().startswith("lea"):
+                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                    else:
+                        result.append("    push rax")
+                        result.append(f"    mov rax, {addr}")
+                        new_line = _RE_REL_PAT.sub("[rax]", line)
+                        result.append(f"    {new_line}")
+                        result.append("    pop rax")
+                        continue
+                result.append(f"    {line}")
+            return result
+
+        for idx, node in enumerate(body):
+            opc = node._opcode
+
+            if opc == OP_LITERAL:
+                val = int(node.data) & 0xFFFFFFFFFFFFFFFF
+                if val >= 0x8000000000000000:
+                    val -= 0x10000000000000000
+                lines.append("    sub r12, 8")
+                if -0x80000000 <= val <= 0x7FFFFFFF:
+                    lines.append(f"    mov qword [r12], {val}")
+                else:
+                    lines.append(f"    mov rax, {val}")
+                    lines.append("    mov [r12], rax")
+
+            elif opc == OP_WORD:
+                wref = node._word_ref
+                if wref is None:
+                    name = node.data
+                    if name == "begin":
+                        pair = ba_map.get(idx)
+                        if pair:
+                            begin_rt.append(pair)
+                            lines.append(f"{pair[0]}:")
+                    elif name == "again":
+                        pair = ba_map.get(idx)
+                        if pair:
+                            lines.append(f"    jmp {pair[0]}")
+                            lines.append(f"{pair[1]}:")
+                            if begin_rt and begin_rt[-1] == pair:
+                                begin_rt.pop()
+                    elif name == "continue":
+                        if begin_rt:
+                            lines.append(f"    jmp {begin_rt[-1][0]}")
+                    elif name == "exit":
+                        if begin_rt:
+                            pair = begin_rt.pop()
+                            lines.append(f"    jmp {pair[1]}")
+                        else:
+                            lines.append("    jmp _ct_save")
+                    continue
+
+                wd = wref.definition
+                if isinstance(wd, AsmDefinition):
+                    prefix = _nl(f"a{idx}")
+                    lines.extend(_patch_asm_body(wd.body.strip("\n"), prefix))
+                elif isinstance(wd, Definition):
+                    # Call JIT'd sub-definition
+                    ck = f"__defn_jit_{wref.name}"
+                    func_addr = self._jit_cache.get(ck + "_addr")
+                    if func_addr is None:
+                        return None  # should have been pre-compiled above
+                    # Save & call: rdi=r12, rsi=r13, rdx=output_ptr
+                    lines.append("    mov rax, [rsp]")
+                    lines.append("    mov rdi, r12")
+                    lines.append("    mov rsi, r13")
+                    lines.append("    mov rdx, rax")
+                    lines.append(f"    mov rax, {func_addr}")
+                    lines.append("    call rax")
+                    # Restore r12/r13 from output struct
+                    lines.append("    mov rax, [rsp]")
+                    lines.append("    mov r12, [rax]")
+                    lines.append("    mov r13, [rax + 8]")
+
+            elif opc == OP_FOR_BEGIN:
+                pair = for_map.get(idx)
+                if pair is None:
+                    return None
+                bl, el = pair
+                lines.append("    mov rax, [r12]")
+                lines.append("    add r12, 8")
+                lines.append("    cmp rax, 0")
+                lines.append(f"    jle {el}")
+                lines.append("    sub r13, 8")
+                lines.append("    mov [r13], rax")
+                lines.append(f"{bl}:")
+
+            elif opc == OP_FOR_END:
+                pair = for_map.get(idx)
+                if pair is None:
+                    return None
+                bl, el = pair
+                lines.append("    dec qword [r13]")
+                lines.append("    cmp qword [r13], 0")
+                lines.append(f"    jg {bl}")
+                lines.append("    add r13, 8")
+                lines.append(f"{el}:")
+
+            elif opc == OP_BRANCH_ZERO:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    return None
+                lines.append("    mov rax, [r12]")
+                lines.append("    add r12, 8")
+                lines.append("    test rax, rax")
+                lines.append(f"    jz {al}")
+
+            elif opc == OP_JUMP:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    return None
+                lines.append(f"    jmp {al}")
+
+            elif opc == OP_LABEL:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    return None
+                lines.append(f"{al}:")
+
+        # Epilog
+        lines.extend([
+            "_ct_save:",
+            "    mov rax, [rsp]",
+            "    mov [rax], r12",
+            "    mov [rax + 8], r13",
+            "    add rsp, 16",
+            "    pop r15",
+            "    pop r14",
+            "    pop r13",
+            "    pop r12",
+            "    pop rbx",
+            "    ret",
+        ])
+
+        def _norm(l: str) -> str:
+            l = l.split(";", 1)[0].rstrip()
+            for sz in ("qword", "dword", "word", "byte"):
+                l = l.replace(f"{sz} [", f"{sz} ptr [")
+            return l
+        normalized = [_norm(l) for l in lines if _norm(l).strip()]
+
+        ks = Ks(KS_ARCH_X86, KS_MODE_64)
+        try:
+            encoding, _ = ks.asm("\n".join(normalized))
+        except KsError:
+            return None
+        if encoding is None:
+            return None
+
+        code = bytes(encoding)
+        page_size = max(len(code), 4096)
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.mmap.restype = ctypes.c_void_p
+        _libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        PROT_RWX = 0x1 | 0x2 | 0x4
+        MAP_PRIVATE = 0x02
+        MAP_ANONYMOUS = 0x20
+        ptr = _libc.mmap(None, page_size, PROT_RWX,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        if ptr == ctypes.c_void_p(-1).value or ptr is None:
+            return None
+        ctypes.memmove(ptr, code, len(code))
+        self._jit_code_pages.append((ptr, page_size))
+        if CompileTimeVM._JIT_FUNC_TYPE is None:
+            CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
+        return self._JIT_FUNC_TYPE(ptr)
 
     # -- Old non-runtime asm execution (kept for non-runtime CT mode) -------
 
@@ -2225,6 +2821,7 @@ class CompileTimeVM:
             )
 
         code = bytes(encoding)
+        import mmap
         code_buf = mmap.mmap(-1, len(code), prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
         code_buf.write(code)
         code_ptr = ctypes.addressof(ctypes.c_char.from_buffer(code_buf))
@@ -2495,7 +3092,7 @@ class CompileTimeVM:
             label_positions, loop_pairs, begin_pairs = self._analyze_nodes(nodes)
         prev_loop_stack = self.loop_stack
         self.loop_stack = []
-        begin_stack: List[Dict[str, int]] = []
+        begin_stack: List[Tuple[int, int]] = []
 
         # Local variable aliases for hot-path speedup
         _runtime_mode = self.runtime_mode
@@ -2518,7 +3115,16 @@ class CompileTimeVM:
         _AsmDef = AsmDefinition
         _merged_runs = (_defn._merged_runs if _defn is not None and _defn._merged_runs else None) if _runtime_mode else None
 
-        n_nodes = len(nodes)
+        # Inline ctypes for runtime mode — eliminates per-op function call overhead
+        if _runtime_mode:
+            _c_int64_at = ctypes.c_int64.from_address
+            _I64_MASK = 0xFFFFFFFFFFFFFFFF
+            _I64_SIGN = 0x8000000000000000
+            _I64_WRAP = 0x10000000000000000
+            _store_string = self.memory.store_string
+        else:
+            _c_int64_at = _I64_MASK = _I64_SIGN = _I64_WRAP = _store_string = None  # type: ignore[assignment]
+
         ip = 0
         prev_location = self.current_location
         # Local opcode constants (avoid global dict lookup)
@@ -2534,10 +3140,9 @@ class CompileTimeVM:
         _OP_LIST_END = OP_LIST_END
         _OP_LIST_LITERAL = OP_LIST_LITERAL
         try:
-            while ip < n_nodes:
-                node = nodes[ip]
-                self.current_location = node.loc
-                kind = node._opcode
+            while ip < len(nodes):
+                _node = nodes[ip]
+                kind = _node._opcode
 
                 if kind == _OP_WORD:
                     # Merged JIT run: call one combined function for N words
@@ -2547,14 +3152,10 @@ class CompileTimeVM:
                             end_ip, cache_key = run_info
                             func = _jit_cache.get(cache_key)
                             if func is None:
-                                # Warmup: only compile merged function after seen 2+ times
                                 hit_key = cache_key + "_hits"
                                 hits = _jit_cache.get(hit_key, 0) + 1
                                 _jit_cache[hit_key] = hits
-                                if hits < 2:
-                                    # Fall through to individual JIT calls
-                                    pass
-                                else:
+                                if hits >= 2:
                                     run_words = [nodes[j]._word_ref for j in range(ip, end_ip)]
                                     func = _compile_merged(run_words, cache_key)
                                     _jit_cache[cache_key] = func
@@ -2566,9 +3167,8 @@ class CompileTimeVM:
                                 continue
 
                     # Fast path: pre-resolved word reference
-                    word = node._word_ref
+                    word = _node._word_ref
                     if word is not None:
-                        # Inlined _call_word for common cases (JIT asm words)
                         if _runtime_mode:
                             ri = word.runtime_intrinsic
                             if ri is not None:
@@ -2589,7 +3189,6 @@ class CompileTimeVM:
                                 continue
                             defn = word.definition
                             if isinstance(defn, _AsmDef):
-                                # Ultra-hot path: inline JIT call, skip call_stack
                                 wn = word.name
                                 func = _jit_cache.get(wn)
                                 if func is None:
@@ -2600,7 +3199,23 @@ class CompileTimeVM:
                                 self.r13 = _jit_out2[1]
                                 ip += 1
                                 continue
-                        # Fall through to full _call_word for other cases
+                            # Whole-word JIT for Definition bodies
+                            ck = "__defn_jit_" + word.name
+                            jf = _jit_cache.get(ck)
+                            if jf is None and _jit_cache.get(ck + "_miss") is None:
+                                jf = self._compile_definition_jit(word)
+                                if jf is not None:
+                                    _jit_cache[ck] = jf
+                                    _jit_cache[ck + "_addr"] = ctypes.cast(jf, ctypes.c_void_p).value
+                                else:
+                                    _jit_cache[ck + "_miss"] = True
+                            if jf is not None:
+                                jf(self.r12, self.r13, _jit_out2_addr)
+                                self.r12 = _jit_out2[0]
+                                self.r13 = _jit_out2[1]
+                                ip += 1
+                                continue
+                        self.current_location = _node.loc
                         try:
                             _call_word(word)
                         except _CTVMJump as jmp:
@@ -2612,35 +3227,37 @@ class CompileTimeVM:
                         continue
 
                     # Structural keywords or unresolved words
-                    name = str(node.data)
+                    name = _node.data
                     if name == "begin":
                         end_idx = begin_pairs.get(ip)
                         if end_idx is None:
                             raise ParseError("'begin' without matching 'again'")
-                        begin_stack.append({"begin": ip, "end": end_idx})
+                        begin_stack.append((ip, end_idx))
                         ip += 1
                         continue
                     if name == "again":
-                        if not begin_stack or begin_stack[-1]["end"] != ip:
+                        if not begin_stack or begin_stack[-1][1] != ip:
                             raise ParseError("'again' without matching 'begin'")
-                        ip = begin_stack[-1]["begin"] + 1
+                        ip = begin_stack[-1][0] + 1
                         continue
                     if name == "continue":
                         if not begin_stack:
                             raise ParseError("'continue' outside begin/again loop")
-                        ip = begin_stack[-1]["begin"] + 1
+                        ip = begin_stack[-1][0] + 1
                         continue
                     if name == "exit":
                         if begin_stack:
                             frame = begin_stack.pop()
-                            ip = frame["end"] + 1
+                            ip = frame[1] + 1
                             continue
                         return
                     if _runtime_mode and name == "get_addr":
-                        _push(ip + 1)
+                        r12 = self.r12 - 8
+                        _c_int64_at(r12).value = ip + 1
+                        self.r12 = r12
                         ip += 1
                         continue
-                    # Lookup at runtime (rare: word was defined after body was compiled)
+                    self.current_location = _node.loc
                     w = _dict_lookup(name)
                     if w is None:
                         raise ParseError(f"unknown word '{name}' during compile-time execution")
@@ -2654,77 +3271,121 @@ class CompileTimeVM:
                     ip += 1
                     continue
 
+                if kind == _OP_LITERAL:
+                    if _runtime_mode:
+                        data = _node.data
+                        if isinstance(data, str):
+                            addr, length = _store_string(data)
+                            r12 = self.r12 - 16
+                            _c_int64_at(r12 + 8).value = addr
+                            _c_int64_at(r12).value = length
+                            self.r12 = r12
+                        else:
+                            r12 = self.r12 - 8
+                            v = int(data) & _I64_MASK
+                            if v >= _I64_SIGN:
+                                v -= _I64_WRAP
+                            _c_int64_at(r12).value = v
+                            self.r12 = r12
+                    else:
+                        _push(_node.data)
+                    ip += 1
+                    continue
+
+                if kind == _OP_FOR_END:
+                    if _runtime_mode:
+                        val = _c_int64_at(self.r13).value - 1
+                        _c_int64_at(self.r13).value = val
+                        if val > 0:
+                            ip = self.loop_stack[-1] + 1
+                            continue
+                        self.r13 += 8
+                    else:
+                        if not self.loop_stack:
+                            raise ParseError("'next' without matching 'for'")
+                        val = _peek_return() - 1
+                        _poke_return(val)
+                        if val > 0:
+                            ip = self.loop_stack[-1] + 1
+                            continue
+                        _pop_return()
+                    self.loop_stack.pop()
+                    ip += 1
+                    continue
+
+                if kind == _OP_FOR_BEGIN:
+                    if _runtime_mode:
+                        count = _c_int64_at(self.r12).value
+                        self.r12 += 8
+                        if count <= 0:
+                            match = loop_pairs.get(ip)
+                            if match is None:
+                                raise ParseError("internal loop bookkeeping error")
+                            ip = match + 1
+                            continue
+                        r13 = self.r13 - 8
+                        v = count & _I64_MASK
+                        if v >= _I64_SIGN:
+                            v -= _I64_WRAP
+                        _c_int64_at(r13).value = v
+                        self.r13 = r13
+                    else:
+                        count = _pop_int()
+                        if count <= 0:
+                            match = loop_pairs.get(ip)
+                            if match is None:
+                                raise ParseError("internal loop bookkeeping error")
+                            ip = match + 1
+                            continue
+                        _push_return(count)
+                    self.loop_stack.append(ip)
+                    ip += 1
+                    continue
+
+                if kind == _OP_BRANCH_ZERO:
+                    if _runtime_mode:
+                        condition = _c_int64_at(self.r12).value
+                        self.r12 += 8
+                        if condition == 0:
+                            ip = label_positions.get(str(_node.data), -1)
+                            if ip == -1:
+                                raise ParseError(f"unknown label during compile-time execution")
+                        else:
+                            ip += 1
+                    else:
+                        condition = _pop()
+                        if isinstance(condition, bool):
+                            flag = condition
+                        elif isinstance(condition, int):
+                            flag = condition != 0
+                        else:
+                            raise ParseError("branch expects integer or boolean condition")
+                        if not flag:
+                            ip = label_positions.get(str(_node.data), -1)
+                            if ip == -1:
+                                raise ParseError(f"unknown label during compile-time execution")
+                        else:
+                            ip += 1
+                    continue
+
+                if kind == _OP_JUMP:
+                    ip = label_positions.get(str(_node.data), -1)
+                    if ip == -1:
+                        raise ParseError(f"unknown label during compile-time execution")
+                    continue
+
+                if kind == _OP_LABEL:
+                    ip += 1
+                    continue
+
                 if kind == _OP_WORD_PTR:
-                    target_name = str(node.data)
+                    target_name = str(_node.data)
                     target_word = _dict_lookup(target_name)
                     if target_word is None:
                         raise ParseError(
                             f"unknown word '{target_name}' referenced by pointer during compile-time execution"
                         )
                     _push(self._handles.store(target_word))
-                    ip += 1
-                    continue
-
-                if kind == _OP_LITERAL:
-                    data = node.data
-                    if _runtime_mode and isinstance(data, str):
-                        addr, length = self.memory.store_string(data)
-                        _push(addr)
-                        _push(length)
-                    else:
-                        _push(data)
-                    ip += 1
-                    continue
-
-                if kind == _OP_FOR_END:
-                    if not self.loop_stack:
-                        raise ParseError("'next' without matching 'for'")
-                    val = _peek_return() - 1
-                    _poke_return(val)
-                    if val > 0:
-                        ip = self.loop_stack[-1]["begin"] + 1
-                        continue
-                    _pop_return()
-                    self.loop_stack.pop()
-                    ip += 1
-                    continue
-
-                if kind == _OP_FOR_BEGIN:
-                    count = _pop_int()
-                    if count <= 0:
-                        match = loop_pairs.get(ip)
-                        if match is None:
-                            raise ParseError("internal loop bookkeeping error")
-                        ip = match + 1
-                        continue
-                    _push_return(count)
-                    self.loop_stack.append({"begin": ip})
-                    ip += 1
-                    continue
-
-                if kind == _OP_BRANCH_ZERO:
-                    condition = _pop()
-                    if isinstance(condition, bool):
-                        flag = condition
-                    elif isinstance(condition, int):
-                        flag = condition != 0
-                    else:
-                        raise ParseError("branch expects integer or boolean condition")
-                    if not flag:
-                        ip = label_positions.get(str(node.data), -1)
-                        if ip == -1:
-                            raise ParseError(f"unknown label '{node.data}' during compile-time execution")
-                    else:
-                        ip += 1
-                    continue
-
-                if kind == _OP_JUMP:
-                    ip = label_positions.get(str(node.data), -1)
-                    if ip == -1:
-                        raise ParseError(f"unknown label '{node.data}' during compile-time execution")
-                    continue
-
-                if kind == _OP_LABEL:
                     ip += 1
                     continue
 
@@ -2737,7 +3398,7 @@ class CompileTimeVM:
                     continue
 
                 if kind == _OP_LIST_LITERAL:
-                    values = list(node.data or [])
+                    values = list(_node.data or [])
                     count = len(values)
                     buf_size = (count + 1) * 8
                     addr = self.memory.allocate(buf_size)
@@ -2756,7 +3417,7 @@ class CompileTimeVM:
                         items: List[int] = []
                         ptr = saved - 8
                         while ptr >= self.r12:
-                            items.append(CTMemory.read_qword(ptr))
+                            items.append(_c_int64_at(ptr).value)
                             ptr -= 8
                         self.r12 = saved
                     else:
@@ -2772,7 +3433,8 @@ class CompileTimeVM:
                     ip += 1
                     continue
 
-                raise ParseError(f"unsupported compile-time op {node!r}")
+                self.current_location = _node.loc
+                raise ParseError(f"unsupported compile-time op (opcode={kind})")
         finally:
             self.current_location = prev_location
             self.loop_stack = prev_loop_stack
@@ -2914,38 +3576,33 @@ class FunctionEmitter:
         self.text.append(f"    ; {message}")
 
     def push_literal(self, value: int) -> None:
-        self.text.extend([
-            f"    ; push {value}",
-            "    sub r12, 8",
-            f"    mov qword [r12], {value}",
-        ])
+        _a = self.text.append
+        _a(f"    ; push {value}")
+        _a("    sub r12, 8")
+        _a(f"    mov qword [r12], {value}")
 
     def push_float(self, label: str) -> None:
-        self.text.extend([
-            f"    ; push float from {label}",
-            "    sub r12, 8",
-            f"    mov rax, [rel {label}]",
-            "    mov [r12], rax",
-        ])
+        _a = self.text.append
+        _a(f"    ; push float from {label}")
+        _a("    sub r12, 8")
+        _a(f"    mov rax, [rel {label}]")
+        _a("    mov [r12], rax")
 
     def push_label(self, label: str) -> None:
-        self.text.extend([
-            f"    ; push {label}",
-            "    sub r12, 8",
-            f"    mov qword [r12], {label}",
-        ])
+        _a = self.text.append
+        _a(f"    ; push {label}")
+        _a("    sub r12, 8")
+        _a(f"    mov qword [r12], {label}")
 
     def push_from(self, register: str) -> None:
-        self.text.extend([
-            "    sub r12, 8",
-            f"    mov [r12], {register}",
-        ])
+        _a = self.text.append
+        _a("    sub r12, 8")
+        _a(f"    mov [r12], {register}")
 
     def pop_to(self, register: str) -> None:
-        self.text.extend([
-            f"    mov {register}, [r12]",
-            "    add r12, 8",
-        ])
+        _a = self.text.append
+        _a(f"    mov {register}, [r12]")
+        _a("    add r12, 8")
 
 
 def _int_trunc_div(lhs: int, rhs: int) -> int:
@@ -3011,6 +3668,16 @@ def sanitize_label(name: str) -> str:
     prefixed = f"w_{safe}"
     _sanitize_label_cache[name] = prefixed
     return prefixed
+
+
+# Auto-inline asm bodies with at most this many instructions (excl. ret/blanks).
+_ASM_AUTO_INLINE_THRESHOLD = 8
+
+# Pre-compiled regexes for sanitizing symbol references in asm bodies.
+_RE_ASM_CALL = re.compile(r"\bcall\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_RE_ASM_GLOBAL = re.compile(r"\bglobal\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_RE_ASM_EXTERN = re.compile(r"\bextern\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_RE_ASM_CALL_EXTRACT = re.compile(r"call\s+(?:qword\s+)?(?:\[rel\s+([A-Za-z0-9_.$@]+)\]|([A-Za-z0-9_.$@]+))")
 
 
 def _is_identifier(text: str) -> bool:
@@ -3305,7 +3972,12 @@ class Assembler:
         enable_constant_folding: bool = True,
         enable_static_list_folding: bool = True,
         enable_peephole_optimization: bool = True,
+        enable_loop_unroll: bool = True,
+        enable_auto_inline: bool = True,
+        enable_extern_type_check: bool = True,
+        enable_stack_check: bool = True,
         loop_unroll_threshold: int = 8,
+        verbosity: int = 0,
     ) -> None:
         self.dictionary = dictionary
         self._string_literals: Dict[str, Tuple[str, int]] = {}
@@ -3320,13 +3992,19 @@ class Assembler:
         self.enable_constant_folding = enable_constant_folding
         self.enable_static_list_folding = enable_static_list_folding
         self.enable_peephole_optimization = enable_peephole_optimization
+        self.enable_loop_unroll = enable_loop_unroll
+        self.enable_auto_inline = enable_auto_inline
+        self.enable_extern_type_check = enable_extern_type_check
+        self.enable_stack_check = enable_stack_check
         self.loop_unroll_threshold = loop_unroll_threshold
+        self.verbosity = verbosity
         self._last_cfg_definitions: List[Definition] = []
+        self._need_cfg: bool = False
 
     def _copy_definition_for_cfg(self, definition: Definition) -> Definition:
         return Definition(
             name=definition.name,
-            body=[Op(op=node.op, data=node.data, loc=node.loc) for node in definition.body],
+            body=[_make_op(node.op, node.data, node.loc) for node in definition.body],
             immediate=definition.immediate,
             compile_only=definition.compile_only,
             terminator=definition.terminator,
@@ -3630,73 +4308,37 @@ class Assembler:
         lines.append("}")
         return "\n".join(lines)
 
-    def _peephole_optimize_definition(self, definition: Definition) -> None:
-        # Word-only rewrite rules: pattern → replacement (both tuples of
-        # word names).  The engine scans left-to-right and applies the
-        # longest matching rule at each position.
-        word_rules: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
-            # --- stack no-ops (cancellation) ---
-            (("dup", "drop"), ()),
-            (("swap", "swap"), ()),
-            (("over", "drop"), ()),
-            (("dup", "nip"), ()),
-            (("2dup", "2drop"), ()),
-            (("2swap", "2swap"), ()),
-            (("rot", "rot", "rot"), ()),
-            (("rot", "-rot"), ()),
-            (("-rot", "rot"), ()),
-            (("drop", "drop"), ("2drop",)),
-            (("over", "over"), ("2dup",)),
-            (("inc", "dec"), ()),
-            (("dec", "inc"), ()),
-            (("neg", "neg"), ()),
-            (("not", "not"), ()),
-            (("bitnot", "bitnot"), ()),
-            (("bnot", "bnot"), ()),
-            (("abs", "abs"), ("abs",)),
-            # --- canonicalizations that merge into single ops ---
-            (("swap", "drop"), ("nip",)),
-            (("swap", "over"), ("tuck",)),
-            (("swap", "nip"), ("drop",)),
-            (("nip", "drop"), ("2drop",)),
-            (("tuck", "drop"), ("swap",)),
-            # --- commutative ops: swap before them is a no-op ---
-            (("swap", "+"), ("+",)),
-            (("swap", "*"), ("*",)),
-            (("swap", "=="), ("==",)),
-            (("swap", "!="), ("!=",)),
-            (("swap", "band"), ("band",)),
-            (("swap", "bor"), ("bor",)),
-            (("swap", "bxor"), ("bxor",)),
-            (("swap", "and"), ("and",)),
-            (("swap", "or"), ("or",)),
-            (("swap", "min"), ("min",)),
-            (("swap", "max"), ("max",)),
-            # --- dup + self-idempotent binary → identity ---
-            (("dup", "bor"), ()),            # x | x == x
-            (("dup", "band"), ()),           # x & x == x
-            (("dup", "bxor"), ("drop", "literal_0")),  # x ^ x == 0
-            (("dup", "=="), ("drop", "literal_1")),     # x == x always true
-            (("dup", "-"), ("drop", "literal_0")),      # x - x == 0
-        ]
-
-        # Filter out placeholder rules whose replacements contain
-        # pseudo-words; expand them into proper Op sequences later.
-        _PLACEHOLDER_RULES: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
-        clean_rules: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
-        for pat, repl in word_rules:
-            if any(r.startswith("literal_") for r in repl):
-                _PLACEHOLDER_RULES[pat] = repl
+    @staticmethod
+    def _log_op_diff(name: str, pass_name: str, before: list, after: list) -> None:
+        """Print a contextual diff of (op, data) tuples for v4 optimization detail."""
+        import difflib
+        def _fmt(op_data: tuple) -> str:
+            op, data = op_data
+            if op == "literal":
+                return f"  {data!r}" if isinstance(data, str) else f"  {data}"
+            if op == "word":
+                return f"  {data}"
+            return f"  [{op}] {data!r}" if data is not None else f"  [{op}]"
+        before_lines = [_fmt(t) for t in before]
+        after_lines = [_fmt(t) for t in after]
+        diff = list(difflib.unified_diff(before_lines, after_lines, n=1, lineterm=""))
+        if len(diff) <= 2:
+            return
+        for line in diff[2:]:  # skip --- / +++ header
+            if line.startswith("@@"):
+                print(f"[v4]   {pass_name} '{name}' {line}")
+            elif line.startswith("-"):
+                print(f"[v4]     - {line[1:]}")
+            elif line.startswith("+"):
+                print(f"[v4]     + {line[1:]}")
             else:
-                clean_rules.append((pat, repl))
-        word_rules = clean_rules
+                print(f"[v4]      {line[1:]}")
 
-        max_pat_len = max(len(p) for p, _ in word_rules) if word_rules else 0
-        rule_index: Dict[str, List[Tuple[Tuple[str, ...], Tuple[str, ...]]]] = {}
-        for pattern, repl in word_rules:
-            rule_index.setdefault(pattern[0], []).append((pattern, repl))
-
+    def _peephole_optimize_definition(self, definition: Definition) -> None:
         nodes = definition.body
+        all_rules = _PEEPHOLE_ALL_RULES
+        first_words = _PEEPHOLE_FIRST_WORDS
+        _OP_W = OP_WORD
 
         # Outer loop: keeps re-running all passes until nothing changes.
         any_changed = True
@@ -3708,248 +4350,200 @@ class Assembler:
             while changed:
                 changed = False
                 optimized: List[Op] = []
+                _opt_append = optimized.append
                 idx = 0
-                while idx < len(nodes):
+                nlen = len(nodes)
+                while idx < nlen:
                     node = nodes[idx]
-                    matched = False
-                    if node._opcode == OP_WORD:
-                        word_name = str(node.data)
-
-                        # --- placeholder rules (produce literals) ---
-                        for pat, repl in _PLACEHOLDER_RULES.items():
-                            plen = len(pat)
-                            if pat[0] != word_name:
-                                continue
-                            if idx + plen > len(nodes):
-                                continue
-                            seg = nodes[idx:idx + plen]
-                            if any(n._opcode != OP_WORD for n in seg):
-                                continue
-                            if tuple(str(n.data) for n in seg) == pat:
-                                base_loc = seg[0].loc
-                                for r in repl:
-                                    if r.startswith("literal_"):
-                                        val = int(r[len("literal_"):])
-                                        optimized.append(Op(op="literal", data=val, loc=base_loc))
-                                    else:
-                                        optimized.append(Op(op="word", data=r, loc=base_loc))
-                                idx += plen
-                                changed = True
-                                matched = True
-                                break
-                        if matched:
-                            continue
-
-                        # --- normal word-only rules ---
-                        candidates = rule_index.get(word_name)
-                        if candidates:
-                            for window in range(min(max_pat_len, len(nodes) - idx), 1, -1):
-                                segment = nodes[idx:idx + window]
-                                if any(n._opcode != OP_WORD for n in segment):
-                                    continue
-                                names = tuple(str(n.data) for n in segment)
-                                replacement: Optional[Tuple[str, ...]] = None
-                                for pattern, repl in candidates:
-                                    if names == pattern:
-                                        replacement = repl
-                                        break
-                                if replacement is None:
-                                    continue
-                                base_loc = segment[0].loc
-                                for repl_name in replacement:
-                                    optimized.append(Op(op="word", data=repl_name, loc=base_loc))
-                                idx += window
-                                changed = True
-                                matched = True
-                                break
-                    if matched:
+                    if node._opcode != _OP_W:
+                        _opt_append(node)
+                        idx += 1
                         continue
-                    optimized.append(nodes[idx])
-                    idx += 1
+                    word_name = node.data
+                    if word_name not in first_words:
+                        _opt_append(node)
+                        idx += 1
+                        continue
+
+                    # Try longest match first (max pattern len = 3)
+                    matched = False
+                    # Try window=3
+                    if idx + 2 < nlen:
+                        b = nodes[idx + 1]
+                        c = nodes[idx + 2]
+                        if b._opcode == _OP_W and c._opcode == _OP_W:
+                            repl = all_rules.get((word_name, b.data, c.data))
+                            if repl is not None:
+                                base_loc = node.loc
+                                for r in repl:
+                                    if r[0] == 'l' and r[:8] == "literal_":
+                                        _opt_append(_make_literal_op(int(r[8:]), loc=base_loc))
+                                    else:
+                                        _opt_append(_make_word_op(r, base_loc))
+                                idx += 3
+                                changed = True
+                                matched = True
+                    # Try window=2
+                    if not matched and idx + 1 < nlen:
+                        b = nodes[idx + 1]
+                        if b._opcode == _OP_W:
+                            repl = all_rules.get((word_name, b.data))
+                            if repl is not None:
+                                base_loc = node.loc
+                                for r in repl:
+                                    if r[0] == 'l' and r[:8] == "literal_":
+                                        _opt_append(_make_literal_op(int(r[8:]), loc=base_loc))
+                                    else:
+                                        _opt_append(_make_word_op(r, base_loc))
+                                idx += 2
+                                changed = True
+                                matched = True
+                    if not matched:
+                        _opt_append(node)
+                        idx += 1
                 if changed:
                     any_changed = True
                 nodes = optimized
 
             # ---------- Pass 2: literal + word algebraic identities ----------
-            # String literals push TWO values (pointer + length), so
-            # most literal-aware rewrites must be restricted to scalars.
-            def _is_scalar_literal(node: Op) -> bool:
-                return node._opcode == OP_LITERAL and not isinstance(node.data, str)
-
+            _CANCEL_PAIRS = _PEEPHOLE_CANCEL_PAIRS
+            _SHIFT_OPS = _PEEPHOLE_SHIFT_OPS
             changed = True
             while changed:
                 changed = False
                 optimized = []
+                _opt_a = optimized.append
+                nlen = len(nodes)
                 idx = 0
-                while idx < len(nodes):
+                while idx < nlen:
+                    node = nodes[idx]
+                    n_oc = node._opcode
+
                     # -- Redundant unary pairs (word word) --
-                    if idx + 1 < len(nodes):
-                        a, b = nodes[idx], nodes[idx + 1]
-                        if a._opcode == OP_WORD and b._opcode == OP_WORD:
-                            wa, wb = str(a.data), str(b.data)
-                            if (wa, wb) in {
-                                ("not", "not"), ("neg", "neg"),
-                                ("bitnot", "bitnot"), ("bnot", "bnot"),
-                                ("inc", "dec"), ("dec", "inc"),
-                            }:
+                    if n_oc == OP_WORD and idx + 1 < nlen:
+                        b = nodes[idx + 1]
+                        if b._opcode == OP_WORD:
+                            wa, wb = node.data, b.data
+                            if (wa, wb) in _CANCEL_PAIRS:
                                 idx += 2
                                 changed = True
                                 continue
-                            # abs is idempotent
                             if wa == "abs" and wb == "abs":
-                                optimized.append(a)
+                                _opt_a(node)
                                 idx += 2
                                 changed = True
                                 continue
 
-                    # -- scalar literal + dup → literal literal --
-                    if idx + 1 < len(nodes):
-                        a, b = nodes[idx], nodes[idx + 1]
-                        if _is_scalar_literal(a) and b._opcode == OP_WORD and str(b.data) == "dup":
-                            optimized.append(a)
-                            optimized.append(Op(op="literal", data=a.data, loc=a.loc))
+                    # -- scalar literal patterns (excludes string literals which push 2 values) --
+                    if n_oc == OP_LITERAL and type(node.data) is not str and idx + 1 < nlen:
+                        b = nodes[idx + 1]
+                        b_oc = b._opcode
+
+                        # literal + dup → literal literal
+                        if b_oc == OP_WORD and b.data == "dup":
+                            _opt_a(node)
+                            _opt_a(_make_literal_op(node.data, node.loc))
                             idx += 2
                             changed = True
                             continue
 
-                    # -- scalar literal + drop → (nothing) --
-                    if idx + 1 < len(nodes):
-                        a, b = nodes[idx], nodes[idx + 1]
-                        if _is_scalar_literal(a) and b._opcode == OP_WORD and str(b.data) == "drop":
+                        # literal + drop → (nothing)
+                        if b_oc == OP_WORD and b.data == "drop":
                             idx += 2
                             changed = True
                             continue
 
-                    # -- scalar literal scalar literal + 2drop → (nothing) --
-                    if idx + 2 < len(nodes):
-                        a, b, c = nodes[idx], nodes[idx + 1], nodes[idx + 2]
-                        if _is_scalar_literal(a) and _is_scalar_literal(b) and c._opcode == OP_WORD and str(c.data) == "2drop":
-                            idx += 3
-                            changed = True
-                            continue
+                        # literal literal + 2drop / swap
+                        if b_oc == OP_LITERAL and type(b.data) is not str and idx + 2 < nlen:
+                            c = nodes[idx + 2]
+                            if c._opcode == OP_WORD:
+                                cd = c.data
+                                if cd == "2drop":
+                                    idx += 3
+                                    changed = True
+                                    continue
+                                if cd == "swap":
+                                    _opt_a(_make_literal_op(b.data, b.loc))
+                                    _opt_a(_make_literal_op(node.data, node.loc))
+                                    idx += 3
+                                    changed = True
+                                    continue
 
-                    # -- scalar literal scalar literal + swap → swapped --
-                    if idx + 2 < len(nodes):
-                        a, b, c = nodes[idx], nodes[idx + 1], nodes[idx + 2]
-                        if _is_scalar_literal(a) and _is_scalar_literal(b) and c._opcode == OP_WORD and str(c.data) == "swap":
-                            optimized.append(Op(op="literal", data=b.data, loc=b.loc))
-                            optimized.append(Op(op="literal", data=a.data, loc=a.loc))
-                            idx += 3
-                            changed = True
-                            continue
+                        # Binary op identities: literal K + word
+                        if type(node.data) is int and b_oc == OP_WORD:
+                            k = node.data
+                            w = b.data
+                            base_loc = node.loc or b.loc
 
-                    # -- Binary op identities: literal K + word --
-                    if idx + 1 < len(nodes):
-                        lit, op = nodes[idx], nodes[idx + 1]
-                        if lit._opcode == OP_LITERAL and isinstance(lit.data, int) and op._opcode == OP_WORD:
-                            k = int(lit.data)
-                            w = str(op.data)
-                            base_loc = lit.loc or op.loc
-
-                            # Identity elements
                             if (w == "+" and k == 0) or (w == "-" and k == 0) or (w == "*" and k == 1) or (w == "/" and k == 1):
-                                idx += 2
-                                changed = True
-                                continue
+                                idx += 2; changed = True; continue
 
-                            # Absorbing elements
-                            if w == "*" and k == 0:
-                                optimized.append(Op(op="word", data="drop", loc=base_loc))
-                                optimized.append(Op(op="literal", data=0, loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                            if w == "*":
+                                if k == 0:
+                                    _opt_a(_make_word_op("drop", base_loc))
+                                    _opt_a(_make_literal_op(0, base_loc))
+                                    idx += 2; changed = True; continue
+                                if k == -1:
+                                    _opt_a(_make_word_op("neg", base_loc))
+                                    idx += 2; changed = True; continue
+                                if k > 1 and (k & (k - 1)) == 0:
+                                    _opt_a(_make_literal_op(k.bit_length() - 1, base_loc))
+                                    _opt_a(_make_word_op("shl", base_loc))
+                                    idx += 2; changed = True; continue
 
-                            if w == "band" and k == 0:
-                                optimized.append(Op(op="word", data="drop", loc=base_loc))
-                                optimized.append(Op(op="literal", data=0, loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                            if w == "band":
+                                if k == 0:
+                                    _opt_a(_make_word_op("drop", base_loc))
+                                    _opt_a(_make_literal_op(0, base_loc))
+                                    idx += 2; changed = True; continue
+                                if k == -1:
+                                    idx += 2; changed = True; continue
 
-                            if w == "bor" and k == -1:
-                                optimized.append(Op(op="word", data="drop", loc=base_loc))
-                                optimized.append(Op(op="literal", data=-1, loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                            if w == "bor":
+                                if k == -1:
+                                    _opt_a(_make_word_op("drop", base_loc))
+                                    _opt_a(_make_literal_op(-1, base_loc))
+                                    idx += 2; changed = True; continue
+                                if k == 0:
+                                    idx += 2; changed = True; continue
 
-                            # Negate
-                            if w == "*" and k == -1:
-                                optimized.append(Op(op="word", data="neg", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                            if w == "bxor" and k == 0:
+                                idx += 2; changed = True; continue
 
-                            # Modulo 1 → always 0
                             if w == "%" and k == 1:
-                                optimized.append(Op(op="word", data="drop", loc=base_loc))
-                                optimized.append(Op(op="literal", data=0, loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                                _opt_a(_make_word_op("drop", base_loc))
+                                _opt_a(_make_literal_op(0, base_loc))
+                                idx += 2; changed = True; continue
 
-                            # 0 == → not
                             if w == "==" and k == 0:
-                                optimized.append(Op(op="word", data="not", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                                _opt_a(_make_word_op("not", base_loc))
+                                idx += 2; changed = True; continue
 
-                            # No-op bitwise
-                            if (w == "bor" and k == 0) or (w == "bxor" and k == 0):
-                                idx += 2
-                                changed = True
-                                continue
-                            if w == "band" and k == -1:
-                                idx += 2
-                                changed = True
-                                continue
-                            if w in {"shl", "shr", "sar"} and k == 0:
-                                idx += 2
-                                changed = True
-                                continue
+                            if w in _SHIFT_OPS and k == 0:
+                                idx += 2; changed = True; continue
 
-                            # Strength reduction: multiply by power of 2 → shl
-                            if w == "*" and k > 1 and (k & (k - 1)) == 0:
-                                shift = k.bit_length() - 1
-                                optimized.append(Op(op="literal", data=shift, loc=base_loc))
-                                optimized.append(Op(op="word", data="shl", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
+                            if w == "+":
+                                if k == 1:
+                                    _opt_a(_make_word_op("inc", base_loc))
+                                    idx += 2; changed = True; continue
+                                if k == -1:
+                                    _opt_a(_make_word_op("dec", base_loc))
+                                    idx += 2; changed = True; continue
+                            if w == "-":
+                                if k == 1:
+                                    _opt_a(_make_word_op("dec", base_loc))
+                                    idx += 2; changed = True; continue
+                                if k == -1:
+                                    _opt_a(_make_word_op("inc", base_loc))
+                                    idx += 2; changed = True; continue
 
-                            # +1 → inc,  -1 → dec,  +(-1) → dec,  -(−1) → inc
-                            if w == "+" and k == 1:
-                                optimized.append(Op(op="word", data="inc", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
-                            if w == "+" and k == -1:
-                                optimized.append(Op(op="word", data="dec", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
-                            if w == "-" and k == 1:
-                                optimized.append(Op(op="word", data="dec", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
-                            if w == "-" and k == -1:
-                                optimized.append(Op(op="word", data="inc", loc=base_loc))
-                                idx += 2
-                                changed = True
-                                continue
-
-                    optimized.append(nodes[idx])
+                    _opt_a(node)
                     idx += 1
                 if changed:
                     any_changed = True
                 nodes = optimized
 
             # ---------- Pass 3: dead-code after unconditional jump/end ----------
-            # Opcodes that prevent fall-through.
-            _TERMINATORS = {OP_JUMP}
             new_nodes: List[Op] = []
             dead = False
             for node in nodes:
@@ -3963,7 +4557,7 @@ class Assembler:
                         any_changed = True
                     continue
                 new_nodes.append(node)
-                if kind in _TERMINATORS:
+                if kind in _PEEPHOLE_TERMINATORS:
                     dead = True
             if len(new_nodes) != len(nodes):
                 any_changed = True
@@ -3979,26 +4573,59 @@ class Assembler:
         definition.body = optimized
 
     def _attempt_constant_fold_tail(self, nodes: List[Op]) -> None:
+        _LIT = OP_LITERAL
+        _W = OP_WORD
         while nodes:
             last = nodes[-1]
-            if last.op != "word":
+            if last._opcode != _W:
                 return
-            fold_entry = _FOLDABLE_WORDS.get(str(last.data))
+            fold_entry = _FOLDABLE_WORDS.get(last.data)
             if fold_entry is None:
                 return
             arity, func = fold_entry
-            if len(nodes) < arity + 1:
+            nlen = len(nodes)
+            if nlen < arity + 1:
                 return
+            # Fast path for binary ops (arity 2, the most common case)
+            if arity == 2:
+                a = nodes[-3]
+                b = nodes[-2]
+                if a._opcode != _LIT or type(a.data) is not int:
+                    return
+                if b._opcode != _LIT or type(b.data) is not int:
+                    return
+                try:
+                    result = func(a.data, b.data)
+                except Exception:
+                    return
+                new_loc = a.loc or last.loc
+                del nodes[-3:]
+                nodes.append(_make_literal_op(result, new_loc))
+                continue
+            # Fast path for unary ops (arity 1)
+            if arity == 1:
+                a = nodes[-2]
+                if a._opcode != _LIT or type(a.data) is not int:
+                    return
+                try:
+                    result = func(a.data)
+                except Exception:
+                    return
+                new_loc = a.loc or last.loc
+                del nodes[-2:]
+                nodes.append(_make_literal_op(result, new_loc))
+                continue
+            # General case
             operands = nodes[-(arity + 1):-1]
-            if any(op._opcode != OP_LITERAL or not isinstance(op.data, int) for op in operands):
+            if any(op._opcode != _LIT or type(op.data) is not int for op in operands):
                 return
-            values = [int(op.data) for op in operands]
+            values = [op.data for op in operands]
             try:
                 result = func(*values)
             except Exception:
                 return
             new_loc = operands[0].loc or last.loc
-            nodes[-(arity + 1):] = [Op(op="literal", data=result, loc=new_loc)]
+            nodes[-(arity + 1):] = [_make_literal_op(result, new_loc)]
 
     def _for_pairs(self, nodes: Sequence[Op]) -> Dict[int, int]:
         stack: List[int] = []
@@ -4050,12 +4677,12 @@ class Assembler:
             kind = node._opcode
             data = node.data
             if kind == OP_LABEL:
-                cloned.append(Op(op="label", data=remap(str(data)), loc=node.loc))
+                cloned.append(_make_op("label", remap(str(data)), loc=node.loc))
                 continue
             if kind == OP_JUMP or kind == OP_BRANCH_ZERO:
                 target = str(data)
                 mapped = remap(target) if target in internal_labels else target
-                cloned.append(Op(op=node.op, data=mapped, loc=node.loc))
+                cloned.append(_make_op(node.op, mapped, node.loc))
                 continue
             if kind == OP_FOR_BEGIN or kind == OP_FOR_END:
                 cloned.append(
@@ -4070,9 +4697,9 @@ class Assembler:
                 )
                 continue
             if kind == OP_LIST_BEGIN or kind == OP_LIST_END:
-                cloned.append(Op(op=node.op, data=remap(str(data)), loc=node.loc))
+                cloned.append(_make_op(node.op, remap(str(data)), loc=node.loc))
                 continue
-            cloned.append(Op(op=node.op, data=data, loc=node.loc))
+            cloned.append(_make_op(node.op, data, node.loc))
         return cloned
 
     def _unroll_constant_for_loops(self, definition: Definition) -> None:
@@ -4165,7 +4792,7 @@ class Assembler:
                 continue
 
             if is_static:
-                rebuilt.append(Op(op="list_literal", data=static_values, loc=node.loc))
+                rebuilt.append(_make_op("list_literal", static_values, node.loc))
                 idx = j + 1
                 continue
 
@@ -4174,13 +4801,144 @@ class Assembler:
 
         definition.body = rebuilt
 
+    # Known stack effects: (inputs_consumed, outputs_produced)
+    _BUILTIN_STACK_EFFECTS: Dict[str, Tuple[int, int]] = {
+        "dup":   (1, 2),
+        "drop":  (1, 0),
+        "swap":  (2, 2),
+        "over":  (2, 3),
+        "rot":   (3, 3),
+        "nip":   (2, 1),
+        "tuck":  (2, 3),
+        "+":     (2, 1),
+        "-":     (2, 1),
+        "*":     (2, 1),
+        "/":     (2, 1),
+        "mod":   (2, 1),
+        "=":     (2, 1),
+        "!=":    (2, 1),
+        "<":     (2, 1),
+        ">":     (2, 1),
+        "<=":    (2, 1),
+        ">=":    (2, 1),
+        "and":   (2, 1),
+        "or":    (2, 1),
+        "xor":   (2, 1),
+        "not":   (1, 1),
+        "shl":   (2, 1),
+        "shr":   (2, 1),
+        "neg":   (1, 1),
+        "@":     (1, 1),
+        "!":     (2, 0),
+        "@8":    (1, 1),
+        "!8":    (2, 0),
+        "@16":   (1, 1),
+        "!16":   (2, 0),
+        "@32":   (1, 1),
+        "!32":   (2, 0),
+    }
+
+    def _check_extern_types(self, definitions: Sequence[Union["Definition", "AsmDefinition"]]) -> None:
+        """Basic type checking: verify stack depth at extern call sites and builtin underflows."""
+        _v = self.verbosity
+        _effects = self._BUILTIN_STACK_EFFECTS
+        _OP_LIT = OP_LITERAL
+        _OP_W = OP_WORD
+        _OP_WP = OP_WORD_PTR
+        _OP_LIST_LIT = OP_LIST_LITERAL
+        _check_extern = self.enable_extern_type_check
+        _check_stack = self.enable_stack_check
+        extern_issues: List[str] = []
+        stack_issues: List[str] = []
+        for defn in definitions:
+            if not isinstance(defn, Definition):
+                continue
+            # depth tracks values on the data stack relative to entry.
+            # 'main' starts with an empty stack.  For other words we can
+            # only check underflows when a stack-effect comment provides
+            # the input count (e.g. ``# a b -- c`` → 2 inputs).
+            si = defn.stack_inputs
+            if si is not None:
+                known_entry_depth = si
+            elif defn.name == 'main':
+                known_entry_depth = 0
+            else:
+                known_entry_depth = -1  # unknown — disable underflow checks
+            depth: Optional[int] = known_entry_depth if known_entry_depth >= 0 else 0
+            for node in defn.body:
+                opc = node._opcode
+                if depth is None:
+                    # After control flow we can't track depth reliably
+                    if opc == _OP_W and _check_extern:
+                        word = self.dictionary.lookup(str(node.data))
+                        if word and word.is_extern and word.extern_signature:
+                            # Can't verify — depth unknown after branch
+                            if _v >= 3:
+                                print(f"[v3] type-check: '{defn.name}' -> extern '{word.name}' skipped (unknown depth)")
+                    continue
+                if opc == _OP_LIT:
+                    depth += 1
+                elif opc == _OP_WP:
+                    depth += 1
+                elif opc == _OP_LIST_LIT:
+                    depth += 1
+                elif opc in (OP_BRANCH_ZERO, OP_JUMP, OP_LABEL, OP_FOR_BEGIN, OP_FOR_END):
+                    # Control flow — stop tracking precisely
+                    if opc == OP_BRANCH_ZERO:
+                        depth -= 1
+                    depth = None
+                elif opc == _OP_W:
+                    name = str(node.data)
+                    word = self.dictionary.lookup(name)
+                    if word is None:
+                        depth = None
+                        continue
+                    if word.is_extern and word.extern_signature:
+                        inputs = word.extern_inputs
+                        outputs = word.extern_outputs
+                        if _check_extern and known_entry_depth >= 0 and depth < inputs:
+                            extern_issues.append(
+                                f"in '{defn.name}': extern '{name}' expects {inputs} "
+                                f"argument{'s' if inputs != 1 else ''}, but only {depth} "
+                                f"value{'s' if depth != 1 else ''} on the stack"
+                            )
+                        depth = depth - inputs + outputs
+                    elif name in _effects:
+                        consumed, produced = _effects[name]
+                        if known_entry_depth >= 0 and depth < consumed:
+                            if _check_stack:
+                                stack_issues.append(
+                                    f"in '{defn.name}': '{name}' needs {consumed} "
+                                    f"value{'s' if consumed != 1 else ''}, but only {depth} "
+                                    f"on the stack"
+                                )
+                            depth = None
+                        else:
+                            depth = depth - consumed + produced
+                    elif word.is_extern:
+                        # Extern without signature — apply inputs/outputs
+                        depth = depth - word.extern_inputs + word.extern_outputs
+                    else:
+                        # Unknown word — lose depth tracking
+                        depth = None
+
+        for issue in extern_issues:
+            print(f"[extern-type-check] warning: {issue}")
+        for issue in stack_issues:
+            print(f"[stack-check] warning: {issue}")
+        if _v >= 1 and not extern_issues and not stack_issues:
+            print(f"[v1] type-check: no issues found")
+
     def _reachable_runtime_defs(self, runtime_defs: Sequence[Union[Definition, AsmDefinition]], extra_roots: Optional[Sequence[str]] = None) -> Set[str]:
         edges: Dict[str, Set[str]] = {}
+        _OP_W = OP_WORD
+        _OP_WP = OP_WORD_PTR
         for definition in runtime_defs:
             refs: Set[str] = set()
             if isinstance(definition, Definition):
                 for node in definition.body:
-                    if node.op in {"word", "word_ptr"}:
+                    oc = node._opcode
+                    if oc == _OP_W or oc == _OP_WP:
                         refs.add(str(node.data))
             elif isinstance(definition, AsmDefinition):
                 # Collect obvious textual `call` targets from asm bodies so
@@ -4226,8 +4984,7 @@ class Assembler:
         `call [rel <symbol>]` and `call qword [rel <symbol>]`.
         """
         calls: Set[str] = set()
-        pattern = re.compile(r"call\s+(?:qword\s+)?(?:\[rel\s+([A-Za-z0-9_.$@]+)\]|([A-Za-z0-9_.$@]+))")
-        for m in pattern.finditer(asm_body):
+        for m in _RE_ASM_CALL_EXTRACT.finditer(asm_body):
             sym = m.group(1) or m.group(2)
             if sym:
                 calls.add(sym)
@@ -4283,21 +5040,96 @@ class Assembler:
             valid_defs = (Definition, AsmDefinition)
             raw_defs = [form for form in module.forms if isinstance(form, valid_defs)]
             definitions = self._dedup_definitions(raw_defs)
-            for defn in definitions:
-                if isinstance(defn, Definition):
-                    self._unroll_constant_for_loops(defn)
+
+            _v = self.verbosity
+            if _v >= 1:
+                import time as _time_mod
+                _emit_t0 = _time_mod.perf_counter()
+                n_def = sum(1 for d in definitions if isinstance(d, Definition))
+                n_asm = sum(1 for d in definitions if isinstance(d, AsmDefinition))
+                print(f"[v1] definitions: {n_def} high-level, {n_asm} asm")
+                opts = []
+                if self.enable_loop_unroll: opts.append(f"loop-unroll(threshold={self.loop_unroll_threshold})")
+                if self.enable_peephole_optimization: opts.append("peephole")
+                if self.enable_constant_folding: opts.append("constant-folding")
+                if self.enable_static_list_folding: opts.append("static-list-folding")
+                if self.enable_auto_inline: opts.append("auto-inline")
+                if self.enable_extern_type_check: opts.append("extern-type-check")
+                if self.enable_stack_check: opts.append("stack-check")
+                print(f"[v1] optimizations: {', '.join(opts) if opts else 'none'}")
+
+            if _v >= 2:
+                # v2: log per-definition summary before optimization
+                for defn in definitions:
+                    if isinstance(defn, Definition):
+                        print(f"[v2] def '{defn.name}': {len(defn.body)} ops, inline={getattr(defn, 'inline', False)}, compile_only={getattr(defn, 'compile_only', False)}")
+                    else:
+                        print(f"[v2] asm '{defn.name}'")
+
+            if self.enable_loop_unroll:
+                if _v >= 1: _t0 = _time_mod.perf_counter()
+                for defn in definitions:
+                    if isinstance(defn, Definition):
+                        self._unroll_constant_for_loops(defn)
+                if _v >= 1:
+                    print(f"[v1] loop unrolling: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
             if self.enable_peephole_optimization:
-                for defn in definitions:
-                    if isinstance(defn, Definition):
-                        self._peephole_optimize_definition(defn)
+                if _v >= 1: _t0 = _time_mod.perf_counter()
+                if _v >= 4:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            before_ops = [(n.op, n.data) for n in defn.body]
+                            self._peephole_optimize_definition(defn)
+                            after_ops = [(n.op, n.data) for n in defn.body]
+                            if before_ops != after_ops:
+                                print(f"[v2] peephole '{defn.name}': {len(before_ops)} -> {len(after_ops)} ops ({len(before_ops) - len(after_ops)} removed)")
+                                self._log_op_diff(defn.name, "peephole", before_ops, after_ops)
+                elif _v >= 2:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            _before = len(defn.body)
+                            self._peephole_optimize_definition(defn)
+                            _after = len(defn.body)
+                            if _before != _after:
+                                print(f"[v2] peephole '{defn.name}': {_before} -> {_after} ops ({_before - _after} removed)")
+                else:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            self._peephole_optimize_definition(defn)
+                if _v >= 1:
+                    print(f"[v1] peephole optimization: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
             if self.enable_constant_folding:
-                for defn in definitions:
-                    if isinstance(defn, Definition):
-                        self._fold_constants_in_definition(defn)
+                if _v >= 1: _t0 = _time_mod.perf_counter()
+                if _v >= 4:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            before_ops = [(n.op, n.data) for n in defn.body]
+                            self._fold_constants_in_definition(defn)
+                            after_ops = [(n.op, n.data) for n in defn.body]
+                            if before_ops != after_ops:
+                                print(f"[v2] constant-fold '{defn.name}': {len(before_ops)} -> {len(after_ops)} ops ({len(before_ops) - len(after_ops)} folded)")
+                                self._log_op_diff(defn.name, "constant-fold", before_ops, after_ops)
+                elif _v >= 2:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            _before = len(defn.body)
+                            self._fold_constants_in_definition(defn)
+                            _after = len(defn.body)
+                            if _before != _after:
+                                print(f"[v2] constant-fold '{defn.name}': {_before} -> {_after} ops ({_before - _after} folded)")
+                else:
+                    for defn in definitions:
+                        if isinstance(defn, Definition):
+                            self._fold_constants_in_definition(defn)
+                if _v >= 1:
+                    print(f"[v1] constant folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
             if self.enable_static_list_folding:
+                if _v >= 1: _t0 = _time_mod.perf_counter()
                 for defn in definitions:
                     if isinstance(defn, Definition):
                         self._fold_static_list_literals_definition(defn)
+                if _v >= 1:
+                    print(f"[v1] static list folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
             stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
             if stray_forms:
                 raise CompileError("top-level literals or word references are not supported yet")
@@ -4336,7 +5168,14 @@ class Assembler:
 
                 reachable = self._reachable_runtime_defs(runtime_defs, extra_roots=extra_roots)
                 if len(reachable) != len(runtime_defs):
+                    if _v >= 2:
+                        eliminated = [defn.name for defn in runtime_defs if defn.name not in reachable]
+                    _n_before_dce = len(runtime_defs)
                     runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
+                    if _v >= 1:
+                        print(f"[v1] DCE: {_n_before_dce} -> {len(runtime_defs)} definitions ({_n_before_dce - len(runtime_defs)} eliminated)")
+                    if _v >= 2 and eliminated:
+                        print(f"[v2] DCE eliminated: {', '.join(eliminated)}")
                 # Ensure `_start` is preserved even if not reachable from
                 # `main` or the discovered roots; user-provided `_start`
                 # must override the default stub.
@@ -4350,14 +5189,35 @@ class Assembler:
             # Inline-only definitions are expanded at call sites; skip emitting standalone labels.
             runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
 
-            self._last_cfg_definitions = [
-                self._copy_definition_for_cfg(defn)
-                for defn in runtime_defs
-                if isinstance(defn, Definition)
-            ]
+            if self._need_cfg:
+                self._last_cfg_definitions = [
+                    self._copy_definition_for_cfg(defn)
+                    for defn in runtime_defs
+                    if isinstance(defn, Definition)
+                ]
 
+            if self.enable_extern_type_check or self.enable_stack_check:
+                if _v >= 1: _t0 = _time_mod.perf_counter()
+                self._check_extern_types(runtime_defs)
+                if _v >= 1:
+                    print(f"[v1] type/stack checking: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+
+            if _v >= 1:
+                print(f"[v1] emitting {len(runtime_defs)} runtime definitions")
+
+            if _v >= 1: _t0 = _time_mod.perf_counter()
             for definition in runtime_defs:
+                if _v >= 3:
+                    body_len = len(definition.body) if isinstance(definition, Definition) else 0
+                    kind = "asm" if isinstance(definition, AsmDefinition) else "def"
+                    # v3: dump full body opcodes
+                    print(f"[v3] emit {kind} '{definition.name}' (body ops: {body_len})")
+                    if isinstance(definition, Definition) and definition.body:
+                        for i, node in enumerate(definition.body):
+                            print(f"[v3]   [{i}] {node.op}({node.data!r})")
                 self._emit_definition(definition, emission.text, debug=debug)
+            if _v >= 1:
+                print(f"[v1] code emission: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
 
             # --- now generate and emit the runtime prelude ---
             # Determine whether a user-provided `_start` exists among the
@@ -4399,7 +5259,7 @@ class Assembler:
             # Prepend prelude lines to any already-emitted text (definitions).
             emission.text = (prelude_lines if prelude_lines is not None else []) + list(emission.text)
             try:
-                self._emitted_start = any(l.strip().startswith("_start:") for l in emission.text)
+                self._emitted_start = user_has_start
             except Exception:
                 self._emitted_start = False
             # If no `_start` has been emitted (either detected in
@@ -4442,6 +5302,9 @@ class Assembler:
                     self._data_section.append("data_end:")
             bss_lines = module.bss if module.bss is not None else self._bss_layout()
             emission.bss.extend(bss_lines)
+            if _v >= 1:
+                _emit_dt = (_time_mod.perf_counter() - _emit_t0) * 1000
+                print(f"[v1] total emit: {_emit_dt:.2f}ms")
             return emission
         finally:
             self._data_section = None
@@ -4575,33 +5438,33 @@ class Assembler:
             data = node.data
             if kind == OP_LABEL:
                 mapped = remap(str(data))
-                self._emit_node(Op(op="label", data=mapped), builder)
+                self._emit_node(_make_op("label", mapped), builder)
                 continue
             if kind == OP_JUMP:
                 mapped = remap(str(data))
-                self._emit_node(Op(op="jump", data=mapped), builder)
+                self._emit_node(_make_op("jump", mapped), builder)
                 continue
             if kind == OP_BRANCH_ZERO:
                 mapped = remap(str(data))
-                self._emit_node(Op(op="branch_zero", data=mapped), builder)
+                self._emit_node(_make_op("branch_zero", mapped), builder)
                 continue
             if kind == OP_FOR_BEGIN:
                 mapped = {
                     "loop": remap(data["loop"]),
                     "end": remap(data["end"]),
                 }
-                self._emit_node(Op(op="for_begin", data=mapped), builder)
+                self._emit_node(_make_op("for_begin", mapped), builder)
                 continue
             if kind == OP_FOR_END:
                 mapped = {
                     "loop": remap(data["loop"]),
                     "end": remap(data["end"]),
                 }
-                self._emit_node(Op(op="for_end", data=mapped), builder)
+                self._emit_node(_make_op("for_end", mapped), builder)
                 continue
             if kind == OP_LIST_BEGIN or kind == OP_LIST_END:
                 mapped = remap(str(data))
-                self._emit_node(Op(op=node.op, data=mapped), builder)
+                self._emit_node(_make_op(node.op, mapped), builder)
                 continue
             self._emit_node(node, builder)
 
@@ -4611,33 +5474,50 @@ class Assembler:
         body = definition.body.strip("\n")
         if not body:
             return
-        import re
+        _call_sub = _RE_ASM_CALL.sub
+        _global_sub = _RE_ASM_GLOBAL.sub
+        _extern_sub = _RE_ASM_EXTERN.sub
+        def repl_sym(m: re.Match) -> str:
+            name = m.group(1)
+            return m.group(0).replace(name, sanitize_label(name))
         for line in body.splitlines():
             if not line.strip():
                 continue
-            # Sanitize symbol references in raw asm bodies so they match
-            # the sanitized labels emitted for high-level definitions.
-            # Handle common patterns: `call NAME`, `global NAME`, `extern NAME`.
+            line = _call_sub(repl_sym, line)
+            line = _global_sub(repl_sym, line)
+            line = _extern_sub(repl_sym, line)
+            builder.emit(line)
+
+    def _emit_asm_body_inline(self, definition: AsmDefinition, builder: FunctionEmitter) -> None:
+        """Emit an asm body inline, stripping ret instructions."""
+        # Cache sanitized lines on the definition to avoid re-parsing.
+        cached = definition._inline_lines
+        if cached is None:
+            _call_sub = _RE_ASM_CALL.sub
+            _global_sub = _RE_ASM_GLOBAL.sub
+            _extern_sub = _RE_ASM_EXTERN.sub
             def repl_sym(m: re.Match) -> str:
                 name = m.group(1)
                 return m.group(0).replace(name, sanitize_label(name))
-
-            # `call NAME`
-            line = re.sub(r"\bcall\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
-            # `global NAME`
-            line = re.sub(r"\bglobal\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
-            # `extern NAME`
-            line = re.sub(r"\bextern\s+([A-Za-z_][A-Za-z0-9_]*)\b", repl_sym, line)
-
-            builder.emit(line)
+            cached = []
+            body = definition.body.strip("\n")
+            for line in body.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped == "ret":
+                    continue
+                if "call " in line or "global " in line or "extern " in line:
+                    line = _call_sub(repl_sym, line)
+                    line = _global_sub(repl_sym, line)
+                    line = _extern_sub(repl_sym, line)
+                cached.append(line)
+            definition._inline_lines = cached
+        text = builder.text
+        text.extend(cached)
 
     def _emit_node(self, node: Op, builder: FunctionEmitter) -> None:
         kind = node._opcode
         data = node.data
         builder.set_location(node.loc)
-
-        def ctx() -> str:
-            return f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
 
         if kind == OP_LITERAL:
             if isinstance(data, int):
@@ -4652,18 +5532,18 @@ class Assembler:
                 builder.push_label(label)
                 builder.push_literal(length)
                 return
-            raise CompileError(f"unsupported literal type {type(data)!r}{ctx()}")
+            raise CompileError(f"unsupported literal type {type(data)!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported literal type {type(data)!r}")
 
         if kind == OP_WORD:
-            self._emit_wordref(str(data), builder)
+            self._emit_wordref(data, builder)
             return
 
         if kind == OP_WORD_PTR:
-            self._emit_wordptr(str(data), builder)
+            self._emit_wordptr(data, builder)
             return
 
         if kind == OP_BRANCH_ZERO:
-            self._emit_branch_zero(str(data), builder)
+            self._emit_branch_zero(data, builder)
             return
 
         if kind == OP_JUMP:
@@ -4768,7 +5648,7 @@ class Assembler:
             builder.emit("    mov [r12], rax")
             return
 
-        raise CompileError(f"unsupported op {node!r}{ctx()}")
+        raise CompileError(f"unsupported op {node!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported op {node!r}")
 
     def _emit_mmap_alloc(self, builder: FunctionEmitter, size: int, target_reg: str = "rax") -> None:
         alloc_size = max(1, int(size))
@@ -4993,21 +5873,49 @@ class Assembler:
             raise CompileError(f"unknown word '{name}'{suffix}")
         if word.compile_only:
             return  # silently skip compile-time-only words during emission
-        if getattr(word, "inline", False) and isinstance(word.definition, Definition):
-            if word.name in self._inline_stack:
-                suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-                raise CompileError(f"recursive inline expansion for '{word.name}'{suffix}")
-            self._inline_stack.append(word.name)
-            self._emit_inline_definition(word, builder)
-            self._inline_stack.pop()
-            return
+        if getattr(word, "inline", False):
+            if isinstance(word.definition, Definition):
+                if word.name in self._inline_stack:
+                    suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+                    raise CompileError(f"recursive inline expansion for '{word.name}'{suffix}")
+                self._inline_stack.append(word.name)
+                self._emit_inline_definition(word, builder)
+                self._inline_stack.pop()
+                return
+            if isinstance(word.definition, AsmDefinition):
+                self._emit_asm_body_inline(word.definition, builder)
+                return
         if word.intrinsic:
             word.intrinsic(builder)
+            return
+        # Auto-inline small asm bodies even without explicit `inline` keyword.
+        if self.enable_auto_inline and isinstance(word.definition, AsmDefinition) and self._asm_auto_inline_ok(word.definition):
+            self._emit_asm_body_inline(word.definition, builder)
             return
         if getattr(word, "is_extern", False):
             self._emit_extern_wordref(name, word, builder)
         else:
             builder.emit(f"    call {sanitize_label(name)}")
+
+    @staticmethod
+    def _asm_auto_inline_ok(defn: AsmDefinition) -> bool:
+        """Return True if *defn* is small enough to auto-inline at call sites."""
+        cached = defn._inline_lines
+        if cached is not None:
+            return len(cached) <= _ASM_AUTO_INLINE_THRESHOLD
+        count = 0
+        for line in defn.body.split('\n'):
+            s = line.strip()
+            if not s or s == 'ret':
+                continue
+            if s.endswith(':'):
+                return False  # labels would duplicate on multiple inlines
+            if 'rsp' in s:
+                return False  # references call-frame; must stay a real call
+            count += 1
+            if count > _ASM_AUTO_INLINE_THRESHOLD:
+                return False
+        return True
 
     def _emit_wordptr(self, name: str, builder: FunctionEmitter) -> None:
         word = self.dictionary.lookup(name)
@@ -5121,10 +6029,10 @@ def macro_compile_only(ctx: MacroContext) -> Optional[List[Op]]:
 def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
     next_tok = parser.peek_token()
-    if next_tok is None or next_tok.lexeme != "word":
-        raise ParseError("'inline' must be followed by 'word'")
+    if next_tok is None or next_tok.lexeme not in ("word", ":asm"):
+        raise ParseError("'inline' must be followed by 'word' or ':asm'")
     if parser._pending_inline_definition:
-        raise ParseError("duplicate 'inline' before 'word'")
+        raise ParseError("duplicate 'inline' before definition")
     parser._pending_inline_definition = True
     return None
 
@@ -5146,7 +6054,7 @@ def macro_label(ctx: MacroContext) -> Optional[List[Op]]:
     definition = _require_definition_context(parser, "label")
     if any(node._opcode == OP_LABEL and node.data == name for node in definition.body):
         raise ParseError(f"duplicate label '{name}' in definition '{definition.name}'")
-    parser.emit_node(Op(op="label", data=name))
+    parser.emit_node(_make_op("label", name))
     return None
 
 
@@ -5159,7 +6067,7 @@ def macro_goto(ctx: MacroContext) -> Optional[List[Op]]:
     if not _is_identifier(name):
         raise ParseError(f"invalid label name '{name}'")
     _require_definition_context(parser, "goto")
-    parser.emit_node(Op(op="jump", data=name))
+    parser.emit_node(_make_op("jump", name))
     return None
 
 
@@ -5178,7 +6086,7 @@ def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
     parser.compile_time_vm.invoke(word)
     parser.compile_time_vm._ct_executed.add(name)
     if isinstance(parser.context_stack[-1], Definition):
-        parser.emit_node(Op(op="word", data=name))
+        parser.emit_node(_make_op("word", name))
     return None
 
 
@@ -6078,6 +6986,8 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
     ctypes.memmove(ptr, code, len(code))
     vm._jit_code_pages.append((ptr, page_size))
     # Same signature: (r12, r13, out_ptr) → void
+    if CompileTimeVM._JIT_FUNC_TYPE is None:
+        CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
     func = CompileTimeVM._JIT_FUNC_TYPE(ptr)
     return func
 
@@ -6354,9 +7264,9 @@ def macro_cstruct_begin(ctx: MacroContext) -> Optional[List[Op]]:
 def macro_here(ctx: MacroContext) -> Optional[List[Op]]:
     tok = ctx.parser._last_token
     if tok is None:
-        return [Op(op="literal", data="<source>:0:0")]
+        return [_make_op("literal", "<source>:0:0")]
     loc = ctx.parser.location_for_token(tok)
-    return [Op(op="literal", data=f"{loc.path.name}:{loc.line}:{loc.column}")]
+    return [_make_op("literal", f"{loc.path.name}:{loc.line}:{loc.column}")]
 
 
 def bootstrap_dictionary() -> Dictionary:
@@ -6391,12 +7301,21 @@ class FileSpan:
 
 
 class Compiler:
-    def __init__(self, include_paths: Optional[Sequence[Path]] = None) -> None:
+    def __init__(
+        self,
+        include_paths: Optional[Sequence[Path]] = None,
+        *,
+        macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
+    ) -> None:
         self.reader = Reader()
         self.dictionary = bootstrap_dictionary()
         self._syscall_label_counter = 0
         self._register_syscall_words()
-        self.parser = Parser(self.dictionary, self.reader)
+        self.parser = Parser(
+            self.dictionary,
+            self.reader,
+            macro_expansion_limit=macro_expansion_limit,
+        )
         self.assembler = Assembler(self.dictionary)
         if include_paths is None:
             include_paths = [Path("."), Path("./stdlib")]
@@ -6522,7 +7441,7 @@ class Compiler:
         spans: List[FileSpan],
         seen: Set[Path],
     ) -> None:
-        path = path.resolve()
+        # path is expected to be already resolved by callers
         if path in seen:
             return
         seen.add(path)
@@ -6540,90 +7459,115 @@ class Compiler:
         segment_start_global: Optional[int] = None
         segment_start_local: int = 1
         file_line_no = 1
+        _out_append = out_lines.append
+        _spans_append = spans.append
+        _FileSpan = FileSpan
 
-        def begin_segment_if_needed() -> None:
-            nonlocal segment_start_global, segment_start_local
-            if segment_start_global is None:
-                segment_start_global = len(out_lines) + 1
-                segment_start_local = file_line_no
-
-        def close_segment_if_open() -> None:
-            nonlocal segment_start_global
-            if segment_start_global is None:
-                return
-            spans.append(
-                FileSpan(
-                    path=path,
-                    start_line=segment_start_global,
-                    end_line=len(out_lines) + 1,
-                    local_start_line=segment_start_local,
-                )
-            )
-            segment_start_global = None
-
-        def scan_line(line: str) -> None:
-            nonlocal brace_depth, string_char, escape
-            for ch in line:
-                if string_char:
-                    if escape:
-                        escape = False
-                    elif ch == "\\":
-                        escape = True
-                    elif ch == string_char:
-                        string_char = None
-                else:
-                    if ch in ("'", '"'):
-                        string_char = ch
-                    elif ch == "{":
-                        brace_depth += 1
-                    elif ch == "}":
-                        brace_depth -= 1
-
-        for idx, line in enumerate(contents.splitlines()):
+        for line in contents.splitlines():
             stripped = line.strip()
 
-            if not in_py_block and stripped.startswith(":py") and "{" in stripped:
+            if not in_py_block and stripped[:3] == ":py" and "{" in stripped:
                 in_py_block = True
                 brace_depth = 0
                 string_char = None
                 escape = False
-                scan_line(line)
-                begin_segment_if_needed()
-                out_lines.append(line)
+                # scan_line inline
+                for ch in line:
+                    if string_char:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == string_char:
+                            string_char = None
+                    else:
+                        if ch == "'" or ch == '"':
+                            string_char = ch
+                        elif ch == "{":
+                            brace_depth += 1
+                        elif ch == "}":
+                            brace_depth -= 1
+                # begin_segment_if_needed inline
+                if segment_start_global is None:
+                    segment_start_global = len(out_lines) + 1
+                    segment_start_local = file_line_no
+                _out_append(line)
                 file_line_no += 1
                 if brace_depth == 0:
                     in_py_block = False
                 continue
 
             if in_py_block:
-                scan_line(line)
-                begin_segment_if_needed()
-                out_lines.append(line)
+                # scan_line inline
+                for ch in line:
+                    if string_char:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == string_char:
+                            string_char = None
+                    else:
+                        if ch == "'" or ch == '"':
+                            string_char = ch
+                        elif ch == "{":
+                            brace_depth += 1
+                        elif ch == "}":
+                            brace_depth -= 1
+                # begin_segment_if_needed inline
+                if segment_start_global is None:
+                    segment_start_global = len(out_lines) + 1
+                    segment_start_local = file_line_no
+                _out_append(line)
                 file_line_no += 1
                 if brace_depth == 0:
                     in_py_block = False
                 continue
 
-            if stripped.startswith("import "):
+            if stripped[:7] == "import ":
                 target = stripped.split(None, 1)[1].strip()
                 if not target:
-                    raise ParseError(f"empty import target in {path}:{idx + 1}")
+                    raise ParseError(f"empty import target in {path}:{file_line_no}")
 
-                # Keep a placeholder line so line numbers in the importing file stay stable.
-                begin_segment_if_needed()
-                out_lines.append("")
+                # begin_segment_if_needed inline
+                if segment_start_global is None:
+                    segment_start_global = len(out_lines) + 1
+                    segment_start_local = file_line_no
+                _out_append("")
                 file_line_no += 1
-                close_segment_if_open()
+                # close_segment_if_open inline
+                if segment_start_global is not None:
+                    _spans_append(
+                        _FileSpan(
+                            path=path,
+                            start_line=segment_start_global,
+                            end_line=len(out_lines) + 1,
+                            local_start_line=segment_start_local,
+                        )
+                    )
+                    segment_start_global = None
 
                 target_path = self._resolve_import_target(path, target)
                 self._append_file_with_imports(target_path, out_lines, spans, seen)
                 continue
 
-            begin_segment_if_needed()
-            out_lines.append(line)
+            # begin_segment_if_needed inline
+            if segment_start_global is None:
+                segment_start_global = len(out_lines) + 1
+                segment_start_local = file_line_no
+            _out_append(line)
             file_line_no += 1
 
-        close_segment_if_open()
+        # close_segment_if_open inline
+        if segment_start_global is not None:
+            _spans_append(
+                _FileSpan(
+                    path=path,
+                    start_line=segment_start_global,
+                    end_line=len(out_lines) + 1,
+                    local_start_line=segment_start_local,
+                )
+            )
 
 
 class BuildCache:
@@ -6634,10 +7578,12 @@ class BuildCache:
 
     @staticmethod
     def _hash_bytes(data: bytes) -> str:
+        import hashlib
         return hashlib.sha256(data).hexdigest()
 
     @staticmethod
     def _hash_str(s: str) -> str:
+        import hashlib
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
     def _manifest_path(self, source: Path) -> Path:
@@ -6652,9 +7598,15 @@ class BuildCache:
         peephole: bool,
         entry_mode: str,
     ) -> str:
+        # Include the compiler's own mtime so any change to main.py
+        # (codegen improvements, bug fixes) invalidates cached results.
+        try:
+            compiler_mtime = os.path.getmtime(__file__)
+        except OSError:
+            compiler_mtime = 0
         return self._hash_str(
             f"debug={debug},folding={folding},static_list_folding={static_list_folding},"
-            f"peephole={peephole},entry_mode={entry_mode}"
+            f"peephole={peephole},entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
         )
 
     def _file_info(self, path: Path) -> dict:
@@ -6670,8 +7622,9 @@ class BuildCache:
         if not mp.exists():
             return None
         try:
+            import json
             return json.loads(mp.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             return None
 
     def check_fresh(self, manifest: dict, fhash: str) -> bool:
@@ -6730,14 +7683,17 @@ class BuildCache:
             "asm_hash": asm_hash,
             "has_ct_effects": has_ct_effects,
         }
+        import json
         self._manifest_path(source).write_text(json.dumps(manifest))
 
     def clean(self) -> None:
         if self.cache_dir.exists():
+            import shutil
             shutil.rmtree(self.cache_dir)
 
 
 def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
+    import subprocess
     cmd = ["nasm", "-f", "elf64"]
     if debug:
         cmd.extend(["-g", "-F", "dwarf"])
@@ -6748,6 +7704,7 @@ def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
 def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *, shared: bool = False):
     libs = libs or []
 
+    import shutil
     lld = shutil.which("ld.lld")
     ld = shutil.which("ld")
 
@@ -6781,6 +7738,10 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
             cmd.extend([
                 "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
             ])
+        # Add standard library search paths so ld.lld can find libc etc.
+        for lib_dir in ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/lib/x86_64-linux-gnu"]:
+            if os.path.isdir(lib_dir):
+                cmd.append(f"-L{lib_dir}")
         for lib in libs:
             if not lib:
                 continue
@@ -6805,10 +7766,12 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
     if debug:
         cmd.append("-g")
 
+    import subprocess
     subprocess.run(cmd, check=True)
 
 
 def build_static_library(obj_path: Path, archive_path: Path) -> None:
+    import subprocess
     parent = archive_path.parent
     if parent and not parent.exists():
         parent.mkdir(parents=True, exist_ok=True)
@@ -6821,6 +7784,7 @@ def _load_sidecar_meta_libs(source: Path) -> List[str]:
     if not meta_path.exists():
         return []
     try:
+        import json
         payload = json.loads(meta_path.read_text())
     except Exception as exc:
         print(f"[warn] failed to read {meta_path}: {exc}")
@@ -6843,6 +7807,7 @@ def _build_ct_sidecar_shared(source: Path, temp_dir: Path) -> Optional[Path]:
     temp_dir.mkdir(parents=True, exist_ok=True)
     so_path = temp_dir / f"{source.stem}.ctlib.so"
     cmd = ["cc", "-shared", "-fPIC", str(c_path), "-o", str(so_path)]
+    import subprocess
     subprocess.run(cmd, check=True)
     return so_path
 
@@ -6971,7 +7936,10 @@ def run_repl(
             has_user_main = False
             pending_block.clear()
             # Re-create compiler for a clean dictionary state
-            compiler = Compiler(include_paths=include_paths)
+            compiler = Compiler(
+                include_paths=include_paths,
+                macro_expansion_limit=compiler.parser.macro_expansion_limit,
+            )
             print("[repl] session cleared")
             continue
         if stripped.startswith(":seteditor"):
@@ -7001,7 +7969,9 @@ def run_repl(
                 if not target_path.exists():
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     target_path.touch()
+                import shlex
                 cmd_parts = shlex.split(editor_cmd)
+                import subprocess
                 subprocess.run([*cmd_parts, str(target_path)])
                 if target_path.resolve() == src_path.resolve():
                     try:
@@ -7334,6 +8304,7 @@ def _filter_docs(entries: Sequence[DocEntry], query: str) -> List[DocEntry]:
         return list(entries)
 
     try:
+        import shlex
         raw_terms = [term.lower() for term in shlex.split(q) if term]
     except Exception:
         raw_terms = [term.lower() for term in q.split() if term]
@@ -8118,6 +9089,7 @@ def run_docs_explorer(
 
 
 def cli(argv: Sequence[str]) -> int:
+    import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
     parser.add_argument("-o", dest="output", type=Path, default=None, help="output path (defaults vary by artifact)")
@@ -8146,6 +9118,13 @@ def cli(argv: Sequence[str]) -> int:
         help="disable static list-literal folding (lists stay runtime-allocated)",
     )
     parser.add_argument("--no-peephole", action="store_true", help="disable peephole optimizations")
+    parser.add_argument("--no-loop-unroll", action="store_true", help="disable loop unrolling optimization")
+    parser.add_argument("--no-auto-inline", action="store_true", help="disable auto-inlining of small asm bodies")
+    parser.add_argument("-O0", dest="O0", action="store_true", help="disable all optimizations")
+    parser.add_argument("-O2", dest="O2", action="store_true", help="fast mode: disable all optimizations and checks")
+    parser.add_argument("-v", "--verbose", type=int, default=0, metavar="LEVEL", help="verbosity level (1=summary+timing, 2=per-function/DCE, 3=full debug, 4=optimization detail)")
+    parser.add_argument("--no-extern-type-check", action="store_true", help="disable extern function argument count checking")
+    parser.add_argument("--no-stack-check", action="store_true", help="disable stack underflow checking for builtins")
     parser.add_argument("--no-cache", action="store_true", help="disable incremental build cache")
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
@@ -8185,6 +9164,12 @@ def cli(argv: Sequence[str]) -> int:
         metavar="PATH",
         help="write Graphviz DOT control-flow dump (default: <temp-dir>/<source>.cfg.dot)",
     )
+    parser.add_argument(
+        "--macro-expansion-limit",
+        type=int,
+        default=DEFAULT_MACRO_EXPANSION_LIMIT,
+        help="maximum nested macro expansion depth (default: %(default)s)",
+    )
 
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
@@ -8204,11 +9189,36 @@ def cli(argv: Sequence[str]) -> int:
         args.no_artifact = True
         args.ct_run_main = True
 
+    if args.macro_expansion_limit < 1:
+        parser.error("--macro-expansion-limit must be >= 1")
+
     artifact_kind = args.artifact
-    folding_enabled = not args.no_folding
-    static_list_folding_enabled = not args.no_static_list_folding
-    peephole_enabled = not args.no_peephole
+    if args.O2:
+        folding_enabled = False
+        static_list_folding_enabled = False
+        peephole_enabled = False
+        loop_unroll_enabled = False
+        auto_inline_enabled = False
+        extern_type_check_enabled = False
+        stack_check_enabled = False
+    elif args.O0:
+        folding_enabled = False
+        static_list_folding_enabled = False
+        peephole_enabled = False
+        loop_unroll_enabled = False
+        auto_inline_enabled = not args.no_auto_inline
+        extern_type_check_enabled = not args.no_extern_type_check
+        stack_check_enabled = not args.no_stack_check
+    else:
+        folding_enabled = not args.no_folding
+        static_list_folding_enabled = not args.no_static_list_folding
+        peephole_enabled = not args.no_peephole
+        loop_unroll_enabled = not args.no_loop_unroll
+        auto_inline_enabled = not args.no_auto_inline
+        extern_type_check_enabled = not args.no_extern_type_check
+        stack_check_enabled = not args.no_stack_check
     cfg_output: Optional[Path] = None
+    verbosity: int = args.verbose
 
     if args.ct_run_main and artifact_kind != "exe":
         parser.error("--ct-run-main requires --artifact exe")
@@ -8222,6 +9232,7 @@ def cli(argv: Sequence[str]) -> int:
     if args.clean:
         try:
             if args.temp_dir.exists():
+                import shutil
                 shutil.rmtree(args.temp_dir)
                 print(f"[info] removed {args.temp_dir}")
             else:
@@ -8277,6 +9288,7 @@ def cli(argv: Sequence[str]) -> int:
                 ct_run_libs.append(lib)
 
     if args.ct_run_main and args.source is not None:
+        import subprocess
         try:
             ct_sidecar = _build_ct_sidecar_shared(args.source, args.temp_dir)
         except subprocess.CalledProcessError as exc:
@@ -8287,10 +9299,20 @@ def cli(argv: Sequence[str]) -> int:
             if so_lib not in ct_run_libs:
                 ct_run_libs.append(so_lib)
 
-    compiler = Compiler(include_paths=[Path("."), Path("./stdlib"), *args.include_paths])
+    compiler = Compiler(
+        include_paths=[Path("."), Path("./stdlib"), *args.include_paths],
+        macro_expansion_limit=args.macro_expansion_limit,
+    )
     compiler.assembler.enable_constant_folding = folding_enabled
     compiler.assembler.enable_static_list_folding = static_list_folding_enabled
     compiler.assembler.enable_peephole_optimization = peephole_enabled
+    compiler.assembler.enable_loop_unroll = loop_unroll_enabled
+    compiler.assembler.enable_auto_inline = auto_inline_enabled
+    compiler.assembler.enable_extern_type_check = extern_type_check_enabled
+    compiler.assembler.enable_stack_check = stack_check_enabled
+    compiler.assembler.verbosity = verbosity
+    if args.dump_cfg is not None:
+        compiler.assembler._need_cfg = True
 
     cache: Optional[BuildCache] = None
     if not args.no_cache:
@@ -8311,6 +9333,7 @@ def cli(argv: Sequence[str]) -> int:
                 folding_enabled,
                 static_list_folding_enabled,
                 peephole_enabled,
+                auto_inline_enabled,
                 entry_mode,
             )
             manifest = cache.load_manifest(args.source)
@@ -8318,13 +9341,22 @@ def cli(argv: Sequence[str]) -> int:
                 cached = cache.get_cached_asm(manifest)
                 if cached is not None:
                     asm_text = cached
+                    if verbosity >= 1:
+                        print(f"[v1] cache hit for {args.source}")
 
         if asm_text is None:
+            if verbosity >= 1:
+                import time as _time_mod
+                _compile_t0 = _time_mod.perf_counter()
             emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
 
             # Snapshot assembly text *before* ct-run-main JIT execution, which may
             # corrupt Python heap objects depending on memory layout.
             asm_text = emission.snapshot()
+            if verbosity >= 1:
+                _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
+                print(f"[v1] compilation: {_compile_dt:.1f}ms")
+                print(f"[v1] assembly size: {len(asm_text)} bytes")
 
             if cache and not args.ct_run_main:
                 if not fhash:
@@ -8333,6 +9365,7 @@ def cli(argv: Sequence[str]) -> int:
                         folding_enabled,
                         static_list_folding_enabled,
                         peephole_enabled,
+                        auto_inline_enabled,
                         entry_mode,
                     )
                 has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
@@ -8390,8 +9423,18 @@ def cli(argv: Sequence[str]) -> int:
     if args.output.parent and not args.output.parent.exists():
         args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- incremental: skip linker if output newer than .o ---
-    need_link = need_nasm or not args.output.exists()
+    # --- incremental: skip linker if output newer than .o AND same source ---
+    # Track which .o produced the output so switching source files forces relink.
+    link_stamp = args.temp_dir / f"{args.output.name}.link_src"
+    need_link = need_nasm or not args.output.exists() or args.no_cache
+    if not need_link:
+        # Check that the output was linked from the same .o last time.
+        try:
+            recorded = link_stamp.read_text()
+        except OSError:
+            recorded = ""
+        if recorded != str(obj_path.resolve()):
+            need_link = True
     if not need_link:
         try:
             need_link = args.output.stat().st_mtime < obj_path.stat().st_mtime
@@ -8402,12 +9445,19 @@ def cli(argv: Sequence[str]) -> int:
         dest = args.output
         if obj_path.resolve() != dest.resolve():
             if need_link:
+                import shutil
                 shutil.copy2(obj_path, dest)
     elif artifact_kind == "static":
         if need_link:
             build_static_library(obj_path, args.output)
     else:
         if need_link:
+            # Remove existing output first to avoid "Text file busy" on Linux
+            # when the old binary is still mapped by a running process.
+            try:
+                args.output.unlink(missing_ok=True)
+            except OSError:
+                pass
             run_linker(
                 obj_path,
                 args.output,
@@ -8416,9 +9466,14 @@ def cli(argv: Sequence[str]) -> int:
                 shared=(artifact_kind == "shared"),
             )
 
-    print(f"[info] built {args.output}")
+    if need_link:
+        link_stamp.write_text(str(obj_path.resolve()))
+        print(f"[info] built {args.output}")
+    else:
+        print(f"[info] {args.output} is up to date")
 
     if artifact_kind == "exe":
+        import subprocess
         exe_path = Path(args.output).resolve()
         if args.dbg:
             subprocess.run(["gdb", str(exe_path)])

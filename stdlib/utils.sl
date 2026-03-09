@@ -21,8 +21,7 @@ word strconcat
     swap
     3 pick
     -
-    swap
-    drop
+    nip
     swap
     0 rpick
     nip
@@ -56,11 +55,11 @@ end
 #toint [*, addr | len] -> [* | int]
 # converts a string to an int
 word toint
-    swap
-    over 0 swap
+    tuck
+    0 swap
     dup >r
     for
-        over over +
+        2dup +
         c@ 48 -
         swap rot
         swap
@@ -72,7 +71,7 @@ word toint
     digitsN>num
     r> 1 +
     for
-        swap drop
+        nip
     end
     rdrop rdrop
 end
@@ -134,7 +133,7 @@ word indexof
     while dup 3 pick < 2 pick -1 == band do # while i < len && result == -1
         dup 4 pick + c@                     # byte = addr[i]
         r@ == if                            # byte == char?
-            swap drop dup                   # result = i
+            nip dup                         # result = i
         end
         1 +                                 # i++
     end
@@ -220,7 +219,7 @@ end
 #formats [*, sN_addr, sN_len, ..., s1_addr, s1_len, fmt_addr | fmt_len] -> [*, result_addr | result_len]
 word formats
     2dup 37 count_char_in_str nip nip  # count '%' -> n
-    dup 0 == if
+    dup not if
         drop                       # no substitutions needed
     else
         1 - >r                     # remaining = n - 1
@@ -243,7 +242,7 @@ end
 #formati [*, iN, ..., i1, fmt_addr | fmt_len] -> [*, result_addr | result_len]
 word formati
     2dup 37 count_char_in_str nip nip  # count '%' -> n
-    dup 0 == if
+    dup not if
         drop                       # no substitutions needed
     else
         1 - >r                     # remaining = n - 1
@@ -269,7 +268,7 @@ end
 word find_fmt
     over >r dup >r           # rstack: 0=len, 1=addr
     -1 0 0                    # pos=-1, type=0, i=0
-    while dup 0 rpick 1 - < 2 pick 0 == band do
+    while dup 0 rpick 1 - < 2 pick not band do
         1 rpick over + c@    # addr[i]
         37 == if              # '%'
             1 rpick over + 1 + c@  # addr[i+1]
@@ -363,7 +362,7 @@ end
 # original format string unchanged if there are no placeholders.
 word format
     2dup count_fmt nip nip     # n = placeholder count
-    dup 0 == if
+    dup not if
         drop
     else
         >r

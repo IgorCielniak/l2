@@ -7301,6 +7301,79 @@ class FileSpan:
     local_start_line: int  # 1-based line in the original file
 
 
+# Uppercase macro prefixes to strip (API export macros like RLAPI, WINGDIAPI, etc.)
+# Keep common uppercase type names.
+_C_HEADER_KEEP_UPPER = frozenset({"FILE", "DIR", "EOF", "NULL", "BOOL"})
+
+
+def _parse_c_header_externs(header_text: str) -> List[str]:
+    """Extract function declarations from a C header and return L2 ``extern`` lines."""
+    text = re.sub(r"/\*.*?\*/", " ", header_text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"^\s*#[^\n]*$", "", text, flags=re.MULTILINE)
+    text = text.replace("\\\n", " ")
+    # Collapse whitespace (including newlines) so multi-line declarations become single-line
+    text = re.sub(r"\s+", " ", text)
+    # Strip __attribute__((...)), __nonnull((...)), __THROW, __wur, and similar GCC extensions
+    text = re.sub(r"__\w+\s*\(\([^)]*\)\)", "", text)
+    text = re.sub(r"__\w+", "", text)
+    # Remove __restrict
+    text = text.replace("__restrict", "")
+
+    # Match function declarations: <tokens> <name>(<params>);
+    _RE = re.compile(
+        r"([\w][\w\s*]+?)"           # return type tokens + function name
+        r"\s*\(([^)]*?)\)"           # parameter list
+        r"\s*;"
+    )
+
+    results: List[str] = []
+    for m in _RE.finditer(text):
+        prefix = m.group(1).strip()
+        params_raw = m.group(2).strip()
+
+        if "..." in params_raw:
+            continue
+
+        tokens = prefix.split()
+        if len(tokens) < 2:
+            continue
+
+        # Last token is function name (may have leading * for pointer-returning functions)
+        func_name = tokens[-1].lstrip("*")
+        if not func_name or not re.match(r"^[A-Za-z_]\w*$", func_name):
+            continue
+
+        # Skip typedef, struct/enum/union definitions
+        if tokens[0] in ("typedef", "struct", "enum", "union"):
+            continue
+
+        # Build return type: strip API macros and calling-convention qualifiers
+        type_tokens = tokens[:-1]
+        cleaned: List[str] = []
+        for t in type_tokens:
+            if t in ("extern", "static", "inline"):
+                continue
+            # Strip uppercase macro prefixes (3+ chars, all caps) unless known type
+            if re.match(r"^[A-Z_][A-Z_0-9]{2,}$", t) and t not in _C_HEADER_KEEP_UPPER:
+                continue
+            cleaned.append(t)
+
+        # Pointer stars attached to the function name belong to the return type
+        leading_stars = len(tokens[-1]) - len(tokens[-1].lstrip("*"))
+        ret_type = " ".join(cleaned)
+        if leading_stars:
+            ret_type += " " + "*" * leading_stars
+        ret_type = ret_type.strip()
+        if not ret_type:
+            ret_type = "int"
+
+        param_str = "void" if params_raw in ("void", "") else params_raw
+
+        results.append(f"extern {ret_type} {func_name}({param_str})")
+    return results
+
+
 class Compiler:
     def __init__(
         self,
@@ -7550,6 +7623,30 @@ class Compiler:
 
                 target_path = self._resolve_import_target(path, target)
                 self._append_file_with_imports(target_path, out_lines, spans, seen)
+                continue
+
+            if stripped[:9] == 'cimport "' or stripped[:9] == "cimport \"":
+                # cimport "header.h" — extract extern declarations from a C header
+                m_cimport = re.match(r'cimport\s+"([^"]+)"', stripped)
+                if not m_cimport:
+                    raise ParseError(f"invalid cimport syntax at {path}:{file_line_no}")
+                header_target = m_cimport.group(1)
+                header_path = self._resolve_import_target(path, header_target)
+                try:
+                    header_text = header_path.read_text()
+                except FileNotFoundError as exc:
+                    raise ParseError(f"cimport cannot read {header_path}: {exc}") from exc
+                extern_lines = _parse_c_header_externs(header_text)
+
+                # begin_segment_if_needed inline
+                if segment_start_global is None:
+                    segment_start_global = len(out_lines) + 1
+                    segment_start_local = file_line_no
+                # Replace the cimport line with the extracted extern declarations
+                for ext_line in extern_lines:
+                    _out_append(ext_line)
+                _out_append("")  # blank line after externs
+                file_line_no += 1
                 continue
 
             # begin_segment_if_needed inline

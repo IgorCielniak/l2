@@ -4877,7 +4877,8 @@ class Assembler:
                                 print(f"[v3] type-check: '{defn.name}' -> extern '{word.name}' skipped (unknown depth)")
                     continue
                 if opc == _OP_LIT:
-                    depth += 1
+                    # String literals push 2 values (addr + len), others push 1.
+                    depth += 2 if isinstance(node.data, str) else 1
                 elif opc == _OP_WP:
                     depth += 1
                 elif opc == _OP_LIST_LIT:

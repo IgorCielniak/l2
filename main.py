@@ -7596,6 +7596,7 @@ class BuildCache:
         folding: bool,
         static_list_folding: bool,
         peephole: bool,
+        auto_inline: bool,
         entry_mode: str,
     ) -> str:
         # Include the compiler's own mtime so any change to main.py
@@ -7606,7 +7607,8 @@ class BuildCache:
             compiler_mtime = 0
         return self._hash_str(
             f"debug={debug},folding={folding},static_list_folding={static_list_folding},"
-            f"peephole={peephole},entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
+            f"peephole={peephole},auto_inline={auto_inline},"
+            f"entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
         )
 
     def _file_info(self, path: Path) -> dict:

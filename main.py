@@ -13,11 +13,11 @@ from __future__ import annotations
 import bisect
 import os
 import re
-import struct
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
 
 try:  # lazy optional import; required for compile-time :asm execution
     from keystone import Ks, KsError, KS_ARCH_X86, KS_MODE_64
@@ -30,7 +30,24 @@ except Exception:  # pragma: no cover - optional dependency
 _RE_REL_PAT = re.compile(r'\[rel\s+(\w+)\]')
 _RE_LABEL_PAT = re.compile(r'^(\.\w+|\w+):')
 _RE_BSS_PERSISTENT = re.compile(r'persistent:\s*resb\s+(\d+)')
+_RE_NEWLINE = re.compile('\n')
+# Blanking asm bodies before tokenization: the tokenizer doesn't need asm
+# content (the parser extracts it from the original source via byte offsets).
+# This removes ~75% of tokens for asm-heavy programs like game_of_life.
+_RE_ASM_BODY = re.compile(r'(:asm\b[^{]*\{)([^}]*)(})')
+_ASM_BLANK_TBL = str.maketrans({chr(i): ' ' for i in range(128) if i != 10})
+def _blank_asm_bodies(source: str) -> str:
+    return _RE_ASM_BODY.sub(lambda m: m.group(1) + m.group(2).translate(_ASM_BLANK_TBL) + m.group(3), source)
 DEFAULT_MACRO_EXPANSION_LIMIT = 256
+_SOURCE_PATH = Path("<source>")
+
+_struct_mod = None
+def _get_struct():
+    global _struct_mod
+    if _struct_mod is None:
+        import struct as _s
+        _struct_mod = _s
+    return _struct_mod
 
 
 class ParseError(Exception):
@@ -50,24 +67,38 @@ class CompileTimeError(ParseError):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
 class Token:
-    lexeme: str
-    line: int
-    column: int
-    start: int
-    end: int
-    expansion_depth: int = 0
+    __slots__ = ('lexeme', 'line', 'column', 'start', 'end', 'expansion_depth')
+
+    def __init__(self, lexeme: str, line: int, column: int, start: int, end: int, expansion_depth: int = 0) -> None:
+        self.lexeme = lexeme
+        self.line = line
+        self.column = column
+        self.start = start
+        self.end = end
+        self.expansion_depth = expansion_depth
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return f"Token({self.lexeme!r}@{self.line}:{self.column})"
 
 
-@dataclass(frozen=True, slots=True)
 class SourceLocation:
-    path: Path
-    line: int
-    column: int
+    __slots__ = ('path', 'line', 'column')
+
+    def __init__(self, path: Path, line: int, column: int) -> None:
+        self.path = path
+        self.line = line
+        self.column = column
+
+_SourceLocation_new = SourceLocation.__new__
+_SourceLocation_cls = SourceLocation
+
+def _make_loc(path: Path, line: int, column: int) -> SourceLocation:
+    loc = _SourceLocation_new(_SourceLocation_cls)
+    loc.path = path
+    loc.line = line
+    loc.column = column
+    return loc
 
 _READER_REGEX_CACHE: Dict[frozenset, "re.Pattern[str]"] = {}
 
@@ -177,36 +208,36 @@ class Reader:
             token_re = self._build_token_re()
             self._token_re = token_re
         # Pre-compute line start offsets for O(1) amortized line/column lookup
-        _line_starts = [0]
-        _pos = 0
-        _find = source.find
-        while True:
-            _pos = _find('\n', _pos)
-            if _pos == -1:
-                break
-            _pos += 1
-            _line_starts.append(_pos)
+        _line_starts = [0] + [m.end() for m in _RE_NEWLINE.finditer(source)]
         _n_lines = len(_line_starts)
         result: List[Token] = []
         _append = result.append
-        _Token = Token
-        _src = source
+        _Token_new = Token.__new__
+        _Token_cls = Token
         # Linear scan: tokens arrive in source order, so line index only advances
         _cur_li = 0
         _next_line_start = _line_starts[1] if _n_lines > 1 else 0x7FFFFFFFFFFFFFFF
         for m in token_re.finditer(source):
             start, end = m.span()
-            if _src[start] == '#':
+            fc = source[start]
+            if fc == '#':
                 continue  # skip comment
-            text = _src[start:end]
-            if text[0] == '"':
-                if len(text) < 2 or text[-1] != '"':
+            text = source[start:end]
+            if fc == '"':
+                if end - start < 2 or source[end - 1] != '"':
                     raise ParseError("unterminated string literal")
             # Advance line index to find the correct line for this position
             while start >= _next_line_start:
                 _cur_li += 1
                 _next_line_start = _line_starts[_cur_li + 1] if _cur_li + 1 < _n_lines else 0x7FFFFFFFFFFFFFFF
-            _append(_Token(text, _cur_li + 1, start - _line_starts[_cur_li], start, end))
+            tok = _Token_new(_Token_cls)
+            tok.lexeme = text
+            tok.line = _cur_li + 1
+            tok.column = start - _line_starts[_cur_li]
+            tok.start = start
+            tok.end = end
+            tok.expansion_depth = 0
+            _append(tok)
         # Update reader state to end-of-source position
         self.line = _n_lines
         self.column = len(source) - _line_starts[_n_lines - 1]
@@ -331,18 +362,17 @@ _PEEPHOLE_CANCEL_PAIRS = frozenset({
 _PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
 
 
-@dataclass(slots=True)
 class Op:
     """Flat operation used for both compile-time execution and emission."""
+    __slots__ = ('op', 'data', 'loc', '_word_ref', '_opcode')
 
-    op: str
-    data: Any = None
-    loc: Optional[SourceLocation] = None
-    _word_ref: Optional["Word"] = field(default=None, repr=False, compare=False)
-    _opcode: int = field(default=OP_OTHER, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        self._opcode = _OP_STR_TO_INT.get(self.op, OP_OTHER)
+    def __init__(self, op: str, data: Any = None, loc: Optional[SourceLocation] = None,
+                 _word_ref: Optional[Word] = None, _opcode: int = OP_OTHER) -> None:
+        self.op = op
+        self.data = data
+        self.loc = loc
+        self._word_ref = _word_ref
+        self._opcode = _OP_STR_TO_INT.get(op, OP_OTHER)
 
 
 def _make_op(op: str, data: Any = None, loc: Optional[SourceLocation] = None) -> Op:
@@ -378,73 +408,93 @@ def _make_word_op(data: str, loc: Optional[SourceLocation] = None) -> Op:
     return node
 
 
-@dataclass(slots=True)
 class Definition:
-    name: str
-    body: List[Op]
-    immediate: bool = False
-    compile_only: bool = False
-    terminator: str = "end"
-    inline: bool = False
-    stack_inputs: Optional[int] = None  # From stack-effect comment (e.g. # a b -- c)
-    # Cached analysis (populated lazily by CT VM)
-    _label_positions: Optional[Dict[str, int]] = field(default=None, repr=False, compare=False)
-    _for_pairs: Optional[Dict[int, int]] = field(default=None, repr=False, compare=False)
-    _begin_pairs: Optional[Dict[int, int]] = field(default=None, repr=False, compare=False)
-    _words_resolved: bool = field(default=False, repr=False, compare=False)
-    # Merged JIT runs: maps start_ip → (end_ip_exclusive, cache_key)
-    _merged_runs: Optional[Dict[int, Tuple[int, str]]] = field(default=None, repr=False, compare=False)
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'terminator', 'inline',
+                 'stack_inputs', '_label_positions', '_for_pairs', '_begin_pairs',
+                 '_words_resolved', '_merged_runs')
+
+    def __init__(self, name: str, body: List[Op], immediate: bool = False,
+                 compile_only: bool = False, terminator: str = "end", inline: bool = False,
+                 stack_inputs: Optional[int] = None) -> None:
+        self.name = name
+        self.body = body
+        self.immediate = immediate
+        self.compile_only = compile_only
+        self.terminator = terminator
+        self.inline = inline
+        self.stack_inputs = stack_inputs
+        self._label_positions = None
+        self._for_pairs = None
+        self._begin_pairs = None
+        self._words_resolved = False
+        self._merged_runs = None
 
 
-@dataclass(slots=True)
 class AsmDefinition:
-    name: str
-    body: str
-    immediate: bool = False
-    compile_only: bool = False
-    inline: bool = False
-    effects: Set[str] = field(default_factory=set)
-    _inline_lines: Optional[List[str]] = field(default=None, repr=False, compare=False)
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'inline', 'effects', '_inline_lines')
+
+    def __init__(self, name: str, body: str, immediate: bool = False,
+                 compile_only: bool = False, inline: bool = False,
+                 effects: Set[str] = None, _inline_lines: Optional[List[str]] = None) -> None:
+        self.name = name
+        self.body = body
+        self.immediate = immediate
+        self.compile_only = compile_only
+        self.inline = inline
+        self.effects = effects if effects is not None else set()
+        self._inline_lines = _inline_lines
 
 
-@dataclass(slots=True)
 class Module:
-    forms: List[Any]
-    variables: Dict[str, str] = field(default_factory=dict)
-    prelude: Optional[List[str]] = None
-    bss: Optional[List[str]] = None
-    cstruct_layouts: Dict[str, CStructLayout] = field(default_factory=dict)
+    __slots__ = ('forms', 'variables', 'prelude', 'bss', 'cstruct_layouts')
+
+    def __init__(self, forms: List[Any], variables: Dict[str, str] = None,
+                 prelude: Optional[List[str]] = None, bss: Optional[List[str]] = None,
+                 cstruct_layouts: Dict[str, CStructLayout] = None) -> None:
+        self.forms = forms
+        self.variables = variables if variables is not None else {}
+        self.prelude = prelude
+        self.bss = bss
+        self.cstruct_layouts = cstruct_layouts if cstruct_layouts is not None else {}
 
 
-@dataclass(slots=True)
 class MacroDefinition:
-    name: str
-    tokens: List[str]
-    param_count: int = 0
+    __slots__ = ('name', 'tokens', 'param_count')
+
+    def __init__(self, name: str, tokens: List[str], param_count: int = 0) -> None:
+        self.name = name
+        self.tokens = tokens
+        self.param_count = param_count
 
 
-@dataclass(slots=True)
 class StructField:
-    name: str
-    offset: int
-    size: int
+    __slots__ = ('name', 'offset', 'size')
+
+    def __init__(self, name: str, offset: int, size: int) -> None:
+        self.name = name
+        self.offset = offset
+        self.size = size
 
 
-@dataclass(slots=True)
 class CStructField:
-    name: str
-    type_name: str
-    offset: int
-    size: int
-    align: int
+    __slots__ = ('name', 'type_name', 'offset', 'size', 'align')
+
+    def __init__(self, name: str, type_name: str, offset: int, size: int, align: int) -> None:
+        self.name = name
+        self.type_name = type_name
+        self.offset = offset
+        self.size = size
+        self.align = align
 
 
-@dataclass(slots=True)
 class CStructLayout:
-    name: str
-    size: int
-    align: int
-    fields: List[CStructField]
+    __slots__ = ('name', 'size', 'align', 'fields')
+
+    def __init__(self, name: str, size: int, align: int, fields: List[CStructField]) -> None:
+        self.name = name
+        self.size = size
+        self.align = align
+        self.fields = fields
 
 
 class MacroContext:
@@ -500,8 +550,9 @@ class MacroContext:
         return self._parser.most_recent_definition()
 
 
-MacroHandler = Callable[[MacroContext], Optional[List[Op]]]
-IntrinsicEmitter = Callable[["FunctionEmitter"], None]
+# Type aliases (only evaluated under TYPE_CHECKING)
+MacroHandler = None  # Callable[[MacroContext], Optional[List[Op]]]
+IntrinsicEmitter = None  # Callable[["FunctionEmitter"], None]
 
 
 # Word effects ---------------------------------------------------------------
@@ -518,25 +569,36 @@ _WORD_EFFECT_ALIASES: Dict[str, str] = {
 }
 
 
-@dataclass(slots=True)
 class Word:
-    name: str
-    priority: int = 0
-    immediate: bool = False
-    definition: Optional[Union[Definition, AsmDefinition]] = None
-    macro: Optional[MacroHandler] = None
-    intrinsic: Optional[IntrinsicEmitter] = None
-    macro_expansion: Optional[List[str]] = None
-    macro_params: int = 0
-    compile_time_intrinsic: Optional[Callable[["CompileTimeVM"], None]] = None
-    runtime_intrinsic: Optional[Callable[["CompileTimeVM"], None]] = None
-    compile_only: bool = False
-    compile_time_override: bool = False
-    is_extern: bool = False
-    extern_inputs: int = 0
-    extern_outputs: int = 0
-    extern_signature: Optional[Tuple[List[str], str]] = None  # (arg_types, ret_type)
-    inline: bool = False
+    __slots__ = ('name', 'priority', 'immediate', 'definition', 'macro', 'intrinsic',
+                 'macro_expansion', 'macro_params', 'compile_time_intrinsic',
+                 'runtime_intrinsic', 'compile_only', 'compile_time_override',
+                 'is_extern', 'extern_inputs', 'extern_outputs', 'extern_signature', 'inline')
+
+    def __init__(self, name: str, priority: int = 0, immediate: bool = False,
+                 definition=None, macro=None, intrinsic=None,
+                 macro_expansion=None, macro_params: int = 0,
+                 compile_time_intrinsic=None, runtime_intrinsic=None,
+                 compile_only: bool = False, compile_time_override: bool = False,
+                 is_extern: bool = False, extern_inputs: int = 0, extern_outputs: int = 0,
+                 extern_signature=None, inline: bool = False) -> None:
+        self.name = name
+        self.priority = priority
+        self.immediate = immediate
+        self.definition = definition
+        self.macro = macro
+        self.intrinsic = intrinsic
+        self.macro_expansion = macro_expansion
+        self.macro_params = macro_params
+        self.compile_time_intrinsic = compile_time_intrinsic
+        self.runtime_intrinsic = runtime_intrinsic
+        self.compile_only = compile_only
+        self.compile_time_override = compile_time_override
+        self.is_extern = is_extern
+        self.extern_inputs = extern_inputs
+        self.extern_outputs = extern_outputs
+        self.extern_signature = extern_signature
+        self.inline = inline
 
 
 _suppress_redefine_warnings = False
@@ -547,9 +609,11 @@ def _suppress_redefine_warnings_set(value: bool) -> None:
     _suppress_redefine_warnings = value
 
 
-@dataclass(slots=True)
 class Dictionary:
-    words: Dict[str, Word] = field(default_factory=dict)
+    __slots__ = ('words',)
+
+    def __init__(self, words: Dict[str, Word] = None) -> None:
+        self.words = words if words is not None else {}
 
     def register(self, word: Word) -> Word:
         existing = self.words.get(word.name)
@@ -595,7 +659,7 @@ class Dictionary:
 # ---------------------------------------------------------------------------
 
 
-Context = Union[Module, Definition]
+Context = None  # Union[Module, Definition] - only used in annotations
 
 
 class Parser:
@@ -647,7 +711,7 @@ class Parser:
     def location_for_token(self, token: Token) -> SourceLocation:
         spans = self.file_spans
         if not spans:
-            return SourceLocation(Path("<source>"), token.line, token.column)
+            return _make_loc(_SOURCE_PATH, token.line, token.column)
         if self._span_index_len != len(spans):
             self._rebuild_span_index()
             self._span_cache_idx = -1
@@ -657,15 +721,15 @@ class Parser:
         if ci >= 0:
             span = spans[ci]
             if span.start_line <= tl < span.end_line:
-                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
+                return _make_loc(span.path, span.local_start_line + (tl - span.start_line), token.column)
         span_starts = self._span_starts
         idx = bisect.bisect_right(span_starts, tl) - 1
         if idx >= 0:
             span = spans[idx]
             if tl < span.end_line:
                 self._span_cache_idx = idx
-                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
-        return SourceLocation(Path("<source>"), tl, token.column)
+                return _make_loc(span.path, span.local_start_line + (tl - span.start_line), token.column)
+        return _make_loc(_SOURCE_PATH, tl, token.column)
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
@@ -776,6 +840,30 @@ class Parser:
         _priority_keywords = {
             "word", ":asm", ":py", "extern", "inline", "priority",
         }
+
+        # Sentinel values for dispatch actions
+        _KW_LIST_BEGIN = 1
+        _KW_LIST_END = 2
+        _KW_WORD = 3
+        _KW_END = 4
+        _KW_ASM = 5
+        _KW_PY = 6
+        _KW_EXTERN = 7
+        _KW_PRIORITY = 8
+        _KW_IF = 9
+        _KW_ELSE = 10
+        _KW_FOR = 11
+        _KW_WHILE = 12
+        _KW_DO = 13
+        _keyword_dispatch = {
+            "[": _KW_LIST_BEGIN, "]": _KW_LIST_END, "word": _KW_WORD,
+            "end": _KW_END, ":asm": _KW_ASM, ":py": _KW_PY,
+            "extern": _KW_EXTERN, "priority": _KW_PRIORITY,
+            "if": _KW_IF, "else": _KW_ELSE, "for": _KW_FOR,
+            "while": _KW_WHILE, "do": _KW_DO,
+        }
+        _kw_get = _keyword_dispatch.get
+
         _tokens = self.tokens
         try:
             while self.pos < len(_tokens):
@@ -795,51 +883,42 @@ class Parser:
                     raise ParseError(
                         f"priority {self._pending_priority} must be followed by definition/extern"
                     )
-                if lexeme == "[":
-                    self._handle_list_begin()
-                    continue
-                if lexeme == "]":
-                    self._handle_list_end(token)
-                    continue
-                if lexeme == "word":
-                    inline_def = self._consume_pending_inline()
-                    self._begin_definition(token, terminator="end", inline=inline_def)
-                    continue
-                if lexeme == "end":
-                    if self.control_stack:
-                        self._handle_end_control()
-                        continue
-                    if self._try_end_definition(token):
-                        continue
-                    raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
-                if lexeme == ":asm":
-                    self._parse_asm_definition(token)
-                    _tokens = self.tokens
-                    continue
-                if lexeme == ":py":
-                    self._parse_py_definition(token)
-                    _tokens = self.tokens
-                    continue
-                if lexeme == "extern":
-                    self._parse_extern(token)
-                    continue
-                if lexeme == "priority":
-                    self._parse_priority_directive(token)
-                    continue
-                if lexeme == "if":
-                    self._handle_if_control()
-                    continue
-                if lexeme == "else":
-                    self._handle_else_control()
-                    continue
-                if lexeme == "for":
-                    self._handle_for_control()
-                    continue
-                if lexeme == "while":
-                    self._handle_while_control()
-                    continue
-                if lexeme == "do":
-                    self._handle_do_control()
+                kw = _kw_get(lexeme)
+                if kw is not None:
+                    if kw == _KW_LIST_BEGIN:
+                        self._handle_list_begin()
+                    elif kw == _KW_LIST_END:
+                        self._handle_list_end(token)
+                    elif kw == _KW_WORD:
+                        inline_def = self._consume_pending_inline()
+                        self._begin_definition(token, terminator="end", inline=inline_def)
+                    elif kw == _KW_END:
+                        if self.control_stack:
+                            self._handle_end_control()
+                        elif self._try_end_definition(token):
+                            pass
+                        else:
+                            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
+                    elif kw == _KW_ASM:
+                        self._parse_asm_definition(token)
+                        _tokens = self.tokens
+                    elif kw == _KW_PY:
+                        self._parse_py_definition(token)
+                        _tokens = self.tokens
+                    elif kw == _KW_EXTERN:
+                        self._parse_extern(token)
+                    elif kw == _KW_PRIORITY:
+                        self._parse_priority_directive(token)
+                    elif kw == _KW_IF:
+                        self._handle_if_control()
+                    elif kw == _KW_ELSE:
+                        self._handle_else_control()
+                    elif kw == _KW_FOR:
+                        self._handle_for_control()
+                    elif kw == _KW_WHILE:
+                        self._handle_while_control()
+                    elif kw == _KW_DO:
+                        self._handle_do_control()
                     continue
                 if self._handle_token(token):
                     _tokens = self.tokens
@@ -1078,7 +1157,7 @@ class Parser:
             self._append_op(_make_op("word_ptr", target_name))
             return False
 
-        word = self.dictionary.lookup(lexeme)
+        word = self.dictionary.words.get(lexeme)
         if word is not None:
             if word.macro_expansion is not None:
                 args = self._collect_macro_args(word.macro_params)
@@ -1469,9 +1548,9 @@ class Parser:
     def _py_exec_namespace(self) -> Dict[str, Any]:
         return dict(PY_EXEC_GLOBALS)
 
-    def _append_op(self, node: Op, token: Optional[Token] = None) -> None:
+    def _append_op(self, node: Op) -> None:
         if node.loc is None:
-            tok = token or self._last_token
+            tok = self._last_token
             if tok is not None:
                 # Inlined fast path of location_for_token
                 spans = self.file_spans
@@ -1484,13 +1563,13 @@ class Parser:
                     if ci >= 0:
                         span = spans[ci]
                         if span.start_line <= tl < span.end_line:
-                            node.loc = SourceLocation(span.path, span.local_start_line + (tl - span.start_line), tok.column)
+                            node.loc = _make_loc(span.path, span.local_start_line + (tl - span.start_line), tok.column)
                         else:
                             node.loc = self._location_for_token_slow(tok, tl)
                     else:
                         node.loc = self._location_for_token_slow(tok, tl)
                 else:
-                    node.loc = SourceLocation(Path("<source>"), tok.line, tok.column)
+                    node.loc = _make_loc(_SOURCE_PATH, tok.line, tok.column)
         target = self.context_stack[-1]
         if target.__class__ is Definition:
             target.body.append(node)
@@ -1505,8 +1584,8 @@ class Parser:
             span = self.file_spans[idx]
             if tl < span.end_line:
                 self._span_cache_idx = idx
-                return SourceLocation(span.path, span.local_start_line + (tl - span.start_line), token.column)
-        return SourceLocation(Path("<source>"), tl, token.column)
+                return _make_loc(span.path, span.local_start_line + (tl - span.start_line), token.column)
+        return _make_loc(_SOURCE_PATH, tl, token.column)
 
     def _try_literal(self, token: Token) -> bool:
         lexeme = token.lexeme
@@ -1761,6 +1840,9 @@ class CompileTimeVM:
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ctypes_struct_cache: Dict[str, Any] = {}
         self.current_location: Optional[SourceLocation] = None
+        # Coroutine JIT support: save buffer for callee-saved regs (lazily allocated)
+        self._jit_save_buf: Optional[Any] = None
+        self._jit_save_buf_addr: int = 0
 
     @property
     def memory(self) -> CTMemory:
@@ -1780,6 +1862,30 @@ class CompileTimeVM:
             self._jit_out2_addr = _ctypes.addressof(self._jit_out2)
             self._jit_out4 = (_ctypes.c_int64 * 4)()
             self._jit_out4_addr = _ctypes.addressof(self._jit_out4)
+
+    def _ensure_jit_save_buf(self) -> None:
+        if self._jit_save_buf is None:
+            self._jit_save_buf = (ctypes.c_int64 * 8)()
+            self._jit_save_buf_addr = ctypes.addressof(self._jit_save_buf)
+
+    @staticmethod
+    def _is_coroutine_asm(body: str) -> bool:
+        """Detect asm words that manipulate the x86 return stack (coroutine patterns).
+
+        Heuristic: if the body pops rsi/rdi before any label (capturing the
+        return address), it's a coroutine word.
+        """
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(";"):
+                continue
+            if _RE_LABEL_PAT.match(line):
+                break
+            if line.startswith("pop "):
+                reg = line.split()[1].rstrip(",")
+                if reg in ("rsi", "rdi"):
+                    return True
+        return False
 
     def reset(self) -> None:
         self.stack.clear()
@@ -1963,7 +2069,7 @@ class CompileTimeVM:
         if self.runtime_mode:
             self.r12 -= 8
             if isinstance(value, float):
-                bits = struct.unpack("q", struct.pack("d", value))[0]
+                bits = _get_struct().unpack("q", _get_struct().pack("d", value))[0]
                 CTMemory.write_qword(self.r12, bits)
             else:
                 CTMemory.write_qword(self.r12, _to_i64(int(value)))
@@ -2234,7 +2340,7 @@ class CompileTimeVM:
             if arg_type in ("float", "double"):
                 # Reinterpret the int64 bits as a double (matching the language's convention)
                 raw_int = _to_i64(int(raw))
-                double_val = struct.unpack("d", struct.pack("q", raw_int))[0]
+                double_val = _get_struct().unpack("d", _get_struct().pack("q", raw_int))[0]
                 call_args.append(double_val)
             elif arg_type is not None and arg_type.startswith("struct ") and not arg_type.endswith("*"):
                 struct_name = arg_type[len("struct "):].strip()
@@ -2248,7 +2354,7 @@ class CompileTimeVM:
         if outputs > 0 and result is not None:
             ret_type = _canonical_c_type_name(func._ct_signature[1]) if func._ct_signature else None
             if ret_type in ("float", "double"):
-                int_bits = struct.unpack("q", struct.pack("d", float(result)))[0]
+                int_bits = _get_struct().unpack("q", _get_struct().pack("d", float(result)))[0]
                 self.push(int_bits)
             elif ret_type is not None and ret_type.startswith("struct "):
                 struct_name = ret_type[len("struct "):].strip()
@@ -2341,34 +2447,71 @@ class CompileTimeVM:
         if not isinstance(definition, AsmDefinition):
             raise ParseError(f"word '{word.name}' has no asm body")
         asm_body = definition.body.strip("\n")
+        is_coro = self._is_coroutine_asm(asm_body)
 
         bss = self._bss_symbols
 
         # Build wrapper
         lines: List[str] = []
-        # Entry: save callee-saved regs, set r12/r13, stash output ptr at [rsp]
-        lines.extend([
-            "_ct_entry:",
-            "    push rbx",
-            "    push r12",
-            "    push r13",
-            "    push r14",
-            "    push r15",
-            "    sub rsp, 16",       # align + room for output ptr
-            "    mov [rsp], rdx",    # save output-struct pointer
-            "    mov r12, rdi",      # data stack
-            "    mov r13, rsi",      # return stack
-        ])
+        if is_coro:
+            self._ensure_jit_save_buf()
+            sb = self._jit_save_buf_addr
+            # Use register-indirect addressing: x86-64 mov [disp],reg only
+            # supports 32-bit displacement -- sb is a 64-bit heap address.
+            lines.extend([
+                "_ct_entry:",
+                f"    mov rax, {sb}",        # load save buffer base
+                "    mov [rax], rbx",
+                "    mov [rax + 8], r12",
+                "    mov [rax + 16], r13",
+                "    mov [rax + 24], r14",
+                "    mov [rax + 32], r15",
+                "    mov [rax + 40], rdx",   # output ptr
+                "    mov r12, rdi",
+                "    mov r13, rsi",
+                # Replace return address with trampoline
+                "    pop rcx",
+                "    mov [rax + 48], rcx",   # save ctypes return addr
+                "    lea rcx, [rip + _ct_trampoline]",
+                "    push rcx",
+            ])
+        else:
+            # Standard wrapper: save callee-saved regs on stack
+            lines.extend([
+                "_ct_entry:",
+                "    push rbx",
+                "    push r12",
+                "    push r13",
+                "    push r14",
+                "    push r15",
+                "    sub rsp, 16",       # align + room for output ptr
+                "    mov [rsp], rdx",    # save output-struct pointer
+                "    mov r12, rdi",      # data stack
+                "    mov r13, rsi",      # return stack
+            ])
 
         # Patch asm body
+        # Collect dot-prefixed local labels and build rename map for Keystone
+        _local_labels: Set[str] = set()
+        for raw_line in asm_body.splitlines():
+            line = raw_line.strip()
+            lm = _RE_LABEL_PAT.match(line)
+            if lm and lm.group(1).startswith('.'):
+                _local_labels.add(lm.group(1))
+
         for raw_line in asm_body.splitlines():
             line = raw_line.strip()
             if not line or line.startswith(";"):
                 continue
             if line.startswith("extern"):
                 continue  # strip extern declarations
-            if line == "ret":
+            if line == "ret" and not is_coro:
                 line = "jmp _ct_save"
+
+            # Rename dot-prefixed local labels to Keystone-compatible names
+            for lbl in _local_labels:
+                line = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
+                              '_jl' + lbl[1:], line)
 
             # Patch [rel SYMBOL] → concrete address
             m = _RE_REL_PAT.search(line)
@@ -2387,51 +2530,75 @@ class CompileTimeVM:
                     lines.append(f"    {new_line}")
                     lines.append("    pop rax")
                     continue
+            # Convert NASM 'rel' to explicit rip-relative for Keystone
+            if '[rel ' in line:
+                line = line.replace('[rel ', '[rip + ')
             lines.append(f"    {line}")
 
-        # Save: restore output ptr from [rsp], write r12/r13 out, restore regs
-        lines.extend([
-            "_ct_save:",
-            "    mov rax, [rsp]",      # output-struct pointer
-            "    mov [rax], r12",
-            "    mov [rax + 8], r13",
-            "    add rsp, 16",
-            "    pop r15",
-            "    pop r14",
-            "    pop r13",
-            "    pop r12",
-            "    pop rbx",
-            "    ret",
-        ])
+        # Save/epilogue
+        if is_coro:
+            sb = self._jit_save_buf_addr
+            lines.extend([
+                "_ct_trampoline:",
+                f"    mov rax, {sb}",        # reload save buffer base
+                "    mov rcx, [rax + 40]",   # output ptr
+                "    mov [rcx], r12",
+                "    mov [rcx + 8], r13",
+                "    mov rbx, [rax]",
+                "    mov r12, [rax + 8]",
+                "    mov r13, [rax + 16]",
+                "    mov r14, [rax + 24]",
+                "    mov r15, [rax + 32]",
+                "    mov rcx, [rax + 48]",   # ctypes return addr
+                "    push rcx",
+                "    ret",
+            ])
+        else:
+            lines.extend([
+                "_ct_save:",
+                "    mov rax, [rsp]",      # output-struct pointer
+                "    mov [rax], r12",
+                "    mov [rax + 8], r13",
+                "    add rsp, 16",
+                "    pop r15",
+                "    pop r14",
+                "    pop r13",
+                "    pop r12",
+                "    pop rbx",
+                "    ret",
+            ])
 
-        # Normalize for Keystone
+        ptr = self._jit_assemble_page(lines, word.name)
+        if CompileTimeVM._JIT_FUNC_TYPE is None:
+            CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
+        func = self._JIT_FUNC_TYPE(ptr)
+        return func
+
+    def _jit_assemble_page(self, lines: List[str], word_name: str) -> int:
+        """Assemble lines into an RWX page and return its address."""
         def _norm(l: str) -> str:
             l = l.split(";", 1)[0].rstrip()
             for sz in ("qword", "dword", "word", "byte"):
                 l = l.replace(f"{sz} [", f"{sz} ptr [")
             return l
         normalized = [_norm(l) for l in lines if _norm(l).strip()]
-
         ks = Ks(KS_ARCH_X86, KS_MODE_64)
         try:
             encoding, _ = ks.asm("\n".join(normalized))
         except KsError as exc:
             debug_txt = "\n".join(normalized)
             raise ParseError(
-                f"JIT assembly failed for '{word.name}': {exc}\n--- asm ---\n{debug_txt}\n--- end ---"
+                f"JIT assembly failed for '{word_name}': {exc}\n--- asm ---\n{debug_txt}\n--- end ---"
             ) from exc
         if encoding is None:
-            raise ParseError(f"JIT produced no code for '{word.name}'")
-
+            raise ParseError(f"JIT produced no code for '{word_name}'")
         code = bytes(encoding)
-        # Allocate RWX memory via libc mmap (not Python's mmap module) so
-        # Python's GC never tries to finalize the mapping.
         page_size = max(len(code), 4096)
         _libc = ctypes.CDLL(None, use_errno=True)
         _libc.mmap.restype = ctypes.c_void_p
         _libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_long]
-        PROT_RWX = 0x1 | 0x2 | 0x4  # READ | WRITE | EXEC
+        PROT_RWX = 0x1 | 0x2 | 0x4
         MAP_PRIVATE = 0x02
         MAP_ANONYMOUS = 0x20
         ptr = _libc.mmap(None, page_size, PROT_RWX,
@@ -2439,12 +2606,297 @@ class CompileTimeVM:
         if ptr == ctypes.c_void_p(-1).value or ptr is None:
             raise RuntimeError(f"mmap failed for JIT code ({page_size} bytes)")
         ctypes.memmove(ptr, code, len(code))
-        # Store (ptr, size) so we can munmap later
         self._jit_code_pages.append((ptr, page_size))
-        if CompileTimeVM._JIT_FUNC_TYPE is None:
-            CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
-        func = self._JIT_FUNC_TYPE(ptr)
-        return func
+        return ptr
+
+    def _compile_raw_jit(self, word: Word) -> int:
+        """Compile a word into executable memory without a wrapper.
+
+        Returns the native code address (not a ctypes callable).
+        For AsmDefinition: just the asm body (patched, no wrapper).
+        For Definition: compiled body with ret (no entry/exit wrapper).
+        """
+        cache_key = f"__raw_jit_{word.name}"
+        cached = self._jit_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        definition = word.definition
+        bss = self._bss_symbols
+        lines: List[str] = []
+
+        if isinstance(definition, AsmDefinition):
+            asm_body = definition.body.strip("\n")
+            is_coro = self._is_coroutine_asm(asm_body)
+            _local_labels: Set[str] = set()
+            for raw_line in asm_body.splitlines():
+                line = raw_line.strip()
+                lm = _RE_LABEL_PAT.match(line)
+                if lm and lm.group(1).startswith('.'):
+                    _local_labels.add(lm.group(1))
+            for raw_line in asm_body.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith(";") or line.startswith("extern"):
+                    continue
+                # Keep ret as-is (raw functions return normally)
+                for lbl in _local_labels:
+                    line = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
+                                  '_jl' + lbl[1:], line)
+                m = _RE_REL_PAT.search(line)
+                if m and m.group(1) in bss:
+                    sym = m.group(1)
+                    addr = bss[sym]
+                    if line.lstrip().startswith("lea"):
+                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                    else:
+                        lines.append("    push rax")
+                        lines.append(f"    mov rax, {addr}")
+                        new_line = _RE_REL_PAT.sub("[rax]", line)
+                        lines.append(f"    {new_line}")
+                        lines.append("    pop rax")
+                        continue
+                if '[rel ' in line:
+                    line = line.replace('[rel ', '[rip + ')
+                lines.append(f"    {line}")
+            lines.append("    ret")
+        elif isinstance(definition, Definition):
+            lines.extend(self._compile_raw_definition_lines(word, definition))
+        else:
+            raise ParseError(f"cannot raw-JIT word '{word.name}'")
+
+        ptr = self._jit_assemble_page(lines, f"raw_{word.name}")
+        self._jit_cache[cache_key] = ptr
+        return ptr
+
+    def _compile_raw_definition_lines(self, word: Word, defn: Definition) -> List[str]:
+        """Compile a Definition body to raw JIT asm lines (no wrapper, just body + ret)."""
+        self._resolve_words_in_body(defn)
+        bss = self._bss_symbols
+        body = defn.body
+        lines: List[str] = []
+        uid = id(defn)
+        lc = [0]
+        def _nl(prefix: str) -> str:
+            lc[0] += 1
+            return f"_rj{uid}_{prefix}_{lc[0]}"
+
+        # Label maps
+        label_map: Dict[str, str] = {}
+        for node in body:
+            if node._opcode == OP_LABEL:
+                ln = str(node.data)
+                if ln not in label_map:
+                    label_map[ln] = _nl("lbl")
+
+        for_map: Dict[int, Tuple[str, str]] = {}
+        fstack: List[Tuple[int, str, str]] = []
+        for idx, node in enumerate(body):
+            if node._opcode == OP_FOR_BEGIN:
+                bl, el = _nl("for_top"), _nl("for_end")
+                fstack.append((idx, bl, el))
+            elif node._opcode == OP_FOR_END:
+                if fstack:
+                    bi, bl, el = fstack.pop()
+                    for_map[bi] = (bl, el)
+                    for_map[idx] = (bl, el)
+
+        ba_map: Dict[int, Tuple[str, str]] = {}
+        bstack: List[Tuple[int, str, str]] = []
+        for idx, node in enumerate(body):
+            if node._opcode == OP_WORD and node._word_ref is None:
+                nm = node.data
+                if nm == "begin":
+                    bl, al = _nl("begin"), _nl("again")
+                    bstack.append((idx, bl, al))
+                elif nm == "again":
+                    if bstack:
+                        bi, bl, al = bstack.pop()
+                        ba_map[bi] = (bl, al)
+                        ba_map[idx] = (bl, al)
+
+        begin_rt: List[Tuple[str, str]] = []
+        out2_addr = self._jit_out2_addr
+
+        for idx, node in enumerate(body):
+            opc = node._opcode
+            if opc == OP_LITERAL:
+                data = node.data
+                if isinstance(data, str):
+                    addr, length = self.memory.store_string(data)
+                    lines.append("    sub r12, 16")
+                    lines.append(f"    mov rax, {addr}")
+                    lines.append("    mov [r12 + 8], rax")
+                    if -0x80000000 <= length <= 0x7FFFFFFF:
+                        lines.append(f"    mov qword [r12], {length}")
+                    else:
+                        lines.append(f"    mov rax, {length}")
+                        lines.append("    mov [r12], rax")
+                else:
+                    val = int(data) & 0xFFFFFFFFFFFFFFFF
+                    if val >= 0x8000000000000000:
+                        val -= 0x10000000000000000
+                    lines.append("    sub r12, 8")
+                    if -0x80000000 <= val <= 0x7FFFFFFF:
+                        lines.append(f"    mov qword [r12], {val}")
+                    else:
+                        lines.append(f"    mov rax, {val}")
+                        lines.append("    mov [r12], rax")
+            elif opc == OP_WORD:
+                wref = node._word_ref
+                if wref is None:
+                    name = node.data
+                    if name == "begin":
+                        pair = ba_map.get(idx)
+                        if pair:
+                            begin_rt.append(pair)
+                            lines.append(f"{pair[0]}:")
+                    elif name == "again":
+                        pair = ba_map.get(idx)
+                        if pair:
+                            lines.append(f"    jmp {pair[0]}")
+                            lines.append(f"{pair[1]}:")
+                            if begin_rt and begin_rt[-1] == pair:
+                                begin_rt.pop()
+                    elif name == "continue":
+                        if begin_rt:
+                            lines.append(f"    jmp {begin_rt[-1][0]}")
+                    elif name == "exit":
+                        lines.append("    ret")
+                    continue
+
+                wd = wref.definition
+                if isinstance(wd, AsmDefinition):
+                    if self._is_coroutine_asm(wd.body.strip("\n")):
+                        # Coroutine asm: call raw JIT instead of inlining
+                        raw_addr = self._compile_raw_jit(wref)
+                        lines.append(f"    mov rax, {raw_addr}")
+                        lines.append("    call rax")
+                    else:
+                        # Inline asm body
+                        prefix = _nl(f"a{idx}")
+                        _local_labels: Set[str] = set()
+                        asm_txt = wd.body.strip("\n")
+                        has_ret = False
+                        for raw_line in asm_txt.splitlines():
+                            ln = raw_line.strip()
+                            lm = _RE_LABEL_PAT.match(ln)
+                            if lm:
+                                _local_labels.add(lm.group(1))
+                            if ln == "ret":
+                                has_ret = True
+                        end_lbl = f"{prefix}_end" if has_ret else None
+                        for raw_line in asm_txt.splitlines():
+                            ln = raw_line.strip()
+                            if not ln or ln.startswith(";") or ln.startswith("extern"):
+                                continue
+                            if ln == "ret":
+                                lines.append(f"    jmp {end_lbl}")
+                                continue
+                            for lbl in _local_labels:
+                                ln = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
+                                            prefix + lbl, ln)
+                            m = _RE_REL_PAT.search(ln)
+                            if m and m.group(1) in bss:
+                                sym = m.group(1)
+                                addr = bss[sym]
+                                if ln.lstrip().startswith("lea"):
+                                    ln = _RE_REL_PAT.sub(str(addr), ln).replace("lea", "mov", 1)
+                                else:
+                                    lines.append("    push rax")
+                                    lines.append(f"    mov rax, {addr}")
+                                    new_ln = _RE_REL_PAT.sub("[rax]", ln)
+                                    lines.append(f"    {new_ln}")
+                                    lines.append("    pop rax")
+                                    continue
+                            if '[rel ' in ln:
+                                ln = ln.replace('[rel ', '[')
+                            lines.append(f"    {ln}")
+                        if end_lbl is not None:
+                            lines.append(f"{end_lbl}:")
+                elif isinstance(wd, Definition):
+                    # Call standard JIT'd sub-definition via output buffer
+                    ck = f"__defn_jit_{wref.name}"
+                    if ck not in self._jit_cache:
+                        sub = self._compile_definition_jit(wref)
+                        if sub is None:
+                            # Can't JIT; fall back to raw JIT of the sub-word
+                            raw_addr = self._compile_raw_jit(wref)
+                            lines.append(f"    mov rax, {raw_addr}")
+                            lines.append("    call rax")
+                            continue
+                        self._jit_cache[ck] = sub
+                        self._jit_cache[ck + "_addr"] = ctypes.cast(sub, ctypes.c_void_p).value
+                    func_addr = self._jit_cache.get(ck + "_addr")
+                    if func_addr is None:
+                        raise ParseError(f"raw JIT: missing JIT for '{wref.name}'")
+                    lines.append("    mov rdi, r12")
+                    lines.append("    mov rsi, r13")
+                    lines.append(f"    mov rdx, {out2_addr}")
+                    lines.append(f"    mov rax, {func_addr}")
+                    lines.append("    call rax")
+                    lines.append(f"    mov rax, {out2_addr}")
+                    lines.append("    mov r12, [rax]")
+                    lines.append("    mov r13, [rax + 8]")
+                else:
+                    raise ParseError(f"raw JIT: unsupported word '{wref.name}'")
+            elif opc == OP_WORD_PTR:
+                # Word pointer: push the raw JIT address of the target
+                target_name = str(node.data)
+                tw = self.dictionary.lookup(target_name)
+                if tw is None:
+                    raise ParseError(f"raw JIT: unknown word '{target_name}'")
+                raw_addr = self._compile_raw_jit(tw)
+                lines.append("    sub r12, 8")
+                lines.append(f"    mov rax, {raw_addr}")
+                lines.append("    mov [r12], rax")
+            elif opc == OP_FOR_BEGIN:
+                pair = for_map.get(idx)
+                if pair is None:
+                    raise ParseError("raw JIT: unmatched for")
+                bl, el = pair
+                lines.append("    mov rax, [r12]")
+                lines.append("    add r12, 8")
+                lines.append("    cmp rax, 0")
+                lines.append(f"    jle {el}")
+                lines.append("    sub r13, 8")
+                lines.append("    mov [r13], rax")
+                lines.append(f"{bl}:")
+            elif opc == OP_FOR_END:
+                pair = for_map.get(idx)
+                if pair is None:
+                    raise ParseError("raw JIT: unmatched for end")
+                bl, el = pair
+                lines.append("    dec qword [r13]")
+                lines.append("    cmp qword [r13], 0")
+                lines.append(f"    jg {bl}")
+                lines.append("    add r13, 8")
+                lines.append(f"{el}:")
+            elif opc == OP_BRANCH_ZERO:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    raise ParseError("raw JIT: unknown branch target")
+                lines.append("    mov rax, [r12]")
+                lines.append("    add r12, 8")
+                lines.append("    test rax, rax")
+                lines.append(f"    jz {al}")
+            elif opc == OP_JUMP:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    raise ParseError("raw JIT: unknown jump target")
+                lines.append(f"    jmp {al}")
+            elif opc == OP_LABEL:
+                ln = str(node.data)
+                al = label_map.get(ln)
+                if al is None:
+                    raise ParseError("raw JIT: unknown label")
+                lines.append(f"{al}:")
+            else:
+                raise ParseError(f"raw JIT: unsupported opcode {opc} in '{word.name}'")
+
+        lines.append("    ret")
+        return lines
 
     # -- Whole-word JIT: compile Definition bodies to native code -----------
 
@@ -2577,17 +3029,22 @@ class CompileTimeVM:
             """Patch an asm body for inlining: uniquify labels, patch [rel]."""
             result: List[str] = []
             local_labels: Set[str] = set()
+            has_ret = False
             for raw_line in asm_body.splitlines():
                 line = raw_line.strip()
                 lm = _RE_LABEL_PAT.match(line)
                 if lm:
                     local_labels.add(lm.group(1))
+                if line == "ret":
+                    has_ret = True
+            end_label = f"{prefix}_end" if has_ret else None
             for raw_line in asm_body.splitlines():
                 line = raw_line.strip()
                 if not line or line.startswith(";") or line.startswith("extern"):
                     continue
                 if line == "ret":
-                    continue  # fall through
+                    result.append(f"    jmp {end_label}")
+                    continue
                 for label in local_labels:
                     line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
                 m = _RE_REL_PAT.search(line)
@@ -2603,7 +3060,12 @@ class CompileTimeVM:
                         result.append(f"    {new_line}")
                         result.append("    pop rax")
                         continue
+                # Convert NASM 'rel' to explicit rip-relative for Keystone
+                if '[rel ' in line:
+                    line = line.replace('[rel ', '[rip + ')
                 result.append(f"    {line}")
+            if end_label is not None:
+                result.append(f"{end_label}:")
             return result
 
         for idx, node in enumerate(body):
@@ -2875,6 +3337,9 @@ class CompileTimeVM:
                         patched_body.append(new_line)
                         patched_body.append(f"pop rax")
                         continue
+                # Convert NASM 'rel' to explicit rip-relative for Keystone
+                if '[rel ' in line:
+                    line = line.replace('[rel ', '[rip + ')
                 patched_body.append(line)
             wrapper_lines.extend(patched_body)
         wrapper_lines.extend([
@@ -3126,6 +3591,9 @@ class CompileTimeVM:
                         lines.append(f"    {new_line}")
                         lines.append("    pop rax")
                         continue
+                # Convert NASM 'rel' to explicit rip-relative for Keystone
+                if '[rel ' in line:
+                    line = line.replace('[rel ', '[rip + ')
                 lines.append(f"    {line}")
 
         # Save epilog
@@ -3480,7 +3948,14 @@ class CompileTimeVM:
                         raise ParseError(
                             f"unknown word '{target_name}' referenced by pointer during compile-time execution"
                         )
-                    _push(self._handles.store(target_word))
+                    if _runtime_mode:
+                        # Push native code address so asm can jmp/call it
+                        addr = self._compile_raw_jit(target_word)
+                        _push(addr)
+                        # Store reverse mapping so _rt_jmp can resolve back to Word
+                        self._handles.objects[addr] = target_word
+                    else:
+                        _push(self._handles.store(target_word))
                     ip += 1
                     continue
 
@@ -3619,11 +4094,13 @@ class CompileTimeVM:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
 class Emission:
-    text: List[str] = field(default_factory=list)
-    data: List[str] = field(default_factory=list)
-    bss: List[str] = field(default_factory=list)
+    __slots__ = ('text', 'data', 'bss')
+
+    def __init__(self, text: List[str] = None, data: List[str] = None, bss: List[str] = None) -> None:
+        self.text = text if text is not None else []
+        self.data = data if data is not None else []
+        self.bss = bss if bss is not None else []
 
     def snapshot(self) -> str:
         parts: List[str] = []
@@ -4431,6 +4908,8 @@ class Assembler:
 
     def _peephole_optimize_definition(self, definition: Definition) -> None:
         nodes = definition.body
+        if not nodes:
+            return
         all_rules = _PEEPHOLE_ALL_RULES
         first_words = _PEEPHOLE_FIRST_WORDS
         _OP_W = OP_WORD
@@ -4661,6 +5140,8 @@ class Assembler:
         definition.body = nodes
 
     def _fold_constants_in_definition(self, definition: Definition) -> None:
+        if not definition.body:
+            return
         optimized: List[Op] = []
         for node in definition.body:
             optimized.append(node)
@@ -5137,6 +5618,10 @@ class Assembler:
             raw_defs = [form for form in module.forms if isinstance(form, valid_defs)]
             definitions = self._dedup_definitions(raw_defs)
 
+            stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
+            if stray_forms:
+                raise CompileError("top-level literals or word references are not supported yet")
+
             _v = self.verbosity
             if _v >= 1:
                 import time as _time_mod
@@ -5162,10 +5647,22 @@ class Assembler:
                     else:
                         print(f"[v2] asm '{defn.name}'")
 
+            # --- Early DCE: compute reachable set before optimization passes
+            # so we skip optimizing definitions that will be eliminated. ---
+            if is_program:
+                _early_rt = [d for d in definitions if not getattr(d, "compile_only", False)]
+                _early_reachable = self._reachable_runtime_defs(_early_rt)
+                # Also include inline defs that are referenced by reachable defs
+                # (they need optimization for correct inlining).
+            else:
+                _early_reachable = None  # library mode: optimize everything
+
             if self.enable_loop_unroll:
                 if _v >= 1: _t0 = _time_mod.perf_counter()
                 for defn in definitions:
                     if isinstance(defn, Definition):
+                        if _early_reachable is not None and defn.name not in _early_reachable:
+                            continue
                         self._unroll_constant_for_loops(defn)
                 if _v >= 1:
                     print(f"[v1] loop unrolling: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
@@ -5174,6 +5671,8 @@ class Assembler:
                 if _v >= 4:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             before_ops = [(n.op, n.data) for n in defn.body]
                             self._peephole_optimize_definition(defn)
                             after_ops = [(n.op, n.data) for n in defn.body]
@@ -5183,6 +5682,8 @@ class Assembler:
                 elif _v >= 2:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             _before = len(defn.body)
                             self._peephole_optimize_definition(defn)
                             _after = len(defn.body)
@@ -5191,6 +5692,8 @@ class Assembler:
                 else:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             self._peephole_optimize_definition(defn)
                 if _v >= 1:
                     print(f"[v1] peephole optimization: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
@@ -5199,6 +5702,8 @@ class Assembler:
                 if _v >= 4:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             before_ops = [(n.op, n.data) for n in defn.body]
                             self._fold_constants_in_definition(defn)
                             after_ops = [(n.op, n.data) for n in defn.body]
@@ -5208,6 +5713,8 @@ class Assembler:
                 elif _v >= 2:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             _before = len(defn.body)
                             self._fold_constants_in_definition(defn)
                             _after = len(defn.body)
@@ -5216,6 +5723,8 @@ class Assembler:
                 else:
                     for defn in definitions:
                         if isinstance(defn, Definition):
+                            if _early_reachable is not None and defn.name not in _early_reachable:
+                                continue
                             self._fold_constants_in_definition(defn)
                 if _v >= 1:
                     print(f"[v1] constant folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
@@ -5223,12 +5732,11 @@ class Assembler:
                 if _v >= 1: _t0 = _time_mod.perf_counter()
                 for defn in definitions:
                     if isinstance(defn, Definition):
+                        if _early_reachable is not None and defn.name not in _early_reachable:
+                            continue
                         self._fold_static_list_literals_definition(defn)
                 if _v >= 1:
                     print(f"[v1] static list folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
-            stray_forms = [form for form in module.forms if not isinstance(form, valid_defs)]
-            if stray_forms:
-                raise CompileError("top-level literals or word references are not supported yet")
 
             runtime_defs = [defn for defn in definitions if not getattr(defn, "compile_only", False)]
             if is_program:
@@ -5462,7 +5970,7 @@ class Assembler:
         label = f"flt_{len(self._float_literals)}"
         # Use hex representation of double precision float
         import struct
-        hex_val = struct.pack('>d', value).hex()
+        hex_val = _get_struct().pack('>d', value).hex()
         # NASM expects hex starting with 0x
         self._data_section.append(f"{label}: dq 0x{hex_val}")
         self._float_literals[value] = label
@@ -5579,9 +6087,10 @@ class Assembler:
         for line in body.splitlines():
             if not line.strip():
                 continue
-            line = _call_sub(repl_sym, line)
-            line = _global_sub(repl_sym, line)
-            line = _extern_sub(repl_sym, line)
+            if "call " in line or "global " in line or "extern " in line:
+                line = _call_sub(repl_sym, line)
+                line = _global_sub(repl_sym, line)
+                line = _extern_sub(repl_sym, line)
             builder.emit(line)
 
     def _emit_asm_body_inline(self, definition: AsmDefinition, builder: FunctionEmitter) -> None:
@@ -5615,6 +6124,10 @@ class Assembler:
         data = node.data
         builder.set_location(node.loc)
 
+        if kind == OP_WORD:
+            self._emit_wordref(data, builder)
+            return
+
         if kind == OP_LITERAL:
             if isinstance(data, int):
                 builder.push_literal(data)
@@ -5629,10 +6142,6 @@ class Assembler:
                 builder.push_literal(length)
                 return
             raise CompileError(f"unsupported literal type {type(data)!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported literal type {type(data)!r}")
-
-        if kind == OP_WORD:
-            self._emit_wordref(data, builder)
-            return
 
         if kind == OP_WORD_PTR:
             self._emit_wordptr(data, builder)
@@ -5963,7 +6472,7 @@ class Assembler:
             raise CompileError("extern only supports 0 or 1 scalar output")
 
     def _emit_wordref(self, name: str, builder: FunctionEmitter) -> None:
-        word = self.dictionary.lookup(name)
+        word = self.dictionary.words.get(name)
         if word is None:
             suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
             raise CompileError(f"unknown word '{name}'{suffix}")
@@ -7388,12 +7897,14 @@ def bootstrap_dictionary() -> Dictionary:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
 class FileSpan:
-    path: Path
-    start_line: int  # inclusive (global line number in expanded source, 1-based)
-    end_line: int    # exclusive
-    local_start_line: int  # 1-based line in the original file
+    __slots__ = ('path', 'start_line', 'end_line', 'local_start_line')
+
+    def __init__(self, path: Path, start_line: int, end_line: int, local_start_line: int) -> None:
+        self.path = path
+        self.start_line = start_line
+        self.end_line = end_line
+        self.local_start_line = local_start_line
 
 
 # Uppercase macro prefixes to strip (API export macros like RLAPI, WINGDIAPI, etc.)
@@ -7500,7 +8011,7 @@ class Compiler:
         entry_mode: str = "program",
     ) -> Emission:
         self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(source)
+        tokens = self.reader.tokenize(_blank_asm_bodies(source))
         module = self.parser.parse(tokens, source)
         return self.assembler.emit(module, debug=debug, entry_mode=entry_mode)
 
@@ -7508,7 +8019,7 @@ class Compiler:
         """Parse a source file to populate the dictionary without emitting assembly."""
         source, spans = self._load_with_imports(path.resolve())
         self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(source)
+        tokens = self.reader.tokenize(_blank_asm_bodies(source))
         self.parser.parse(tokens, source)
 
     def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
@@ -7531,7 +8042,13 @@ class Compiler:
             raise CompileTimeError(f"word '{name}' not defined; cannot run at compile time")
         self.parser.compile_time_vm.invoke_repl(word, libs=libs)
 
+    _import_resolve_cache: Dict[Tuple[Path, str], Path] = {}
+
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
+        cache_key = (importing_file.parent, target)
+        cached = self._import_resolve_cache.get(cache_key)
+        if cached is not None:
+            return cached
         raw = Path(target)
         tried: List[Path] = []
 
@@ -7539,17 +8056,21 @@ class Compiler:
             candidate = raw
             tried.append(candidate)
             if candidate.exists():
-                return candidate.resolve()
+                result = candidate.resolve()
+                self._import_resolve_cache[cache_key] = result
+                return result
 
         candidate = (importing_file.parent / raw).resolve()
         tried.append(candidate)
         if candidate.exists():
+            self._import_resolve_cache[cache_key] = candidate
             return candidate
 
         for base in self.include_paths:
             candidate = (base / raw).resolve()
             tried.append(candidate)
             if candidate.exists():
+                self._import_resolve_cache[cache_key] = candidate
                 return candidate
 
         tried_str = "\n".join(f"  - {p}" for p in tried)
@@ -7894,30 +8415,65 @@ class BuildCache:
             shutil.rmtree(self.cache_dir)
 
 
-def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False) -> None:
-    import subprocess
-    cmd = ["nasm", "-f", "elf64"]
+_nasm_path: str = ""
+_linker_path: str = ""
+_linker_is_lld: bool = False
+
+def _find_nasm() -> str:
+    global _nasm_path
+    if _nasm_path:
+        return _nasm_path
+    import shutil
+    p = shutil.which("nasm")
+    if not p:
+        raise RuntimeError("nasm not found")
+    _nasm_path = p
+    return p
+
+def _find_linker() -> tuple:
+    global _linker_path, _linker_is_lld
+    if _linker_path:
+        return _linker_path, _linker_is_lld
+    import shutil
+    lld = shutil.which("ld.lld")
+    if lld:
+        _linker_path = lld
+        _linker_is_lld = True
+        return lld, True
+    ld = shutil.which("ld")
+    if ld:
+        _linker_path = ld
+        _linker_is_lld = False
+        return ld, False
+    raise RuntimeError("No linker found")
+
+def _run_cmd(args: list) -> None:
+    """Run a command using posix_spawn for lower overhead than subprocess."""
+    pid = os.posix_spawn(args[0], args, os.environ)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status):
+        code = os.WEXITSTATUS(status)
+        if code != 0:
+            import subprocess
+            raise subprocess.CalledProcessError(code, args)
+    elif os.WIFSIGNALED(status):
+        import subprocess
+        raise subprocess.CalledProcessError(-os.WTERMSIG(status), args)
+
+
+def run_nasm(asm_path: Path, obj_path: Path, debug: bool = False, asm_text: str = "") -> None:
+    nasm = _find_nasm()
+    cmd = [nasm, "-f", "elf64"]
     if debug:
         cmd.extend(["-g", "-F", "dwarf"])
     cmd += ["-o", str(obj_path), str(asm_path)]
-    subprocess.run(cmd, check=True)
+    _run_cmd(cmd)
 
 
 def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *, shared: bool = False):
     libs = libs or []
 
-    import shutil
-    lld = shutil.which("ld.lld")
-    ld = shutil.which("ld")
-
-    if lld:
-        linker = lld
-        use_lld = True
-    elif ld:
-        linker = ld
-        use_lld = False
-    else:
-        raise RuntimeError("No linker found")
+    linker, use_lld = _find_linker()
 
     cmd = [linker]
 
@@ -7968,8 +8524,7 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
     if debug:
         cmd.append("-g")
 
-    import subprocess
-    subprocess.run(cmd, check=True)
+    _run_cmd(cmd)
 
 
 def build_static_library(obj_path: Path, archive_path: Path) -> None:
@@ -8558,14 +9113,16 @@ def _repl_build_source(
     return "\n".join(lines) + "\n"
 
 
-@dataclass(frozen=True)
 class DocEntry:
-    name: str
-    stack_effect: str
-    description: str
-    kind: str
-    path: Path
-    line: int
+    __slots__ = ('name', 'stack_effect', 'description', 'kind', 'path', 'line')
+
+    def __init__(self, name: str, stack_effect: str, description: str, kind: str, path: Path, line: int) -> None:
+        self.name = name
+        self.stack_effect = stack_effect
+        self.description = description
+        self.kind = kind
+        self.path = path
+        self.line = line
 
 
 _DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
@@ -8854,8 +9411,1104 @@ def _run_docs_tui(
     _MODE_SEARCH = 1
     _MODE_DETAIL = 2
     _MODE_FILTER = 3
+    _MODE_LANG_REF = 4
+    _MODE_LANG_DETAIL = 5
+    _MODE_LICENSE = 6
+    _MODE_PHILOSOPHY = 7
+    _MODE_CT_REF = 8
+
+    _TAB_LIBRARY = 0
+    _TAB_LANG_REF = 1
+    _TAB_CT_REF = 2
+    _TAB_NAMES = ["Library Docs", "Language Reference", "Compile-Time Reference"]
 
     _FILTER_KINDS = ["all", "word", "asm", "py", "macro"]
+
+    # ── Language Reference Entries ──────────────────────────────────
+    _LANG_REF_ENTRIES: List[Dict[str, str]] = [
+        {
+            "name": "word ... end",
+            "category": "Definitions",
+            "syntax": "word <name> <body...> end",
+            "summary": "Define a new word (function).",
+            "detail": (
+                "Defines a named word that can be called by other words. "
+                "The body consists of stack operations, literals, and calls to other words. "
+                "Redefinitions overwrite the previous entry with a warning.\n\n"
+                "Example:\n"
+                "  word square dup * end\n"
+                "  word greet \"hello world\" puts end"
+            ),
+        },
+        {
+            "name": "inline word ... end",
+            "category": "Definitions",
+            "syntax": "inline word <name> <body...> end",
+            "summary": "Define an inlined word (body is expanded at call sites).",
+            "detail": (
+                "Marks the definition for inline expansion. "
+                "Every call site gets a copy of the body rather than a function call. "
+                "Recursive inline calls are rejected at compile time.\n\n"
+                "Example:\n"
+                "  inline word inc 1 + end"
+            ),
+        },
+        {
+            "name": ":asm ... ;",
+            "category": "Definitions",
+            "syntax": ":asm <name> { <nasm body> } ;",
+            "summary": "Define a word in raw NASM x86-64 assembly.",
+            "detail": (
+                "The body is copied verbatim into the output assembly. "
+                "r12 = data stack pointer, r13 = return stack pointer. "
+                "Values are 64-bit qwords. An implicit `ret` is appended.\n\n"
+                "Example:\n"
+                "  :asm double {\n"
+                "      mov rax, [r12]\n"
+                "      shl rax, 1\n"
+                "      mov [r12], rax\n"
+                "  } ;"
+            ),
+        },
+        {
+            "name": ":py ... ;",
+            "category": "Definitions",
+            "syntax": ":py <name> { <python body> } ;",
+            "summary": "Define a compile-time Python macro or intrinsic.",
+            "detail": (
+                "The body executes once during parsing. It may define:\n"
+                "  - macro(ctx: MacroContext): manipulate tokens, emit literals\n"
+                "  - intrinsic(builder: FunctionEmitter): emit assembly directly\n\n"
+                "Used by syntax extensions like libs/fn.sl to reshape the language."
+            ),
+        },
+        {
+            "name": "extern",
+            "category": "Definitions",
+            "syntax": "extern <name> <n_args> <n_rets>\nextern <ret_type> <name>(<arg_types>)",
+            "summary": "Declare a foreign (C) function.",
+            "detail": (
+                "Two forms:\n"
+                "  Raw:    extern foo 2 1     (2 args, 1 return)\n"
+                "  C-like: extern double atan2(double y, double x)\n\n"
+                "The emitter marshals arguments into System V registers "
+                "(rdi, rsi, rdx, rcx, r8, r9 for ints; xmm0-xmm7 for floats), "
+                "aligns rsp, and pushes the result from rax or xmm0."
+            ),
+        },
+        {
+            "name": "macro ... ;",
+            "category": "Definitions",
+            "syntax": "macro <name> [<param_count>] <tokens...> ;",
+            "summary": "Define a text macro with positional substitution.",
+            "detail": (
+                "Records raw tokens until `;`. On expansion, `$0`, `$1`, ... "
+                "are replaced by positional arguments. Macros cannot nest.\n\n"
+                "Example:\n"
+                "  macro max2 [2] $0 $1 > if $0 else $1 end ;\n"
+                "  5 3 max2   # leaves 5 on stack"
+            ),
+        },
+        {
+            "name": "struct ... end",
+            "category": "Definitions",
+            "syntax": "struct <Name>\n  <size> <field>\n  ...\nend",
+            "summary": "Define a packed struct with auto-generated accessors.",
+            "detail": (
+                "Emits helper words:\n"
+                "  <Name>.size         — total byte size\n"
+                "  <Name>.<field>.size   — field byte size\n"
+                "  <Name>.<field>.offset — field byte offset\n"
+                "  <Name>.<field>@     — read field from struct pointer\n"
+                "  <Name>.<field>!     — write field to struct pointer\n\n"
+                "Layout is tightly packed with no implicit padding.\n\n"
+                "Example:\n"
+                "  struct Point\n"
+                "    8 x\n"
+                "    8 y\n"
+                "  end\n"
+                "  # Now Point.x@, Point.x!, Point.y@, Point.y! exist"
+            ),
+        },
+        {
+            "name": "if ... end",
+            "category": "Control Flow",
+            "syntax": "<cond> if <body> end\n<cond> if <then> else <otherwise> end",
+            "summary": "Conditional execution — pops a flag from the stack.",
+            "detail": (
+                "Pops the top of stack. If non-zero, executes the `then` branch; "
+                "otherwise executes the `else` branch (if present).\n\n"
+                "For else-if chains, place `if` on the same line as `else`:\n"
+                "  <cond1> if\n"
+                "    ... branch 1 ...\n"
+                "  else <cond2> if\n"
+                "    ... branch 2 ...\n"
+                "  else\n"
+                "    ... fallback ...\n"
+                "  end\n\n"
+                "Example:\n"
+                "  dup 0 > if \"positive\" puts else \"non-positive\" puts end"
+            ),
+        },
+        {
+            "name": "while ... do ... end",
+            "category": "Control Flow",
+            "syntax": "while <condition> do <body> end",
+            "summary": "Loop while condition is true.",
+            "detail": (
+                "The condition block runs before each iteration. It must leave "
+                "a flag on the stack. If non-zero, the body executes and the loop "
+                "repeats. If zero, execution continues after `end`.\n\n"
+                "Example:\n"
+                "  10\n"
+                "  while dup 0 > do\n"
+                "    dup puti cr\n"
+                "    1 -\n"
+                "  end\n"
+                "  drop"
+            ),
+        },
+        {
+            "name": "for ... end",
+            "category": "Control Flow",
+            "syntax": "<count> for <body> end",
+            "summary": "Counted loop — pops count, loops that many times.",
+            "detail": (
+                "Pops the loop count from the stack, stores it on the return stack, "
+                "and decrements it each pass. The loop index is accessible via "
+                "the compile-time word `i` inside macros.\n\n"
+                "Example:\n"
+                "  10 for\n"
+                "    \"hello\" puts\n"
+                "  end\n\n"
+                "  # prints \"hello\" 10 times"
+            ),
+        },
+        {
+            "name": "begin ... again",
+            "category": "Control Flow",
+            "syntax": "begin <body> again",
+            "summary": "Infinite loop (use `exit` or `goto` to break out).",
+            "detail": (
+                "Creates an unconditional loop. The body repeats forever "
+                "available only at compile time.\n\n"
+                "Example:\n"
+                "  begin\n"
+                "    read_stdin\n"
+                "    dup 0 == if drop exit end\n"
+                "    process\n"
+                "  again"
+            ),
+        },
+        {
+            "name": "label / goto",
+            "category": "Control Flow",
+            "syntax": "label <name>\ngoto <name>",
+            "summary": "Local jumps within a definition.",
+            "detail": (
+                "Defines a local label and jumps to it. "
+                "to the enclosing word definition.\n\n"
+                "Example:\n"
+                "  word example\n"
+                "    label start\n"
+                "    dup 0 == if drop exit end\n"
+                "    1 - goto start\n"
+                "  end"
+            ),
+        },
+        {
+            "name": "&name",
+            "category": "Control Flow",
+            "syntax": "&<word_name>",
+            "summary": "Push pointer to a word's code label.",
+            "detail": (
+                "Pushes the callable address of the named word onto the stack. "
+                "Combine with `jmp` for indirect/tail calls.\n\n"
+                "Example:\n"
+                "  &my_handler jmp   # tail-call my_handler"
+            ),
+        },
+        {
+            "name": "with ... in ... end",
+            "category": "Control Flow",
+            "syntax": "with <a> <b> in <body> end",
+            "summary": "Local variable scope using hidden globals.",
+            "detail": (
+                "Pops the named values from the stack and stores them in hidden "
+                "global cells (__with_a, etc.). Inside the body, reading `a` "
+                "compiles to `@`, writing compiles to `!`. The cells persist "
+                "across calls and are NOT re-entrant.\n\n"
+                "Example:\n"
+                "  10 20 with x y in\n"
+                "    x y + puti cr   # prints 30\n"
+                "  end"
+            ),
+        },
+        {
+            "name": "import",
+            "category": "Modules",
+            "syntax": "import <path>",
+            "summary": "Textually include another .sl file.",
+            "detail": (
+                "Inserts the referenced file. Resolution order:\n"
+                "  1. Absolute path\n"
+                "  2. Relative to the importing file\n"
+                "  3. Each include path (defaults: project root, ./stdlib)\n\n"
+                "Each file is included at most once per compilation unit."
+            ),
+        },
+        {
+            "name": "[ ... ]",
+            "category": "Data",
+            "syntax": "[ <values...> ]",
+            "summary": "List literal — captures stack segment into mmap'd buffer.",
+            "detail": (
+                "Captures the intervening stack values into a freshly allocated "
+                "buffer. Format: [len, item0, item1, ...] as qwords. "
+                "The buffer address is pushed. User must `munmap` when done.\n\n"
+                "Example:\n"
+                "  [ 1 2 3 4 5 ]   # pushes addr of [5, 1, 2, 3, 4, 5]"
+            ),
+        },
+        {
+            "name": "String literals",
+            "category": "Data",
+            "syntax": "\"<text>\"",
+            "summary": "Push (addr len) pair for a string.",
+            "detail": (
+                "String literals push a (addr len) pair with length on top. "
+                "Stored in .data with a trailing NULL for C compatibility. "
+                "Escape sequences: \\\", \\\\, \\n, \\r, \\t, \\0.\n\n"
+                "Example:\n"
+                "  \"hello world\" puts   # prints: hello world"
+            ),
+        },
+        {
+            "name": "Number literals",
+            "category": "Data",
+            "syntax": "123  0xFF  0b1010  0o77",
+            "summary": "Push a signed 64-bit integer.",
+            "detail": (
+                "Numbers are signed 64-bit integers. Supports:\n"
+                "  Decimal:  123, -42\n"
+                "  Hex:      0xFF, 0x1A\n"
+                "  Binary:   0b1010, 0b11110000\n"
+                "  Octal:    0o77, 0o755\n"
+                "  Float:    3.14, 1e10 (stored as 64-bit IEEE double)"
+            ),
+        },
+        {
+            "name": "immediate",
+            "category": "Modifiers",
+            "syntax": "immediate",
+            "summary": "Mark the last-defined word to execute at parse time.",
+            "detail": (
+                "Applied to the most recently defined word. Immediate words "
+                "run during parsing rather than being compiled into the output. "
+                "Used for syntax extensions and compile-time computation."
+            ),
+        },
+        {
+            "name": "compile-only",
+            "category": "Modifiers",
+            "syntax": "compile-only",
+            "summary": "Mark the last-defined word as compile-only.",
+            "detail": (
+                "The word can only be used inside other definitions, not at "
+                "the top level. Often combined with `immediate`."
+            ),
+        },
+        {
+            "name": "priority",
+            "category": "Modifiers",
+            "syntax": "priority <int>",
+            "summary": "Set priority for the next definition (conflict resolution).",
+            "detail": (
+                "Controls redefinition conflicts. Higher priority wins; "
+                "lower-priority definitions are silently ignored. Equal priority "
+                "keeps the last definition with a warning."
+            ),
+        },
+        {
+            "name": "compile-time",
+            "category": "Modifiers",
+            "syntax": "compile-time <word>",
+            "summary": "Execute a word at compile time but still emit it.",
+            "detail": (
+                "Runs the named word immediately during compilation, "
+                "but its definition is also emitted for runtime use."
+            ),
+        },
+        {
+            "name": "syscall",
+            "category": "System",
+            "syntax": "<argN> ... <arg0> <count> <nr> syscall",
+            "summary": "Invoke a Linux system call directly.",
+            "detail": (
+                "Expects (argN ... arg0 count nr) on the stack. Count is "
+                "clamped to [0,6]. Arguments are loaded into rdi, rsi, rdx, r10, "
+                "r8, r9. Executes `syscall` and pushes rax.\n\n"
+                "Example:\n"
+                "  # write(1, addr, len)\n"
+                "  addr len 1   # fd=stdout\n"
+                "  3 1 syscall  # 3 args, nr=1 (write)"
+            ),
+        },
+        {
+            "name": "exit",
+            "category": "System",
+            "syntax": "<code> exit",
+            "summary": "Terminate the process with given exit code.",
+            "detail": (
+                "Pops the exit code and terminates via sys_exit_group(231). "
+                "Convention: 0 = success, non-zero = failure.\n\n"
+                "Example:\n"
+                "  0 exit   # success"
+            ),
+        },
+    ]
+
+    _LANG_REF_CATEGORIES = []
+    _cat_seen: set = set()
+    for _lre in _LANG_REF_ENTRIES:
+        if _lre["category"] not in _cat_seen:
+            _cat_seen.add(_lre["category"])
+            _LANG_REF_CATEGORIES.append(_lre["category"])
+
+    _L2_LICENSE_TEXT = (
+        "═══════════════════════════════════════════════════════════════\n"
+        "          Apache License, Version 2.0\n"
+        "          January 2004\n"
+        "          http://www.apache.org/licenses/\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "\n"
+        "  TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n"
+        "\n"
+        "  1. Definitions.\n"
+        "\n"
+        "  \"License\" shall mean the terms and conditions for use,\n"
+        "  reproduction, and distribution as defined by Sections 1\n"
+        "  through 9 of this document.\n"
+        "\n"
+        "  \"Licensor\" shall mean the copyright owner or entity\n"
+        "  authorized by the copyright owner that is granting the\n"
+        "  License.\n"
+        "\n"
+        "  \"Legal Entity\" shall mean the union of the acting entity\n"
+        "  and all other entities that control, are controlled by,\n"
+        "  or are under common control with that entity. For the\n"
+        "  purposes of this definition, \"control\" means (i) the\n"
+        "  power, direct or indirect, to cause the direction or\n"
+        "  management of such entity, whether by contract or\n"
+        "  otherwise, or (ii) ownership of fifty percent (50%) or\n"
+        "  more of the outstanding shares, or (iii) beneficial\n"
+        "  ownership of such entity.\n"
+        "\n"
+        "  \"You\" (or \"Your\") shall mean an individual or Legal\n"
+        "  Entity exercising permissions granted by this License.\n"
+        "\n"
+        "  \"Source\" form shall mean the preferred form for making\n"
+        "  modifications, including but not limited to software\n"
+        "  source code, documentation source, and configuration\n"
+        "  files.\n"
+        "\n"
+        "  \"Object\" form shall mean any form resulting from\n"
+        "  mechanical transformation or translation of a Source\n"
+        "  form, including but not limited to compiled object code,\n"
+        "  generated documentation, and conversions to other media\n"
+        "  types.\n"
+        "\n"
+        "  \"Work\" shall mean the work of authorship, whether in\n"
+        "  Source or Object form, made available under the License,\n"
+        "  as indicated by a copyright notice that is included in\n"
+        "  or attached to the work.\n"
+        "\n"
+        "  \"Derivative Works\" shall mean any work, whether in\n"
+        "  Source or Object form, that is based on (or derived\n"
+        "  from) the Work and for which the editorial revisions,\n"
+        "  annotations, elaborations, or other modifications\n"
+        "  represent, as a whole, an original work of authorship.\n"
+        "\n"
+        "  \"Contribution\" shall mean any work of authorship,\n"
+        "  including the original version of the Work and any\n"
+        "  modifications or additions to that Work or Derivative\n"
+        "  Works thereof, that is intentionally submitted to the\n"
+        "  Licensor for inclusion in the Work by the copyright\n"
+        "  owner or by an individual or Legal Entity authorized to\n"
+        "  submit on behalf of the copyright owner.\n"
+        "\n"
+        "  \"Contributor\" shall mean Licensor and any individual or\n"
+        "  Legal Entity on behalf of whom a Contribution has been\n"
+        "  received by the Licensor and subsequently incorporated\n"
+        "  within the Work.\n"
+        "\n"
+        "  2. Grant of Copyright License.\n"
+        "\n"
+        "  Subject to the terms and conditions of this License,\n"
+        "  each Contributor hereby grants to You a perpetual,\n"
+        "  worldwide, non-exclusive, no-charge, royalty-free,\n"
+        "  irrevocable copyright license to reproduce, prepare\n"
+        "  Derivative Works of, publicly display, publicly perform,\n"
+        "  sublicense, and distribute the Work and such Derivative\n"
+        "  Works in Source or Object form.\n"
+        "\n"
+        "  3. Grant of Patent License.\n"
+        "\n"
+        "  Subject to the terms and conditions of this License,\n"
+        "  each Contributor hereby grants to You a perpetual,\n"
+        "  worldwide, non-exclusive, no-charge, royalty-free,\n"
+        "  irrevocable (except as stated in this section) patent\n"
+        "  license to make, have made, use, offer to sell, sell,\n"
+        "  import, and otherwise transfer the Work, where such\n"
+        "  license applies only to those patent claims licensable\n"
+        "  by such Contributor that are necessarily infringed by\n"
+        "  their Contribution(s) alone or by combination of their\n"
+        "  Contribution(s) with the Work to which such\n"
+        "  Contribution(s) was submitted.\n"
+        "\n"
+        "  If You institute patent litigation against any entity\n"
+        "  (including a cross-claim or counterclaim in a lawsuit)\n"
+        "  alleging that the Work or a Contribution incorporated\n"
+        "  within the Work constitutes direct or contributory\n"
+        "  patent infringement, then any patent licenses granted\n"
+        "  to You under this License for that Work shall terminate\n"
+        "  as of the date such litigation is filed.\n"
+        "\n"
+        "  4. Redistribution.\n"
+        "\n"
+        "  You may reproduce and distribute copies of the Work or\n"
+        "  Derivative Works thereof in any medium, with or without\n"
+        "  modifications, and in Source or Object form, provided\n"
+        "  that You meet the following conditions:\n"
+        "\n"
+        "  (a) You must give any other recipients of the Work or\n"
+        "      Derivative Works a copy of this License; and\n"
+        "\n"
+        "  (b) You must cause any modified files to carry prominent\n"
+        "      notices stating that You changed the files; and\n"
+        "\n"
+        "  (c) You must retain, in the Source form of any Derivative\n"
+        "      Works that You distribute, all copyright, patent,\n"
+        "      trademark, and attribution notices from the Source\n"
+        "      form of the Work, excluding those notices that do\n"
+        "      not pertain to any part of the Derivative Works; and\n"
+        "\n"
+        "  (d) If the Work includes a \"NOTICE\" text file as part\n"
+        "      of its distribution, then any Derivative Works that\n"
+        "      You distribute must include a readable copy of the\n"
+        "      attribution notices contained within such NOTICE\n"
+        "      file, excluding any notices that do not pertain to\n"
+        "      any part of the Derivative Works, in at least one\n"
+        "      of the following places: within a NOTICE text file\n"
+        "      distributed as part of the Derivative Works; within\n"
+        "      the Source form or documentation, if provided along\n"
+        "      with the Derivative Works; or, within a display\n"
+        "      generated by the Derivative Works, if and wherever\n"
+        "      such third-party notices normally appear.\n"
+        "\n"
+        "  5. Submission of Contributions.\n"
+        "\n"
+        "  Unless You explicitly state otherwise, any Contribution\n"
+        "  intentionally submitted for inclusion in the Work by You\n"
+        "  to the Licensor shall be under the terms and conditions\n"
+        "  of this License, without any additional terms or\n"
+        "  conditions. Notwithstanding the above, nothing herein\n"
+        "  shall supersede or modify the terms of any separate\n"
+        "  license agreement you may have executed with Licensor\n"
+        "  regarding such Contributions.\n"
+        "\n"
+        "  6. Trademarks.\n"
+        "\n"
+        "  This License does not grant permission to use the trade\n"
+        "  names, trademarks, service marks, or product names of\n"
+        "  the Licensor, except as required for reasonable and\n"
+        "  customary use in describing the origin of the Work and\n"
+        "  reproducing the content of the NOTICE file.\n"
+        "\n"
+        "  7. Disclaimer of Warranty.\n"
+        "\n"
+        "  Unless required by applicable law or agreed to in\n"
+        "  writing, Licensor provides the Work (and each\n"
+        "  Contributor provides its Contributions) on an \"AS IS\"\n"
+        "  BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,\n"
+        "  either express or implied, including, without limitation,\n"
+        "  any warranties or conditions of TITLE, NON-INFRINGEMENT,\n"
+        "  MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE.\n"
+        "  You are solely responsible for determining the\n"
+        "  appropriateness of using or redistributing the Work and\n"
+        "  assume any risks associated with Your exercise of\n"
+        "  permissions under this License.\n"
+        "\n"
+        "  8. Limitation of Liability.\n"
+        "\n"
+        "  In no event and under no legal theory, whether in tort\n"
+        "  (including negligence), contract, or otherwise, unless\n"
+        "  required by applicable law (such as deliberate and\n"
+        "  grossly negligent acts) or agreed to in writing, shall\n"
+        "  any Contributor be liable to You for damages, including\n"
+        "  any direct, indirect, special, incidental, or\n"
+        "  consequential damages of any character arising as a\n"
+        "  result of this License or out of the use or inability\n"
+        "  to use the Work (including but not limited to damages\n"
+        "  for loss of goodwill, work stoppage, computer failure\n"
+        "  or malfunction, or any and all other commercial damages\n"
+        "  or losses), even if such Contributor has been advised\n"
+        "  of the possibility of such damages.\n"
+        "\n"
+        "  9. Accepting Warranty or Additional Liability.\n"
+        "\n"
+        "  While redistributing the Work or Derivative Works\n"
+        "  thereof, You may choose to offer, and charge a fee for,\n"
+        "  acceptance of support, warranty, indemnity, or other\n"
+        "  liability obligations and/or rights consistent with\n"
+        "  this License. However, in accepting such obligations,\n"
+        "  You may act only on Your own behalf and on Your sole\n"
+        "  responsibility, not on behalf of any other Contributor,\n"
+        "  and only if You agree to indemnify, defend, and hold\n"
+        "  each Contributor harmless for any liability incurred\n"
+        "  by, or claims asserted against, such Contributor by\n"
+        "  reason of your accepting any such warranty or\n"
+        "  additional liability.\n"
+        "\n"
+        "  END OF TERMS AND CONDITIONS\n"
+        "\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "\n"
+        "  Copyright 2024-2026 Igor Cielniak\n"
+        "\n"
+        "  Licensed under the Apache License, Version 2.0 (the\n"
+        "  \"License\"); you may not use this file except in\n"
+        "  compliance with the License. You may obtain a copy at\n"
+        "\n"
+        "    http://www.apache.org/licenses/LICENSE-2.0\n"
+        "\n"
+        "  Unless required by applicable law or agreed to in\n"
+        "  writing, software distributed under the License is\n"
+        "  distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES\n"
+        "  OR CONDITIONS OF ANY KIND, either express or implied.\n"
+        "  See the License for the specific language governing\n"
+        "  permissions and limitations under the License.\n"
+        "\n"
+        "═══════════════════════════════════════════════════════════════\n"
+    )
+
+    _L2_PHILOSOPHY_TEXT = (
+        "═══════════════════════════════════════════════════════════\n"
+        "          T H E   P H I L O S O P H Y   O F   L 2\n"
+        "═══════════════════════════════════════════════════════════\n"
+        "\n"
+        "  \"Give the programmer raw power and get out of the way.\"\n"
+        "\n"
+        "───────────────────────────────────────────────────────────\n"
+        "\n"
+        "  L2 is a stack-based systems language that compiles\n"
+        "  ahead-of-time to native x86-64 Linux binaries. It\n"
+        "  descends from the Forth tradition: small words compose\n"
+        "  into larger words, and the machine is always visible.\n"
+        "\n"
+        "  CORE TENETS\n"
+        "\n"
+        "  1. SIMPLICITY OVER CONVENIENCE\n"
+        "     No garbage collector, no hidden magic. The compiler\n"
+        "     emits a minimal runtime you can read and modify.\n"
+        "     You own every allocation and every free.\n"
+        "\n"
+        "  2. TRANSPARENCY\n"
+        "     Every word compiles to a known, inspectable\n"
+        "     sequence of x86-64 instructions. --emit-asm\n"
+        "     shows exactly what runs on the metal.\n"
+        "\n"
+        "  3. COMPOSABILITY\n"
+        "     Small words build big programs. The stack is the\n"
+        "     universal interface — no types to reconcile, no\n"
+        "     generics to instantiate. If it fits on the stack,\n"
+        "     it composes.\n"
+        "\n"
+        "  4. META-PROGRAMMABILITY\n"
+        "     The front-end is user-extensible: immediate words,\n"
+        "     text macros, :py blocks, and token hooks let you\n"
+        "     reshape syntax without forking the compiler.\n"
+        "\n"
+        "  5. UNSAFE BY DESIGN\n"
+        "     Safety is the programmer's job, not the language's.\n"
+        "     L2 trusts you with raw memory, inline assembly,\n"
+        "     and direct syscalls. This is a feature, not a bug.\n"
+        "\n"
+        "  6. MINIMAL STANDARD LIBRARY\n"
+        "     The stdlib provides building blocks — not policy.\n"
+        "     It gives you alloc/free, puts/puti, arrays, and\n"
+        "     file I/O. Everything else is your choice.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────\n"
+        "\n"
+        "  L2 is for programmers who want to understand every\n"
+        "  byte their program emits, and who believe that the\n"
+        "  best abstraction is the one you built yourself.\n"
+        "\n"
+        "═══════════════════════════════════════════════════════════\n"
+    )
+
+    _L2_CT_REF_TEXT = (
+        "═══════════════════════════════════════════════════════════════\n"
+        "        C O M P I L E - T I M E   R E F E R E N C E\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "\n"
+        "  L2 runs a compile-time virtual machine (the CT VM) during\n"
+        "  parsing. Code marked `compile-time`, immediate words, and\n"
+        "  :py blocks execute inside this VM. They can inspect and\n"
+        "  transform the token stream, emit definitions, manipulate\n"
+        "  lists and maps, and control the generated assembly output.\n"
+        "\n"
+        "  All words listed below are compile-only: they exist only\n"
+        "  during compilation and produce no runtime code.\n"
+        "\n"
+        "  Stack notation:  [*, deeper, deeper | top] -> [*] || [*, result]\n"
+        "    *   = rest of stack (unchanged)\n"
+        "    |   = separates deeper elements from the top\n"
+        "    ->  = before / after\n"
+        "    ||  = separates alternative stack effects\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 1  COMPILE-TIME HOOKS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  compile-time                             [immediate]\n"
+        "    Marks a word definition so that its body\n"
+        "    runs in the CT VM. The word's definition\n"
+        "    is interpreted by the VM when the\n"
+        "    word is referenced during compilation.\n"
+        "\n"
+        "      word double-ct dup + end\n"
+        "      compile-time double-ct\n"
+        "\n"
+        "  immediate                                [immediate]\n"
+        "    Mark the preceding word as immediate: it runs at parse\n"
+        "    time whenever the compiler encounters it. Immediate words\n"
+        "    receive a MacroContext and can consume tokens, emit ops,\n"
+        "    or inject tokens into the stream.\n"
+        "\n"
+        "  compile-only                             [immediate]\n"
+        "    Mark the preceding word as compile-only. It can only be\n"
+        "    called during compilation, its asm is not emitted.\n"
+        "\n"
+        "  inline                                   [immediate]\n"
+        "    Mark a word for inline expansion: its body\n"
+        "    is expanded at each call site instead of emitting a call.\n"
+        "\n"
+        "  use-l2-ct                           [immediate, compile-only]\n"
+        "    Replace the built-in CT intrinsic of a word with its L2\n"
+        "    definition body. With a name on the stack, targets that\n"
+        "    word; with an empty stack, targets the most recently\n"
+        "    defined word.\n"
+        "\n"
+        "      word 3dup dup dup dup end  use-l2-ct\n"
+        "\n"
+        "  set-token-hook                           [compile-only]\n"
+        "    [* | name] -> [*]\n"
+        "    Register a word as the token hook. Every token the parser\n"
+        "    encounters is pushed onto the CT stack, the hook word is\n"
+        "    invoked, and the result (0 = not handled, 1 = handled)\n"
+        "    tells the parser whether to skip normal processing.\n"
+        "\n"
+        "  clear-token-hook                         [compile-only]\n"
+        "    [*] -> [*]\n"
+        "    Remove the currently active token hook.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 2  LIST OPERATIONS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Lists are dynamic arrays that live in the CT VM. They hold\n"
+        "  integers, strings, tokens, other lists, maps, or nil.\n"
+        "\n"
+        "  list-new          [*] -> [* | list]\n"
+        "    Create a new empty list.\n"
+        "\n"
+        "  list-clone         [* | list] -> [* | copy]\n"
+        "    Shallow-copy a list.\n"
+        "\n"
+        "  list-append        [*, list | value] -> [* | list]\n"
+        "    Append value to the end of list (mutates in place).\n"
+        "\n"
+        "  list-pop            [* | list] -> [*, list | value]\n"
+        "    Remove and return the last element.\n"
+        "\n"
+        "  list-pop-front      [* | list] -> [*, list | value]\n"
+        "    Remove and return the first element.\n"
+        "\n"
+        "  list-peek-front     [* | list] -> [*, list | value]\n"
+        "    Return the first element without removing it.\n"
+        "\n"
+        "  list-push-front     [*, list | value] -> [* | list]\n"
+        "    Insert value at the beginning of list.\n"
+        "\n"
+        "  list-reverse        [* | list] -> [* | list]\n"
+        "    Reverse the list in place.\n"
+        "\n"
+        "  list-length         [* | list] -> [* | n]\n"
+        "    Push the number of elements.\n"
+        "\n"
+        "  list-empty?         [* | list] -> [* | flag]\n"
+        "    Push 1 if the list is empty, 0 otherwise.\n"
+        "\n"
+        "  list-get            [*, list | index] -> [* | value]\n"
+        "    Get element at index (0-based). Errors on out-of-range.\n"
+        "\n"
+        "  list-set            [*, list, index | value] -> [* | list]\n"
+        "    Set element at index. Errors on out-of-range.\n"
+        "\n"
+        "  list-clear          [* | list] -> [* | list]\n"
+        "    Remove all elements from the list.\n"
+        "\n"
+        "  list-extend         [*, target | source] -> [* | target]\n"
+        "    Append all elements of source to target.\n"
+        "\n"
+        "  list-last           [* | list] -> [* | value]\n"
+        "    Push the last element without removing it.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 3  MAP OPERATIONS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Maps are string-keyed dictionaries in the CT VM.\n"
+        "\n"
+        "  map-new             [*] -> [* | map]\n"
+        "    Create a new empty map.\n"
+        "\n"
+        "  map-set             [*, map, key | value] -> [* | map]\n"
+        "    Set key to value in the map (mutates in place).\n"
+        "\n"
+        "  map-get             [*, map | key] -> [*, map, value | flag]\n"
+        "    Look up key. Pushes the map back, then the value\n"
+        "    (or nil if absent), then 1 if found or 0 if not.\n"
+        "\n"
+        "  map-has?            [*, map | key] -> [*, map | flag]\n"
+        "    Push 1 if the key exists in the map, 0 otherwise.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 4  NIL\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  nil                 [*] -> [* | nil]\n"
+        "    Push the nil sentinel value.\n"
+        "\n"
+        "  nil?                [* | value] -> [* | flag]\n"
+        "    Push 1 if the value is nil, 0 otherwise.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 5  STRING OPERATIONS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Strings in the CT VM are immutable sequences of characters.\n"
+        "\n"
+        "  string=             [*, a | b] -> [* | flag]\n"
+        "    Push 1 if strings a and b are equal, 0 otherwise.\n"
+        "\n"
+        "  string-length       [* | str] -> [* | n]\n"
+        "    Push the length of the string.\n"
+        "\n"
+        "  string-append       [*, left | right] -> [* | result]\n"
+        "    Concatenate two strings.\n"
+        "\n"
+        "  string>number       [* | str] -> [*, value | flag]\n"
+        "    Parse an integer from the string (supports 0x, 0b, 0o\n"
+        "    prefixes). Pushes (value, 1) on success or (0, 0) on\n"
+        "    failure.\n"
+        "\n"
+        "  int>string          [* | n] -> [* | str]\n"
+        "    Convert an integer to its decimal string representation.\n"
+        "\n"
+        "  identifier?         [* | value] -> [* | flag]\n"
+        "    Push 1 if the value is a valid L2 identifier string,\n"
+        "    0 otherwise. Also accepts token objects.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 6  TOKEN STREAM MANIPULATION\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  These words give compile-time code direct control over\n"
+        "  the token stream the parser reads from.\n"
+        "\n"
+        "  next-token          [*] -> [* | token]\n"
+        "    Consume and push the next token from the parser.\n"
+        "\n"
+        "  peek-token          [*] -> [* | token]\n"
+        "    Push the next token without consuming it.\n"
+        "\n"
+        "  token-lexeme        [* | token] -> [* | str]\n"
+        "    Extract the lexeme (text) from a token or string.\n"
+        "\n"
+        "  token-from-lexeme   [*, lexeme | template] -> [* | token]\n"
+        "    Create a new token with the given lexeme, using source\n"
+        "    location from the template token.\n"
+        "\n"
+        "  inject-tokens       [* | list-of-tokens] -> [*]\n"
+        "    Insert a list of token objects at the current parser\n"
+        "    position. The parser will read them before continuing\n"
+        "    with the original stream.\n"
+        "\n"
+        "  add-token           [* | str] -> [*]\n"
+        "    Register a single-character string as a token separator\n"
+        "    recognized by the reader.\n"
+        "\n"
+        "  add-token-chars     [* | str] -> [*]\n"
+        "    Register each character of the string as a token\n"
+        "    separator character.\n"
+        "\n"
+        "  emit-definition     [*, name | body-list] -> [*]\n"
+        "    Emit a word definition dynamically. `name` is a token or\n"
+        "    string; `body-list` is a list of tokens/strings that form\n"
+        "    the word body. Injects the equivalent of\n"
+        "      word <name> <body...> end\n"
+        "    into the parser's token stream.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 7  LEXER OBJECTS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Lexer objects provide structured token parsing with custom\n"
+        "  separator characters. They wrap the main parser and let\n"
+        "  macros build mini-DSLs that tokenize differently.\n"
+        "\n"
+        "  lexer-new           [* | separators] -> [* | lexer]\n"
+        "    Create a lexer object with the given separator characters\n"
+        "    (e.g. \",;\" to split on commas and semicolons).\n"
+        "\n"
+        "  lexer-pop           [* | lexer] -> [*, lexer | token]\n"
+        "    Consume and return the next token from the lexer.\n"
+        "\n"
+        "  lexer-peek          [* | lexer] -> [*, lexer | token]\n"
+        "    Return the next token without consuming it.\n"
+        "\n"
+        "  lexer-expect        [*, lexer | str] -> [*, lexer | token]\n"
+        "    Consume the next token and assert its lexeme matches str.\n"
+        "    Raises a parse error on mismatch.\n"
+        "\n"
+        "  lexer-collect-brace [* | lexer] -> [*, lexer | list]\n"
+        "    Collect all tokens between matching { } braces into a\n"
+        "    list. The opening { must be the next token.\n"
+        "\n"
+        "  lexer-push-back     [* | lexer] -> [* | lexer]\n"
+        "    Push the most recently consumed token back onto the\n"
+        "    lexer's stream.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 8  ASSEMBLY OUTPUT CONTROL\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  These words let compile-time code modify the generated\n"
+        "  assembly: the prelude (code inside _start) and the\n"
+        "  BSS section (uninitialized data).\n"
+        "\n"
+        "  prelude-clear       [*] -> [*]\n"
+        "    Discard the entire custom prelude.\n"
+        "\n"
+        "  prelude-append      [* | line] -> [*]\n"
+        "    Append a line of assembly to the custom prelude.\n"
+        "\n"
+        "  prelude-set         [* | list-of-strings] -> [*]\n"
+        "    Replace the custom prelude with the given list of\n"
+        "    assembly lines.\n"
+        "\n"
+        "  bss-clear           [*] -> [*]\n"
+        "    Discard all custom BSS declarations.\n"
+        "\n"
+        "  bss-append          [* | line] -> [*]\n"
+        "    Append a line to the custom BSS section.\n"
+        "\n"
+        "  bss-set             [* | list-of-strings] -> [*]\n"
+        "    Replace the custom BSS with the given list of lines.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 9  EXPRESSION HELPER\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  shunt               [* | token-list] -> [* | postfix-list]\n"
+        "    Shunting-yard algorithm. Takes a list of infix token\n"
+        "    strings (numbers, identifiers, +, -, *, /, %, parentheses)\n"
+        "    and returns the equivalent postfix (RPN) token list.\n"
+        "    Useful for building expression-based DSLs.\n"
+        "\n"
+        "      [\"3\" \"+\" \"4\" \"*\" \"2\"] shunt\n"
+        "      # => [\"3\" \"4\" \"2\" \"*\" \"+\"]\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 10  LOOP INDEX\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  i                   [*] -> [* | index]\n"
+        "    Push the current iteration index (0-based) of the\n"
+        "    innermost compile-time for loop.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 11  ASSERTIONS & ERRORS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  static_assert       [* | condition] -> [*]\n"
+        "    If condition is zero or false, abort compilation with a\n"
+        "    static assertion failure (includes source location).\n"
+        "\n"
+        "  parse-error         [* | message] -> (aborts)\n"
+        "    Abort compilation with the given error message.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 12  EVAL\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  eval                [* | source-string] -> [*]\n"
+        "    Parse and execute a string of L2 code in the CT VM.\n"
+        "    The string is tokenized, parsed as if it were part of\n"
+        "    a definition body, and the resulting ops are executed\n"
+        "    immediately.\n"
+        "\n"
+        "      \"3 4 +\" eval   # pushes 7 onto the CT stack\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 13  MACRO & TEXT MACRO DEFINITION\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  macro <name> <number> <body...> ;\n"
+        "    Define a text macro that expands during tokenization.\n"
+        "    The number is the parameter count. The body tokens are\n"
+        "    substituted literally wherever the macro is invoked.\n"
+        "\n"
+        "      macro BUFFER_SIZE 0 4096 ;\n"
+        "      macro MAX 2 >r dup r> dup >r < if drop r> else r> drop end ;\n"
+        "\n"
+        "  :py { ... }\n"
+        "    Embed a Python code block that runs at compile time.\n"
+        "    The block receives a `ctx` (MacroContext) variable and\n"
+        "    can call ctx.emit(), ctx.next_token(), etc.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 14  STRUCT & CSTRUCT\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  struct <name> field <name> <size> ... end\n"
+        "    Define a simple struct with manually-sized fields.\n"
+        "    Generates accessor words:\n"
+        "      <struct>.size           — total byte size\n"
+        "      <struct>.<field>.offset — byte offset\n"
+        "      <struct>.<field>.size   — field byte size\n"
+        "      <struct>.<field>@       — read field (qword)\n"
+        "      <struct>.<field>!       — write field (qword)\n"
+        "\n"
+        "  cstruct <name> cfield <name> <type> ... end\n"
+        "    Define a C-compatible struct with automatic alignment\n"
+        "    and padding. Field types use C names (int, long, char*,\n"
+        "    struct <name>*, etc.). Generates the same accessors as\n"
+        "    struct plus <struct>.align.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 15  FLOW CONTROL LABELS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  label <name>                             [immediate]\n"
+        "    Emit a named label at the current position in the word\n"
+        "    body. Can be targeted by `goto`.\n"
+        "\n"
+        "  goto <name>                              [immediate]\n"
+        "    Emit an unconditional jump to the named label.\n"
+        "\n"
+        "  here                                     [immediate]\n"
+        "    Push a \"file:line:col\" string literal for the current\n"
+        "    source location. Useful for error messages and debugging.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 16  WITH (SCOPED VARIABLES)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  with <name> ... end\n"
+        "    Bind the top of the data stack to a compile-time name.\n"
+        "    Inside the with block, referencing <name> pushes the\n"
+        "    bound value. At the end of the block the binding is\n"
+        "    removed. Useful for readability and avoiding stack shuffling.\n"
+        "\n"
+        "      10 with x\n"
+        "        x x +   # pushes 10 twice, adds → 20\n"
+        "      end\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 17  SUMMARY TABLE\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Word                  Category        Stack Effect\n"
+        "  ────────────────────  ──────────────  ──────────────────────────\n"
+        "  nil                   Nil             [*] -> [* | nil]\n"
+        "  nil?                  Nil             [* | v] -> [* | flag]\n"
+        "  list-new              List            [*] -> [* | list]\n"
+        "  list-clone            List            [* | list] -> [* | copy]\n"
+        "  list-append           List            [*, list | v] -> [* | list]\n"
+        "  list-pop              List            [* | list] -> [*, list | v]\n"
+        "  list-pop-front        List            [* | list] -> [*, list | v]\n"
+        "  list-peek-front       List            [* | list] -> [*, list | v]\n"
+        "  list-push-front       List            [*, list | v] -> [* | list]\n"
+        "  list-reverse          List            [* | list] -> [* | list]\n"
+        "  list-length           List            [* | list] -> [* | n]\n"
+        "  list-empty?           List            [* | list] -> [* | flag]\n"
+        "  list-get              List            [*, list | i] -> [* | v]\n"
+        "  list-set              List            [*, list, i | v] -> [* | list]\n"
+        "  list-clear            List            [* | list] -> [* | list]\n"
+        "  list-extend           List            [*, tgt | src] -> [* | tgt]\n"
+        "  list-last             List            [* | list] -> [* | v]\n"
+        "  map-new               Map             [*] -> [* | map]\n"
+        "  map-set               Map             [*, map, k | v] -> [* | map]\n"
+        "  map-get               Map             [*, map | k] -> [*, map, v | f]\n"
+        "  map-has?              Map             [*, map | k] -> [*, map | f]\n"
+        "  string=               String          [*, a | b] -> [* | flag]\n"
+        "  string-length         String          [* | s] -> [* | n]\n"
+        "  string-append         String          [*, l | r] -> [* | lr]\n"
+        "  string>number         String          [* | s] -> [*, v | flag]\n"
+        "  int>string            String          [* | n] -> [* | s]\n"
+        "  identifier?           String          [* | v] -> [* | flag]\n"
+        "  next-token            Token           [*] -> [* | tok]\n"
+        "  peek-token            Token           [*] -> [* | tok]\n"
+        "  token-lexeme          Token           [* | tok] -> [* | s]\n"
+        "  token-from-lexeme     Token           [*, s | tmpl] -> [* | tok]\n"
+        "  inject-tokens         Token           [* | list] -> [*]\n"
+        "  add-token             Token           [* | s] -> [*]\n"
+        "  add-token-chars       Token           [* | s] -> [*]\n"
+        "  emit-definition       Token           [*, name | body] -> [*]\n"
+        "  set-token-hook        Hook            [* | name] -> [*]\n"
+        "  clear-token-hook      Hook            [*] -> [*]\n"
+        "  prelude-clear         Assembly        [*] -> [*]\n"
+        "  prelude-append        Assembly        [* | line] -> [*]\n"
+        "  prelude-set           Assembly        [* | list] -> [*]\n"
+        "  bss-clear             Assembly        [*] -> [*]\n"
+        "  bss-append            Assembly        [* | line] -> [*]\n"
+        "  bss-set               Assembly        [* | list] -> [*]\n"
+        "  shunt                 Expression      [* | list] -> [* | list]\n"
+        "  i                     Loop            [*] -> [* | idx]\n"
+        "  static_assert         Assert          [* | cond] -> [*]\n"
+        "  parse-error           Assert          [* | msg] -> (aborts)\n"
+        "  eval                  Eval            [* | str] -> [*]\n"
+        "  lexer-new             Lexer           [* | seps] -> [* | lex]\n"
+        "  lexer-pop             Lexer           [* | lex] -> [*, lex | tok]\n"
+        "  lexer-peek            Lexer           [* | lex] -> [*, lex | tok]\n"
+        "  lexer-expect          Lexer           [*, lex | s] -> [*, lex | tok]\n"
+        "  lexer-collect-brace   Lexer           [* | lex] -> [*, lex | list]\n"
+        "  lexer-push-back       Lexer           [* | lex] -> [* | lex]\n"
+        "  use-l2-ct             Hook            [* | name?] -> [*]\n"
+        "\n"
+        "═══════════════════════════════════════════════════════════════\n"
+    )
 
     def _parse_sig_counts(effect: str) -> Tuple[int, int]:
         """Parse stack effect to (n_args, n_returns).
@@ -8997,6 +10650,7 @@ def _run_docs_tui(
         selected = 0
         scroll = 0
         mode = _MODE_BROWSE
+        active_tab = _TAB_LIBRARY
 
         # Search mode state
         search_buf = query
@@ -9004,6 +10658,17 @@ def _run_docs_tui(
         # Detail mode state
         detail_scroll = 0
         detail_lines: List[str] = []
+
+        # Language reference state
+        lang_selected = 0
+        lang_scroll = 0
+        lang_cat_filter = 0  # 0 = all
+        lang_detail_scroll = 0
+        lang_detail_lines: List[str] = []
+
+        # License/philosophy scroll state
+        info_scroll = 0
+        info_lines: List[str] = []
 
         # Filter mode state
         filter_kind_idx = 0  # index into _FILTER_KINDS
@@ -9027,6 +10692,55 @@ def _run_docs_tui(
             old = filter_files_enabled
             filter_files_enabled = {p: old.get(p, True) for p in new_paths}
             all_file_paths = new_paths
+
+        def _filter_lang_ref() -> List[Dict[str, str]]:
+            if lang_cat_filter == 0:
+                return list(_LANG_REF_ENTRIES)
+            cat = _LANG_REF_CATEGORIES[lang_cat_filter - 1]
+            return [e for e in _LANG_REF_ENTRIES if e["category"] == cat]
+
+        def _build_lang_detail_lines(entry: Dict[str, str], width: int) -> List[str]:
+            lines: List[str] = []
+            lines.append(f"{'Name:':<14} {entry['name']}")
+            lines.append(f"{'Category:':<14} {entry['category']}")
+            lines.append("")
+            lines.append("Syntax:")
+            for sl in entry["syntax"].split("\n"):
+                lines.append(f"  {sl}")
+            lines.append("")
+            lines.append(f"{'Summary:':<14} {entry['summary']}")
+            lines.append("")
+            lines.append("Description:")
+            for dl in entry["detail"].split("\n"):
+                if len(dl) <= width - 4:
+                    lines.append(f"  {dl}")
+                else:
+                    words = dl.split()
+                    current: List[str] = []
+                    col = 2
+                    for w in words:
+                        if current and col + 1 + len(w) > width - 2:
+                            lines.append("  " + " ".join(current))
+                            current = [w]
+                            col = 2 + len(w)
+                        else:
+                            current.append(w)
+                            col += 1 + len(w) if current else len(w)
+                    if current:
+                        lines.append("  " + " ".join(current))
+            return lines
+
+        def _render_tab_bar(scr: Any, y: int, width: int) -> None:
+            x = 1
+            for i, name in enumerate(_TAB_NAMES):
+                label = f" {name} "
+                attr = curses.A_REVERSE | curses.A_BOLD if i == active_tab else curses.A_DIM
+                _safe_addnstr(scr, y, x, label, width - x - 1, attr)
+                x += len(label) + 1
+            # Right-aligned shortcuts
+            shortcuts = " L license  P philosophy "
+            if x + len(shortcuts) < width:
+                _safe_addnstr(scr, y, width - len(shortcuts) - 1, shortcuts, len(shortcuts), curses.A_DIM)
 
         def _apply_filters(items: List[DocEntry]) -> List[DocEntry]:
             result = items
@@ -9217,6 +10931,13 @@ def _run_docs_tui(
                 if key == 9:  # Tab
                     filter_field = (filter_field + 1) % _N_FILTER_FIELDS
                     continue
+                if filter_field not in (5, 6):
+                    if key in (curses.KEY_DOWN, ord("j")):
+                        filter_field = (filter_field + 1) % _N_FILTER_FIELDS
+                        continue
+                    if key in (curses.KEY_UP, ord("k")):
+                        filter_field = (filter_field - 1) % _N_FILTER_FIELDS
+                        continue
                 if filter_field == 0:
                     # Kind field
                     if key in (curses.KEY_LEFT, ord("h")):
@@ -9362,8 +11083,260 @@ def _run_docs_tui(
                     continue
                 continue
 
+            # -- LANGUAGE REFERENCE BROWSE --
+            if mode == _MODE_LANG_REF:
+                lang_entries = _filter_lang_ref()
+                if lang_selected >= len(lang_entries):
+                    lang_selected = max(0, len(lang_entries) - 1)
+
+                list_height = max(1, height - 5)
+                if lang_selected < lang_scroll:
+                    lang_scroll = lang_selected
+                if lang_selected >= lang_scroll + list_height:
+                    lang_scroll = lang_selected - list_height + 1
+                max_ls = max(0, len(lang_entries) - list_height)
+                if lang_scroll > max_ls:
+                    lang_scroll = max_ls
+
+                stdscr.erase()
+                _render_tab_bar(stdscr, 0, width)
+                cat_names = ["all"] + _LANG_REF_CATEGORIES
+                cat_label = cat_names[lang_cat_filter]
+                header = f" Language Reference  {len(lang_entries)} entries  category: {cat_label}"
+                _safe_addnstr(stdscr, 1, 0, header, width - 1, curses.A_BOLD)
+                hint = " c category  Enter detail  j/k nav  Tab switch  C ct-ref  L license  P philosophy  q quit"
+                _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
+
+                for row in range(list_height):
+                    idx = lang_scroll + row
+                    if idx >= len(lang_entries):
+                        break
+                    le = lang_entries[idx]
+                    cat_tag = f"[{le['category']}]"
+                    line = f"  {le['name']:<28} {le['summary']:<36} {cat_tag}"
+                    attr = curses.A_REVERSE if idx == lang_selected else 0
+                    _safe_addnstr(stdscr, 3 + row, 0, line, width - 1, attr)
+
+                if lang_entries:
+                    cur = lang_entries[lang_selected]
+                    _safe_addnstr(stdscr, height - 1, 0, f" {cur['syntax'].split(chr(10))[0]}", width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+
+                if key in (27, ord("q")):
+                    return 0
+                if key == 9:  # Tab
+                    active_tab = _TAB_CT_REF
+                    info_lines = _L2_CT_REF_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_CT_REF
+                    continue
+                if key == ord("c"):
+                    lang_cat_filter = (lang_cat_filter + 1) % (len(_LANG_REF_CATEGORIES) + 1)
+                    lang_selected = 0
+                    lang_scroll = 0
+                    continue
+                if key in (10, 13, curses.KEY_ENTER):
+                    if lang_entries:
+                        lang_detail_lines = _build_lang_detail_lines(lang_entries[lang_selected], width)
+                        lang_detail_scroll = 0
+                        mode = _MODE_LANG_DETAIL
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    if lang_selected > 0:
+                        lang_selected -= 1
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    if lang_selected + 1 < len(lang_entries):
+                        lang_selected += 1
+                    continue
+                if key == curses.KEY_PPAGE:
+                    lang_selected = max(0, lang_selected - list_height)
+                    continue
+                if key == curses.KEY_NPAGE:
+                    lang_selected = min(max(0, len(lang_entries) - 1), lang_selected + list_height)
+                    continue
+                if key == ord("g"):
+                    lang_selected = 0
+                    lang_scroll = 0
+                    continue
+                if key == ord("G"):
+                    lang_selected = max(0, len(lang_entries) - 1)
+                    continue
+                if key == ord("L"):
+                    info_lines = _L2_LICENSE_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_LICENSE
+                    continue
+                if key == ord("P"):
+                    info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_PHILOSOPHY
+                    continue
+                if key == ord("C"):
+                    active_tab = _TAB_CT_REF
+                    info_lines = _L2_CT_REF_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_CT_REF
+                    continue
+
+            # -- LANGUAGE DETAIL MODE --
+            if mode == _MODE_LANG_DETAIL:
+                stdscr.erase()
+                _safe_addnstr(
+                    stdscr, 0, 0,
+                    f" {lang_detail_lines[0] if lang_detail_lines else ''} ",
+                    width - 1, curses.A_BOLD,
+                )
+                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k/Up/Down: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
+                body_height = max(1, height - 3)
+                max_ldscroll = max(0, len(lang_detail_lines) - body_height)
+                if lang_detail_scroll > max_ldscroll:
+                    lang_detail_scroll = max_ldscroll
+                for row in range(body_height):
+                    li = lang_detail_scroll + row
+                    if li >= len(lang_detail_lines):
+                        break
+                    _safe_addnstr(stdscr, 2 + row, 0, lang_detail_lines[li], width - 1)
+                pos_text = f" {lang_detail_scroll + 1}-{min(lang_detail_scroll + body_height, len(lang_detail_lines))}/{len(lang_detail_lines)} "
+                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
+                    mode = _MODE_LANG_REF
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    if lang_detail_scroll < max_ldscroll:
+                        lang_detail_scroll += 1
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    if lang_detail_scroll > 0:
+                        lang_detail_scroll -= 1
+                    continue
+                if key == curses.KEY_NPAGE:
+                    lang_detail_scroll = min(max_ldscroll, lang_detail_scroll + body_height)
+                    continue
+                if key == curses.KEY_PPAGE:
+                    lang_detail_scroll = max(0, lang_detail_scroll - body_height)
+                    continue
+                if key == ord("g"):
+                    lang_detail_scroll = 0
+                    continue
+                if key == ord("G"):
+                    lang_detail_scroll = max_ldscroll
+                    continue
+                continue
+
+            # -- LICENSE / PHILOSOPHY MODE --
+            if mode in (_MODE_LICENSE, _MODE_PHILOSOPHY):
+                title = "License" if mode == _MODE_LICENSE else "Philosophy of L2"
+                stdscr.erase()
+                _safe_addnstr(stdscr, 0, 0, f" {title} ", width - 1, curses.A_BOLD)
+                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
+                body_height = max(1, height - 3)
+                max_iscroll = max(0, len(info_lines) - body_height)
+                if info_scroll > max_iscroll:
+                    info_scroll = max_iscroll
+                for row in range(body_height):
+                    li = info_scroll + row
+                    if li >= len(info_lines):
+                        break
+                    _safe_addnstr(stdscr, 2 + row, 0, f"  {info_lines[li]}", width - 1)
+                pos_text = f" {info_scroll + 1}-{min(info_scroll + body_height, len(info_lines))}/{len(info_lines)} "
+                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+                prev_mode = _MODE_LANG_REF if active_tab == _TAB_LANG_REF else (_MODE_CT_REF if active_tab == _TAB_CT_REF else _MODE_BROWSE)
+                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
+                    mode = prev_mode
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    if info_scroll < max_iscroll:
+                        info_scroll += 1
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    if info_scroll > 0:
+                        info_scroll -= 1
+                    continue
+                if key == curses.KEY_NPAGE:
+                    info_scroll = min(max_iscroll, info_scroll + body_height)
+                    continue
+                if key == curses.KEY_PPAGE:
+                    info_scroll = max(0, info_scroll - body_height)
+                    continue
+                if key == ord("g"):
+                    info_scroll = 0
+                    continue
+                if key == ord("G"):
+                    info_scroll = max_iscroll
+                    continue
+                continue
+
+            # -- COMPILE-TIME REFERENCE MODE --
+            if mode == _MODE_CT_REF:
+                stdscr.erase()
+                _safe_addnstr(stdscr, 0, 0, " Compile-Time Reference ", width - 1, curses.A_BOLD)
+                _render_tab_bar(stdscr, 1, width)
+                _safe_addnstr(stdscr, 2, 0, " j/k scroll  PgUp/PgDn  Tab switch  L license  P philosophy  q quit", width - 1, curses.A_DIM)
+                body_height = max(1, height - 4)
+                max_iscroll = max(0, len(info_lines) - body_height)
+                if info_scroll > max_iscroll:
+                    info_scroll = max_iscroll
+                for row in range(body_height):
+                    li = info_scroll + row
+                    if li >= len(info_lines):
+                        break
+                    _safe_addnstr(stdscr, 3 + row, 0, f"  {info_lines[li]}", width - 1)
+                pos_text = f" {info_scroll + 1}-{min(info_scroll + body_height, len(info_lines))}/{len(info_lines)} "
+                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (27, ord("q")):
+                    return 0
+                if key == 9:  # Tab
+                    active_tab = _TAB_LIBRARY
+                    mode = _MODE_BROWSE
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    if info_scroll < max_iscroll:
+                        info_scroll += 1
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    if info_scroll > 0:
+                        info_scroll -= 1
+                    continue
+                if key == curses.KEY_NPAGE:
+                    info_scroll = min(max_iscroll, info_scroll + body_height)
+                    continue
+                if key == curses.KEY_PPAGE:
+                    info_scroll = max(0, info_scroll - body_height)
+                    continue
+                if key == ord("g"):
+                    info_scroll = 0
+                    continue
+                if key == ord("G"):
+                    info_scroll = max_iscroll
+                    continue
+                if key == ord("L"):
+                    info_lines = _L2_LICENSE_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_LICENSE
+                    continue
+                if key == ord("P"):
+                    info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_PHILOSOPHY
+                    continue
+                if key == ord("C"):
+                    active_tab = _TAB_CT_REF
+                    info_lines = _L2_CT_REF_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_CT_REF
+                    continue
+                continue
+
             # -- BROWSE MODE --
-            list_height = max(1, height - 4)
+            list_height = max(1, height - 5)
             if selected < scroll:
                 scroll = selected
             if selected >= scroll + list_height:
@@ -9398,8 +11371,9 @@ def _run_docs_tui(
                 filter_info = "  [" + ", ".join(parts) + "]"
             header = f" L2 docs  {len(filtered)}/{len(entries)}" + (f"  search: {query}" if query else "") + filter_info
             _safe_addnstr(stdscr, 0, 0, header, width - 1, curses.A_BOLD)
-            hint = " / search  f filters  r reload  Enter detail  j/k nav  q quit"
-            _safe_addnstr(stdscr, 1, 0, hint, width - 1, curses.A_DIM)
+            _render_tab_bar(stdscr, 1, width)
+            hint = " / search  f filters  r reload  Enter detail  j/k nav  Tab switch  C ct-ref  L license  P philosophy  q quit"
+            _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
 
             for row in range(list_height):
                 idx = scroll + row
@@ -9410,7 +11384,7 @@ def _run_docs_tui(
                 kind_tag = f"[{entry.kind}]"
                 line = f" {entry.name:24} {effect:30} {kind_tag}"
                 attr = curses.A_REVERSE if idx == selected else 0
-                _safe_addnstr(stdscr, 2 + row, 0, line, width - 1, attr)
+                _safe_addnstr(stdscr, 3 + row, 0, line, width - 1, attr)
 
             if filtered:
                 current = filtered[selected]
@@ -9426,6 +11400,26 @@ def _run_docs_tui(
 
             if key in (27, ord("q")):
                 return 0
+            if key == 9:  # Tab
+                active_tab = _TAB_LANG_REF
+                mode = _MODE_LANG_REF
+                continue
+            if key == ord("L"):
+                info_lines = _L2_LICENSE_TEXT.splitlines()
+                info_scroll = 0
+                mode = _MODE_LICENSE
+                continue
+            if key == ord("P"):
+                info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
+                info_scroll = 0
+                mode = _MODE_PHILOSOPHY
+                continue
+            if key == ord("C"):
+                active_tab = _TAB_CT_REF
+                info_lines = _L2_CT_REF_TEXT.splitlines()
+                info_scroll = 0
+                mode = _MODE_CT_REF
+                continue
             if key == ord("/"):
                 search_buf = query
                 mode = _MODE_SEARCH

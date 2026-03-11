@@ -50,12 +50,94 @@ def _get_struct():
     return _struct_mod
 
 
+class Diagnostic:
+    """Structured error/warning with optional source context and suggestions."""
+    __slots__ = ('level', 'message', 'path', 'line', 'column', 'length', 'hint', 'suggestion')
+
+    def __init__(
+        self,
+        level: str,
+        message: str,
+        path: Optional[Path] = None,
+        line: int = 0,
+        column: int = 0,
+        length: int = 0,
+        hint: str = "",
+        suggestion: str = "",
+    ) -> None:
+        self.level = level       # "error", "warning", "note"
+        self.message = message
+        self.path = path
+        self.line = line
+        self.column = column
+        self.length = length
+        self.hint = hint
+        self.suggestion = suggestion
+
+    def format(self, *, color: bool = True) -> str:
+        """Format the diagnostic in Rust-style with source context."""
+        _RED = "\033[1;31m" if color else ""
+        _YELLOW = "\033[1;33m" if color else ""
+        _BLUE = "\033[1;34m" if color else ""
+        _CYAN = "\033[1;36m" if color else ""
+        _BOLD = "\033[1m" if color else ""
+        _DIM = "\033[2m" if color else ""
+        _RST = "\033[0m" if color else ""
+
+        level_color = _RED if self.level == "error" else (_YELLOW if self.level == "warning" else _BLUE)
+        parts: List[str] = []
+        parts.append(f"{level_color}{self.level}{_RST}{_BOLD}: {self.message}{_RST}")
+
+        if self.path and self.line > 0:
+            loc = f"{self.path}:{self.line}"
+            if self.column > 0:
+                loc += f":{self.column}"
+            parts.append(f"  {_BLUE}-->{_RST} {loc}")
+
+            # Try to show the source line
+            try:
+                src_lines = self.path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if 0 < self.line <= len(src_lines):
+                    src_line = src_lines[self.line - 1]
+                    line_no = str(self.line)
+                    pad = " " * len(line_no)
+                    parts.append(f"  {_BLUE}{pad} |{_RST}")
+                    parts.append(f"  {_BLUE}{line_no} |{_RST} {src_line}")
+                    if self.column > 0:
+                        caret_len = max(1, self.length) if self.length else 1
+                        arrow = " " * (self.column - 1) + level_color + "^" * caret_len + _RST
+                        parts.append(f"  {_BLUE}{pad} |{_RST} {arrow}")
+                    if self.hint:
+                        parts.append(f"  {_BLUE}{pad} |{_RST} {_CYAN}= note: {self.hint}{_RST}")
+                    if self.suggestion:
+                        parts.append(f"  {_BLUE}{pad} |{_RST}")
+                        parts.append(f"  {_BLUE}{pad} = {_CYAN}help{_RST}: {self.suggestion}")
+            except Exception:
+                pass
+
+        elif self.hint:
+            parts.append(f"  {_CYAN}= note: {self.hint}{_RST}")
+
+        return "\n".join(parts)
+
+    def __str__(self) -> str:
+        if self.path and self.line > 0:
+            return f"{self.level}: {self.message} at {self.path}:{self.line}:{self.column}"
+        return f"{self.level}: {self.message}"
+
+
 class ParseError(Exception):
     """Raised when the source stream cannot be parsed."""
+    def __init__(self, message: str = "", *, diagnostic: Optional[Diagnostic] = None) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(message)
 
 
 class CompileError(Exception):
     """Raised when IR cannot be turned into assembly."""
+    def __init__(self, message: str = "", *, diagnostic: Optional[Diagnostic] = None) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(message)
 
 
 class CompileTimeError(ParseError):
@@ -321,7 +403,7 @@ _PEEPHOLE_WORD_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
     (("swap", "or"), ("or",)),
     (("swap", "min"), ("min",)),
     (("swap", "max"), ("max",)),
-    # --- dup + self-idempotent binary → identity ---
+    # --- dup + self-idempotent binary -> identity ---
     (("dup", "bor"), ()),
     (("dup", "band"), ()),
     (("dup", "bxor"), ("drop", "literal_0")),
@@ -339,7 +421,7 @@ for _pat, _repl in _PEEPHOLE_WORD_RULES:
 
 _PEEPHOLE_MAX_PAT_LEN = max(len(p) for p, _ in _PEEPHOLE_WORD_RULES) if _PEEPHOLE_WORD_RULES else 0
 
-# Unified dict: pattern tuple → replacement tuple (for O(1) lookup)
+# Unified dict: pattern tuple -> replacement tuple (for O(1) lookup)
 _PEEPHOLE_ALL_RULES: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
 for _pat, _repl in _PEEPHOLE_WORD_RULES:
     _PEEPHOLE_ALL_RULES[_pat] = _repl
@@ -573,7 +655,8 @@ class Word:
     __slots__ = ('name', 'priority', 'immediate', 'definition', 'macro', 'intrinsic',
                  'macro_expansion', 'macro_params', 'compile_time_intrinsic',
                  'runtime_intrinsic', 'compile_only', 'compile_time_override',
-                 'is_extern', 'extern_inputs', 'extern_outputs', 'extern_signature', 'inline')
+                 'is_extern', 'extern_inputs', 'extern_outputs', 'extern_signature',
+                 'extern_variadic', 'inline')
 
     def __init__(self, name: str, priority: int = 0, immediate: bool = False,
                  definition=None, macro=None, intrinsic=None,
@@ -581,7 +664,8 @@ class Word:
                  compile_time_intrinsic=None, runtime_intrinsic=None,
                  compile_only: bool = False, compile_time_override: bool = False,
                  is_extern: bool = False, extern_inputs: int = 0, extern_outputs: int = 0,
-                 extern_signature=None, inline: bool = False) -> None:
+                 extern_signature=None, extern_variadic: bool = False,
+                 inline: bool = False) -> None:
         self.name = name
         self.priority = priority
         self.immediate = immediate
@@ -598,6 +682,7 @@ class Word:
         self.extern_inputs = extern_inputs
         self.extern_outputs = extern_outputs
         self.extern_signature = extern_signature
+        self.extern_variadic = extern_variadic
         self.inline = inline
 
 
@@ -610,10 +695,11 @@ def _suppress_redefine_warnings_set(value: bool) -> None:
 
 
 class Dictionary:
-    __slots__ = ('words',)
+    __slots__ = ('words', 'warn_callback')
 
     def __init__(self, words: Dict[str, Word] = None) -> None:
         self.words = words if words is not None else {}
+        self.warn_callback: Optional[Callable] = None
 
     def register(self, word: Word) -> Word:
         existing = self.words.get(word.name)
@@ -646,7 +732,10 @@ class Dictionary:
             return word
 
         if not _suppress_redefine_warnings:
-            sys.stderr.write(f"[warn] redefining word {word.name} (priority {word.priority})\n")
+            if self.warn_callback is not None:
+                self.warn_callback(word.name, word.priority)
+            else:
+                sys.stderr.write(f"[warn] redefining word {word.name} (priority {word.priority})\n")
         self.words[word.name] = word
         return word
 
@@ -702,6 +791,10 @@ class Parser:
         self.cstruct_layouts: Dict[str, CStructLayout] = {}
         self._pending_inline_definition: bool = False
         self._pending_priority: Optional[int] = None
+        self.diagnostics: List[Diagnostic] = []
+        self._max_errors: int = 20
+        self._warnings_enabled: Set[str] = set()
+        self._werror: bool = False
 
     def _rebuild_span_index(self) -> None:
         """Rebuild bisect index after file_spans changes."""
@@ -730,6 +823,57 @@ class Parser:
                 self._span_cache_idx = idx
                 return _make_loc(span.path, span.local_start_line + (tl - span.start_line), token.column)
         return _make_loc(_SOURCE_PATH, tl, token.column)
+
+    def _record_diagnostic(self, token: Optional[Token], message: str, *, level: str = "error", hint: str = "", suggestion: str = "") -> None:
+        """Record a diagnostic and raise ParseError if too many errors."""
+        loc = self.location_for_token(token) if token else _make_loc(_SOURCE_PATH, 0, 0)
+        diag = Diagnostic(
+            level=level, message=message,
+            path=loc.path, line=loc.line, column=loc.column,
+            length=len(token.lexeme) if token else 0,
+            hint=hint, suggestion=suggestion,
+        )
+        self.diagnostics.append(diag)
+        if level == "error" and sum(1 for d in self.diagnostics if d.level == "error") >= self._max_errors:
+            raise ParseError(f"too many errors ({self._max_errors}), aborting", diagnostic=diag)
+
+    def _warn(self, token: Optional[Token], category: str, message: str, *, hint: str = "", suggestion: str = "") -> None:
+        """Record a warning if the category is enabled. Promotes to error under --Werror."""
+        if "all" not in self._warnings_enabled and category not in self._warnings_enabled:
+            return
+        level = "error" if self._werror else "warning"
+        self._record_diagnostic(token, message, level=level, hint=hint, suggestion=suggestion)
+
+    def _skip_to_recovery_point(self) -> None:
+        """Skip tokens until we reach a safe recovery point (end, ;, or top-level definition keyword)."""
+        _recovery_keywords = {"word", "end", ";", ":asm", ":py", "extern", "macro"}
+        depth = 0
+        while self.pos < len(self.tokens):
+            lex = self.tokens[self.pos].lexeme
+            if lex == "word" or lex == ":asm" or lex == ":py":
+                if depth == 0:
+                    break  # Don't consume — let the main loop pick it up
+                depth += 1
+            elif lex == "end":
+                if depth <= 1:
+                    self.pos += 1
+                    break
+                depth -= 1
+            elif lex == ";":
+                self.pos += 1
+                break
+            elif lex == "extern" and depth == 0:
+                break
+            self.pos += 1
+        # Reset state for recovery
+        self.macro_recording = None
+        self._pending_priority = None
+        self._pending_inline_definition = False
+        while self.definition_stack:
+            self.definition_stack.pop()
+        while len(self.context_stack) > 1:
+            self.context_stack.pop()
+        self.control_stack.clear()
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
@@ -867,6 +1011,7 @@ class Parser:
         _tokens = self.tokens
         try:
             while self.pos < len(_tokens):
+              try:
                 token = _tokens[self.pos]
                 self.pos += 1
                 self._last_token = token
@@ -922,6 +1067,15 @@ class Parser:
                     continue
                 if self._handle_token(token):
                     _tokens = self.tokens
+              except CompileTimeError:
+                raise
+              except ParseError as _recov_exc:
+                self._record_diagnostic(self._last_token, str(_recov_exc))
+                self._skip_to_recovery_point()
+                _tokens = self.tokens
+                continue
+        except CompileTimeError:
+            raise
         except ParseError:
             raise
         except Exception as exc:
@@ -933,14 +1087,19 @@ class Parser:
             ) from None
 
         if self.macro_recording is not None:
-            raise ParseError("unterminated macro definition (missing ';')")
+            self._record_diagnostic(self._last_token, "unterminated macro definition (missing ';')")
         if self._pending_priority is not None:
-            raise ParseError(f"dangling priority {self._pending_priority} without following definition")
+            self._record_diagnostic(self._last_token, f"dangling priority {self._pending_priority} without following definition")
 
         if len(self.context_stack) != 1:
-            raise ParseError("unclosed definition at EOF")
+            self._record_diagnostic(self._last_token, "unclosed definition at EOF")
         if self.control_stack:
-            raise ParseError("unclosed control structure at EOF")
+            self._record_diagnostic(self._last_token, "unclosed control structure at EOF")
+
+        # If any errors were accumulated, raise with all diagnostics
+        error_count = sum(1 for d in self.diagnostics if d.level == "error")
+        if error_count > 0:
+            raise ParseError(f"compilation failed with {error_count} error(s)")
 
         module = self.context_stack.pop()
         if not isinstance(module, Module):  # pragma: no cover - defensive
@@ -1048,23 +1207,37 @@ class Parser:
             raise ParseError(f"extern expected identifier before '(' but got '{name_lexeme}'")
 
         ret_type = _normalize_c_type_tokens(prefix_tokens, allow_default=True)
-        inputs, arg_types = self._parse_c_param_list()
+        inputs, arg_types, variadic = self._parse_c_param_list()
         outputs = 0 if ret_type == "void" else 1
-        self._register_c_extern(name_lexeme, inputs, outputs, arg_types, ret_type, priority=priority)
+        self._register_c_extern(name_lexeme, inputs, outputs, arg_types, ret_type,
+                                priority=priority, variadic=variadic)
         return True
 
-    def _parse_c_param_list(self) -> Tuple[int, List[str]]:
+    def _parse_c_param_list(self) -> Tuple[int, List[str], bool]:
+        """Parse C-style parameter list. Returns (count, types, is_variadic)."""
         inputs = 0
         arg_types: List[str] = []
+        variadic = False
 
         if self._eof():
             raise ParseError("extern unclosed '('")
         peek = self.peek_token()
         if peek.lexeme == ")":
             self._consume()
-            return inputs, arg_types
+            return inputs, arg_types, False
 
         while True:
+            # Check for ... (variadic)
+            peek = self.peek_token()
+            if peek is not None and peek.lexeme == "...":
+                self._consume()
+                variadic = True
+                if self._eof():
+                    raise ParseError("extern unclosed '(' after '...'")
+                closing = self._consume()
+                if closing.lexeme != ")":
+                    raise ParseError("expected ')' after '...' in extern parameter list")
+                break
             lexemes = self._collect_c_param_lexemes()
             arg_type = _normalize_c_type_tokens(lexemes, allow_default=False)
             if arg_type == "void" and inputs == 0:
@@ -1073,7 +1246,7 @@ class Parser:
                 closing = self._consume()
                 if closing.lexeme != ")":
                     raise ParseError("expected ')' after 'void' in extern parameter list")
-                return 0, []
+                return 0, [], False
             inputs += 1
             arg_types.append(arg_type)
             if self._eof():
@@ -1085,7 +1258,7 @@ class Parser:
                 raise ParseError(
                     f"expected ',' or ')' in extern parameter list, got '{separator.lexeme}'"
                 )
-        return inputs, arg_types
+        return inputs, arg_types, variadic
 
     def _collect_c_param_lexemes(self) -> List[str]:
         lexemes: List[str] = []
@@ -1121,6 +1294,7 @@ class Parser:
         ret_type: str,
         *,
         priority: int = 0,
+        variadic: bool = False,
     ) -> None:
         candidate = Word(name=name, priority=priority)
         word = self.dictionary.register(candidate)
@@ -1130,6 +1304,7 @@ class Parser:
         word.extern_inputs = inputs
         word.extern_outputs = outputs
         word.extern_signature = (arg_types, ret_type)
+        word.extern_variadic = variadic
 
     def _handle_token(self, token: Token) -> bool:
         """Handle a token. Returns True if the token list was modified (macro expansion)."""
@@ -1824,7 +1999,7 @@ class CompileTimeVM:
         self._repl_libs: List[str] = []
         self._native_return_stack: Optional[Any] = None  # ctypes buffer
         self._native_return_top: int = 0
-        # JIT cache: word name → ctypes callable
+        # JIT cache: word name -> ctypes callable
         self._jit_cache: Dict[str, Any] = {}
         self._jit_code_pages: List[Any] = []  # keep mmap pages alive
         # Pre-allocated output structs for JIT calls (lazily allocated)
@@ -1836,7 +2011,7 @@ class CompileTimeVM:
         self._bss_symbols: Dict[str, int] = {}
         # dlopen handles for C extern support
         self._dl_handles: List[Any] = []  # ctypes.CDLL handles
-        self._dl_func_cache: Dict[str, Any] = {}  # name → ctypes callable
+        self._dl_func_cache: Dict[str, Any] = {}  # name -> ctypes callable
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ctypes_struct_cache: Dict[str, Any] = {}
         self.current_location: Optional[SourceLocation] = None
@@ -2325,7 +2500,18 @@ class CompileTimeVM:
 
         inputs = func._ct_inputs
         outputs = func._ct_outputs
-        arg_types = func._ct_signature[0] if func._ct_signature else []
+        arg_types = list(func._ct_signature[0]) if func._ct_signature else []
+
+        # For variadic externs, the TOS value is the extra arg count
+        # (consumed by the compiler, not passed to C).
+        va_extra = 0
+        if getattr(word, "extern_variadic", False):
+            va_extra = int(self.pop())
+            inputs += va_extra
+            for _ in range(va_extra):
+                arg_types.append("long")
+            # Update ctypes argtypes to include the variadic args
+            func.argtypes = list(func._ct_arg_types) + [ctypes.c_int64] * va_extra
 
         # Pop arguments off the native data stack (right-to-left / reverse order)
         raw_args = []
@@ -2513,13 +2699,13 @@ class CompileTimeVM:
                 line = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
                               '_jl' + lbl[1:], line)
 
-            # Patch [rel SYMBOL] → concrete address
+            # Patch [rel SYMBOL] -> concrete address
             m = _RE_REL_PAT.search(line)
             if m and m.group(1) in bss:
                 sym = m.group(1)
                 addr = bss[sym]
                 if line.lstrip().startswith("lea"):
-                    # lea REG, [rel X] → mov REG, addr
+                    # lea REG, [rel X] -> mov REG, addr
                     line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
                 else:
                     # e.g. mov rax, [rel X] or mov byte [rel X], val
@@ -3302,7 +3488,7 @@ class CompileTimeVM:
         ])
         if asm_body:
             patched_body = []
-            # Build BSS symbol table for [rel X] → concrete address substitution
+            # Build BSS symbol table for [rel X] -> concrete address substitution
             _bss_symbols: Dict[str, int] = {
                 "data_start": data_start,
                 "data_end": data_end,
@@ -3323,7 +3509,7 @@ class CompileTimeVM:
                 if m and m.group(1) in _bss_symbols:
                     sym = m.group(1)
                     addr = _bss_symbols[sym]
-                    # lea REG, [rel X]  →  mov REG, addr
+                    # lea REG, [rel X]  ->  mov REG, addr
                     if line.lstrip().startswith("lea"):
                         line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
                     else:
@@ -3461,7 +3647,7 @@ class CompileTimeVM:
         self._call_word(word)
 
     def _resolve_words_in_body(self, defn: Definition) -> None:
-        """Pre-resolve word name → Word objects on Op nodes (once per Definition)."""
+        """Pre-resolve word name -> Word objects on Op nodes (once per Definition)."""
         if defn._words_resolved:
             return
         lookup = self.dictionary.lookup
@@ -3568,7 +3754,7 @@ class CompileTimeVM:
                 if line == "ret":
                     # Last word: jmp to save; others: fall through
                     if word_idx < len(words) - 1:
-                        continue  # just skip ret → fall through
+                        continue  # just skip ret -> fall through
                     else:
                         line = "jmp _ct_save"
 
@@ -3577,7 +3763,7 @@ class CompileTimeVM:
                     # Use word-boundary replacement to avoid partial matches
                     line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
 
-                # Patch [rel SYMBOL] → concrete address
+                # Patch [rel SYMBOL] -> concrete address
                 m = _RE_REL_PAT.search(line)
                 if m and m.group(1) in bss:
                     sym = m.group(1)
@@ -5013,7 +5199,7 @@ class Assembler:
                         b = nodes[idx + 1]
                         b_oc = b._opcode
 
-                        # literal + dup → literal literal
+                        # literal + dup -> literal literal
                         if b_oc == OP_WORD and b.data == "dup":
                             _opt_a(node)
                             _opt_a(_make_literal_op(node.data, node.loc))
@@ -5021,7 +5207,7 @@ class Assembler:
                             changed = True
                             continue
 
-                        # literal + drop → (nothing)
+                        # literal + drop -> (nothing)
                         if b_oc == OP_WORD and b.data == "drop":
                             idx += 2
                             changed = True
@@ -5432,7 +5618,7 @@ class Assembler:
             # depth tracks values on the data stack relative to entry.
             # 'main' starts with an empty stack.  For other words we can
             # only check underflows when a stack-effect comment provides
-            # the input count (e.g. ``# a b -- c`` → 2 inputs).
+            # the input count (e.g. ``# a b -- c`` -> 2 inputs).
             si = defn.stack_inputs
             if si is not None:
                 known_entry_depth = si
@@ -5872,7 +6058,7 @@ class Assembler:
             # stub now (after definitions) so the emitter does not
             # produce duplicate `_start` labels.
             if is_program and not (user_has_start or getattr(self, "_emitted_start", False)):
-                emission.text.extend([
+                _start_lines = [
                     "; __ORIGIN__ default_stub",
                     "global _start",
                     "_start:",
@@ -5892,10 +6078,13 @@ class Assembler:
                     "    mov rax, [r12]",
                     "    add r12, 8",
                     ".no_exit_value:",
+                ]
+                _start_lines.extend([
                     "    mov rdi, rax",
                     "    mov rax, 60",
                     "    syscall",
                 ])
+                emission.text.extend(_start_lines)
 
             self._emit_variables(module.variables)
 
@@ -6304,6 +6493,27 @@ class Assembler:
             builder.emit(f"    mov byte [{dst_expr} + {copied}], r11b")
             copied += 1
 
+    @staticmethod
+    def _pop_preceding_literal(builder: FunctionEmitter) -> Optional[int]:
+        """If the last emitted instructions are a literal push, remove them and return the value."""
+        text = builder.text
+        n = len(text)
+        if n < 3:
+            return None
+        # push_literal emits:  "; push N" / "sub r12, 8" / "mov qword [r12], N"
+        mov_line = text[n - 1].strip()
+        sub_line = text[n - 2].strip()
+        cmt_line = text[n - 3].strip()
+        if not (sub_line == "sub r12, 8" and mov_line.startswith("mov qword [r12],") and cmt_line.startswith("; push")):
+            return None
+        val_str = mov_line.split(",", 1)[1].strip()
+        try:
+            value = int(val_str)
+        except ValueError:
+            return None
+        del text[n - 3:n]
+        return value
+
     def _emit_extern_wordref(self, name: str, word: Word, builder: FunctionEmitter) -> None:
         inputs = getattr(word, "extern_inputs", 0)
         outputs = getattr(word, "extern_outputs", 0)
@@ -6315,6 +6525,21 @@ class Assembler:
 
         arg_types = list(signature[0]) if signature else ["long"] * inputs
         ret_type = signature[1] if signature else ("long" if outputs > 0 else "void")
+
+        # For variadic externs, consume the preceding literal as the count of
+        # extra variadic arguments.  These are NOT passed to the C function as
+        # a count parameter – they simply tell the compiler how many additional
+        # stack values to pop and place into registers / the C stack.
+        if getattr(word, "extern_variadic", False):
+            va_count = self._pop_preceding_literal(builder)
+            if va_count is None:
+                suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+                raise CompileError(
+                    f"variadic extern '{name}' requires a literal arg count on TOS{suffix}"
+                )
+            for _ in range(va_count):
+                arg_types.append("long")
+            inputs += va_count
 
         if len(arg_types) != inputs and signature is not None:
             suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
@@ -7449,8 +7674,8 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
     # Output struct: [r12, r13, exit_flag, exit_code]
     #
     # Stack protocol (matching _emit_syscall_intrinsic):
-    #   TOS:   syscall number → rax
-    #   TOS-1: arg count → rcx
+    #   TOS:   syscall number -> rax
+    #   TOS-1: arg count -> rcx
     #   then args on stack as ... arg0 arg1 ... argN (argN is top)
     #
 
@@ -7590,7 +7815,7 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         raise RuntimeError("mmap failed for JIT syscall stub")
     ctypes.memmove(ptr, code, len(code))
     vm._jit_code_pages.append((ptr, page_size))
-    # Same signature: (r12, r13, out_ptr) → void
+    # Same signature: (r12, r13, out_ptr) -> void
     if CompileTimeVM._JIT_FUNC_TYPE is None:
         CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
     func = CompileTimeVM._JIT_FUNC_TYPE(ptr)
@@ -7939,7 +8164,12 @@ def _parse_c_header_externs(header_text: str) -> List[str]:
         params_raw = m.group(2).strip()
 
         if "..." in params_raw:
-            continue
+            # Variadic function: strip the ... from parameter list, keep fixed args
+            params_fixed = re.sub(r",?\s*\.\.\.", "", params_raw).strip()
+            param_str = "void" if params_fixed in ("void", "") else params_fixed
+            is_variadic = True
+        else:
+            is_variadic = False
 
         tokens = prefix.split()
         if len(tokens) < 2:
@@ -7950,8 +8180,9 @@ def _parse_c_header_externs(header_text: str) -> List[str]:
         if not func_name or not re.match(r"^[A-Za-z_]\w*$", func_name):
             continue
 
-        # Skip typedef, struct/enum/union definitions
-        if tokens[0] in ("typedef", "struct", "enum", "union"):
+        # Skip typedef (struct/enum/union return types are fine — the regex
+        # already ensures this matched a function declaration with parentheses)
+        if tokens[0] in ("typedef",):
             continue
 
         # Build return type: strip API macros and calling-convention qualifiers
@@ -7974,10 +8205,100 @@ def _parse_c_header_externs(header_text: str) -> List[str]:
         if not ret_type:
             ret_type = "int"
 
-        param_str = "void" if params_raw in ("void", "") else params_raw
+        if not is_variadic:
+            param_str = "void" if params_raw in ("void", "") else params_raw
 
-        results.append(f"extern {ret_type} {func_name}({param_str})")
+        va_suffix = ", ..." if is_variadic else ""
+        results.append(f"extern {ret_type} {func_name}({param_str}{va_suffix})")
     return results
+
+
+# Map C types to L2 cstruct field types
+_C_TO_L2_FIELD_TYPE: Dict[str, str] = {
+    "char": "i8", "signed char": "i8", "unsigned char": "u8",
+    "short": "i16", "unsigned short": "u16", "short int": "i16",
+    "int": "i32", "unsigned int": "u32", "unsigned": "u32",
+    "long": "i64", "unsigned long": "u64", "long int": "i64",
+    "long long": "i64", "unsigned long long": "u64",
+    "float": "f32", "double": "f64",
+    "size_t": "u64", "ssize_t": "i64",
+    "int8_t": "i8", "uint8_t": "u8",
+    "int16_t": "i16", "uint16_t": "u16",
+    "int32_t": "i32", "uint32_t": "u32",
+    "int64_t": "i64", "uint64_t": "u64",
+}
+
+
+def _parse_c_header_structs(header_text: str) -> List[str]:
+    """Extract struct definitions from C header text and return L2 ``cstruct`` lines."""
+    text = re.sub(r"/\*.*?\*/", " ", header_text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"#[^\n]*", "", text)
+    text = re.sub(r"\s+", " ", text)
+
+    results: List[str] = []
+    # Match: struct Name { fields }; or typedef struct Name { fields } Alias;
+    # or typedef struct { fields } Name;
+    _RE_STRUCT = re.compile(
+        r"(?:typedef\s+)?struct\s*(\w*)\s*\{([^}]*)\}\s*(\w*)\s*;",
+    )
+    for m in _RE_STRUCT.finditer(text):
+        struct_name = m.group(1).strip()
+        body = m.group(2).strip()
+        typedef_name = m.group(3).strip()
+        # Prefer typedef name if present
+        name = typedef_name if typedef_name else struct_name
+        if not name or name.startswith("_"):
+            continue
+        fields = _extract_struct_fields(body)
+        if not fields:
+            continue
+        # Generate L2 cstruct declaration
+        field_parts = []
+        for fname, ftype in fields:
+            field_parts.append(f"cfield {fname} {ftype}")
+        results.append(f"cstruct {name} {' '.join(field_parts)} end")
+    return results
+
+
+def _extract_struct_fields(body: str) -> List[Tuple[str, str]]:
+    """Parse C struct field declarations into (name, l2_type) pairs."""
+    fields: List[Tuple[str, str]] = []
+    for decl in body.split(";"):
+        decl = decl.strip()
+        if not decl:
+            continue
+        # Skip bitfields
+        if ":" in decl:
+            continue
+        # Skip nested struct/union definitions (but allow struct pointers)
+        if ("struct " in decl or "union " in decl) and "*" not in decl:
+            continue
+        tokens = decl.split()
+        if len(tokens) < 2:
+            continue
+        # Last token is field name (may have * prefix for pointers)
+        field_name = tokens[-1].lstrip("*")
+        if not field_name or not re.match(r"^[A-Za-z_]\w*$", field_name):
+            continue
+        # Check if pointer
+        is_ptr = "*" in decl
+        if is_ptr:
+            fields.append((field_name, "ptr"))
+            continue
+        # Build type from all tokens except field name
+        type_tokens = tokens[:-1]
+        # Remove qualifiers
+        type_tokens = [t for t in type_tokens if t not in ("const", "volatile", "static",
+                                                            "register", "restrict", "_Atomic")]
+        ctype = " ".join(type_tokens)
+        l2_type = _C_TO_L2_FIELD_TYPE.get(ctype)
+        if l2_type is None:
+            # Unknown type, treat as pointer-sized
+            fields.append((field_name, "ptr"))
+        else:
+            fields.append((field_name, l2_type))
+    return fields
 
 
 class Compiler:
@@ -7986,6 +8307,7 @@ class Compiler:
         include_paths: Optional[Sequence[Path]] = None,
         *,
         macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
+        defines: Optional[Sequence[str]] = None,
     ) -> None:
         self.reader = Reader()
         self.dictionary = bootstrap_dictionary()
@@ -8001,6 +8323,7 @@ class Compiler:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
         self._loaded_files: Set[Path] = set()
+        self.defines: Set[str] = set(defines or [])
 
     def compile_source(
         self,
@@ -8043,6 +8366,23 @@ class Compiler:
         self.parser.compile_time_vm.invoke_repl(word, libs=libs)
 
     _import_resolve_cache: Dict[Tuple[Path, str], Path] = {}
+
+    def _preprocess_c_header(self, header_path: Path, raw_text: str) -> str:
+        """Try running the C preprocessor on a header file for accurate parsing.
+
+        Falls back to raw_text if the preprocessor is not available."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["cc", "-E", "-P", "-D__attribute__(x)=", "-D__extension__=",
+                 "-D__restrict=", "-D__asm__(x)=", str(header_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        return raw_text
 
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
         cache_key = (importing_file.parent, target)
@@ -8160,8 +8500,53 @@ class Compiler:
         _spans_append = spans.append
         _FileSpan = FileSpan
 
+        # ifdef/ifndef/else/endif conditional compilation stack
+        # Each entry is True (include lines) or False (skip lines)
+        _ifdef_stack: List[bool] = []
+
+        def _ifdef_active() -> bool:
+            return all(_ifdef_stack)
+
         for line in contents.splitlines():
             stripped = line.strip()
+
+            # --- Conditional compilation directives ---
+            if stripped[:6] == "ifdef " or stripped == "ifdef":
+                name = stripped[6:].strip() if len(stripped) > 6 else ""
+                if not name:
+                    raise ParseError(f"ifdef missing symbol name at {path}:{file_line_no}")
+                _ifdef_stack.append(name in self.defines if _ifdef_active() else False)
+                _out_append("")  # placeholder to keep line numbers aligned
+                file_line_no += 1
+                continue
+            if stripped[:7] == "ifndef " or stripped == "ifndef":
+                name = stripped[7:].strip() if len(stripped) > 7 else ""
+                if not name:
+                    raise ParseError(f"ifndef missing symbol name at {path}:{file_line_no}")
+                _ifdef_stack.append(name not in self.defines if _ifdef_active() else False)
+                _out_append("")
+                file_line_no += 1
+                continue
+            if stripped == "elsedef":
+                if not _ifdef_stack:
+                    raise ParseError(f"elsedef without matching ifdef/ifndef at {path}:{file_line_no}")
+                _ifdef_stack[-1] = not _ifdef_stack[-1]
+                _out_append("")
+                file_line_no += 1
+                continue
+            if stripped == "endif":
+                if not _ifdef_stack:
+                    raise ParseError(f"endif without matching ifdef/ifndef at {path}:{file_line_no}")
+                _ifdef_stack.pop()
+                _out_append("")
+                file_line_no += 1
+                continue
+
+            # If inside a false ifdef branch, skip the line
+            if not _ifdef_active():
+                _out_append("")
+                file_line_no += 1
+                continue
 
             if not in_py_block and stripped[:3] == ":py" and "{" in stripped:
                 in_py_block = True
@@ -8259,15 +8644,22 @@ class Compiler:
                     header_text = header_path.read_text()
                 except FileNotFoundError as exc:
                     raise ParseError(f"cimport cannot read {header_path}: {exc}") from exc
+
+                # Try running the C preprocessor for more accurate parsing
+                header_text = self._preprocess_c_header(header_path, header_text)
+
                 extern_lines = _parse_c_header_externs(header_text)
+                struct_lines = _parse_c_header_structs(header_text)
 
                 # begin_segment_if_needed inline
                 if segment_start_global is None:
                     segment_start_global = len(out_lines) + 1
                     segment_start_local = file_line_no
-                # Replace the cimport line with the extracted extern declarations
+                # Replace the cimport line with the extracted extern + struct declarations
                 for ext_line in extern_lines:
                     _out_append(ext_line)
+                for st_line in struct_lines:
+                    _out_append(st_line)
                 _out_append("")  # blank line after externs
                 file_line_no += 1
                 continue
@@ -8289,6 +8681,9 @@ class Compiler:
                     local_start_line=segment_start_local,
                 )
             )
+
+        if _ifdef_stack:
+            raise ParseError(f"unterminated ifdef/ifndef ({len(_ifdef_stack)} level(s) deep) in {path}")
 
 
 class BuildCache:
@@ -8492,7 +8887,12 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
         cmd.extend(["-nostdlib", "-static"])
 
     if libs:
-        if not shared:
+        # Determine if any libs require dynamic linking (shared libraries).
+        needs_dynamic = any(
+            not (str(lib).endswith(".a") or str(lib).endswith(".o"))
+            for lib in libs if lib
+        )
+        if not shared and needs_dynamic:
             cmd.extend([
                 "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
             ])
@@ -9129,7 +9529,7 @@ _DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
 _DOC_WORD_RE = re.compile(r"^\s*(?:inline\s+)?word\s+([^\s]+)\b")
 _DOC_ASM_RE = re.compile(r"^\s*:asm\s+([^\s{]+)")
 _DOC_PY_RE = re.compile(r"^\s*:py\s+([^\s{]+)")
-_DOC_MACRO_RE = re.compile(r"^\s*macro\s+([^\s]+)")
+_DOC_MACRO_RE = re.compile(r"^\s*macro\s+([^\s]+)(?:\s+(\d+))?")
 
 
 def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
@@ -9145,15 +9545,16 @@ def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
     return name, tail
 
 
-def _extract_definition_name(text: str, *, include_macros: bool = False) -> Optional[Tuple[str, str]]:
+def _extract_definition_name(text: str, *, include_macros: bool = False) -> Optional[Tuple[str, str, int]]:
     for kind, regex in (("word", _DOC_WORD_RE), ("asm", _DOC_ASM_RE), ("py", _DOC_PY_RE)):
         match = regex.match(text)
         if match is not None:
-            return kind, match.group(1)
+            return kind, match.group(1), -1
     if include_macros:
         match = _DOC_MACRO_RE.match(text)
         if match is not None:
-            return "macro", match.group(1)
+            arg_count = int(match.group(2)) if match.group(2) is not None else 0
+            return "macro", match.group(1), arg_count
     return None
 
 
@@ -9215,11 +9616,18 @@ def _scan_doc_file(
         parsed = _extract_definition_name(line, include_macros=include_macros)
         if parsed is None:
             continue
-        kind, name = parsed
+        kind, name, macro_args = parsed
         if not _is_doc_symbol_name(name, include_private=include_private):
             continue
         defined_names.add(name)
         stack_effect, description = _collect_leading_doc_comments(lines, idx, name)
+        # Auto-generate stack effect for macros from arg count
+        if kind == "macro" and not stack_effect:
+            if macro_args > 0:
+                params = " ".join(f"${i}" for i in range(macro_args))
+                stack_effect = f"macro({macro_args}): {params} -> expanded"
+            else:
+                stack_effect = "macro(0): -> expanded"
         if not include_undocumented and not stack_effect and not description:
             continue
         entries.append(
@@ -9416,6 +9824,8 @@ def _run_docs_tui(
     _MODE_LICENSE = 6
     _MODE_PHILOSOPHY = 7
     _MODE_CT_REF = 8
+    _MODE_QA = 9
+    _MODE_HOW = 10
 
     _TAB_LIBRARY = 0
     _TAB_LANG_REF = 1
@@ -9499,20 +9909,20 @@ def _run_docs_tui(
         {
             "name": "macro ... ;",
             "category": "Definitions",
-            "syntax": "macro <name> [<param_count>] <tokens...> ;",
+            "syntax": "macro <name> <param_count> <tokens...> ;",
             "summary": "Define a text macro with positional substitution.",
             "detail": (
                 "Records raw tokens until `;`. On expansion, `$0`, `$1`, ... "
                 "are replaced by positional arguments. Macros cannot nest.\n\n"
                 "Example:\n"
-                "  macro max2 [2] $0 $1 > if $0 else $1 end ;\n"
+                "  macro max2 2 $0 $1 > if $0 else $1 end ;\n"
                 "  5 3 max2   # leaves 5 on stack"
             ),
         },
         {
             "name": "struct ... end",
             "category": "Definitions",
-            "syntax": "struct <Name>\n  <size> <field>\n  ...\nend",
+            "syntax": "struct <Name>\n  field <field> <size>\n  ...\nend",
             "summary": "Define a packed struct with auto-generated accessors.",
             "detail": (
                 "Emits helper words:\n"
@@ -9524,8 +9934,8 @@ def _run_docs_tui(
                 "Layout is tightly packed with no implicit padding.\n\n"
                 "Example:\n"
                 "  struct Point\n"
-                "    8 x\n"
-                "    8 y\n"
+                "    field x 8\n"
+                "    field y 8\n"
                 "  end\n"
                 "  # Now Point.x@, Point.x!, Point.y@, Point.y! exist"
             ),
@@ -9575,8 +9985,8 @@ def _run_docs_tui(
             "summary": "Counted loop — pops count, loops that many times.",
             "detail": (
                 "Pops the loop count from the stack, stores it on the return stack, "
-                "and decrements it each pass. The loop index is accessible via "
-                "the compile-time word `i` inside macros.\n\n"
+                "and decrements it each pass. Use `r@` (return "
+                "stack peek) to read the current counter value.\n\n"
                 "Example:\n"
                 "  10 for\n"
                 "    \"hello\" puts\n"
@@ -9590,8 +10000,8 @@ def _run_docs_tui(
             "syntax": "begin <body> again",
             "summary": "Infinite loop (use `exit` or `goto` to break out).",
             "detail": (
-                "Creates an unconditional loop. The body repeats forever "
-                "available only at compile time.\n\n"
+                "Creates an unconditional loop. The body repeats forever.\n"
+                "Available only at compile time.\n\n"
                 "Example:\n"
                 "  begin\n"
                 "    read_stdin\n"
@@ -9607,7 +10017,7 @@ def _run_docs_tui(
             "summary": "Local jumps within a definition.",
             "detail": (
                 "Defines a local label and jumps to it. "
-                "to the enclosing word definition.\n\n"
+                "Labels are scoped to the enclosing word definition.\n\n"
                 "Example:\n"
                 "  word example\n"
                 "    label start\n"
@@ -10001,10 +10411,40 @@ def _run_docs_tui(
         "\n"
         "───────────────────────────────────────────────────────────\n"
         "\n"
-        "  L2 is a stack-based systems language that compiles\n"
-        "  ahead-of-time to native x86-64 Linux binaries. It\n"
-        "  descends from the Forth tradition: small words compose\n"
-        "  into larger words, and the machine is always visible.\n"
+        "  WHAT IS L2?\n"
+        "\n"
+        "  At its core, L2 is a programmable assembly templating\n"
+        "  engine with a Forth-style stack interface. You write\n"
+        "  small 'words' that compose into larger programs, and\n"
+        "  each word compiles to a known, inspectable sequence of\n"
+        "  x86-64 instructions. The language sits just above raw\n"
+        "  assembly — close enough to see every byte, high enough\n"
+        "  to be genuinely productive.\n"
+        "\n"
+        "  But L2 is more than a glorified macro assembler. Its\n"
+        "  compile-time virtual machine lets you run arbitrary L2\n"
+        "  code at compile time: generate words, compute lookup\n"
+        "  tables, build structs, or emit entire subsystems before\n"
+        "  a single byte of native code is produced. Text macros,\n"
+        "  :py blocks, and token hooks extend the syntax in ways\n"
+        "  that feel like language features — because they are.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────\n"
+        "\n"
+        "  WHY DOES L2 EXIST?\n"
+        "\n"
+        "  L2 was built for fun — and that's a feature, not an\n"
+        "  excuse. It exists because writing a compiler is deeply\n"
+        "  satisfying, because Forth's ideas deserve to be pushed\n"
+        "  further, and because sometimes you want to write a\n"
+        "  program that does exactly what you told it to.\n"
+        "\n"
+        "  That said, 'fun' doesn't mean 'toy'. L2 produces real\n"
+        "  native binaries, links against C libraries, and handles\n"
+        "  practical tasks like file I/O, hashmap manipulation,\n"
+        "  and async scheduling — all with a minimal runtime.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────\n"
         "\n"
         "  CORE TENETS\n"
         "\n"
@@ -10025,9 +10465,12 @@ def _run_docs_tui(
         "     it composes.\n"
         "\n"
         "  4. META-PROGRAMMABILITY\n"
-        "     The front-end is user-extensible: immediate words,\n"
-        "     text macros, :py blocks, and token hooks let you\n"
-        "     reshape syntax without forking the compiler.\n"
+        "     The front-end is user-extensible: text macros, :py\n"
+        "     blocks, immediate words, and token hooks reshape\n"
+        "     syntax at compile time. The compile-time VM can\n"
+        "     execute full L2 programs during compilation, making\n"
+        "     the boundary between 'language' and 'metaprogram'\n"
+        "     deliberately blurry.\n"
         "\n"
         "  5. UNSAFE BY DESIGN\n"
         "     Safety is the programmer's job, not the language's.\n"
@@ -10038,6 +10481,12 @@ def _run_docs_tui(
         "     The stdlib provides building blocks — not policy.\n"
         "     It gives you alloc/free, puts/puti, arrays, and\n"
         "     file I/O. Everything else is your choice.\n"
+        "\n"
+        "  7. FUN FIRST\n"
+        "     If using L2 feels like a chore, the design has\n"
+        "     failed. The language should reward curiosity and\n"
+        "     make you want to dig deeper into how things work.\n"
+        "     At least its fun for me to write programs in. ;)"
         "\n"
         "───────────────────────────────────────────────────────────\n"
         "\n"
@@ -10434,14 +10883,14 @@ def _run_docs_tui(
         "  § 16  WITH (SCOPED VARIABLES)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  with <name> ... end\n"
-        "    Bind the top of the data stack to a compile-time name.\n"
-        "    Inside the with block, referencing <name> pushes the\n"
-        "    bound value. At the end of the block the binding is\n"
-        "    removed. Useful for readability and avoiding stack shuffling.\n"
+        "  with <names...> in <body> end\n"
+        "    Pop values from the stack into named local variables.\n"
+        "    Inside the body, referencing a name reads the variable;\n"
+        "    `name !` writes to it. Variables are backed by hidden\n"
+        "    globals and are NOT re-entrant.\n"
         "\n"
-        "      10 with x\n"
-        "        x x +   # pushes 10 twice, adds → 20\n"
+        "      10 20 with x y in\n"
+        "        x y +   # reads x (10) and y (20), adds -> 30\n"
         "      end\n"
         "\n"
         "\n"
@@ -10506,6 +10955,282 @@ def _run_docs_tui(
         "  lexer-collect-brace   Lexer           [* | lex] -> [*, lex | list]\n"
         "  lexer-push-back       Lexer           [* | lex] -> [* | lex]\n"
         "  use-l2-ct             Hook            [* | name?] -> [*]\n"
+        "\n"
+        "═══════════════════════════════════════════════════════════════\n"
+    )
+
+    _L2_QA_TEXT = (
+        "═══════════════════════════════════════════════════════════\n"
+        "              Q & A   /   T I P S   &   T R I C K S\n"
+        "═══════════════════════════════════════════════════════════\n"
+        "\n"
+        "  HOW DO I DEBUG AN L2 PROGRAM?\n"
+        "\n"
+        "    Compile with --debug to embed DWARF debug info, then\n"
+        "    launch with --dbg to drop straight into GDB:\n"
+        "\n"
+        "      python3 main.py my_program.sl --debug --dbg\n"
+        "\n"
+        "    Inside GDB you can:\n"
+        "      - Set breakpoints on word labels  (b word_main)\n"
+        "      - Inspect the data stack via r12  (x/8gx $r12)\n"
+        "      - Step through asm instructions   (si / ni)\n"
+        "      - View registers                  (info registers)\n"
+        "      - Disassemble a word              (disas word_foo)\n"
+        "\n"
+        "    Tip: r12 is the stack pointer. [r12] = TOS,\n"
+        "    [r12+8] = second element, etc.\n"
+        "\n"
+        "  HOW DO I VIEW THE GENERATED ASSEMBLY?\n"
+        "\n"
+        "    Use --emit-asm to stop after generating assembly:\n"
+        "\n"
+        "      python3 main.py my_program.sl --emit-asm\n"
+        "\n"
+        "    The .asm file is written to build/<name>.asm.\n"
+        "    You can also use -v1 or higher for timing info,\n"
+        "    -v2 for per-function details, and -v3 or -v4 for\n"
+        "    full optimization tracing.\n"
+        "\n"
+        "  HOW DO I CALL C FUNCTIONS?\n"
+        "\n"
+        "    Declare them with the C-style extern syntax:\n"
+        "\n"
+        "      extern int printf(const char* fmt, ...)\n"
+        "      extern void* malloc(size_t size)\n"
+        "\n"
+        "    Or use the legacy style:\n"
+        "\n"
+        "      extern printf 2 1\n"
+        "\n"
+        "    Link the library with -l:\n"
+        "\n"
+        "      python3 main.py my_program.sl -l c\n"
+        "\n"
+        "    You can also use cimport to auto-extract externs:\n"
+        "\n"
+        "      cimport \"my_header.h\"\n"
+        "\n"
+        "  HOW DO MACROS WORK?\n"
+        "\n"
+        "    Text macros are template expansions. Define with\n"
+        "    an optional parameter count:\n"
+        "\n"
+        "      macro square       # 0-arg: inline expansion\n"
+        "        dup *\n"
+        "      ;\n"
+        "\n"
+        "      macro defconst 2   # 2-arg: $0 and $1 are args\n"
+        "        word $0\n"
+        "          $1\n"
+        "        end\n"
+        "      ;\n"
+        "\n"
+        "    Use them normally; macro args are positional:\n"
+        "\n"
+        "      5 square           # expands to: 5 dup *\n"
+        "      defconst TEN 10    # defines: word TEN 10 end\n"
+        "\n"
+        "  HOW DO I RUN CODE AT COMPILE TIME?\n"
+        "\n"
+        "    Use --ct-run-main or --script to execute 'main' at\n"
+        "    compile time. The CT VM supports most stack ops, I/O,\n"
+        "    lists, hashmaps, and string manipulation.\n"
+        "\n"
+        "    You can also mark words as compile-time:\n"
+        "\n"
+        "      word generate-table\n"
+        "        # ... runs during compilation\n"
+        "      end\n"
+        "      compile-time generate-table\n"
+        "\n"
+        "  WHAT IS THE --SCRIPT FLAG?\n"
+        "\n"
+        "    Shorthand for --no-artifact --ct-run-main. It parses\n"
+        "    and runs 'main' in the compile-time VM without\n"
+        "    producing a binary — useful for scripts as the name suggests.\n"
+        "\n"
+        "  HOW DO I USE THE BUILD CACHE?\n"
+        "\n"
+        "    The cache is automatic. It stores assembly output\n"
+        "    and skips recompilation when source files haven't\n"
+        "    changed. Disable with --no-cache if needed.\n"
+        "\n"
+        "  HOW DO I DUMP THE CONTROL-FLOW GRAPH?\n"
+        "\n"
+        "    Use --dump-cfg to produce a Graphviz DOT file:\n"
+        "\n"
+        "      python3 main.py prog.sl --dump-cfg\n"
+        "      dot -Tpng build/prog.cfg.dot -o cfg.png\n"
+        "\n"
+        "  WHAT OPTIMIZATIONS DOES L2 PERFORM?\n"
+        "\n"
+        "    - Constant folding (--no-folding to disable)\n"
+        "    - Peephole optimization (--no-peephole)\n"
+        "    - Loop unrolling (--no-loop-unroll)\n"
+        "    - Auto-inlining of small asm bodies (--no-auto-inline)\n"
+        "    - Static list folding (--no-static-list-folding)\n"
+        "    - Dead code elimination (automatic)\n"
+        "    - -O0 disables all optimizations\n"
+        "    - -O2 disables all optimizations AND checks\n"
+        "\n"
+        "══════════════════════════════════════════════════════════\n"
+    )
+
+    _L2_HOW_TEXT = (
+        "═══════════════════════════════════════════════════════════════\n"
+        "          H O W   L 2   W O R K S   (I N T E R N A L S)\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "\n"
+        "  ARCHITECTURE OVERVIEW\n"
+        "\n"
+        "    The L2 compiler is a single-pass, single-file Python\n"
+        "    program (~13K lines) with these major stages:\n"
+        "\n"
+        "    1. READER/TOKENIZER\n"
+        "       Splits source into whitespace-delimited tokens.\n"
+        "       Tracks line, column, and byte offsets per token.\n"
+        "       Comment lines (starting with #) in word bodies are\n"
+        "       preserved as metadata but not compiled.\n"
+        "\n"
+        "    2. IMPORT RESOLUTION\n"
+        "       'import' and 'cimport' directives are resolved\n"
+        "       recursively. Each file is loaded once. Imports are\n"
+        "       concatenated into a single token stream with\n"
+        "       FileSpan markers for error reporting.\n"
+        "\n"
+        "    3. PARSER\n"
+        "       Walks the token stream and builds an IR Module of\n"
+        "       Op lists (one per word definition). Key features:\n"
+        "       - Word/asm/py/extern definitions -> dictionary\n"
+        "       - Control flow (if/else/end, while/do/end, for)\n"
+        "         compiled to label-based jumps\n"
+        "       - Macro expansion (text macros with $N params)\n"
+        "       - Token hooks for user-extensible syntax\n"
+        "       - Compile-time VM execution of immediate words\n"
+        "\n"
+        "    4. ASSEMBLER / CODE GENERATOR\n"
+        "       Converts the Op IR into NASM x86-64 assembly.\n"
+        "       Handles calling conventions, extern C FFI with\n"
+        "       full System V ABI support (register classification,\n"
+        "       struct passing, SSE arguments).\n"
+        "\n"
+        "    5. NASM + LINKER\n"
+        "       The assembly is assembled by NASM into an object\n"
+        "       file, then linked (via ld or gcc) into the final\n"
+        "       binary.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────────\n"
+        "\n"
+        "  THE STACKS\n"
+        "\n"
+        "    L2 uses register r12 as the stack pointer for its data\n"
+        "    stack. The stack grows downward:\n"
+        "\n"
+        "      push:  sub r12, 8; mov [r12], rax\n"
+        "      pop:   mov rax, [r12]; add r12, 8\n"
+        "\n"
+        "    The return stack lives in a separate buffer with r13 as\n"
+        "    its stack pointer (also grows downward). The native x86\n"
+        "    call/ret stack (rsp) is used only for word call/return\n"
+        "    linkage and C interop.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────────\n"
+        "\n"
+        "  THE COMPILE-TIME VM\n"
+        "\n"
+        "    The CT VM is a stack-based interpreter that runs during\n"
+        "    parsing. It maintains:\n"
+        "\n"
+        "      - A value stack (Python list of ints/strings/lists)\n"
+        "      - A dictionary of CT-callable words\n"
+        "      - A return stack for nested calls\n"
+        "\n"
+        "    CT words can:\n"
+        "      - Emit token sequences into the compiler's stream\n"
+        "      - Inspect/modify the parser state\n"
+        "      - Call other CT words or builtins\n"
+        "      - Perform I/O, string ops, list/hashmap manipulation\n"
+        "\n"
+        "    When --ct-run-main is used, the CT VM can also JIT-compile\n"
+        "    and execute native x86-64 code via the Keystone assembler\n"
+        "    engine (for words that need native performance).\n"
+        "\n"
+        "───────────────────────────────────────────────────────────────\n"
+        "\n"
+        "  OPTIMIZATION PASSES\n"
+        "\n"
+        "    CONSTANT FOLDING\n"
+        "      Evaluates pure arithmetic sequences (e.g., 3 4 +\n"
+        "      becomes push 7). Works across word boundaries for\n"
+        "      inlined words.\n"
+        "\n"
+        "    PEEPHOLE OPTIMIZATION\n"
+        "      Pattern-matches instruction sequences and\n"
+        "      replaces them with shorter equivalents. Examples:\n"
+        "        swap drop -> nip\n"
+        "        swap nip  -> drop\n"
+        "\n"
+        "    LOOP UNROLLING\n"
+        "      Small deterministic loops (e.g., '4 for ... next')\n"
+        "      are unrolled into straight-line code when the\n"
+        "      iteration count is known at compile time.\n"
+        "\n"
+        "    AUTO-INLINING\n"
+        "      Small asm-body words (below a size threshold) are\n"
+        "      automatically inlined at call sites, eliminating\n"
+        "      call/ret overhead.\n"
+        "\n"
+        "    STATIC LIST FOLDING\n"
+        "      List literals like [1 2 3] with all-constant\n"
+        "      elements are placed in .data instead of being\n"
+        "      built at runtime.\n"
+        "\n"
+        "    DEAD CODE ELIMINATION\n"
+        "      Words that are never called (and not 'main') are\n"
+        "      excluded from the final assembly output.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────────\n"
+        "\n"
+        "  EXTERN C FFI\n"
+        "\n"
+        "    L2's extern system supports the full System V AMD64 ABI:\n"
+        "\n"
+        "    - Integer args -> rdi, rsi, rdx, rcx, r8, r9, then stack\n"
+        "    - Float/double args -> xmm0..xmm7, then stack\n"
+        "    - Struct args classified per ABI eightbyte rules\n"
+        "    - Return values in rax (int), xmm0 (float), or via\n"
+        "      hidden sret pointer for large structs\n"
+        "    - RSP is aligned to 16 bytes before each call\n"
+        "\n"
+        "    The compiler auto-classifies argument types from the\n"
+        "    C-style declaration and generates the correct register\n"
+        "    shuffle and stack layout.\n"
+        "\n"
+        "───────────────────────────────────────────────────────────────\n"
+        "\n"
+        "  QUIRKS & GOTCHAS\n"
+        "\n"
+        "    - No type system: everything is a 64-bit integer on\n"
+        "      the stack. Pointers, booleans, characters — all\n"
+        "      just numbers. Type safety is your responsibility.\n"
+        "\n"
+        "    - Macro expansion depth: macros can expand macros,\n"
+        "      but there's a limit (default 64, configurable via\n"
+        "      --macro-expansion-limit).\n"
+        "\n"
+        "    - :py blocks: Python code embedded in :py { ... }\n"
+        "      runs in the compiler's Python process. It has full\n"
+        "      access to the parser and dictionary — powerful but\n"
+        "      dangerous.\n"
+        "\n"
+        "    - The CT VM and native codegen share a dictionary\n"
+        "      but have separate stacks. A word defined at CT\n"
+        "      exists at CT only unless also compiled normally.\n"
+        "\n"
+        "    - The build cache tracks file mtimes and a hash of\n"
+        "      compiler flags. CT side effects invalidate the\n"
+        "      cache for that file.\n"
         "\n"
         "═══════════════════════════════════════════════════════════════\n"
     )
@@ -10629,6 +11354,15 @@ def _run_docs_tui(
                         extra_after += 1
                         if extra_after >= 3 or not stripped:
                             break
+            elif entry.kind == "macro":
+                # Show macro body until closing ';'
+                end = min(len(src_lines), start + 200)
+                for i in range(start, end):
+                    prefix = f"  {i + 1:4d}| "
+                    lines.append(prefix + src_lines[i])
+                    stripped = src_lines[i].strip()
+                    if stripped.endswith(";") and i >= start:
+                        break
             else:
                 end = min(len(src_lines), start + 30)
                 for i in range(start, end):
@@ -10644,6 +11378,27 @@ def _run_docs_tui(
         except Exception:
             pass
         stdscr.keypad(True)
+
+        # Initialize color pairs for kind tags
+        _has_colors = False
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)     # word
+                curses.init_pair(2, curses.COLOR_GREEN, -1)    # asm
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)   # py
+                curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # macro
+                _has_colors = True
+        except Exception:
+            pass
+
+        _KIND_COLORS = {
+            "word": curses.color_pair(1) if _has_colors else 0,
+            "asm": curses.color_pair(2) if _has_colors else 0,
+            "py": curses.color_pair(3) if _has_colors else 0,
+            "macro": curses.color_pair(4) if _has_colors else 0,
+        }
 
         nonlocal entries
         query = initial_query
@@ -10738,7 +11493,7 @@ def _run_docs_tui(
                 _safe_addnstr(scr, y, x, label, width - x - 1, attr)
                 x += len(label) + 1
             # Right-aligned shortcuts
-            shortcuts = " L license  P philosophy "
+            shortcuts = " ? Q&A  H how  P philosophy  L license "
             if x + len(shortcuts) < width:
                 _safe_addnstr(scr, y, width - len(shortcuts) - 1, shortcuts, len(shortcuts), curses.A_DIM)
 
@@ -11104,7 +11859,7 @@ def _run_docs_tui(
                 cat_label = cat_names[lang_cat_filter]
                 header = f" Language Reference  {len(lang_entries)} entries  category: {cat_label}"
                 _safe_addnstr(stdscr, 1, 0, header, width - 1, curses.A_BOLD)
-                hint = " c category  Enter detail  j/k nav  Tab switch  C ct-ref  L license  P philosophy  q quit"
+                hint = " c category  Enter detail  j/k nav  Tab switch  C ct-ref  ? Q&A  H how  P philosophy  q quit"
                 _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
 
                 for row in range(list_height):
@@ -11173,6 +11928,16 @@ def _run_docs_tui(
                     info_scroll = 0
                     mode = _MODE_PHILOSOPHY
                     continue
+                if key == ord("?"):
+                    info_lines = _L2_QA_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_QA
+                    continue
+                if key == ord("H"):
+                    info_lines = _L2_HOW_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_HOW
+                    continue
                 if key == ord("C"):
                     active_tab = _TAB_CT_REF
                     info_lines = _L2_CT_REF_TEXT.splitlines()
@@ -11227,9 +11992,15 @@ def _run_docs_tui(
                     continue
                 continue
 
-            # -- LICENSE / PHILOSOPHY MODE --
-            if mode in (_MODE_LICENSE, _MODE_PHILOSOPHY):
-                title = "License" if mode == _MODE_LICENSE else "Philosophy of L2"
+            # -- LICENSE / PHILOSOPHY / Q&A / HOW-IT-WORKS MODE --
+            if mode in (_MODE_LICENSE, _MODE_PHILOSOPHY, _MODE_QA, _MODE_HOW):
+                _info_titles = {
+                    _MODE_LICENSE: "License",
+                    _MODE_PHILOSOPHY: "Philosophy of L2",
+                    _MODE_QA: "Q&A / Tips & Tricks",
+                    _MODE_HOW: "How L2 Works (Internals)",
+                }
+                title = _info_titles.get(mode, "")
                 stdscr.erase()
                 _safe_addnstr(stdscr, 0, 0, f" {title} ", width - 1, curses.A_BOLD)
                 _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
@@ -11249,6 +12020,10 @@ def _run_docs_tui(
                 prev_mode = _MODE_LANG_REF if active_tab == _TAB_LANG_REF else (_MODE_CT_REF if active_tab == _TAB_CT_REF else _MODE_BROWSE)
                 if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
                     mode = prev_mode
+                    # Restore info_lines when returning to CT ref
+                    if prev_mode == _MODE_CT_REF:
+                        info_lines = _L2_CT_REF_TEXT.splitlines()
+                        info_scroll = 0
                     continue
                 if key in (curses.KEY_DOWN, ord("j")):
                     if info_scroll < max_iscroll:
@@ -11277,7 +12052,7 @@ def _run_docs_tui(
                 stdscr.erase()
                 _safe_addnstr(stdscr, 0, 0, " Compile-Time Reference ", width - 1, curses.A_BOLD)
                 _render_tab_bar(stdscr, 1, width)
-                _safe_addnstr(stdscr, 2, 0, " j/k scroll  PgUp/PgDn  Tab switch  L license  P philosophy  q quit", width - 1, curses.A_DIM)
+                _safe_addnstr(stdscr, 2, 0, " j/k scroll  PgUp/PgDn  Tab switch  ? Q&A  H how  P philosophy  L license  q quit", width - 1, curses.A_DIM)
                 body_height = max(1, height - 4)
                 max_iscroll = max(0, len(info_lines) - body_height)
                 if info_scroll > max_iscroll:
@@ -11327,6 +12102,16 @@ def _run_docs_tui(
                     info_scroll = 0
                     mode = _MODE_PHILOSOPHY
                     continue
+                if key == ord("?"):
+                    info_lines = _L2_QA_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_QA
+                    continue
+                if key == ord("H"):
+                    info_lines = _L2_HOW_TEXT.splitlines()
+                    info_scroll = 0
+                    mode = _MODE_HOW
+                    continue
                 if key == ord("C"):
                     active_tab = _TAB_CT_REF
                     info_lines = _L2_CT_REF_TEXT.splitlines()
@@ -11372,7 +12157,7 @@ def _run_docs_tui(
             header = f" L2 docs  {len(filtered)}/{len(entries)}" + (f"  search: {query}" if query else "") + filter_info
             _safe_addnstr(stdscr, 0, 0, header, width - 1, curses.A_BOLD)
             _render_tab_bar(stdscr, 1, width)
-            hint = " / search  f filters  r reload  Enter detail  j/k nav  Tab switch  C ct-ref  L license  P philosophy  q quit"
+            hint = " / search  f filters  r reload  Enter detail  Tab switch  C ct-ref  ? Q&A  H how  P philosophy  L license  q quit"
             _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
 
             for row in range(list_height):
@@ -11381,10 +12166,23 @@ def _run_docs_tui(
                     break
                 entry = filtered[idx]
                 effect = entry.stack_effect if entry.stack_effect else ""
-                kind_tag = f"[{entry.kind}]"
-                line = f" {entry.name:24} {effect:30} {kind_tag}"
-                attr = curses.A_REVERSE if idx == selected else 0
-                _safe_addnstr(stdscr, 3 + row, 0, line, width - 1, attr)
+                kind_tag = f"[{entry.kind:5}]"
+                name_part = f" {entry.name:24} "
+                effect_part = f"{effect:30} "
+                is_sel = idx == selected
+                base_attr = curses.A_REVERSE if is_sel else 0
+                y = 3 + row
+                # Draw name
+                _safe_addnstr(stdscr, y, 0, name_part, width - 1, base_attr | curses.A_BOLD if is_sel else base_attr)
+                # Draw stack effect
+                x = len(name_part)
+                if x < width - 1:
+                    _safe_addnstr(stdscr, y, x, effect_part, width - x - 1, base_attr)
+                # Draw kind tag with color
+                x2 = x + len(effect_part)
+                if x2 < width - 1:
+                    kind_color = _KIND_COLORS.get(entry.kind, 0) if not is_sel else 0
+                    _safe_addnstr(stdscr, y, x2, kind_tag, width - x2 - 1, base_attr | kind_color)
 
             if filtered:
                 current = filtered[selected]
@@ -11413,6 +12211,16 @@ def _run_docs_tui(
                 info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
                 info_scroll = 0
                 mode = _MODE_PHILOSOPHY
+                continue
+            if key == ord("?"):
+                info_lines = _L2_QA_TEXT.splitlines()
+                info_scroll = 0
+                mode = _MODE_QA
+                continue
+            if key == ord("H"):
+                info_lines = _L2_HOW_TEXT.splitlines()
+                info_scroll = 0
+                mode = _MODE_HOW
                 continue
             if key == ord("C"):
                 active_tab = _TAB_CT_REF
@@ -11608,6 +12416,32 @@ def cli(argv: Sequence[str]) -> int:
         default=DEFAULT_MACRO_EXPANSION_LIMIT,
         help="maximum nested macro expansion depth (default: %(default)s)",
     )
+    parser.add_argument(
+        "-D",
+        dest="defines",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="define a preprocessor symbol for ifdef/ifndef (repeatable)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate source without producing artifacts (parse + compile only)",
+    )
+    parser.add_argument(
+        "-W",
+        dest="warnings",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="enable warning (e.g. -W redefine, -W stack-depth, -W all)",
+    )
+    parser.add_argument(
+        "--Werror",
+        action="store_true",
+        help="treat all warnings as errors",
+    )
 
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
@@ -11626,6 +12460,9 @@ def cli(argv: Sequence[str]) -> int:
     if args.script:
         args.no_artifact = True
         args.ct_run_main = True
+
+    if args.check:
+        args.no_artifact = True
 
     if args.macro_expansion_limit < 1:
         parser.error("--macro-expansion-limit must be >= 1")
@@ -11740,6 +12577,7 @@ def cli(argv: Sequence[str]) -> int:
     compiler = Compiler(
         include_paths=[Path("."), Path("./stdlib"), *args.include_paths],
         macro_expansion_limit=args.macro_expansion_limit,
+        defines=args.defines,
     )
     compiler.assembler.enable_constant_folding = folding_enabled
     compiler.assembler.enable_static_list_folding = static_list_folding_enabled
@@ -11751,7 +12589,26 @@ def cli(argv: Sequence[str]) -> int:
     compiler.assembler.verbosity = verbosity
     if args.dump_cfg is not None:
         compiler.assembler._need_cfg = True
-
+    # Warning configuration
+    warnings_set = set(args.warnings)
+    werror = args.Werror
+    # Support GCC-style -Werror (single dash, parsed as -W error)
+    if "error" in warnings_set:
+        warnings_set.discard("error")
+        werror = True
+    # -Werror without explicit -W categories implies -W all
+    if werror and not warnings_set:
+        warnings_set.add("all")
+    compiler.parser._warnings_enabled = warnings_set
+    compiler.parser._werror = werror
+    # Route dictionary redefine warnings through the parser's _warn system
+    if warnings_set or werror:
+        def _dict_warn_cb(name: str, priority: int) -> None:
+            compiler.parser._warn(
+                compiler.parser._last_token, "redefine",
+                f"redefining word {name} (priority {priority})",
+            )
+        compiler.parser.dictionary.warn_callback = _dict_warn_cb
     cache: Optional[BuildCache] = None
     if not args.no_cache:
         cache = BuildCache(args.temp_dir / ".l2cache")
@@ -11822,11 +12679,35 @@ def cli(argv: Sequence[str]) -> int:
                 print(f"[error] compile-time execution of 'main' failed: {exc}")
                 return 1
     except (ParseError, CompileError, CompileTimeError) as exc:
-        print(f"[error] {exc}")
+        # Print all collected diagnostics in Rust-style format
+        use_color = sys.stderr.isatty()
+        diags = getattr(compiler.parser, 'diagnostics', []) if 'compiler' in dir() else []
+        if diags:
+            for diag in diags:
+                print(diag.format(color=use_color), file=sys.stderr)
+            error_count = sum(1 for d in diags if d.level == "error")
+            warn_count = sum(1 for d in diags if d.level == "warning")
+            summary_parts = []
+            if error_count:
+                summary_parts.append(f"{error_count} error(s)")
+            if warn_count:
+                summary_parts.append(f"{warn_count} warning(s)")
+            if summary_parts:
+                print(f"\n{' and '.join(summary_parts)} emitted", file=sys.stderr)
+        else:
+            print(f"[error] {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"[error] unexpected failure: {exc}")
+        print(f"[error] unexpected failure: {exc}", file=sys.stderr)
         return 1
+
+    # Print any warnings accumulated during successful compilation
+    use_color = sys.stderr.isatty()
+    warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
+    if warnings:
+        for diag in warnings:
+            print(diag.format(color=use_color), file=sys.stderr)
+        print(f"\n{len(warnings)} warning(s) emitted", file=sys.stderr)
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")

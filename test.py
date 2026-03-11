@@ -152,6 +152,7 @@ class TestCaseConfig:
     tags: List[str] = field(default_factory=list)
     requires: List[str] = field(default_factory=list)
     libs: List[str] = field(default_factory=list)
+    compile_args: List[str] = field(default_factory=list)
 
     @classmethod
     def from_meta(cls, data: Dict[str, Any]) -> "TestCaseConfig":
@@ -207,6 +208,11 @@ class TestCaseConfig:
             if not isinstance(libs, list) or not all(isinstance(item, str) for item in libs):
                 raise ValueError("libs must be a list of strings")
             cfg.libs = [item.strip() for item in libs if item.strip()]
+        if "compile_args" in data:
+            ca = data["compile_args"]
+            if not isinstance(ca, list) or not all(isinstance(item, str) for item in ca):
+                raise ValueError("compile_args must be a list of strings")
+            cfg.compile_args = list(ca)
         return cfg
 
 
@@ -442,6 +448,7 @@ class TestRunner:
             cmd.extend(["-l", lib])
         for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
+        cmd.extend(case.config.compile_args)
         if self.args.ct_run_main:
             cmd.append("--ct-run-main")
         if self.args.verbose:
@@ -477,7 +484,7 @@ class TestRunner:
         obj_path = case.build_dir / f"{case.binary_stub}_fixture.o"
         archive_path = case.build_dir / f"lib{case.binary_stub}_fixture.a"
 
-        compile_cmd = [cc, "-O2", "-c", str(c_source), "-o", str(obj_path)]
+        compile_cmd = [cc, "-O2", "-fno-stack-protector", "-c", str(c_source), "-o", str(obj_path)]
         archive_cmd = [ar, "rcs", str(archive_path), str(obj_path)]
 
         if self.args.verbose:
@@ -655,6 +662,11 @@ class TestRunner:
             return self._sort_lines(text)
         if case.source.stem == "ct_test" and label == "compile":
             return self._mask_build_path(text, case.binary_stub)
+        if label == "compile":
+            # Normalize absolute source paths to relative for stable compile error comparison
+            source_dir = str(case.source.parent.resolve())
+            if source_dir:
+                text = text.replace(source_dir + "/", "")
         return text
 
     def _sort_lines(self, text: str) -> str:

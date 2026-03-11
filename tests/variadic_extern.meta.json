@@ -1,0 +1,4 @@
+{
+  "description": "Test variadic and non-variadic extern declarations with companion C file",
+  "libs": ["libc.so.6"]
+}

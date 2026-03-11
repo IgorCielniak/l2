@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "Compiler reports multiple errors via error recovery"
+}

@@ -1,0 +1,12 @@
+error: unexpected 'end' at 6:8
+  --> error_recovery.sl:6:8
+    |
+  6 |     end end
+    |        ^^^
+error: unexpected 'end' at 10:8
+  --> error_recovery.sl:10:8
+     |
+  10 |     end end
+     |        ^^^
+
+2 error(s) emitted

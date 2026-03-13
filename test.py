@@ -224,6 +224,7 @@ class TestCase:
     expected_stdout: Path
     expected_stderr: Path
     compile_expected: Path
+    asm_forbid: Path
     stdin_path: Path
     args_path: Path
     meta_path: Path
@@ -324,6 +325,7 @@ class TestRunner:
             expected_stdout=source.with_suffix(".expected"),
             expected_stderr=source.with_suffix(".stderr"),
             compile_expected=source.with_suffix(".compile.expected"),
+            asm_forbid=source.with_suffix(".asm.forbid"),
             stdin_path=source.with_suffix(".stdin"),
             args_path=source.with_suffix(".args"),
             meta_path=meta_path,
@@ -391,6 +393,10 @@ class TestRunner:
             return CaseResult(case, compile_status, "compile", compile_note, compile_details, duration)
         if compile_status == "updated" and compile_note:
             updated_notes.append(compile_note)
+        asm_status, asm_note, asm_details = self._check_asm_forbidden_patterns(case)
+        if asm_status == "failed":
+            duration = time.perf_counter() - start
+            return CaseResult(case, asm_status, "asm", asm_note, asm_details, duration)
         if case.config.compile_only:
             duration = time.perf_counter() - start
             if updated_notes:
@@ -632,6 +638,39 @@ class TestRunner:
                 parts.append("\n")
             parts.append(proc.stderr)
         return "".join(parts)
+
+    def _check_asm_forbidden_patterns(self, case: TestCase) -> Tuple[str, str, Optional[str]]:
+        """Fail test if generated asm contains forbidden markers listed in *.asm.forbid."""
+        if not case.asm_forbid.exists():
+            return "passed", "", None
+
+        asm_path = case.build_dir / f"{case.binary_stub}.asm"
+        if not asm_path.exists():
+            return "failed", f"missing generated asm file {asm_path.name}", None
+
+        asm_text = asm_path.read_text(encoding="utf-8")
+        patterns: List[str] = []
+        for raw in case.asm_forbid.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            patterns.append(line)
+
+        hits: List[str] = []
+        for pattern in patterns:
+            if pattern.startswith("re:"):
+                expr = pattern[3:]
+                if re.search(expr, asm_text, re.MULTILINE):
+                    hits.append(pattern)
+                continue
+            if pattern in asm_text:
+                hits.append(pattern)
+
+        if not hits:
+            return "passed", "", None
+
+        detail = "forbidden asm pattern(s) matched:\n" + "\n".join(f"- {p}" for p in hits)
+        return "failed", "assembly contains forbidden patterns", detail
 
     def _compare_nob_test_stdout(
         self,

@@ -8427,6 +8427,68 @@ class Compiler:
         word.intrinsic = self._emit_syscall_intrinsic
 
     def _emit_syscall_intrinsic(self, builder: FunctionEmitter) -> None:
+        def _try_pop_known_syscall_setup() -> Optional[Tuple[int, int]]:
+            """Recognize and remove literal setup for known-argc syscalls.
+
+            Supported forms right before `syscall`:
+              1) <argc> <nr>
+              2) <nr> <argc> ___linux_swap
+            Returns (argc, nr) when recognized.
+            """
+
+            # Form 1: ... push argc ; push nr ; syscall
+            nr = Assembler._pop_preceding_literal(builder)
+            if nr is not None:
+                argc = Assembler._pop_preceding_literal(builder)
+                if argc is not None and 0 <= argc <= 6:
+                    return argc, nr
+                # rollback if second literal wasn't argc
+                builder.push_literal(nr)
+
+            # Form 2: ... push nr ; push argc ; ___linux_swap ; syscall
+            text = builder.text
+            swap_tail = [
+                "mov rax, [r12]",
+                "mov rbx, [r12 + 8]",
+                "mov [r12], rbx",
+                "mov [r12 + 8], rax",
+            ]
+            if len(text) >= 4 and [s.strip() for s in text[-4:]] == swap_tail:
+                del text[-4:]
+                argc2 = Assembler._pop_preceding_literal(builder)
+                nr2 = Assembler._pop_preceding_literal(builder)
+                if argc2 is not None and nr2 is not None and 0 <= argc2 <= 6:
+                    return argc2, nr2
+                # rollback conservatively if match fails
+                if nr2 is not None:
+                    builder.push_literal(nr2)
+                if argc2 is not None:
+                    builder.push_literal(argc2)
+                text.extend(swap_tail)
+
+            return None
+
+        known = _try_pop_known_syscall_setup()
+        if known is not None:
+            argc, nr = known
+            builder.push_literal(nr)
+            builder.pop_to("rax")
+            if argc >= 6:
+                builder.pop_to("r9")
+            if argc >= 5:
+                builder.pop_to("r8")
+            if argc >= 4:
+                builder.pop_to("r10")
+            if argc >= 3:
+                builder.pop_to("rdx")
+            if argc >= 2:
+                builder.pop_to("rsi")
+            if argc >= 1:
+                builder.pop_to("rdi")
+            builder.emit("    syscall")
+            builder.push_from("rax")
+            return
+
         label_id = self._syscall_label_counter
         self._syscall_label_counter += 1
 

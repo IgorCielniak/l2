@@ -48,7 +48,6 @@ word sh
         !
 
         syscall.fork
-        syscall
         dup 0 < if
             >r
             1 rpick
@@ -67,11 +66,9 @@ word sh
                 dup
                 32 +
                 syscall.execve
-                syscall
                 drop
                 127
                 syscall.exit
-                syscall
             else
                 mem
                 40 +
@@ -79,7 +76,6 @@ word sh
                 0
                 0
                 syscall.wait4
-                syscall
                 dup 0 < if
                     >r
                     rdrop

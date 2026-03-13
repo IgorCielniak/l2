@@ -1,0 +1,4 @@
+# Ensure known-argc syscall lowering avoids generic dynamic syscall boilerplate.
+clamp arg count to [0, 6]
+re:syscall_\d+_count_
+re:syscall_\d+_skip_

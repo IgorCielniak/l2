@@ -6,7 +6,6 @@ word main
     1
     "hello"
     syscall.write
-    syscall
     #drop
 
     1

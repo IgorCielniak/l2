@@ -3,9 +3,9 @@
 # Linux syscall constants + convenience wrappers for L2
 
 # File descriptor constants
-macro fd_stdin 0 0 ;
-macro fd_stdout 0 1 ;
-macro fd_stderr 0 2 ;
+macro FD_STDIN 0 0 ;
+macro FD_STDOUT 0 1 ;
+macro FD_STDERR 0 2 ;
 
 # Common open(2) flags
 macro O_RDONLY 0 0 ;

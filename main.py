@@ -6943,19 +6943,30 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
         raise ParseError("'with' requires at least one variable name")
 
     body: List[Token] = []
+    else_line: Optional[int] = None
     depth = 0
     while True:
         if parser._eof():
             raise ParseError("unterminated 'with' block (missing 'end')")
         tok = parser.next_token()
+        if else_line is not None and tok.line != else_line:
+            else_line = None
         if tok.lexeme == "end":
             if depth == 0:
                 break
             depth -= 1
             body.append(tok)
             continue
-        if tok.lexeme in ("with", "if", "for", "while", "begin", "word"):
+        if tok.lexeme in ("with", "for", "while", "begin", "word"):
             depth += 1
+        elif tok.lexeme == "if":
+            # Support shorthand elif form `else <cond> if` inside with-blocks.
+            # This inline `if` shares the same closing `end` as the preceding
+            # branch and therefore must not increment nesting depth.
+            if else_line != tok.line:
+                depth += 1
+        elif tok.lexeme == "else":
+            else_line = tok.line
         body.append(tok)
 
     helper_for: Dict[str, str] = {}
@@ -6963,14 +6974,26 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
         _, helper = parser.allocate_variable(name)
         helper_for[name] = helper
 
-    emitted: List[str] = []
+    emitted_tokens: List[Token] = []
+
+    def _emit_lex(lex: str, src_tok: Optional[Token] = None) -> None:
+        base = src_tok or template or Token(lexeme="", line=0, column=0, start=0, end=0)
+        emitted_tokens.append(
+            Token(
+                lexeme=lex,
+                line=base.line,
+                column=base.column,
+                start=base.start,
+                end=base.end,
+            )
+        )
 
     # Initialize variables by storing current stack values into their buffers
     for name in reversed(names):
         helper = helper_for[name]
-        emitted.append(helper)
-        emitted.append("swap")
-        emitted.append("!")
+        _emit_lex(helper, template)
+        _emit_lex("swap", template)
+        _emit_lex("!", template)
 
     i = 0
     while i < len(body):
@@ -6980,23 +7003,23 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
         if helper is not None:
             next_tok = body[i + 1] if i + 1 < len(body) else None
             if next_tok is not None and next_tok.lexeme == "!":
-                emitted.append(helper)
-                emitted.append("swap")
-                emitted.append("!")
+                _emit_lex(helper, tok)
+                _emit_lex("swap", tok)
+                _emit_lex("!", tok)
                 i += 2
                 continue
             if next_tok is not None and next_tok.lexeme == "@":
-                emitted.append(helper)
+                _emit_lex(helper, tok)
                 i += 1
                 continue
-            emitted.append(helper)
-            emitted.append("@")
+            _emit_lex(helper, tok)
+            _emit_lex("@", tok)
             i += 1
             continue
-        emitted.append(tok.lexeme)
+        _emit_lex(tok.lexeme, tok)
         i += 1
 
-    ctx.inject_tokens(emitted, template=template)
+    ctx.inject_token_objects(emitted_tokens)
     return None
 
 

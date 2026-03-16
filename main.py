@@ -442,6 +442,7 @@ _PEEPHOLE_CANCEL_PAIRS = frozenset({
     ("inc", "dec"), ("dec", "inc"),
 })
 _PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
+_DEFAULT_CONTROL_WORDS = frozenset({"if", "else", "for", "while", "do"})
 
 
 class Op:
@@ -776,6 +777,9 @@ class Parser:
         self.source: str = ""
         self.macro_recording: Optional[MacroDefinition] = None
         self.control_stack: List[Dict[str, str]] = []
+        self.block_openers: Set[str] = {"word", "with", "for", "while", "begin"}
+        self.control_overrides: Set[str] = set()
+        self._warned_control_overrides: Set[str] = set()
         self.label_counter = 0
         self.token_hook: Optional[str] = None
         self._last_token: Optional[Token] = None
@@ -929,29 +933,43 @@ class Parser:
         return label, hidden_word
 
     def _handle_end_control(self) -> None:
-        """Handle unified 'end' for all block types"""
+        """Close one generic control frame pushed by compile-time words."""
         if not self.control_stack:
             raise ParseError("unexpected 'end' without matching block")
 
         entry = self.control_stack.pop()
+        if not isinstance(entry, dict):
+            raise ParseError("invalid control frame")
 
-        if entry["type"] in ("if", "elif"):
-            # For if/elif without a trailing else
-            if "false" in entry:
-                self._append_op(_make_op("label", entry["false"]))
-            if "end" in entry:
-                self._append_op(_make_op("label", entry["end"]))
-        elif entry["type"] == "else":
-            self._append_op(_make_op("label", entry["end"]))
-        elif entry["type"] == "while":
-            self._append_op(_make_op("jump", entry["begin"]))
-            self._append_op(_make_op("label", entry["end"]))
-        elif entry["type"] == "for":
-            # Emit ForEnd node for loop decrement
-            self._append_op(_make_op("for_end", {"loop": entry["loop"], "end": entry["end"]}))
-        elif entry["type"] == "begin":
-            self._append_op(_make_op("jump", entry["begin"]))
-            self._append_op(_make_op("label", entry["end"]))
+        close_ops = entry.get("close_ops")
+        if close_ops is None:
+            return
+        if not isinstance(close_ops, list):
+            raise ParseError("control frame field 'close_ops' must be a list")
+
+        for spec in close_ops:
+            op_name: Optional[str] = None
+            data: Any = None
+            if isinstance(spec, dict):
+                candidate = spec.get("op")
+                if isinstance(candidate, str):
+                    op_name = candidate
+                if "data" in spec:
+                    data = spec["data"]
+            elif isinstance(spec, (list, tuple)):
+                if not spec:
+                    raise ParseError("close_ops contains empty sequence")
+                if isinstance(spec[0], str):
+                    op_name = spec[0]
+                data = spec[1] if len(spec) > 1 else None
+            elif isinstance(spec, str):
+                op_name = spec
+            else:
+                raise ParseError(f"invalid close op descriptor: {spec!r}")
+
+            if not op_name:
+                raise ParseError(f"close op missing valid 'op' name: {spec!r}")
+            self._append_op(_make_op(op_name, data))
 
     # Parsing ------------------------------------------------------------------
     def parse(self, tokens: Iterable[Token], source: str) -> Module:
@@ -994,17 +1012,10 @@ class Parser:
         _KW_PY = 6
         _KW_EXTERN = 7
         _KW_PRIORITY = 8
-        _KW_IF = 9
-        _KW_ELSE = 10
-        _KW_FOR = 11
-        _KW_WHILE = 12
-        _KW_DO = 13
         _keyword_dispatch = {
             "[": _KW_LIST_BEGIN, "]": _KW_LIST_END, "word": _KW_WORD,
             "end": _KW_END, ":asm": _KW_ASM, ":py": _KW_PY,
             "extern": _KW_EXTERN, "priority": _KW_PRIORITY,
-            "if": _KW_IF, "else": _KW_ELSE, "for": _KW_FOR,
-            "while": _KW_WHILE, "do": _KW_DO,
         }
         _kw_get = _keyword_dispatch.get
 
@@ -1054,16 +1065,8 @@ class Parser:
                         self._parse_extern(token)
                     elif kw == _KW_PRIORITY:
                         self._parse_priority_directive(token)
-                    elif kw == _KW_IF:
-                        self._handle_if_control()
-                    elif kw == _KW_ELSE:
-                        self._handle_else_control()
-                    elif kw == _KW_FOR:
-                        self._handle_for_control()
-                    elif kw == _KW_WHILE:
-                        self._handle_while_control()
-                    elif kw == _KW_DO:
-                        self._handle_do_control()
+                    continue
+                if self._try_handle_builtin_control(token):
                     continue
                 if self._handle_token(token):
                     _tokens = self.tokens
@@ -1119,6 +1122,161 @@ class Parser:
         entry = self._pop_control(("list",))
         label = entry["label"]
         self._append_op(_make_op("list_end", label))
+
+    def _should_use_custom_control(self, lexeme: str) -> bool:
+        # Fast path: default parser controls unless explicitly overridden.
+        if lexeme not in self.control_overrides:
+            return False
+        word = self.dictionary.lookup(lexeme)
+        if word is None:
+            return False
+        return bool(word.immediate)
+
+    def _warn_control_override(self, token: Token, lexeme: str) -> None:
+        if lexeme in self._warned_control_overrides:
+            return
+        self._warned_control_overrides.add(lexeme)
+        sys.stderr.write(
+            f"[warn] default control structure ({lexeme}) has been overridden; using custom implementation\n"
+        )
+
+    def _try_handle_builtin_control(self, token: Token) -> bool:
+        lexeme = token.lexeme
+        if lexeme not in _DEFAULT_CONTROL_WORDS:
+            return False
+        if self._should_use_custom_control(lexeme):
+            self._warn_control_override(token, lexeme)
+            return False
+        if lexeme == "if":
+            self._handle_builtin_if(token)
+            return True
+        if lexeme == "else":
+            self._handle_builtin_else(token)
+            return True
+        if lexeme == "for":
+            self._handle_builtin_for(token)
+            return True
+        if lexeme == "while":
+            self._handle_builtin_while(token)
+            return True
+        if lexeme == "do":
+            self._handle_builtin_do(token)
+            return True
+        return False
+
+    def _handle_builtin_if(self, token: Token) -> None:
+        # Support shorthand `else <cond> if` by sharing the previous else-end label.
+        if self.control_stack:
+            top = self.control_stack[-1]
+            if (
+                top.get("type") == "else"
+                and isinstance(top.get("line"), int)
+                and top["line"] == token.line
+            ):
+                prev_else = self._pop_control(("else",))
+                shared_end = prev_else.get("end")
+                if not isinstance(shared_end, str):
+                    shared_end = self._new_label("if_end")
+                false_label = self._new_label("if_false")
+                self._append_op(_make_op("branch_zero", false_label))
+                self._push_control(
+                    {
+                        "type": "if",
+                        "false": false_label,
+                        "end": shared_end,
+                        "close_ops": [
+                            {"op": "label", "data": false_label},
+                            {"op": "label", "data": shared_end},
+                        ],
+                        "line": token.line,
+                        "column": token.column,
+                    }
+                )
+                return
+
+        false_label = self._new_label("if_false")
+        self._append_op(_make_op("branch_zero", false_label))
+        self._push_control(
+            {
+                "type": "if",
+                "false": false_label,
+                "end": None,
+                "close_ops": [{"op": "label", "data": false_label}],
+                "line": token.line,
+                "column": token.column,
+            }
+        )
+
+    def _handle_builtin_else(self, token: Token) -> None:
+        entry = self._pop_control(("if",))
+        false_label = entry.get("false")
+        if not isinstance(false_label, str):
+            raise ParseError("invalid if control frame")
+        end_label = entry.get("end")
+        if not isinstance(end_label, str):
+            end_label = self._new_label("if_end")
+        self._append_op(_make_op("jump", end_label))
+        self._append_op(_make_op("label", false_label))
+        self._push_control(
+            {
+                "type": "else",
+                "end": end_label,
+                "close_ops": [{"op": "label", "data": end_label}],
+                "line": token.line,
+                "column": token.column,
+            }
+        )
+
+    def _handle_builtin_for(self, token: Token) -> None:
+        loop_label = self._new_label("for_loop")
+        end_label = self._new_label("for_end")
+        frame = {"loop": loop_label, "end": end_label}
+        self._append_op(_make_op("for_begin", dict(frame)))
+        self._push_control(
+            {
+                "type": "for",
+                "loop": loop_label,
+                "end": end_label,
+                "close_ops": [{"op": "for_end", "data": dict(frame)}],
+                "line": token.line,
+                "column": token.column,
+            }
+        )
+
+    def _handle_builtin_while(self, token: Token) -> None:
+        begin_label = self._new_label("begin")
+        end_label = self._new_label("end")
+        self._append_op(_make_op("label", begin_label))
+        self._push_control(
+            {
+                "type": "while_open",
+                "begin": begin_label,
+                "end": end_label,
+                "line": token.line,
+                "column": token.column,
+            }
+        )
+
+    def _handle_builtin_do(self, token: Token) -> None:
+        entry = self._pop_control(("while_open",))
+        begin_label = entry.get("begin")
+        end_label = entry.get("end")
+        if not isinstance(begin_label, str) or not isinstance(end_label, str):
+            raise ParseError("invalid while control frame")
+        self._append_op(_make_op("branch_zero", end_label))
+        self._push_control(
+            {
+                "type": "while",
+                "begin": begin_label,
+                "end": end_label,
+                "close_ops": [
+                    {"op": "jump", "data": begin_label},
+                    {"op": "label", "data": end_label},
+                ],
+                "line": token.line,
+                "column": token.column,
+            }
+        )
 
     def _parse_priority_directive(self, token: Token) -> None:
         if self._eof():
@@ -1468,52 +1626,6 @@ class Parser:
         # Convention: hook leaves handled flag on stack (int truthy means consumed)
         handled = self.compile_time_vm.pop()
         return bool(handled)
-
-    def _handle_if_control(self) -> None:
-        token = self._last_token
-        if (
-            self.control_stack
-            and self.control_stack[-1]["type"] == "else"
-            and token is not None
-            and self.control_stack[-1].get("line") == token.line
-        ):
-            entry = self.control_stack.pop()
-            end_label = entry.get("end")
-            if end_label is None:
-                end_label = self._new_label("if_end")
-            false_label = self._new_label("if_false")
-            self._append_op(_make_op("branch_zero", false_label))
-            self._push_control({"type": "elif", "false": false_label, "end": end_label})
-            return
-        false_label = self._new_label("if_false")
-        self._append_op(_make_op("branch_zero", false_label))
-        self._push_control({"type": "if", "false": false_label})
-
-    def _handle_else_control(self) -> None:
-        entry = self._pop_control(("if", "elif"))
-        end_label = entry.get("end")
-        if end_label is None:
-            end_label = self._new_label("if_end")
-        self._append_op(_make_op("jump", end_label))
-        self._append_op(_make_op("label", entry["false"]))
-        self._push_control({"type": "else", "end": end_label})
-
-    def _handle_for_control(self) -> None:
-        loop_label = self._new_label("for_loop")
-        end_label = self._new_label("for_end")
-        self._append_op(_make_op("for_begin", {"loop": loop_label, "end": end_label}))
-        self._push_control({"type": "for", "loop": loop_label, "end": end_label})
-
-    def _handle_while_control(self) -> None:
-        begin_label = self._new_label("begin")
-        end_label = self._new_label("end")
-        self._append_op(_make_op("label", begin_label))
-        self._push_control({"type": "begin", "begin": begin_label, "end": end_label})
-
-    def _handle_do_control(self) -> None:
-        entry = self._pop_control(("begin",))
-        self._append_op(_make_op("branch_zero", entry["end"]))
-        self._push_control(entry)
 
     def _try_end_definition(self, token: Token) -> bool:
         if len(self.context_stack) <= 1:
@@ -6702,7 +6814,8 @@ class Assembler:
             suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
             raise CompileError(f"unknown word '{name}'{suffix}")
         if word.compile_only:
-            return  # silently skip compile-time-only words during emission
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"word '{name}' is compile-time only and cannot be used at runtime{suffix}")
         if getattr(word, "inline", False):
             if isinstance(word.definition, Definition):
                 if word.name in self._inline_stack:
@@ -6957,9 +7070,7 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
             depth -= 1
             body.append(tok)
             continue
-        if tok.lexeme in ("with", "for", "while", "begin", "word"):
-            depth += 1
-        elif tok.lexeme == "if":
+        if tok.lexeme == "if":
             # Support shorthand elif form `else <cond> if` inside with-blocks.
             # This inline `if` shares the same closing `end` as the preceding
             # branch and therefore must not increment nesting depth.
@@ -6967,6 +7078,8 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
                 depth += 1
         elif tok.lexeme == "else":
             else_line = tok.line
+        elif tok.lexeme in parser.block_openers:
+            depth += 1
         body.append(tok)
 
     helper_for: Dict[str, str] = {}
@@ -7297,6 +7410,105 @@ def _ct_loop_index(vm: CompileTimeVM) -> None:
     frame = vm.loop_stack[-1]
     idx = frame["initial"] - frame["remaining"]
     vm.push(idx)
+
+
+def _ct_control_frame_new(vm: CompileTimeVM) -> None:
+    type_name = vm.pop_str()
+    vm.push({"type": type_name})
+
+
+def _ct_control_get(vm: CompileTimeVM) -> None:
+    key = vm.pop_str()
+    frame = vm.pop()
+    if not isinstance(frame, dict):
+        raise ParseError("ct-control-get expects a control frame")
+    vm.push(frame.get(key))
+
+
+def _ct_control_set(vm: CompileTimeVM) -> None:
+    value = vm.pop()
+    key = vm.pop_str()
+    frame = vm.pop()
+    if not isinstance(frame, dict):
+        raise ParseError("ct-control-set expects a control frame")
+    frame[key] = value
+    vm.push(frame)
+
+
+def _ct_control_push(vm: CompileTimeVM) -> None:
+    frame = vm.pop()
+    if not isinstance(frame, dict):
+        raise ParseError("ct-control-push expects a control frame")
+    vm.parser._push_control(dict(frame))
+
+
+def _ct_control_pop(vm: CompileTimeVM) -> None:
+    if not vm.parser.control_stack:
+        raise ParseError("control stack underflow")
+    vm.push(dict(vm.parser.control_stack.pop()))
+
+
+def _ct_control_peek(vm: CompileTimeVM) -> None:
+    if not vm.parser.control_stack:
+        vm.push(None)
+        return
+    vm.push(dict(vm.parser.control_stack[-1]))
+
+
+def _ct_control_depth(vm: CompileTimeVM) -> None:
+    vm.push(len(vm.parser.control_stack))
+
+
+def _ct_new_label(vm: CompileTimeVM) -> None:
+    prefix = vm.pop_str()
+    vm.push(vm.parser._new_label(prefix))
+
+
+def _ct_emit_op(vm: CompileTimeVM) -> None:
+    data = vm.pop()
+    op_name = vm.pop_str()
+    vm.parser.emit_node(_make_op(op_name, data))
+
+
+def _ct_control_add_close_op(vm: CompileTimeVM) -> None:
+    data = vm.pop()
+    op_name = vm.pop_str()
+    frame = vm.pop()
+    if not isinstance(frame, dict):
+        raise ParseError("ct-control-add-close-op expects a control frame")
+    close_ops = frame.get("close_ops")
+    if close_ops is None:
+        close_ops = []
+    elif not isinstance(close_ops, list):
+        raise ParseError("control frame field 'close_ops' must be a list")
+    close_ops.append({"op": op_name, "data": data})
+    frame["close_ops"] = close_ops
+    vm.push(frame)
+
+
+def _ct_last_token_line(vm: CompileTimeVM) -> None:
+    tok = vm.parser._last_token
+    vm.push(0 if tok is None else tok.line)
+
+
+def _ct_register_block_opener(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.parser.block_openers.add(name)
+
+
+def _ct_unregister_block_opener(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.parser.block_openers.discard(name)
+
+
+def _ct_register_control_override(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.parser.control_overrides.add(name)
+
+
+def _ct_unregister_control_override(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.parser.control_overrides.discard(name)
 
 
 def _ct_list_get(vm: CompileTimeVM) -> None:
@@ -7897,6 +8109,21 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("list-extend", _ct_list_extend, compile_only=True)
     register("list-last", _ct_list_last, compile_only=True)
     register("i", _ct_loop_index, compile_only=True)
+    register("ct-control-frame-new", _ct_control_frame_new, compile_only=True)
+    register("ct-control-get", _ct_control_get, compile_only=True)
+    register("ct-control-set", _ct_control_set, compile_only=True)
+    register("ct-control-push", _ct_control_push, compile_only=True)
+    register("ct-control-pop", _ct_control_pop, compile_only=True)
+    register("ct-control-peek", _ct_control_peek, compile_only=True)
+    register("ct-control-depth", _ct_control_depth, compile_only=True)
+    register("ct-control-add-close-op", _ct_control_add_close_op, compile_only=True)
+    register("ct-new-label", _ct_new_label, compile_only=True)
+    register("ct-emit-op", _ct_emit_op, compile_only=True)
+    register("ct-last-token-line", _ct_last_token_line, compile_only=True)
+    register("ct-register-block-opener", _ct_register_block_opener, compile_only=True)
+    register("ct-unregister-block-opener", _ct_unregister_block_opener, compile_only=True)
+    register("ct-register-control-override", _ct_register_control_override, compile_only=True)
+    register("ct-unregister-control-override", _ct_unregister_control_override, compile_only=True)
 
     register("prelude-clear", _ct_prelude_clear, compile_only=True)
     register("prelude-append", _ct_prelude_append, compile_only=True)
@@ -10802,6 +11029,54 @@ def _run_docs_tui(
         "      word <name> <body...> end\n"
         "    into the parser's token stream.\n"
         "\n"
+        "  ── Control-frame helpers (for custom control structures)\n"
+        "\n"
+        "  ct-control-frame-new [* | type] -> [* | frame]\n"
+        "    Create a control frame map with a `type` field.\n"
+        "\n"
+        "  ct-control-get       [*, frame | key] -> [* | value]\n"
+        "    Read key from a control frame map.\n"
+        "\n"
+        "  ct-control-set       [*, frame, key | value] -> [* | frame]\n"
+        "    Write key/value into a control frame map.\n"
+        "\n"
+        "  ct-control-push      [* | frame] -> [*]\n"
+        "    Push a frame onto the parser control stack.\n"
+        "\n"
+        "  ct-control-pop       [*] -> [* | frame]\n"
+        "    Pop and return the top parser control frame.\n"
+        "\n"
+        "  ct-control-peek      [*] -> [* | frame] || [* | nil]\n"
+        "    Return the top parser control frame without popping.\n"
+        "\n"
+        "  ct-control-depth     [*] -> [* | n]\n"
+        "    Return parser control-stack depth.\n"
+        "\n"
+        "  ct-control-add-close-op [*, frame, op | data] -> [* | frame]\n"
+        "    Append a close operation descriptor to frame.close_ops.\n"
+        "\n"
+        "  ct-new-label         [* | prefix] -> [* | label]\n"
+        "    Allocate a fresh internal label with the given prefix.\n"
+        "\n"
+        "  ct-emit-op           [*, op | data] -> [*]\n"
+        "    Emit an internal op node directly into the current body.\n"
+        "\n"
+        "  ct-last-token-line   [*] -> [* | line]\n"
+        "    Return line number of the last parser token (or 0).\n"
+        "\n"
+        "  ct-register-block-opener [* | name] -> [*]\n"
+        "    Mark a word name as a block opener for `with` nesting.\n"
+        "\n"
+        "  ct-unregister-block-opener [* | name] -> [*]\n"
+        "    Remove a word name from block opener registration.\n"
+        "\n"
+        "  ct-register-control-override [* | name] -> [*]\n"
+        "    Register a control word override so parser can delegate\n"
+        "    built-in control handling to custom compile-time words.\n"
+        "\n"
+        "  ct-unregister-control-override [* | name] -> [*]\n"
+        "    Remove a control word override registration.\n"
+        "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 7  LEXER OBJECTS\n"
@@ -11020,6 +11295,21 @@ def _run_docs_tui(
         "  add-token             Token           [* | s] -> [*]\n"
         "  add-token-chars       Token           [* | s] -> [*]\n"
         "  emit-definition       Token           [*, name | body] -> [*]\n"
+        "  ct-control-frame-new  Control         [* | type] -> [* | frame]\n"
+        "  ct-control-get        Control         [*, frame | key] -> [* | value]\n"
+        "  ct-control-set        Control         [*, frame, key | value] -> [* | frame]\n"
+        "  ct-control-push       Control         [* | frame] -> [*]\n"
+        "  ct-control-pop        Control         [*] -> [* | frame]\n"
+        "  ct-control-peek       Control         [*] -> [* | frame]\n"
+        "  ct-control-depth      Control         [*] -> [* | n]\n"
+        "  ct-control-add-close-op Control       [*, frame, op | data] -> [* | frame]\n"
+        "  ct-new-label          Control         [* | prefix] -> [* | label]\n"
+        "  ct-emit-op            Control         [*, op | data] -> [*]\n"
+        "  ct-last-token-line    Control         [*] -> [* | line]\n"
+        "  ct-register-block-opener Control      [* | name] -> [*]\n"
+        "  ct-unregister-block-opener Control    [* | name] -> [*]\n"
+        "  ct-register-control-override Control  [* | name] -> [*]\n"
+        "  ct-unregister-control-override Control [* | name] -> [*]\n"
         "  set-token-hook        Hook            [* | name] -> [*]\n"
         "  clear-token-hook      Hook            [*] -> [*]\n"
         "  prelude-clear         Assembly        [*] -> [*]\n"

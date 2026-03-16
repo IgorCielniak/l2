@@ -40,9 +40,11 @@ This document reflects the implementation that ships in this repository today (`
 - **Word definitions** – Always `word name ... end`. Redefinitions overwrite the previous entry (a warning prints to stderr). `inline word name ... end` marks the definition for inline expansion; recursive inline calls are rejected. `immediate` and `compile-only` apply to the most recently defined word.
 - **Priority-based redefinition** – Use `priority <int>` before `word`, `:asm`, `:py`, or `extern` to control conflicts for the same name. Higher priority wins; lower-priority definitions are ignored. Equal priority keeps last definition (with a redefinition warning). The compiler prints a note indicating which priority was selected.
 - **Control forms** – Built-in tokens drive code emission:
+  - Default parser-level implementations for `if`, `else`, `for`, `while`, and `do` are always available.
+  - Import `stdlib/control.sl` to override these defaults with custom compile-time words; when an override is active, the compiler warns and uses the custom implementation.
   - `if ... end` and `if ... else ... end`. To express additional branches, place `if` on the same line as the preceding `else` (e.g., `else <condition> if ...`); the reader treats that form as an implicit chained clause, so each inline `if` consumes one flag and jumps past later clauses on success.
   - `while <condition> do <body> end`; the conditional block lives between `while` and `do` and re-runs every iteration.
-  - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros.
+  - `n for ... end`; the loop count is popped, stored on the return stack, and decremented each pass. The compile-time word `i` exposes the loop index inside macros and cannot be used in runtime-emitted words.
   - `label name` / `goto name` perform local jumps within a definition.
   - `&name` pushes a pointer to word `name` (its callable code label). This is intended for indirect control flow; `&name jmp` performs a tail jump to that word and is compatible with `--ct-run-main`.
 - **Text macros** – `macro name [param_count] ... ;` records raw tokens until `;`. `$0`, `$1`, ... expand to positional arguments. Macro definitions cannot nest (attempting to start another `macro` while recording raises a parse error).
@@ -57,6 +59,8 @@ This document reflects the implementation that ships in this repository today (`
   - Strings/numbers: `string=`, `string-length`, `string-append`, `string>number`, `int>string`.
   - Lexer utilities: `lexer-new`, `lexer-pop`, `lexer-peek`, `lexer-expect`, `lexer-collect-brace`, `lexer-push-back` (used by `libs/fn.sl` to parse signatures and infix expressions).
   - Token management: `next-token`, `peek-token`, `inject-tokens`, `token-lexeme`, `token-from-lexeme`.
+  - Control-frame helpers: `ct-control-frame-new`, `ct-control-get`, `ct-control-set`, `ct-control-push`, `ct-control-pop`, `ct-control-peek`, `ct-control-depth`, `ct-control-add-close-op`, `ct-new-label`, `ct-emit-op`, `ct-last-token-line`.
+  - Control registration: `ct-register-block-opener`, `ct-unregister-block-opener`, `ct-register-control-override`, `ct-unregister-control-override`.
   - Reader hooks: `set-token-hook` installs a word that receives each token (pushed as a `Token` object) and must leave a truthy handled flag; `clear-token-hook` disables it. `libs/fn.sl`'s `extend-syntax` demonstrates rewriting `foo(1, 2)` into ordinary word calls.
   - Prelude/BSS control: `prelude-clear`, `prelude-append`, `prelude-set`, `bss-clear`, `bss-append`, `bss-set` let user code override the `_start` stub or `.bss` layout.
   - Definition helpers: `emit-definition` injects a `word ... end` definition on the fly (used by the struct macro). `parse-error` raises a custom diagnostic.
@@ -74,6 +78,7 @@ This document reflects the implementation that ships in this repository today (`
 
 ## 8. Standard Library Overview (`stdlib/`)
 - **`core.sl`** – Stack shuffles, integer arithmetic, comparisons, boolean ops, memory access, syscall stubs (`mmap`, `munmap`, `exit`), argument helpers (`argc`, `argv`, `argv@`), and pointer helpers (`mem`).
+- **`control.sl`** – Optional custom control-structure words (`if`, `else`, `for`, `while`, `do`) that can override parser defaults when imported.
 - **`mem.sl`** – `alloc`/`free` wrappers around `mmap`/`munmap` plus a byte-wise `memcpy` used by higher-level utilities.
 - **`io.sl`** – `read_file`, `write_file`, `read_stdin`, `write_buf`, `ewrite_buf`, `putc`, `puti`, `puts`, `eputs`, and a smart `print` that detects `(addr,len)` pairs located inside the default `.data` region.
 - **`utils.sl`** – String and number helpers (`strcmp`, `strconcat`, `strlen`, `digitsN>num`, `toint`, `count_digits`, `tostr`).

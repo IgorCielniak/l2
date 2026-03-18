@@ -58,6 +58,13 @@ word memdump
     end
 end
 
+#memdump_bytes [*, len | addr] -> [* | addr]
+word memdump_bytes
+    for
+        dup c@ puti cr 1 +
+    end
+end
+
 #realloc [*, addr, old_len | new_len] -> [* | new_addr]
 word realloc
     2 pick swap alloc

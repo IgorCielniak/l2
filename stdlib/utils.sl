@@ -378,3 +378,70 @@ word format
         drop                   # drop counter (0)
     end
 end
+
+# rotate N elements of the top of the stack
+# nrot [*, x1 ... xN - 1 | xN] -> [*, xN, xN - 1 ... x2 | x1]
+word nrot
+    dup 1 + 1 swap for
+        dup pick swap 2 +
+    end
+    1 - 2 / pick
+    dup for
+        swap >r rswap
+    end
+    1 + for
+        nip
+    end
+    for
+        rswap r>
+    end
+end
+
+# convert a string to a sequence of ascii codes of its characters and push the codes on to the stack, 
+# Warning! the sequence is reversed so the ascii code of the last character ends up first on the stack
+# toascii [*, addr | LEN] -> [*, x, x1 ... xLEN - 1 | xLEN + 1]
+word toascii
+    0 swap
+    for
+        2dup + c@
+        -rot
+        1 +
+    end
+    2drop
+end
+
+word splitby_str
+    "split_str isn't implemented yet" puts
+end
+
+# splitby [*, addr, len, addr1 | len1] -> [*, addr1, len1 ... addrN | lenN]
+word splitby
+    dup 1 == if
+        splitby_char
+    else
+        splitby_str
+    end
+end
+
+# splitby_char [*, addr, len, addr1 | len] ->  [*, addr1, len1 ... addrN | lenN]
+word splitby_char
+    >r >r 2dup r> r> 2swap 2dup
+    >r >r toascii 1 rpick nrot r> r>
+
+    dup 3 + pick c@
+
+    0 >r
+    swap for
+        dup
+        3 pick == if rswap r> 1 + >r rswap over 0 c! end
+        swap 1 + swap >r nip r>
+    end
+
+    2drop 2drop drop
+
+    r> 1 + for
+        dup strlen 2dup
+        1 + +
+    end
+    drop
+end

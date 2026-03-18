@@ -442,6 +442,14 @@
 }
 ;
 
+:asm rswap {
+	mov rax, [r13]         ; get top
+	mov rbx, [r13 + 8]     ; get second
+	mov [r13], rbx         ; swap
+	mov [r13 + 8], rax
+}
+;
+
 #pick [* | n] -> [* | x]
 :asm pick {
 	mov rcx, [r12]         ; get index

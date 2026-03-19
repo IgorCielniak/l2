@@ -1,11 +1,13 @@
 import stdlib.sl
 
 word main
-    "g" "g"
+    "ggggggggh" "ggggggggh"
     strcmp
     puti cr
-    puts
-    puts
+
+    "ggggggggh" "ggggggggd"
+    strcmp
+    puti cr
 
     "hello world hello world hello " "world hello world hello world"
     strconcat

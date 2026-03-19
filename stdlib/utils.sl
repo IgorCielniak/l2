@@ -1,7 +1,11 @@
 
-#strcmp [*, addr, len, addr | len] -> [*, addr, len, addr, len | bool]
+#strcmp [*, addr, len, addr | len] -> [* | bool]
 word strcmp
-    3 pick 2 pick @ swap @ ==
+    >r nip r> for
+        2dup c@ swap c@ != if drop drop 0 ret end
+        1 + swap 1 +
+    end
+    drop drop 1
 end
 
 #strconcat [*, addr, len, addr | len] -> [*, addr | len]

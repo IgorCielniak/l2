@@ -344,6 +344,7 @@ OP_LIST_BEGIN = 8
 OP_LIST_END = 9
 OP_LIST_LITERAL = 10
 OP_OTHER = 11
+OP_RET = 12
 
 _OP_STR_TO_INT = {
     "word": OP_WORD,
@@ -357,6 +358,7 @@ _OP_STR_TO_INT = {
     "list_begin": OP_LIST_BEGIN,
     "list_end": OP_LIST_END,
     "list_literal": OP_LIST_LITERAL,
+    "ret": OP_RET,
 }
 
 
@@ -1012,13 +1014,13 @@ class Parser:
         _KW_PY = 6
         _KW_EXTERN = 7
         _KW_PRIORITY = 8
+        _KW_RET = 9
         _keyword_dispatch = {
             "[": _KW_LIST_BEGIN, "]": _KW_LIST_END, "word": _KW_WORD,
             "end": _KW_END, ":asm": _KW_ASM, ":py": _KW_PY,
-            "extern": _KW_EXTERN, "priority": _KW_PRIORITY,
+            "extern": _KW_EXTERN, "priority": _KW_PRIORITY, "ret": _KW_RET,
         }
         _kw_get = _keyword_dispatch.get
-
         _tokens = self.tokens
         try:
             while self.pos < len(_tokens):
@@ -1065,6 +1067,8 @@ class Parser:
                         self._parse_extern(token)
                     elif kw == _KW_PRIORITY:
                         self._parse_priority_directive(token)
+                    elif kw == _KW_RET:
+                        self._handle_ret(token)
                     continue
                 if self._try_handle_builtin_control(token):
                     continue
@@ -1296,6 +1300,9 @@ class Parser:
         value = self._pending_priority
         self._pending_priority = None
         return value
+
+    def _handle_ret(self, token: Token) -> None:
+        self._append_op(_make_op("ret", loc=token))
 
     # Internal helpers ---------------------------------------------------------
 
@@ -3998,6 +4005,7 @@ class CompileTimeVM:
         _OP_JUMP = OP_JUMP
         _OP_LABEL = OP_LABEL
         _OP_LIST_BEGIN = OP_LIST_BEGIN
+        _OP_RET = OP_RET
         _OP_LIST_END = OP_LIST_END
         _OP_LIST_LITERAL = OP_LIST_LITERAL
         try:
@@ -4301,6 +4309,9 @@ class CompileTimeVM:
                     ip += 1
                     continue
 
+                if kind == _OP_RET:
+                    return
+
                 self.current_location = _node.loc
                 raise ParseError(f"unsupported compile-time op (opcode={kind})")
         finally:
@@ -4473,6 +4484,9 @@ class FunctionEmitter:
         _a = self.text.append
         _a(f"    mov {register}, [r12]")
         _a("    add r12, 8")
+
+    def ret(self) -> None:
+        self.text.append("    ret")
 
 
 def _int_trunc_div(lhs: int, rhs: int) -> int:
@@ -6552,6 +6566,10 @@ class Assembler:
             builder.emit("    mov r12, rbx")
             builder.emit("    sub r12, 8")
             builder.emit("    mov [r12], rax")
+            return
+
+        if kind == OP_RET:
+            builder.ret()
             return
 
         raise CompileError(f"unsupported op {node!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported op {node!r}")
@@ -10474,6 +10492,26 @@ def _run_docs_tui(
                 "  # write(1, addr, len)\n"
                 "  addr len 1   # fd=stdout\n"
                 "  3 1 syscall  # 3 args, nr=1 (write)"
+            ),
+        },
+        {
+            "name": "ret",
+            "category": "Control Flow",
+            "syntax": "ret",
+            "summary": "Return from a word",
+            "detail": (
+                "Returns from a word.\n\n"
+                "Example:\n"
+                "  word a\n"
+                "    \"g\" puts\n"
+                "    ret\n"
+                "    \"g\" puts\n"
+                "  end\n\n"
+                "  word main\n"
+                "    a\n"
+                "  end\n"
+                "Output:\n"
+                "  g\n"
             ),
         },
         {

@@ -8,6 +8,11 @@ word strcmp
     drop drop 1
 end
 
+# strdup [*, addr | len] -> [*, addr, len, addr1 | len1]
+word strdup
+    dup alloc 2 pick 2 pick memcpy
+end
+
 #strconcat [*, addr, len, addr | len] -> [*, addr | len]
 word strconcat
     0 pick 3 pick +

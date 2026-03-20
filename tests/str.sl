@@ -14,4 +14,11 @@ word main
     2dup
     puts
     free
+
+    "hello world hello" "world" splitby
+    for puts end
+    "hello world hello world" "world" splitby
+    for puts end
+    "hello world hello world hello" "l" splitby
+    for puts end
 end

@@ -42,7 +42,7 @@ word memcpy
     r> dup -rot - swap
 end
 
-#memset [*, value, len | addr] -> [*]
+#memset [*, addr, len | value] -> [*]
 word memset
     swap
     0 swap for
@@ -51,14 +51,23 @@ word memset
     2drop drop
 end
 
-#memdump [*, len | addr] -> [* | addr]
+# memset_bytes [*, addr, len | value] -> [*]
+word memset_bytes
+    swap
+    0 swap for
+        -rot swap 2 pick + 2dup swap c! 1 + -rot swap
+    end
+    2drop drop
+end
+
+#memdump [*, addr | len] -> [* | addr]
 word memdump
     for
         dup @ puti cr 8 +
     end
 end
 
-#memdump_bytes [*, len | addr] -> [* | addr]
+#memdump_bytes [*, addr | len] -> [* | addr]
 word memdump_bytes
     for
         dup c@ puti cr 1 +

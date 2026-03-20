@@ -414,11 +414,48 @@ word toascii
     2drop
 end
 
-word splitby_str
-    "split_str isn't implemented yet" puts
+# rm_zero_len_str [*, addr0, len0 ... addrN, lenN | N] -> [*, addrX, lenX ... addrY, lenY | Z]
+word rm_zero_len_str
+    dup for
+        swap dup 0 == if
+            drop nip 1 -
+        else
+            >r rswap swap >r rswap
+        end
+    end
+
+    dup 2 * for
+        rswap r> swap
+    end
 end
 
-# splitby [*, addr, len, addr1 | len1] -> [*, addr1, len1 ... addrN | lenN]
+# emit_strs [*, addr | len] -> [*,  addr0, len0 ... addrN | lenN]
+# given an addr and len emits pairs (addr, len) of strings in the given memopry region
+word emit_strs
+    0 >r
+    >r
+    while r@ 0 > do
+        dup strlen dup r> swap - >r
+        over over + rswap r> 1 + >r rswap
+        while dup c@ 0 == do 1 + r> 1 - >r end
+    end
+    drop rdrop
+end
+
+# splitby_str [*, addr, len, addr1, len1] -> [*, addr0, len0 ... addrN, lenN | N]
+# splits a string by another string and emmits a sequence of the new (addr, len) pairs on to the stack as well as the number of strings the oprtation resulted in.
+word splitby_str
+    2 pick for
+        3 pick 0 2 pick 4 pick swap
+        strcmp 1 == if 3 pick over 0 memset_bytes end
+        >r >r swap 1 + swap r> r>
+    end
+    2drop 2dup - >r nip r> swap emit_strs r>
+    rm_zero_len_str
+end
+
+# splitby [*, addr, len, addr1 | len1] -> [*, addr0, len0 ... addrN, lenN | N]
+# split a string by another string, delegates to either splitby_char or splitby_str based on the length of the delimiter.
 word splitby
     dup 1 == if
         splitby_char
@@ -427,25 +464,25 @@ word splitby
     end
 end
 
-# splitby_char [*, addr, len, addr1 | len] ->  [*, addr1, len1 ... addrN | lenN]
+# splitby_char [*, addr, len, addr1 | len] ->  [*, addr1, len1 ... addrN, lenN | N]
+# split a string by a given character, the resulting (addr, len) pairs are pushed on to the stack followed by the number of the pushed strings.
 word splitby_char
+    2 pick >r
     >r >r 2dup r> r> 2swap 2dup
     >r >r toascii 1 rpick nrot r> r>
 
     dup 3 + pick c@
 
-    0 >r
     swap for
         dup
-        3 pick == if rswap r> 1 + >r rswap over 0 c! end
+        3 pick == if over 0 c! end
         swap 1 + swap >r nip r>
     end
 
     2drop 2drop drop
 
-    r> 1 + for
-        dup strlen 2dup
-        1 + +
-    end
-    drop
+    r>
+    emit_strs
+    r>
+    rm_zero_len_str
 end

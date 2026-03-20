@@ -2,7 +2,7 @@
 #strcmp [*, addr, len, addr | len] -> [* | bool]
 word strcmp
     >r nip r> for
-        2dup c@ swap c@ != if drop drop 0 ret end
+        2dup c@ swap c@ != if drop drop 0 rdrop ret end
         1 + swap 1 +
     end
     drop drop 1

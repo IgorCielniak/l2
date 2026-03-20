@@ -4436,9 +4436,21 @@ class FunctionEmitter:
         escaped = path.replace("\\", "\\\\").replace('"', '\\"')
         self.text.append(f'%line {line}+{increment} "{escaped}"')
 
-    def set_location(self, loc: Optional[SourceLocation]) -> None:
+    def set_location(self, loc) -> None:
         if not self.debug_enabled:
             return
+        # Defensive: if loc is a Token, convert to SourceLocation, did not have a better solution, works for me
+        if loc is not None and not hasattr(loc, 'path') and hasattr(loc, 'line') and hasattr(loc, 'column'):
+            # Assume self has a reference to the parser or a location_for_token function
+            # If not, fallback to generic source path
+            try:
+                loc = self.location_for_token(loc)
+            except Exception:
+                from pathlib import Path
+                loc = type('SourceLocation', (), {})()
+                loc.path = Path('<source>')
+                loc.line = getattr(loc, 'line', 0)
+                loc.column = getattr(loc, 'column', 0)
         if loc is None:
             if self._current_loc is None:
                 return

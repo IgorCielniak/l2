@@ -19,22 +19,22 @@ word main
     dup arr_len puti cr
     dup arr_cap puti cr
 
-    # arr_get
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
+    # dyn_arr_get
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
 
-    # arr_set
-    dup 99 1 arr_set
-    dup 1 arr_get puti cr
+    # dyn_arr_set
+    dup 99 1 dyn_arr_set
+    dup 1 dyn_arr_get puti cr
 
     # arr_reserve (with len > 0 so element copy path is exercised)
     dup 8 arr_reserve
     dup arr_cap puti cr
     dup arr_len puti cr
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
 
     # arr_pop (including empty pop)
     arr_pop puti cr
@@ -43,16 +43,16 @@ word main
     arr_pop puti cr
     dup arr_len puti cr
 
-    arr_free
+    dyn_arr_free
 
     # arr_to_dyn (convert std list to dynamic array)
     [ 7 8 9 ] dup arr_to_dyn
     dup arr_len puti cr
     dup arr_cap puti cr
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
-    arr_free
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
+    dyn_arr_free
 
     # free list allocation: bytes = (len + 1) * 8
     dup @ 1 + 8 * free
@@ -64,21 +64,21 @@ word main
     dup 2 arr_push
 
     dup dyn_arr_sorted
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
-    arr_free
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
+    dyn_arr_free
 
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
 
     # dyn_arr_sort (alias) sorts in place
     dyn_arr_sort
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
-    arr_free
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
+    dyn_arr_free
 
     # dyn_arr_sorted (alias) returns a sorted copy
     5 arr_new
@@ -87,13 +87,13 @@ word main
     dup 6 arr_push
 
     dup dyn_arr_sorted
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
-    arr_free
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
+    dyn_arr_free
 
-    dup 0 arr_get puti cr
-    dup 1 arr_get puti cr
-    dup 2 arr_get puti cr
-    arr_free
+    dup 0 dyn_arr_get puti cr
+    dup 1 dyn_arr_get puti cr
+    dup 2 dyn_arr_get puti cr
+    dyn_arr_free
 end

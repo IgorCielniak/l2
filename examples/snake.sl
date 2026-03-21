@@ -1,7 +1,8 @@
 # Terminal Snake (classic real-time: WASD steer, q quit)
 
-import stdlib/stdlib.sl
-import stdlib/linux.sl
+import stdlib.sl
+import arr.sl
+import linux.sl
 
 macro WIDTH 0 20 ;
 macro HEIGHT 0 12 ;
@@ -40,18 +41,6 @@ macro DIR_DOWN 0 1 ;
 macro DIR_LEFT 0 2 ;
 macro DIR_UP 0 3 ;
 
-#arr_get [*, arr | idx] -> [* | value]
-word arr_get
-    8 * + @
-end
-
-#arr_set [*, arr, idx | value] -> [*]
-word arr_set
-    >r
-    8 * +
-    r> !
-end
-
 #xy_idx [*, x | y] -> [* | idx]
 word xy_idx
     WIDTH * +
@@ -60,14 +49,14 @@ end
 #board_get [*, board, x | y] -> [* | value]
 word board_get
     xy_idx
-    arr_get
+    1 - arr_get
 end
 
 #board_set [*, board, x, y | value] -> [*]
 word board_set
     >r
     xy_idx
-    r> arr_set
+    r> swap 1 - arr_set
 end
 
 #state_dir@ [* | state] -> [* | dir]
@@ -304,16 +293,16 @@ word init_snake
         WIDTH 2 /
         HEIGHT 2 /
         with cx cy in
-            xs 0 cx arr_set
-            ys 0 cy arr_set
+            xs 0 cx swap 1 - arr_set
+            ys 0 cy swap 1 - arr_set
             b cx cy 1 board_set
 
-            xs 1 cx 1 - arr_set
-            ys 1 cy arr_set
+            xs 1 cx 1 - swap 1 - arr_set
+            ys 1 cy swap 1 - arr_set
             b cx 1 - cy 1 board_set
 
-            xs 2 cx 2 - arr_set
-            ys 2 cy arr_set
+            xs 2 cx 2 - swap 1 - arr_set
+            ys 2 cy swap 1 - arr_set
             b cx 2 - cy 1 board_set
         end
     end
@@ -328,7 +317,7 @@ word spawn_food
         with start tried found in
             while tried CELLS < do
                 start tried + CELLS %
-                dup b swap arr_get 0 == if
+                dup b swap 1 - arr_get 0 == if
                     dup WIDTH % s swap state_food_x!
                     dup WIDTH / s swap state_food_y!
                     drop
@@ -367,12 +356,12 @@ word draw_game
                         42 putc
                     else
                         over WIDTH * over +
-                        b swap arr_get
+                        b swap 1 - arr_get
                         if 111 putc else 46 putc end
                     end
                 else
                     over WIDTH * over +
-                    b swap arr_get
+                    b swap 1 - arr_get
                     if 111 putc else 46 putc end
                 end
                 1 +
@@ -458,8 +447,8 @@ end
 #step_game [*, board, xs, ys | state] -> [*]
 word step_game
     with b xs ys s in
-        xs 0 arr_get
-        ys 0 arr_get
+        xs 0 1 - arr_get
+        ys 0 1 - arr_get
         with hx hy in
             hx
             hy
@@ -507,8 +496,8 @@ word step_game
                             grow 0 == if
                                 s state_len@ 1 -
                                 with ti in
-                                    xs ti arr_get
-                                    ys ti arr_get
+                                    xs ti 1 - arr_get
+                                    ys ti 1 - arr_get
                                     with tx ty in
                                         b tx ty 0 board_set
                                     end
@@ -528,16 +517,16 @@ word step_game
                                 end
                                 while dup 0 > do
                                     dup >r
-                                    xs r@ xs r@ 1 - arr_get arr_set
-                                    ys r@ ys r@ 1 - arr_get arr_set
+                                    xs r@ xs r@ 2 - arr_get swap 1 - arr_set
+                                    ys r@ ys r@ 2 - arr_get swap 1 - arr_set
                                     rdrop
                                     1 -
                                 end
                                 drop
 
                                 # write new head
-                                xs 0 nx arr_set
-                                ys 0 ny arr_set
+                                xs 0 nx swap 1 - arr_set
+                                ys 0 ny swap 1 - arr_set
                                 b nx ny 1 board_set
 
                                 grow if

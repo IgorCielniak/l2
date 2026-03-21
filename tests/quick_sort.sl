@@ -5,13 +5,13 @@ import ../stdlib/arr.sl
 # Get element from static array, preserving the array pointer
 # [*, arr | i] -> [*, arr | value]
 word aget
-    over swap arr_get_static
+    over swap arr_get
 end
 
 # Set element in static array, preserving the array pointer
 # [*, arr, value | i] -> [* | arr]
 word aset
-    rot dup >r -rot arr_set_static r>
+    rot dup >r -rot arr_set r>
 end
 
 # Swap elements at indices i and j in a static array
@@ -86,7 +86,7 @@ end
 word print_arr
     dup @ 0
     while 2dup > do
-        2 pick over arr_get_static puti cr
+        2 pick over arr_get puti cr
         1 +
     end
     2drop drop

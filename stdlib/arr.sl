@@ -39,8 +39,8 @@ word arr_cap 8 + @ end
 #arr_data [* | arr] -> [* | ptr]
 word arr_data 16 + @ end
 
-#arr_free [* | arr] -> [*]
-word arr_free
+#dyn_arr_free [* | arr] -> [*]
+word dyn_arr_free
     dup arr_cap 8 * 24 + free
 end
 
@@ -81,7 +81,7 @@ word arr_reserve
         arr_copy_elements
 
         # Free old and return new
-        swap arr_free
+        swap dyn_arr_free
         nip
     end
 end
@@ -116,15 +116,15 @@ word arr_pop
     end
 end
 
-#arr_get [*, arr | i] -> [* | x]
+#dyn_arr_get [*, arr | i] -> [* | x]
 # Get element at index i
-word arr_get
+word dyn_arr_get
     swap arr_data swap 8 * + @
 end
 
-#arr_set [*, arr, x | i] -> [*]
+#dyn_arr_set [*, arr, x | i] -> [*]
 # Set element at index i to x
-word arr_set
+word dyn_arr_set
     rot arr_data swap 8 * + swap !
 end
 
@@ -149,21 +149,21 @@ word arr_item_ptr
     swap 8 * swap 8 + +
 end
 
-#arr_get_static [*, arr | i] -> [* | x]
+#arr_get [*, arr | i] -> [* | x]
 # Get element from built-in static array
-word arr_get_static
+word arr_get
     swap arr_item_ptr @
 end
 
-#arr_set_static [*, arr, x | i] -> [*]
+#arr_set [*, arr, x | i] -> [*]
 # Set element in built-in static array
-word arr_set_static
+word arr_set
     rot arr_item_ptr swap !
 end
 
-#arr_static_free [* | arr] -> [*]
+#arr_free [* | arr] -> [*]
 # Free built-in static array allocation produced by list literals.
-word arr_static_free
+word arr_free
     dup @ 1 + 8 * free
 end
 

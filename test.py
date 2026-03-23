@@ -28,6 +28,7 @@ DEFAULT_EXTRA_TESTS = [
     "extra_tests/c_extern_structs.sl",
     "extra_tests/fn_test.sl",
     "extra_tests/nob_test.sl",
+    "extra_tests/termios_test.sl",
 ]
 
 COLORS = {

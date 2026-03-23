@@ -1,0 +1,8 @@
+stdin is a tty? 
+1
+stdout is a tty? 
+0
+stderr is a tty? 
+0
+Invalid fd (999) is a tty? 
+-1

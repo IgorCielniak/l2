@@ -408,7 +408,7 @@ end
 
 # convert a string to a sequence of ascii codes of its characters and push the codes on to the stack, 
 # Warning! the sequence is reversed so the ascii code of the last character ends up first on the stack
-# toascii [*, addr | LEN] -> [*, x, x1 ... xLEN - 1 | xLEN + 1]
+# toascii [*, addr | LEN] -> [*, x, x1 ... xLEN - 1 | xLEN]
 word toascii
     0 swap
     for

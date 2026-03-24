@@ -4,13 +4,13 @@ This document reflects the implementation that ships in this repository today (`
 
 ## 1. Scope and Principles
 - **Stack-based core** – All user code manipulates a 64-bit data stack plus a separate return stack. Every definition is a “word.”
-- **Ahead-of-time native output** – `main.py` always emits NASM-compatible x86-64 assembly, assembles it with `nasm -f elf64`, and links it with `ld`/`ld.lld` into an ELF64 executable. There is no JIT; the REPL repeatedly rebuilds and executes small binaries.
+- **Ahead-of-time native output** – `main.py` emits NASM-compatible x86-64 assembly, assembles it with `nasm -f elf64`, and links it with `ld`/`ld.lld` into an ELF64 executable. There is JIT for the compile time execution and the REPL uses it as well.
 - **Meta-programmable front-end** – Parsing, macro expansion, and syntax sugar live in user space via immediate words, text macros, compile-time intrinsics, and `:py` blocks. Users can reshape syntax without touching the Python host.
 - **Unsafe by design** – Memory, syscalls, inline assembly, and FFI expose raw machine power. The standard library is intentionally thin and policy-free.
 
 ## 2. Toolchain and Repository Layout
 - **Driver (`main.py`)** – Supports `python main.py source.sl -o a.out`, `--emit-asm`, `--run`, `--dbg`, `--repl`, `--temp-dir`, `--clean`, `--dump-cfg[=path]`, repeated `-I/--include` paths, and repeated `-l` linker flags (either `-lfoo` or `-l libc.so.6`). Unknown `-l` flags are collected and forwarded to the linker. Pass `--ct-run-main` to run the program's `main` word on the compile-time VM before NASM/ld run, which surfaces discrepancies between compile-time and runtime semantics. Pass `--no-artifact` to stop after compilation/assembly emission without building an output file, or use `--script` as shorthand for `--no-artifact --ct-run-main`. Pass `--docs` to open a searchable TUI that scans stack-effect comments and nearby docs from `.sl` files (`--docs-query` sets initial filter and `--docs-root` adds scan roots). `--no-folding` disables constant folding and `--no-peephole` disables peephole rewrites (for example `swap drop` → `nip`, `dup drop` removed, `swap over` → `tuck`, `nip drop` → `2drop`, `x 0 +` removed, `x 1 *` removed, `x -1 *` → `neg`, and `not not` removed).
-- **REPL** – `--repl` launches a stateful session with commands such as `:help`, `:reset`, `:load`, `:call <word>`, `:edit`, and `:show`. The REPL still emits/links entire programs for each run; it simply manages the session source for you.
+- **REPL** – `--repl` launches a stateful session with commands such as `:help`, `:reset`, `:load`, `:call <word>`, `:edit`, and `:show`.
 - **Imports** – `import relative/or/absolute/path.sl` inserts the referenced file textually. Resolution order: (1) absolute path, (2) relative to the importing file, (3) each include path (defaults: project root and `./stdlib`). Each file is included at most once per compilation unit. Import lines leave blank placeholders so error spans stay meaningful.
 - **Workspace** – `stdlib/` holds library modules, `tests/` contains executable samples with `.expected` outputs, `extra_tests/` houses standalone integration demos, and `libs/` collects opt-in extensions such as `libs/fn.sl` and `libs/nob.sl`.
 
@@ -18,19 +18,19 @@ This document reflects the implementation that ships in this repository today (`
 - **Reader** – Whitespace-delimited; `#` starts a line comment. String literals honor `\"`, `\\`, `\n`, `\r`, `\t`, and `\0`. Numbers default to signed 64-bit integers via `int(token, 0)` (so `0x`, `0o`, `0b` all work). Tokens containing `.` or `e` parse as floats.
 - **Identifiers** – `[A-Za-z_][A-Za-z0-9_]*`. Everything else is treated as punctuation or literal.
 - **String representation** – At runtime each literal pushes `(addr len)` with the length on top. The assembler stores literals in `section .data` with a trailing `NULL` for convenience.
-- **Lists** – `[` begins a list literal, `]` ends it. The compiler captures the intervening stack segment into a freshly `mmap`'d buffer that stores `(len followed by qword items)`, drops the captured values, and pushes the buffer address. Users must `munmap` the buffer when done.
+- **Lists** – `[` begins a list literal, `]` ends it. The compiler captures the intervening stack segment into a freshly `mmap`'d buffer that stores `(len followed by qword items)`, drops the captured values, and pushes the buffer address. Users must `munmap` the buffer when done. When elems are known at compile time then the list is folded and put in .bss so it doesn't need to be freed then, you can disable this optimization via a flag --no-static-list-folding.
 - **Token customization** – Immediate words can call `add-token` or `add-token-chars` to teach the reader about new multi-character tokens. `libs/fn.sl` uses this in combination with token hooks to recognize `foo(1, 2)` syntax.
 
 ### Stack-effect comments
 - **Location and prefix** – Public words in `stdlib/` (and most user code should) document its stack effect with a line comment directly above the definition: `#word_name …`.
-- **Before/after form** – Use `[before] -> [after]`, where each side is a comma-separated list. Items sitting to the left of `|` are deeper in the stack; the segment to the right of `|` runs all the way to the current top-of-stack. Omit the `|` only when a side is empty (`[*]`).
+- **Before/after form** – Use `[before] -> [after]`, where each side is a comma-separated list. Items sitting to the left of `|` are deeper in the stack and on the right is the top most element. Omit the `|` only when a side is empty (`[*]`).
 - **Tail sentinel** – `*` represents the untouched rest of the stack. By convention it is always the first entry on each side so readers can quickly see which values are consumed/produced.
 - **Alternatives** – Separate multiple outcomes with `||`. Each branch repeats the `[before] -> [after]` structure (e.g., `#read_file [*, path | len] -> [*, addr | len] || [*, tag | neg_errno]`).
 - **Examples** – `#dup [* | x] -> [*, x | x]` means a word consumes the top value `x` and returns two copies with the newest copy at TOS; `#arr_pop [* | arr] -> [*, arr | x]` states that the array pointer remains just below the popped element. This notation keeps stack order resonably easy to read and grep.
 
 ## 4. Runtime Model
 - **Stacks** – `r12` holds the data stack pointer, `r13` the return stack pointer. Both live in `.bss` buffers sized by `DSTK_BYTES`/`RSTK_BYTES` (default 64 KiB each). `stdlib/core.sl` implements all standard stack shuffles, arithmetic, comparisons, boolean ops, `@`/`!`, `c@`/`c!`, and return-stack transfers (`>r`, `r>`, `rdrop`, `rpick`).
-- **Calling convention** – Words call each other using the System V ABI. `extern` words marshal arguments into registers before `call symbol`, then push results back onto the data stack. Integer results come from `rax`; floating results come from `xmm0` and are copied into a qword slot.
+- **Calling convention** – Calling convention applies only to the extern functions and follows the System V ABI. `extern` words marshal arguments into registers before `call symbol`, then push results back onto the data stack. Integer results come from `rax`; floating results come from `xmm0` and are copied into a qword slot.
 - **Memory helpers** – `mem` returns the address of the `persistent` buffer (default 64 bytes). `argc`, `argv`, and `argv@` expose process arguments. `alloc`/`free` wrap `mmap`/`munmap` for general-purpose buffers, while `memcpy` performs byte-wise copies.
 - **BSS customization** – Compile-time words may call `bss-clear` followed by `bss-append`/`bss-set` to replace the default `.bss` layout (e.g., `tests/bss_override.sl` enlarges `persistent`).
 - **Strings & buffers** – IO helpers consume explicit `(addr len)` pairs only; there is no implicit NULL contract except for stored literals.
@@ -80,7 +80,7 @@ This document reflects the implementation that ships in this repository today (`
 - **`core.sl`** – Stack shuffles, integer arithmetic, comparisons, boolean ops, memory access, syscall stubs (`mmap`, `munmap`, `exit`), argument helpers (`argc`, `argv`, `argv@`), and pointer helpers (`mem`).
 - **`control.sl`** – Optional custom control-structure words (`if`, `else`, `for`, `while`, `do`) that can override parser defaults when imported.
 - **`mem.sl`** – `alloc`/`free` wrappers around `mmap`/`munmap` plus a byte-wise `memcpy` used by higher-level utilities.
-- **`io.sl`** – `read_file`, `write_file`, `read_stdin`, `write_buf`, `ewrite_buf`, `putc`, `puti`, `puts`, `eputs`, and a smart `print` that detects `(addr,len)` pairs located inside the default `.data` region.
+- **`io.sl`** – `read_file`, `write_file`, `read_stdin`, `write_buf`, `ewrite_buf`, `putc`, `puti`, `puts`, `eputs`.
 - **`utils.sl`** – String and number helpers (`strcmp`, `strconcat`, `strlen`, `digitsN>num`, `toint`, `count_digits`, `tostr`).
 - **`arr.sl`** – Dynamically sized qword arrays with `arr_new`, `arr_len`, `arr_cap`, `arr_data`, `arr_push`, `arr_pop`, `arr_reserve`, `arr_free`; built-in static-array sorting via `arr_sort`/`arr_sorted`; and dynamic-array sorting via `dyn_arr_sort`/`dyn_arr_sorted`.
 - **`float.sl`** – SSE-based double-precision arithmetic (`f+`, `f-`, `f*`, `f/`, `fneg`, comparisons, `int>float`, `float>int`, `fput`, `fputln`).

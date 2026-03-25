@@ -516,3 +516,14 @@ end
 word trim
     ltrim rtrim
 end
+
+# startswith [*, addr, len, addr | len] -> [*, bool]
+inline word startswith
+    strcmp
+end
+
+# endswith [*, addr, len, addr | len] -> [*, bool]
+word endswith
+    dup 3 pick swap - 4 pick + over 2 pick 4 pick swap strcmp
+    nip nip nip nip
+end

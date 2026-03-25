@@ -531,7 +531,15 @@ end
 # contains [*, addr, len, addr | len] -> [* | bool]
 word contains
     2 pick for
-        4dup strcmp 1 == if 1 nip nip nip nip ret end
+        4dup strcmp 1 == if 1 nip nip nip nip rdrop ret end
         >r >r >r 1 + r> r> r>
+    end 0 nip nip nip nip
+end
+
+# find [*, addr, len, addr | len] -> [* | index]
+word find
+    0 >r 2 pick for
+        4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
+        >r >r >r 1 + r> r> r> rswap r> 1 + >r rswap
     end 0 nip nip nip nip
 end

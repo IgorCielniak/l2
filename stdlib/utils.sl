@@ -542,7 +542,7 @@ word find
     0 >r 2 pick for
         4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
         >r >r >r 1 + r> r> r> rswap r> 1 + >r rswap
-    end 0 nip nip nip nip
+    end -1 nip nip nip nip
 end
 
 # find the last occurence of a string inside another string, returns the index
@@ -552,5 +552,5 @@ word rfind
     2 pick 1 - >r 2 pick for
         4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
         >r >r >r 1 - r> r> r> rswap r> 1 - >r rswap
-    end 0 nip nip nip nip
+    end -1 nip nip nip nip
 end

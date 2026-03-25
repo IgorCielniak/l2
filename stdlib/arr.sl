@@ -326,3 +326,22 @@ word dyn_arr_sorted
     dyn_arr_clone
     dyn_arr_sort
 end
+
+# arr_contains [*, addr | x] -> [* | bool]
+word arr_contains
+    over @ >r >r 8 + r> r>
+    for
+        2dup swap @ == if 1 nip nip rdrop ret end
+        swap 8 + swap
+    end 0 nip nip
+end
+
+# arr_find [*, addr | x] -> [* | bool]
+word arr_find
+    over @ >r >r 8 + r> r>
+    0 >r
+    for
+        2dup swap @ == if rswap r> nip nip rdrop ret end
+        swap 8 + swap rswap r> 1 + >r rswap
+    end rdrop -1 nip nip
+end

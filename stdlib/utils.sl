@@ -536,10 +536,21 @@ word contains
     end 0 nip nip nip nip
 end
 
+# find the first occurence of a string inside another string, returns the index
 # find [*, addr, len, addr | len] -> [* | index]
 word find
     0 >r 2 pick for
         4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
         >r >r >r 1 + r> r> r> rswap r> 1 + >r rswap
+    end 0 nip nip nip nip
+end
+
+# find the last occurence of a string inside another string, returns the index
+# rfind [*, addr, len, addr | len] -> [* | index]
+word rfind
+    >r >r dup >r + 1 - r> r> r>
+    2 pick 1 - >r 2 pick for
+        4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
+        >r >r >r 1 - r> r> r> rswap r> 1 - >r rswap
     end 0 nip nip nip nip
 end

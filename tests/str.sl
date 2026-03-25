@@ -21,4 +21,9 @@ word main
     for puts end
     "hello world hello world hello" "l" splitby
     for puts end
+
+    "    f    " 2dup 2dup
+    124 putc ltrim write_buf 124 putc cr
+    124 putc rtrim write_buf 124 putc cr
+    124 putc trim  write_buf 124 putc cr
 end

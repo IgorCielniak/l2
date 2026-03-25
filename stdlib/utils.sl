@@ -491,3 +491,28 @@ word splitby_char
     r>
     rm_zero_len_str
 end
+
+# ltrim [*, addr | len] -> [*, addr, | len]
+word ltrim
+    dup for
+        over c@ 32 == if
+            swap 1 + swap 1 -
+        end
+    end
+end
+
+# rtrim [*, addr | len] -> [*, addr, | len]
+word rtrim
+    swap tuck swap
+    swap over + 1 - swap
+    dup for
+        over c@ 32 == if
+            swap 1 - swap 1 -
+        end
+    end nip
+end
+
+# trim [*, addr | len] -> [*, addr | len]
+word trim
+    ltrim rtrim
+end

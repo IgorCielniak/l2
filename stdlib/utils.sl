@@ -527,3 +527,11 @@ word endswith
     dup 3 pick swap - 4 pick + over 2 pick 4 pick swap strcmp
     nip nip nip nip
 end
+
+# contains [*, addr, len, addr | len] -> [* | bool]
+word contains
+    2 pick for
+        4dup strcmp 1 == if 1 nip nip nip nip ret end
+        >r >r >r 1 + r> r> r>
+    end 0 nip nip nip nip
+end

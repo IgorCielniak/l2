@@ -3,6 +3,7 @@
 import stdlib.sl
 import arr.sl
 import linux.sl
+import time.sl
 
 macro WIDTH 0 20 ;
 macro HEIGHT 0 12 ;
@@ -217,22 +218,9 @@ end
 }
 ;
 
-#sleep_tick [* | ts_ptr] -> [*]
-:asm sleep_tick {
-    mov r14, [r12]
-    add r12, 8
-
-    ; nanosleep(ts_ptr, NULL)
-    mov rax, 35
-    mov rdi, r14
-    xor rsi, rsi
-    syscall
-}
-;
-
 #wait [* | ts_ptr] -> [*]
 word wait
-    sleep_tick
+    sleep
 end
 
 #term_raw_off [* | orig] -> [*]

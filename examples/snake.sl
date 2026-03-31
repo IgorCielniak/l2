@@ -218,11 +218,6 @@ end
 }
 ;
 
-#wait [* | ts_ptr] -> [*]
-word wait
-    sleep
-end
-
 #term_raw_off [* | orig] -> [*]
 :asm term_raw_off {
     mov r14, [r12]
@@ -572,7 +567,7 @@ word main
                     0
                 else
                     board xs ys state step_game
-                    sleep_ts wait
+                    sleep_ts sleep
                     1
                 end
             end

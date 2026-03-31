@@ -264,9 +264,9 @@ class Reader:
         singles_escaped = ''.join(re.escape(t) for t in sorted(self._single_char_tokens))
         # Word pattern: any non-delimiter char, or ; followed by alpha (;end is one token)
         if ';' in self._single_char_tokens:
-            word_part = rf'(?:[^\s#"{singles_escaped}]|;(?=[a-zA-Z]))+'
+            word_part = rf'(?:[^\s#"\'{singles_escaped}]|;(?=[a-zA-Z]))+'
         else:
-            word_part = rf'[^\s#"{singles_escaped}]+'
+            word_part = rf'[^\s#"\'{singles_escaped}]+'
         # Multi-char tokens (longest first)
         multi_part = ''
         if self._multi_char_tokens:
@@ -274,6 +274,7 @@ class Reader:
             multi_part = rf'|{multi_escaped}'
         pattern = (
             rf'"(?:[^"\\]|\\.)*"?'       # string literal (possibly unterminated)
+            rf"|'(?:[^'\\]|\\.)'?'"      # char literal (possibly unterminated)
             rf'|#[^\n]*'                  # comment
             rf'{multi_part}'              # multi-char tokens (if any)
             rf'|{word_part}'              # word
@@ -343,8 +344,9 @@ OP_LABEL = 7
 OP_LIST_BEGIN = 8
 OP_LIST_END = 9
 OP_LIST_LITERAL = 10
-OP_OTHER = 11
-OP_RET = 12
+OP_BSS_LIST_LITERAL = 11
+OP_OTHER = 12
+OP_RET = 13
 
 _OP_STR_TO_INT = {
     "word": OP_WORD,
@@ -358,12 +360,41 @@ _OP_STR_TO_INT = {
     "list_begin": OP_LIST_BEGIN,
     "list_end": OP_LIST_END,
     "list_literal": OP_LIST_LITERAL,
+    "bss_list_literal": OP_BSS_LIST_LITERAL,
     "ret": OP_RET,
 }
 
 
 def _is_scalar_literal(node: Op) -> bool:
     return node._opcode == OP_LITERAL and not isinstance(node.data, str)
+
+
+_RE_MACRO_ARG_TOKEN = re.compile(r"^\$(\d+)$")
+_ASM_LINE_STARTERS: Set[str] = {
+    "mov", "movzx", "movsx", "movsxd", "lea", "push", "pop", "add", "sub", "imul", "mul", "idiv", "div",
+    "and", "or", "xor", "not", "neg", "inc", "dec", "cmp", "test", "call", "jmp", "je", "jne", "jg",
+    "jge", "jl", "jle", "ja", "jae", "jb", "jbe", "jnz", "jz", "ret", "syscall", "nop", "sal", "sar",
+    "shl", "shr", "rol", "ror", "loop", "cld", "std", "cmpsb", "stosb", "lodsb", "rep", "repe", "repne",
+    "section", "global", "extern", "db", "dw", "dd", "dq", "resb", "resw", "resd", "resq",
+}
+
+
+def _reconstruct_asm_from_tokens(tokens: Sequence[Token]) -> str:
+    if not tokens:
+        return ""
+    lines: List[str] = []
+    cur: List[str] = []
+    for tok in tokens:
+        lex = tok.lexeme
+        low = lex.lower()
+        if cur and (low in _ASM_LINE_STARTERS or lex.endswith(":")):
+            lines.append(" ".join(cur))
+            cur = [lex]
+            continue
+        cur.append(lex)
+    if cur:
+        lines.append(" ".join(cur))
+    return "\n".join(lines)
 
 
 # Pre-computed peephole optimization data structures (avoids rebuilding per definition)
@@ -544,12 +575,15 @@ class Module:
 
 
 class MacroDefinition:
-    __slots__ = ('name', 'tokens', 'param_count')
+    __slots__ = ('name', 'tokens', 'param_count', 'asm_brace_depth', 'awaiting_asm_body', 'awaiting_asm_terminator')
 
     def __init__(self, name: str, tokens: List[str], param_count: int = 0) -> None:
         self.name = name
         self.tokens = tokens
         self.param_count = param_count
+        self.asm_brace_depth = 0
+        self.awaiting_asm_body = False
+        self.awaiting_asm_terminator = False
 
 
 class StructField:
@@ -1015,10 +1049,12 @@ class Parser:
         _KW_EXTERN = 7
         _KW_PRIORITY = 8
         _KW_RET = 9
+        _KW_BSS_LIST_BEGIN = 10
         _keyword_dispatch = {
             "[": _KW_LIST_BEGIN, "]": _KW_LIST_END, "word": _KW_WORD,
             "end": _KW_END, ":asm": _KW_ASM, ":py": _KW_PY,
             "extern": _KW_EXTERN, "priority": _KW_PRIORITY, "ret": _KW_RET,
+            "{": _KW_BSS_LIST_BEGIN,
         }
         _kw_get = _keyword_dispatch.get
         _tokens = self.tokens
@@ -1030,11 +1066,7 @@ class Parser:
                 self._last_token = token
                 if self.token_hook and self._run_token_hook(token):
                     continue
-                if self.macro_recording is not None:
-                    if token.lexeme == ";":
-                        self._finish_macro_recording(token)
-                    else:
-                        self.macro_recording.tokens.append(token.lexeme)
+                if self._handle_macro_recording(token):
                     continue
                 lexeme = token.lexeme
                 if self._pending_priority is not None and lexeme not in _priority_keywords:
@@ -1069,6 +1101,8 @@ class Parser:
                         self._parse_priority_directive(token)
                     elif kw == _KW_RET:
                         self._handle_ret(token)
+                    elif kw == _KW_BSS_LIST_BEGIN:
+                        self._parse_bss_list_literal(token)
                     continue
                 if self._try_handle_builtin_control(token):
                     continue
@@ -1126,6 +1160,42 @@ class Parser:
         entry = self._pop_control(("list",))
         label = entry["label"]
         self._append_op(_make_op("list_end", label))
+
+    def _parse_bss_list_literal(self, token: Token) -> None:
+        values: List[int] = []
+        while True:
+            if self._eof():
+                raise ParseError(f"missing '}}' for '{{' opened at {token.line}:{token.column}")
+            cur = self._consume()
+            if cur.lexeme == "}":
+                break
+            parsed = _parse_int_or_char_literal(cur)
+            if parsed is None:
+                raise ParseError(
+                    f"only int/char literals are allowed in '{{}}' lists; got '{cur.lexeme}' at {cur.line}:{cur.column}"
+                )
+            values.append(parsed)
+
+        list_size = len(values)
+        if not self._eof():
+            peek = self.peek_token()
+            if peek is not None and peek.lexeme.startswith(":"):
+                size_tok = self._consume()
+                raw = size_tok.lexeme[1:]
+                if not raw:
+                    raise ParseError(f"missing size after ':' at {size_tok.line}:{size_tok.column}")
+                try:
+                    list_size = int(raw, 0)
+                except ValueError:
+                    raise ParseError(f"invalid bss list size '{size_tok.lexeme}' at {size_tok.line}:{size_tok.column}")
+                if list_size < 0:
+                    raise ParseError("bss list size must be >= 0")
+                if len(values) > list_size:
+                    raise ParseError(
+                        f"bss list has {len(values)} initializer values but declared size is {list_size}"
+                    )
+
+        self._append_op(_make_op("bss_list_literal", {"size": list_size, "values": values}))
 
     def _should_use_custom_control(self, lexeme: str) -> bool:
         # Fast path: default parser controls unless explicitly overridden.
@@ -1486,7 +1556,7 @@ class Parser:
             # Fall through to float/string check
             if self._try_literal(token):
                 return False
-        elif first == '"' or first == '.':
+        elif first == '"' or first == '.' or first == "'":
             if self._try_literal(token):
                 return False
 
@@ -1529,10 +1599,44 @@ class Parser:
     def _handle_macro_recording(self, token: Token) -> bool:
         if self.macro_recording is None:
             return False
-        if token.lexeme == ";":
+        rec = self.macro_recording
+        lex = token.lexeme
+
+        if rec.awaiting_asm_body:
+            if lex == "{":
+                rec.asm_brace_depth += 1
+                rec.awaiting_asm_body = False
+            rec.tokens.append(lex)
+            return True
+
+        if lex == ":asm":
+            rec.awaiting_asm_body = True
+            rec.tokens.append(lex)
+            return True
+
+        if rec.awaiting_asm_terminator:
+            if lex == ";":
+                rec.tokens.append(lex)
+                rec.awaiting_asm_terminator = False
+                return True
+            rec.awaiting_asm_terminator = False
+
+        if lex == "{" and rec.asm_brace_depth > 0:
+            rec.asm_brace_depth += 1
+            rec.tokens.append(lex)
+            return True
+
+        if lex == "}" and rec.asm_brace_depth > 0:
+            rec.asm_brace_depth -= 1
+            rec.tokens.append(lex)
+            if rec.asm_brace_depth == 0:
+                rec.awaiting_asm_terminator = True
+            return True
+
+        if lex == ";" and rec.asm_brace_depth == 0:
             self._finish_macro_recording(token)
         else:
-            self.macro_recording.tokens.append(token.lexeme)
+            rec.tokens.append(lex)
         return True
 
     def _maybe_expand_macro(self, token: Token) -> bool:
@@ -1551,8 +1655,9 @@ class Parser:
             )
         replaced: List[str] = []
         for lex in word.macro_expansion or []:
-            if lex.startswith("$"):
-                idx = int(lex[1:])
+            arg_match = _RE_MACRO_ARG_TOKEN.fullmatch(lex)
+            if arg_match is not None:
+                idx = int(arg_match.group(1))
                 if idx < 0 or idx >= len(args):
                     raise ParseError(f"macro {word.name} missing argument for {lex}")
                 replaced.append(args[idx])
@@ -1748,6 +1853,7 @@ class Parser:
             raise ParseError(f"expected '{{' after asm name at {brace_token.line}:{brace_token.column}")
         block_start = brace_token.end
         block_end: Optional[int] = None
+        body_tokens: List[Token] = []
         # Scan for closing brace directly via list indexing (avoid method-call overhead)
         _tokens = self.tokens
         _tlen = len(_tokens)
@@ -1758,10 +1864,13 @@ class Parser:
             if nt.lexeme == "}":
                 block_end = nt.start
                 break
+            body_tokens.append(nt)
         self.pos = _pos
         if block_end is None:
             raise ParseError("missing '}' to terminate asm body")
         asm_body = self.source[block_start:block_end]
+        if any(tok.expansion_depth > 0 for tok in body_tokens):
+            asm_body = _reconstruct_asm_from_tokens(body_tokens)
         priority = self._consume_pending_priority()
         definition = AsmDefinition(name=name_token.lexeme, body=asm_body, inline=inline_def)
         if effect_names is not None:
@@ -1906,6 +2015,12 @@ class Parser:
             string_value = _parse_string_literal(token)
             if string_value is not None:
                 self._append_op(_make_literal_op(string_value))
+                return True
+
+        if first == "'":
+            char_value = _parse_char_literal(token)
+            if char_value is not None:
+                self._append_op(_make_literal_op(char_value))
                 return True
 
         return False
@@ -4285,6 +4400,25 @@ class CompileTimeVM:
                     ip += 1
                     continue
 
+                if kind == OP_BSS_LIST_LITERAL:
+                    payload = _node.data if isinstance(_node.data, dict) else {}
+                    count = int(payload.get("size", 0))
+                    values = list(payload.get("values", []) or [])
+                    if count < 0:
+                        raise ParseError("bss list size must be >= 0")
+                    if len(values) > count:
+                        raise ParseError("bss list has more initializer values than declared size")
+                    buf_size = (count + 1) * 8
+                    addr = self.memory.allocate(buf_size)
+                    CTMemory.write_qword(addr, count)
+                    for idx_item, val in enumerate(values):
+                        CTMemory.write_qword(addr + 8 + idx_item * 8, int(val))
+                    for idx_item in range(len(values), count):
+                        CTMemory.write_qword(addr + 8 + idx_item * 8, 0)
+                    _push(addr)
+                    ip += 1
+                    continue
+
                 if kind == _OP_LIST_END:
                     if not self._list_capture_stack:
                         raise ParseError("']' without matching '['")
@@ -4839,6 +4973,52 @@ def _parse_string_literal(token: Token) -> Optional[str]:
     return "".join(result)
 
 
+def _parse_char_literal(token: Token) -> Optional[int]:
+    text = token.lexeme
+    if len(text) < 2 or text[0] != "'" or text[-1] != "'":
+        return None
+    body = text[1:-1]
+    if not body:
+        raise ParseError(f"empty char literal at {token.line}:{token.column}")
+    if body[0] != "\\":
+        if len(body) != 1:
+            raise ParseError(f"char literal must contain exactly one character at {token.line}:{token.column}")
+        return ord(body)
+    if len(body) < 2:
+        raise ParseError(f"unterminated escape in char literal at {token.line}:{token.column}")
+    esc = body[1:]
+    if esc == "n":
+        return ord("\n")
+    if esc == "t":
+        return ord("\t")
+    if esc == "r":
+        return ord("\r")
+    if esc == "0":
+        return 0
+    if esc == "'":
+        return ord("'")
+    if esc == '"':
+        return ord('"')
+    if esc == "\\":
+        return ord("\\")
+    if esc.startswith("x") and len(esc) == 3:
+        try:
+            return int(esc[1:], 16)
+        except ValueError:
+            pass
+    raise ParseError(f"unsupported char escape '\\{esc}' at {token.line}:{token.column}")
+
+
+def _parse_int_or_char_literal(token: Token) -> Optional[int]:
+    char_value = _parse_char_literal(token)
+    if char_value is not None:
+        return char_value
+    try:
+        return int(token.lexeme, 0)
+    except ValueError:
+        return None
+
+
 class _CTHandleTable:
     """Keeps Python object references stable across compile-time asm calls."""
 
@@ -4866,10 +5046,10 @@ class Assembler:
         dictionary: Dictionary,
         *,
         enable_constant_folding: bool = True,
-        enable_static_list_folding: bool = True,
         enable_peephole_optimization: bool = True,
         enable_loop_unroll: bool = True,
         enable_auto_inline: bool = True,
+        enable_string_deduplication: bool = True,
         enable_extern_type_check: bool = True,
         enable_stack_check: bool = True,
         loop_unroll_threshold: int = 8,
@@ -4877,6 +5057,7 @@ class Assembler:
     ) -> None:
         self.dictionary = dictionary
         self._string_literals: Dict[str, Tuple[str, int]] = {}
+        self._string_literal_counter: int = 0
         self._float_literals: Dict[float, str] = {}
         self._data_section: Optional[List[str]] = None
         self._inline_stack: List[str] = []
@@ -4885,11 +5066,13 @@ class Assembler:
         self._emit_stack: List[str] = []
         self._cstruct_layouts: Dict[str, CStructLayout] = {}
         self._export_all_defs: bool = False
+        self._generated_bss: List[str] = []
+        self._generated_bss_counter: int = 0
         self.enable_constant_folding = enable_constant_folding
-        self.enable_static_list_folding = enable_static_list_folding
         self.enable_peephole_optimization = enable_peephole_optimization
         self.enable_loop_unroll = enable_loop_unroll
         self.enable_auto_inline = enable_auto_inline
+        self.enable_string_deduplication = enable_string_deduplication
         self.enable_extern_type_check = enable_extern_type_check
         self.enable_stack_check = enable_stack_check
         self.loop_unroll_threshold = loop_unroll_threshold
@@ -4932,6 +5115,8 @@ class Assembler:
             return "list_end"
         if kind == OP_LIST_LITERAL:
             return f"list_literal {data}"
+        if kind == OP_BSS_LIST_LITERAL:
+            return f"bss_list_literal {data}"
         return f"{node.op}" if data is None else f"{node.op} {data!r}"
 
     @staticmethod
@@ -5746,6 +5931,7 @@ class Assembler:
         _OP_W = OP_WORD
         _OP_WP = OP_WORD_PTR
         _OP_LIST_LIT = OP_LIST_LITERAL
+        _OP_BSS_LIST_LIT = OP_BSS_LIST_LITERAL
         _check_extern = self.enable_extern_type_check
         _check_stack = self.enable_stack_check
         extern_issues: List[str] = []
@@ -5781,7 +5967,7 @@ class Assembler:
                     depth += 2 if isinstance(node.data, str) else 1
                 elif opc == _OP_WP:
                     depth += 1
-                elif opc == _OP_LIST_LIT:
+                elif opc == _OP_LIST_LIT or opc == _OP_BSS_LIST_LIT:
                     depth += 1
                 elif opc in (OP_BRANCH_ZERO, OP_JUMP, OP_LABEL, OP_FOR_BEGIN, OP_FOR_END):
                     # Control flow — stop tracking precisely
@@ -5934,8 +6120,11 @@ class Assembler:
             # and the earlier `user_has_start` check to suppress the default
             # startup stub. This avoids emitting `_start` twice.
             self._string_literals = {}
+            self._string_literal_counter = 0
             self._float_literals = {}
             self._data_section = emission.data
+            self._generated_bss = []
+            self._generated_bss_counter = 0
             self._cstruct_layouts = dict(module.cstruct_layouts)
 
             valid_defs = (Definition, AsmDefinition)
@@ -5957,8 +6146,9 @@ class Assembler:
                 if self.enable_loop_unroll: opts.append(f"loop-unroll(threshold={self.loop_unroll_threshold})")
                 if self.enable_peephole_optimization: opts.append("peephole")
                 if self.enable_constant_folding: opts.append("constant-folding")
-                if self.enable_static_list_folding: opts.append("static-list-folding")
                 if self.enable_auto_inline: opts.append("auto-inline")
+                if self.enable_string_deduplication: opts.append("string-dedup")
+                else: opts.append("string-no-dedup")
                 if self.enable_extern_type_check: opts.append("extern-type-check")
                 if self.enable_stack_check: opts.append("stack-check")
                 print(f"[v1] optimizations: {', '.join(opts) if opts else 'none'}")
@@ -6052,16 +6242,6 @@ class Assembler:
                             self._fold_constants_in_definition(defn)
                 if _v >= 1:
                     print(f"[v1] constant folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
-            if self.enable_static_list_folding:
-                if _v >= 1: _t0 = _time_mod.perf_counter()
-                for defn in definitions:
-                    if isinstance(defn, Definition):
-                        if _early_reachable is not None and defn.name not in _early_reachable:
-                            continue
-                        self._fold_static_list_literals_definition(defn)
-                if _v >= 1:
-                    print(f"[v1] static list folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
-
             runtime_defs = [defn for defn in definitions if not getattr(defn, "compile_only", False)]
             if is_program:
                 if not any(defn.name == "main" for defn in runtime_defs):
@@ -6232,6 +6412,8 @@ class Assembler:
                 if not self._data_section or self._data_section[-1] != "data_end:":
                     self._data_section.append("data_end:")
             bss_lines = module.bss if module.bss is not None else self._bss_layout()
+            if self._generated_bss:
+                bss_lines = list(bss_lines) + self._generated_bss
             emission.bss.extend(bss_lines)
             if _v >= 1:
                 _emit_dt = (_time_mod.perf_counter() - _emit_t0) * 1000
@@ -6267,6 +6449,15 @@ class Assembler:
                 continue
             self._data_section.append(f"{label}: dq 0")
 
+    def _allocate_bss_list_storage(self, size: int) -> str:
+        if size < 0:
+            raise CompileError("bss list size must be >= 0")
+        label = f"bss_list_{self._generated_bss_counter}"
+        self._generated_bss_counter += 1
+        self._generated_bss.append("align 16")
+        self._generated_bss.append(f"{label}: resq {size + 1}")
+        return label
+
     def _ensure_data_start(self) -> None:
         if self._data_section is None:
             raise CompileError("data section is not initialized")
@@ -6277,16 +6468,17 @@ class Assembler:
         if self._data_section is None:
             raise CompileError("string literal emission requested without data section")
         self._ensure_data_start()
-        if value in self._string_literals:
+        if self.enable_string_deduplication and value in self._string_literals:
             return self._string_literals[value]
-        label = f"str_{len(self._string_literals)}"
+        label = f"str_{self._string_literal_counter}"
+        self._string_literal_counter += 1
         encoded = value.encode("utf-8")
         bytes_with_nul = list(encoded) + [0]
         byte_list = ", ".join(str(b) for b in bytes_with_nul)
         self._data_section.append(f"{label}: db {byte_list}")
         self._data_section.append(f"{label}_len equ {len(encoded)}")
         self._string_literals[value] = (label, len(encoded))
-        return self._string_literals[value]
+        return label, len(encoded)
 
     def _intern_float_literal(self, value: float) -> str:
         if self._data_section is None:
@@ -6519,6 +6711,26 @@ class Assembler:
             builder.emit(f"    mov qword [rax], {count}")
             for idx_item, value in enumerate(values):
                 builder.emit(f"    mov qword [rax + {8 + idx_item * 8}], {int(value)}")
+            builder.emit("    sub r12, 8")
+            builder.emit("    mov [r12], rax")
+            return
+
+        if kind == OP_BSS_LIST_LITERAL:
+            payload = data if isinstance(data, dict) else {}
+            count = int(payload.get("size", 0))
+            values = [int(v) for v in list(payload.get("values", []) or [])]
+            if count < 0:
+                raise CompileError("bss list size must be >= 0")
+            if len(values) > count:
+                raise CompileError("bss list has more initializer values than declared size")
+            label = self._allocate_bss_list_storage(count)
+            builder.comment("bss list literal")
+            builder.emit(f"    lea rax, [rel {label}]")
+            builder.emit(f"    mov qword [rax], {count}")
+            for idx_item, value in enumerate(values):
+                builder.emit(f"    mov qword [rax + {8 + idx_item * 8}], {value}")
+            for idx_item in range(len(values), count):
+                builder.emit(f"    mov qword [rax + {8 + idx_item * 8}], 0")
             builder.emit("    sub r12, 8")
             builder.emit("    mov [r12], rax")
             return
@@ -8614,7 +8826,7 @@ class Compiler:
         entry_mode: str = "program",
     ) -> Emission:
         self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(_blank_asm_bodies(source))
+        tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
         return self.assembler.emit(module, debug=debug, entry_mode=entry_mode)
 
@@ -8622,7 +8834,7 @@ class Compiler:
         """Parse a source file to populate the dictionary without emitting assembly."""
         source, spans = self._load_with_imports(path.resolve())
         self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(_blank_asm_bodies(source))
+        tokens = self.reader.tokenize(source)
         self.parser.parse(tokens, source)
 
     def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
@@ -9052,9 +9264,9 @@ class BuildCache:
         self,
         debug: bool,
         folding: bool,
-        static_list_folding: bool,
         peephole: bool,
         auto_inline: bool,
+        string_deduplication: bool,
         entry_mode: str,
     ) -> str:
         # Include the compiler's own mtime so any change to main.py
@@ -9064,8 +9276,9 @@ class BuildCache:
         except OSError:
             compiler_mtime = 0
         return self._hash_str(
-            f"debug={debug},folding={folding},static_list_folding={static_list_folding},"
+            f"debug={debug},folding={folding},"
             f"peephole={peephole},auto_inline={auto_inline},"
+            f"string_deduplication={string_deduplication},"
             f"entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
         )
 
@@ -10255,7 +10468,8 @@ def _run_docs_tui(
             "summary": "Define a text macro with positional substitution.",
             "detail": (
                 "Records raw tokens until `;`. On expansion, `$0`, `$1`, ... "
-                "are replaced by positional arguments. Macros cannot nest.\n\n"
+                "are replaced by positional arguments. A bare `$` token is left "
+                "unchanged (useful in asm). Macros cannot nest.\n\n"
                 "Example:\n"
                 "  macro max2 2 $0 $1 > if $0 else $1 end ;\n"
                 "  5 3 max2   # leaves 5 on stack"
@@ -10413,13 +10627,29 @@ def _run_docs_tui(
             "name": "[ ... ]",
             "category": "Data",
             "syntax": "[ <values...> ]",
-            "summary": "List literal — captures stack segment into mmap'd buffer.",
+            "summary": "Heap list literal — captures stack segment into mmap'd buffer.",
             "detail": (
                 "Captures the intervening stack values into a freshly allocated "
                 "buffer. Format: [len, item0, item1, ...] as qwords. "
                 "The buffer address is pushed. User must `munmap` when done.\n\n"
                 "Example:\n"
                 "  [ 1 2 3 4 5 ]   # pushes addr of [5, 1, 2, 3, 4, 5]"
+            ),
+        },
+        {
+            "name": "{ ... } and { ... }:N",
+            "category": "Data",
+            "syntax": "{ <int-or-char...> } | { <int-or-char...> }:<size> | {}:<size>",
+            "summary": "BSS-backed fixed-size list literal.",
+            "detail": (
+                "Allocates a fixed-size qword list in .bss and pushes its address. "
+                "Layout is [len, item0, item1, ...]. "
+                "With :N, len is forced to N and any missing trailing elements are "
+                "zero-initialized.\n\n"
+                "Examples:\n"
+                "  { 1 2 3 }      # len=3, items=1,2,3\n"
+                "  { 1 2 }:10     # len=10, items=1,2, then zeros\n"
+                "  {}:10          # len=10, all zeros"
             ),
         },
         {
@@ -10433,6 +10663,18 @@ def _run_docs_tui(
                 "Escape sequences: \\\", \\\\, \\n, \\r, \\t, \\0.\n\n"
                 "Example:\n"
                 "  \"hello world\" puts   # prints: hello world"
+            ),
+        },
+        {
+            "name": "Char literals",
+            "category": "Data",
+            "syntax": "'<ch>'",
+            "summary": "Push character code as integer.",
+            "detail": (
+                "Single-quoted literals push an integer character code. "
+                "Supported escapes: \\n, \\r, \\t, \\0, \\\\, \\', \", \\xNN.\n\n"
+                "Example:\n"
+                "  'A' puti cr    # prints 65"
             ),
         },
         {
@@ -11494,7 +11736,7 @@ def _run_docs_tui(
         "    - Peephole optimization (--no-peephole)\n"
         "    - Loop unrolling (--no-loop-unroll)\n"
         "    - Auto-inlining of small asm bodies (--no-auto-inline)\n"
-        "    - Static list folding (--no-static-list-folding)\n"
+        "    - String literal deduplication (--no-string-dedup to disable)\n"
         "    - Dead code elimination (automatic)\n"
         "    - -O0 disables all optimizations\n"
         "    - -O2 disables all optimizations AND checks\n"
@@ -11606,10 +11848,12 @@ def _run_docs_tui(
         "      automatically inlined at call sites, eliminating\n"
         "      call/ret overhead.\n"
         "\n"
-        "    STATIC LIST FOLDING\n"
-        "      List literals like [1 2 3] with all-constant\n"
-        "      elements are placed in .data instead of being\n"
-        "      built at runtime.\n"
+        "    LIST LITERAL LOWERING\n"
+        "      [ ... ] literals are always heap-backed and\n"
+        "      allocated at runtime.\n"
+        "      { ... } literals are fixed-size BSS-backed\n"
+        "      arrays; with { ... }:N, trailing elements are\n"
+        "      zero-initialized up to N.\n"
         "\n"
         "    DEAD CODE ELIMINATION\n"
         "      Words that are never called (and not 'main') are\n"
@@ -12783,14 +13027,10 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--repl", action="store_true", help="interactive REPL; source file is optional")
     parser.add_argument("-l", dest="libs", action="append", default=[], help="pass library to linker (e.g. -l m or -l libc.so.6)")
     parser.add_argument("--no-folding", action="store_true", help="disable constant folding optimization")
-    parser.add_argument(
-        "--no-static-list-folding",
-        action="store_true",
-        help="disable static list-literal folding (lists stay runtime-allocated)",
-    )
     parser.add_argument("--no-peephole", action="store_true", help="disable peephole optimizations")
     parser.add_argument("--no-loop-unroll", action="store_true", help="disable loop unrolling optimization")
     parser.add_argument("--no-auto-inline", action="store_true", help="disable auto-inlining of small asm bodies")
+    parser.add_argument("--no-string-dedup", action="store_true", help="disable string literal deduplication in emitted data section")
     parser.add_argument("-O0", dest="O0", action="store_true", help="disable all optimizations")
     parser.add_argument("-O2", dest="O2", action="store_true", help="fast mode: disable all optimizations and checks")
     parser.add_argument("-v", "--verbose", type=int, default=0, metavar="LEVEL", help="verbosity level (1=summary+timing, 2=per-function/DCE, 3=full debug, 4=optimization detail)")
@@ -12895,26 +13135,26 @@ def cli(argv: Sequence[str]) -> int:
     artifact_kind = args.artifact
     if args.O2:
         folding_enabled = False
-        static_list_folding_enabled = False
         peephole_enabled = False
         loop_unroll_enabled = False
         auto_inline_enabled = False
+        string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = False
         stack_check_enabled = False
     elif args.O0:
         folding_enabled = False
-        static_list_folding_enabled = False
         peephole_enabled = False
         loop_unroll_enabled = False
         auto_inline_enabled = not args.no_auto_inline
+        string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = not args.no_extern_type_check
         stack_check_enabled = not args.no_stack_check
     else:
         folding_enabled = not args.no_folding
-        static_list_folding_enabled = not args.no_static_list_folding
         peephole_enabled = not args.no_peephole
         loop_unroll_enabled = not args.no_loop_unroll
         auto_inline_enabled = not args.no_auto_inline
+        string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = not args.no_extern_type_check
         stack_check_enabled = not args.no_stack_check
     cfg_output: Optional[Path] = None
@@ -13005,10 +13245,10 @@ def cli(argv: Sequence[str]) -> int:
         defines=args.defines,
     )
     compiler.assembler.enable_constant_folding = folding_enabled
-    compiler.assembler.enable_static_list_folding = static_list_folding_enabled
     compiler.assembler.enable_peephole_optimization = peephole_enabled
     compiler.assembler.enable_loop_unroll = loop_unroll_enabled
     compiler.assembler.enable_auto_inline = auto_inline_enabled
+    compiler.assembler.enable_string_deduplication = string_deduplication_enabled
     compiler.assembler.enable_extern_type_check = extern_type_check_enabled
     compiler.assembler.enable_stack_check = stack_check_enabled
     compiler.assembler.verbosity = verbosity
@@ -13051,9 +13291,9 @@ def cli(argv: Sequence[str]) -> int:
             fhash = cache.flags_hash(
                 args.debug,
                 folding_enabled,
-                static_list_folding_enabled,
                 peephole_enabled,
                 auto_inline_enabled,
+                string_deduplication_enabled,
                 entry_mode,
             )
             manifest = cache.load_manifest(args.source)
@@ -13083,9 +13323,9 @@ def cli(argv: Sequence[str]) -> int:
                     fhash = cache.flags_hash(
                         args.debug,
                         folding_enabled,
-                        static_list_folding_enabled,
                         peephole_enabled,
                         auto_inline_enabled,
+                        string_deduplication_enabled,
                         entry_mode,
                     )
                 has_ct = bool(compiler.parser.compile_time_vm._ct_executed)

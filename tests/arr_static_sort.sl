@@ -8,6 +8,10 @@ word main
     dup 1 arr_get puti cr
     dup 2 arr_get puti cr
     dup 3 arr_get puti cr
+    dup list_len puti cr
+    dup list_head puti cr
+    dup list_last puti cr
+    dup list_empty puti cr
     arr_free
 
     [ 9 5 7 ] dup arr_sorted

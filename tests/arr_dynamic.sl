@@ -1,6 +1,6 @@
 import ../stdlib/stdlib.sl
 import ../stdlib/io.sl
-import ../stdlib/arr.sl
+import ../stdlib/dyn_arr.sl
 
 word main
     # arr_new / arr_len / arr_cap / arr_data

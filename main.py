@@ -797,12 +797,14 @@ class Parser:
         reader: Optional[Reader] = None,
         *,
         macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
+        macro_preview: bool = False,
     ) -> None:
         if macro_expansion_limit < 1:
             raise ValueError("macro_expansion_limit must be >= 1")
         self.dictionary = dictionary
         self.reader = reader or Reader()
         self.macro_expansion_limit = macro_expansion_limit
+        self.macro_preview = macro_preview
         self.tokens: List[Token] = []
         self._token_iter: Optional[Iterable[Token]] = None
         self._token_iter_exhausted = True
@@ -1570,7 +1572,7 @@ class Parser:
         word = self.dictionary.words.get(lexeme)
         if word is not None:
             if word.macro_expansion is not None:
-                args = self._collect_macro_args(word.macro_params)
+                args = self._collect_macro_args(word.macro_params, word_name=word.name, call_token=token)
                 self._inject_macro_tokens(word, token, args)
                 return True
             if word.immediate:
@@ -1642,7 +1644,7 @@ class Parser:
     def _maybe_expand_macro(self, token: Token) -> bool:
         word = self.dictionary.lookup(token.lexeme)
         if word and word.macro_expansion is not None:
-            args = self._collect_macro_args(word.macro_params)
+            args = self._collect_macro_args(word.macro_params, word_name=word.name, call_token=token)
             self._inject_macro_tokens(word, token, args)
             return True
         return False
@@ -1659,10 +1661,20 @@ class Parser:
             if arg_match is not None:
                 idx = int(arg_match.group(1))
                 if idx < 0 or idx >= len(args):
-                    raise ParseError(f"macro {word.name} missing argument for {lex}")
+                    raise ParseError(
+                        f"macro '{word.name}' references argument {lex}, "
+                        f"but call provided only {len(args)} argument(s)"
+                    )
                 replaced.append(args[idx])
             else:
                 replaced.append(lex)
+        if self.macro_preview:
+            preview = " ".join(replaced)
+            if len(preview) > 240:
+                preview = preview[:237] + "..."
+            sys.stderr.write(
+                f"[macro-preview] {word.name} at {token.line}:{token.column} -> {preview}\n"
+            )
         insertion = [
             Token(
                 lexeme=lex,
@@ -1676,10 +1688,21 @@ class Parser:
         ]
         self.tokens[self.pos:self.pos] = insertion
 
-    def _collect_macro_args(self, count: int) -> List[str]:
+    def _collect_macro_args(
+        self,
+        count: int,
+        *,
+        word_name: Optional[str] = None,
+        call_token: Optional[Token] = None,
+    ) -> List[str]:
         args: List[str] = []
         for _ in range(count):
             if self._eof():
+                if word_name is not None and call_token is not None:
+                    raise ParseError(
+                        f"macro '{word_name}' at {call_token.line}:{call_token.column} "
+                        f"expects {count} argument(s), got {len(args)}"
+                    )
                 raise ParseError("macro invocation missing arguments")
             args.append(self._consume().lexeme)
         return args
@@ -8799,6 +8822,7 @@ class Compiler:
         include_paths: Optional[Sequence[Path]] = None,
         *,
         macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
+        macro_preview: bool = False,
         defines: Optional[Sequence[str]] = None,
     ) -> None:
         self.reader = Reader()
@@ -8809,6 +8833,7 @@ class Compiler:
             self.dictionary,
             self.reader,
             macro_expansion_limit=macro_expansion_limit,
+            macro_preview=macro_preview,
         )
         self.assembler = Assembler(self.dictionary)
         if include_paths is None:
@@ -9887,6 +9912,7 @@ def run_repl(
             compiler = Compiler(
                 include_paths=include_paths,
                 macro_expansion_limit=compiler.parser.macro_expansion_limit,
+                macro_preview=compiler.parser.macro_preview,
             )
             print(_c(_C_DIM, "[repl] session reset — fresh VM and dictionary"))
             continue
@@ -10468,8 +10494,11 @@ def _run_docs_tui(
             "summary": "Define a text macro with positional substitution.",
             "detail": (
                 "Records raw tokens until `;`. On expansion, `$0`, `$1`, ... "
-                "are replaced by positional arguments. A bare `$` token is left "
-                "unchanged (useful in asm). Macros cannot nest.\n\n"
+                "(exact `$<number>` tokens only) are replaced by positional "
+                "arguments. A bare `$` token is left unchanged (useful in asm). "
+                "Macros cannot nest.\n\n"
+                "Use --macro-preview to print fully expanded macro tokens "
+                "during parsing.\n\n"
                 "Example:\n"
                 "  macro max2 2 $0 $1 > if $0 else $1 end ;\n"
                 "  5 3 max2   # leaves 5 on stack"
@@ -11485,6 +11514,9 @@ def _run_docs_tui(
         "    Define a text macro that expands during tokenization.\n"
         "    The number is the parameter count. The body tokens are\n"
         "    substituted literally wherever the macro is invoked.\n"
+        "    Only exact `$<number>` tokens are replaced (for example\n"
+        "    $0, $1). Bare `$` tokens remain unchanged for asm use.\n"
+        "    Use --macro-preview to print each expansion.\n"
         "\n"
         "      macro BUFFER_SIZE 0 4096 ;\n"
         "      macro MAX 2 >r dup r> dup >r < if drop r> else r> drop end ;\n"
@@ -11698,6 +11730,22 @@ def _run_docs_tui(
         "      5 square           # expands to: 5 dup *\n"
         "      defconst TEN 10    # defines: word TEN 10 end\n"
         "\n"
+        "    Placeholder substitution only applies to exact `$<number>`\n"
+        "    tokens. This keeps bare `$` usable inside asm syntax.\n"
+        "    Use --macro-preview to print each expansion while parsing.\n"
+        "\n"
+        "  WHAT IS THE L2 DATA MODEL FOR ARRAYS/STRINGS?\n"
+        "\n"
+        "    - [ ... ] creates a heap list at runtime. Layout is:\n"
+        "      [len, elem0, elem1, ...]. Free it with arr_free.\n"
+        "    - { ... } creates a fixed-size BSS-backed list.\n"
+        "    - { ... }:N creates BSS storage of N elements, copying\n"
+        "      initializers then zero-filling the rest.\n"
+        "    - String literals are emitted to static data and\n"
+        "      deduplicated by default (--no-string-dedup disables).\n"
+        "    - stdlib/dyn_arr.sl provides growable dynamic arrays\n"
+        "      with [len, cap, data_ptr] style metadata.\n"
+        "\n"
         "  HOW DO I RUN CODE AT COMPILE TIME?\n"
         "\n"
         "    Use --ct-run-main or --script to execute 'main' at\n"
@@ -11855,6 +11903,14 @@ def _run_docs_tui(
         "      arrays; with { ... }:N, trailing elements are\n"
         "      zero-initialized up to N.\n"
         "\n"
+        "    DATA LAYOUTS\n"
+        "      Heap list layout: [len, elem0, elem1, ...]\n"
+        "      BSS list layout:  [len, elem0, elem1, ...]\n"
+        "      Dynamic array layout (stdlib/dyn_arr.sl):\n"
+        "        [len, cap, data_ptr, inline_elems...]\n"
+        "      String literals point at static data bytes\n"
+        "      (deduplicated unless --no-string-dedup).\n"
+        "\n"
         "    DEAD CODE ELIMINATION\n"
         "      Words that are never called (and not 'main') are\n"
         "      excluded from the final assembly output.\n"
@@ -11887,6 +11943,7 @@ def _run_docs_tui(
         "    - Macro expansion depth: macros can expand macros,\n"
         "      but there's a limit (default 256, configurable via\n"
         "      --macro-expansion-limit).\n"
+        "      Use --macro-preview to trace each expansion.\n"
         "\n"
         "    - :py blocks: Python code embedded in :py { ... }\n"
         "      runs in the compiler's Python process. It has full\n"
@@ -13082,6 +13139,11 @@ def cli(argv: Sequence[str]) -> int:
         help="maximum nested macro expansion depth (default: %(default)s)",
     )
     parser.add_argument(
+        "--macro-preview",
+        action="store_true",
+        help="print each text macro expansion to stderr during parsing",
+    )
+    parser.add_argument(
         "-D",
         dest="defines",
         action="append",
@@ -13242,6 +13304,7 @@ def cli(argv: Sequence[str]) -> int:
     compiler = Compiler(
         include_paths=[Path("."), Path("./stdlib"), *args.include_paths],
         macro_expansion_limit=args.macro_expansion_limit,
+        macro_preview=args.macro_preview,
         defines=args.defines,
     )
     compiler.assembler.enable_constant_folding = folding_enabled

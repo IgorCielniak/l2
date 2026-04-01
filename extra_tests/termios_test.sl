@@ -2,8 +2,8 @@ import stdlib.sl
 import termios.sl
 
 word main
-    "stdin is a tty? " puts
-    0 isatty puti cr
+    #"stdin is a tty? " puts
+    #0 isatty puti cr
 
     "stdout is a tty? " puts
     1 isatty puti cr

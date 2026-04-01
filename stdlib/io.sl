@@ -353,6 +353,40 @@
 }
 ;
 
+#putu [* | uint] -> [*]
+:asm putu {
+	mov rbx, [r12]      ; get uint
+	add r12, 8          ; pop
+	lea rsi, [rel print_buf_end]
+	mov rcx, 0
+	mov r10, 10
+	cmp rbx, 0
+	jne .putu_digits
+	dec rsi
+	mov byte [rsi], '0'
+	inc rcx
+	jmp .putu_done
+.putu_digits:
+.putu_loop:
+	xor rdx, rdx
+	mov rax, rbx
+	div r10
+	add dl, '0'
+	dec rsi
+	mov [rsi], dl
+	inc rcx
+	mov rbx, rax
+	test rbx, rbx
+	jne .putu_loop
+.putu_done:
+	mov rax, 1          ; syscall: write
+	mov rdi, 1          ; fd: stdout
+	mov rdx, rcx        ; length
+	syscall
+	ret
+}
+;
+
 #cr [*] -> [*]
 inline word cr 10 putc end
 

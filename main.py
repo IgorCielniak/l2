@@ -1009,6 +1009,62 @@ class Parser:
                 raise ParseError(f"close op missing valid 'op' name: {spec!r}")
             self._append_op(_make_op(op_name, data))
 
+    def _count_remaining_end_tokens(self, start_index: int) -> int:
+        count = 0
+        idx = start_index
+        toks = self.tokens
+        n = len(toks)
+        in_definition = bool(self.context_stack and isinstance(self.context_stack[-1], Definition))
+        definition_starters = {"word", ":asm", ":py", "extern", "inline"}
+        while idx < n:
+            tok = toks[idx]
+            if (
+                in_definition
+                and idx > start_index
+                and tok.column == 0
+                and tok.lexeme in definition_starters
+            ):
+                break
+            if tok.lexeme == "end":
+                count += 1
+            idx += 1
+        return count
+
+    def _auto_close_if_else_frames(self, limit: int) -> int:
+        """Implicitly close up to `limit` trailing if/else control frames."""
+        closed = 0
+        while closed < limit and self.control_stack:
+            top = self.control_stack[-1]
+            if top.get("type") not in ("if", "else"):
+                break
+            self._handle_end_control()
+            closed += 1
+        return closed
+
+    def _handle_flexible_end(self, token: Token) -> None:
+        """Close control frames with tolerant if/else shorthand semantics.
+
+        If explicit `end` tokens are fewer than currently open control frames,
+        trailing `if`/`else` frames are implicitly closed first so legacy and
+        shorthand-heavy styles can coexist.
+        """
+        if not self.control_stack:
+            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
+
+        current_end_index = self.pos - 1
+        remaining_ends = self._count_remaining_end_tokens(current_end_index)
+        reserved_definition_end = 0
+        if self.context_stack and isinstance(self.context_stack[-1], Definition):
+            reserved_definition_end = 1
+        if reserved_definition_end > 0:
+            remaining_ends = max(0, remaining_ends - reserved_definition_end)
+        open_controls = len(self.control_stack)
+        if remaining_ends < open_controls:
+            needed_implicit = open_controls - remaining_ends
+            self._auto_close_if_else_frames(needed_implicit)
+
+        self._handle_end_control()
+
     # Parsing ------------------------------------------------------------------
     def parse(self, tokens: Iterable[Token], source: str) -> Module:
         self.tokens = tokens if isinstance(tokens, list) else list(tokens)
@@ -1086,7 +1142,7 @@ class Parser:
                         self._begin_definition(token, terminator="end", inline=inline_def)
                     elif kw == _KW_END:
                         if self.control_stack:
-                            self._handle_end_control()
+                            self._handle_flexible_end(token)
                         elif self._try_end_definition(token):
                             pass
                         else:
@@ -4578,6 +4634,355 @@ class Emission:
             parts.extend(["section .bss", *self.bss])
         parts.append("section .note.GNU-stack noalloc noexec nowrite")
         return "\n".join(parts)
+
+
+_ASM_LABEL_ONLY_RE = re.compile(r"^\s*([A-Za-z0-9_.$@]+):\s*$")
+_ASM_GLOBAL_RE = re.compile(r"^\s*global\s+([A-Za-z0-9_.$@]+)\s*$", re.IGNORECASE)
+_ASM_JUMP_RE = re.compile(r"^j([a-z]+)$", re.IGNORECASE)
+_ASM_LABEL_NAME_RE = re.compile(r"^[A-Za-z0-9_.$@]+$")
+
+
+def _split_asm_comment(line: str) -> Tuple[str, str]:
+    if ";" not in line:
+        return line.rstrip(), ""
+    code, comment = line.split(";", 1)
+    return code.rstrip(), comment
+
+
+def _parse_asm_instruction(line: str) -> Optional[Tuple[str, List[str]]]:
+    code, _ = _split_asm_comment(line)
+    text = code.strip()
+    if not text:
+        return None
+    if text.startswith("%"):
+        return None
+    if text.lower().startswith("section ") or text.lower().startswith("global ") or text.lower().startswith("extern "):
+        return None
+    if _ASM_LABEL_ONLY_RE.match(text):
+        return None
+    parts = text.split(None, 1)
+    mnemonic = parts[0].lower()
+    ops: List[str] = []
+    if len(parts) > 1:
+        ops = [p.strip() for p in parts[1].split(",") if p.strip()]
+    return mnemonic, ops
+
+
+def _render_instruction(mnemonic: str, operands: Sequence[str], original: str) -> str:
+    indent = "    "
+    m = re.match(r"^(\s+)", original)
+    if m is not None:
+        indent = m.group(1)
+    if operands:
+        return f"{indent}{mnemonic} " + ", ".join(operands)
+    return f"{indent}{mnemonic}"
+
+
+def _invert_jcc(mnemonic: str) -> Optional[str]:
+    inv: Dict[str, str] = {
+        "je": "jne", "jne": "je", "jz": "jnz", "jnz": "jz",
+        "jg": "jle", "jge": "jl", "jl": "jge", "jle": "jg",
+        "ja": "jbe", "jae": "jb", "jb": "jae", "jbe": "ja",
+        "jo": "jno", "jno": "jo", "js": "jns", "jns": "js",
+        "jp": "jnp", "jnp": "jp",
+    }
+    return inv.get(mnemonic.lower())
+
+
+def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[str]]:
+    """Run an extensive but conservative post-emission optimization pass."""
+    lines = asm_text.splitlines()
+    stats: Dict[str, int] = {
+        "removed_nops": 0,
+        "removed_self_moves": 0,
+        "removed_trivial_arith": 0,
+        "removed_jump_to_next_label": 0,
+        "threaded_jump_targets": 0,
+        "removed_unreachable_after_terminator": 0,
+        "inverted_conditional_branches": 0,
+        "collapsed_redundant_jumps": 0,
+        "removed_redundant_labels": 0,
+        "collapsed_blank_runs": 0,
+    }
+
+    def _next_code_index(arr: Sequence[str], i: int) -> int:
+        j = i
+        while j < len(arr):
+            s = arr[j].strip()
+            if s and not s.startswith(";"):
+                return j
+            j += 1
+        return -1
+
+    def _collect_label_positions(arr: Sequence[str]) -> Dict[str, int]:
+        pos: Dict[str, int] = {}
+        for idx, ln in enumerate(arr):
+            m = _ASM_LABEL_ONLY_RE.match(ln.strip())
+            if m is not None:
+                pos[m.group(1)] = idx
+        return pos
+
+    def _resolve_jmp_chain(target: str, arr: Sequence[str], lbl_pos: Dict[str, int]) -> str:
+        seen: Set[str] = set()
+        cur = target
+        while cur not in seen:
+            seen.add(cur)
+            idx = lbl_pos.get(cur)
+            if idx is None:
+                return cur
+            nxt = _next_code_index(arr, idx + 1)
+            if nxt < 0:
+                return cur
+            parsed = _parse_asm_instruction(arr[nxt])
+            if parsed is None:
+                return cur
+            mnem, ops = parsed
+            if mnem != "jmp" or len(ops) != 1 or not _ASM_LABEL_NAME_RE.match(ops[0]):
+                return cur
+            cur = ops[0]
+        return target
+
+    pass_logs: List[str] = []
+
+    def _record_pass(round_no: int, pass_name: str, before: Dict[str, int], after: Dict[str, int]) -> None:
+        delta_parts: List[str] = []
+        for key in sorted(after):
+            delta = after[key] - before.get(key, 0)
+            if delta:
+                delta_parts.append(f"{key}=+{delta}")
+        if delta_parts:
+            pass_logs.append(f"round {round_no} {pass_name}: " + ", ".join(delta_parts))
+        else:
+            pass_logs.append(f"round {round_no} {pass_name}: no changes")
+
+    # Fixed-point optimization rounds.
+    rounds_run = 0
+    for round_idx in range(10):
+        changed = False
+        rounds_run = round_idx + 1
+
+        # Pass A: local no-op/trivial arithmetic cleanup.
+        _before_a = dict(stats)
+        stage_a: List[str] = []
+        for ln in lines:
+            parsed = _parse_asm_instruction(ln)
+            if parsed is None:
+                stage_a.append(ln)
+                continue
+            mnem, ops = parsed
+            if mnem == "nop":
+                stats["removed_nops"] += 1
+                changed = True
+                continue
+            if mnem in ("mov", "xchg") and len(ops) == 2 and ops[0] == ops[1]:
+                stats["removed_self_moves"] += 1
+                changed = True
+                continue
+            if mnem == "lea" and len(ops) == 2:
+                m_lea = re.match(r"^\[\s*([A-Za-z0-9_.$@]+)\s*\]$", ops[1])
+                if m_lea is not None and m_lea.group(1) == ops[0]:
+                    stats["removed_self_moves"] += 1
+                    changed = True
+                    continue
+            if mnem in ("add", "sub", "or", "xor", "shl", "shr", "sar") and len(ops) == 2 and ops[1] in ("0", "0x0"):
+                stats["removed_trivial_arith"] += 1
+                changed = True
+                continue
+            if mnem in ("imul", "mul") and len(ops) == 2 and ops[1] in ("1", "0x1"):
+                stats["removed_trivial_arith"] += 1
+                changed = True
+                continue
+            stage_a.append(ln)
+        lines = stage_a
+        _record_pass(round_idx + 1, "A/local-cleanup", _before_a, stats)
+
+        # Pass B: jump threading and jump-to-next-label elimination.
+        _before_b = dict(stats)
+        lbl_pos = _collect_label_positions(lines)
+        for i, ln in enumerate(list(lines)):
+            parsed = _parse_asm_instruction(ln)
+            if parsed is None:
+                continue
+            mnem, ops = parsed
+            if len(ops) != 1 or not _ASM_LABEL_NAME_RE.match(ops[0]):
+                continue
+            if mnem == "jmp" or _ASM_JUMP_RE.match(mnem):
+                old_target = ops[0]
+                new_target = _resolve_jmp_chain(old_target, lines, lbl_pos)
+                if new_target != old_target:
+                    lines[i] = _render_instruction(mnem, [new_target], ln)
+                    stats["threaded_jump_targets"] += 1
+                    changed = True
+
+                if mnem == "jmp":
+                    j = _next_code_index(lines, i + 1)
+                    if j >= 0:
+                        m_lbl = _ASM_LABEL_ONLY_RE.match(lines[j].strip())
+                        if m_lbl is not None and m_lbl.group(1) == new_target:
+                            lines[i] = ""
+                            stats["removed_jump_to_next_label"] += 1
+                            changed = True
+        _record_pass(round_idx + 1, "B/jump-threading", _before_b, stats)
+
+        # Pass C: remove unreachable instructions after unconditional terminators.
+        _before_c = dict(stats)
+        stage_c: List[str] = []
+        unreachable = False
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped:
+                m_lbl = _ASM_LABEL_ONLY_RE.match(stripped)
+                if m_lbl is not None:
+                    unreachable = False
+            parsed = _parse_asm_instruction(ln)
+            if unreachable and parsed is not None:
+                stage_c.append("")
+                stats["removed_unreachable_after_terminator"] += 1
+                changed = True
+                continue
+            stage_c.append(ln)
+            if parsed is not None:
+                mnem, _ops = parsed
+                if mnem in ("jmp", "ret", "ud2"):
+                    unreachable = True
+        lines = stage_c
+        _record_pass(round_idx + 1, "C/unreachable-prune", _before_c, stats)
+
+        # Pass D: invert branch pattern: jcc L1 ; jmp L2 ; L1:
+        _before_d = dict(stats)
+        i = 0
+        while i < len(lines):
+            parsed = _parse_asm_instruction(lines[i])
+            if parsed is None:
+                i += 1
+                continue
+            mnem, ops = parsed
+            inv = _invert_jcc(mnem)
+            if inv is None or len(ops) != 1 or not _ASM_LABEL_NAME_RE.match(ops[0]):
+                i += 1
+                continue
+            j = _next_code_index(lines, i + 1)
+            if j < 0:
+                i += 1
+                continue
+            parsed_j = _parse_asm_instruction(lines[j])
+            if parsed_j is None or parsed_j[0] != "jmp" or len(parsed_j[1]) != 1:
+                i += 1
+                continue
+            k = _next_code_index(lines, j + 1)
+            if k < 0:
+                i += 1
+                continue
+            m_lbl = _ASM_LABEL_ONLY_RE.match(lines[k].strip())
+            if m_lbl is None or m_lbl.group(1) != ops[0]:
+                i += 1
+                continue
+
+            lines[i] = _render_instruction(inv, [parsed_j[1][0]], lines[i])
+            lines[j] = ""
+            stats["inverted_conditional_branches"] += 1
+            changed = True
+            i = k + 1
+        _record_pass(round_idx + 1, "D/branch-invert", _before_d, stats)
+
+        # Pass E: collapse duplicate adjacent labels and retarget branches.
+        _before_e = dict(stats)
+        alias: Dict[str, str] = {}
+
+        def _label_is_referenced(label: str, arr: Sequence[str], def_idx: int) -> bool:
+            pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
+            for li, ltxt in enumerate(arr):
+                if li == def_idx:
+                    continue
+                if not ltxt.strip():
+                    continue
+                if pat.search(ltxt):
+                    return True
+            return False
+
+        i = 0
+        while i < len(lines):
+            m1 = _ASM_LABEL_ONLY_RE.match(lines[i].strip()) if lines[i].strip() else None
+            if m1 is None:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(lines):
+                sj = lines[j].strip()
+                if not sj or sj.startswith(";"):
+                    j += 1
+                    continue
+                m2 = _ASM_LABEL_ONLY_RE.match(sj)
+                if m2 is not None:
+                    src_lbl = m1.group(1)
+                    dst_lbl = m2.group(1)
+                    if not _label_is_referenced(src_lbl, lines, i):
+                        alias[src_lbl] = dst_lbl
+                        lines[i] = ""
+                        stats["removed_redundant_labels"] += 1
+                        changed = True
+                break
+            i = j
+
+        if alias:
+            def _resolve_alias(lbl: str) -> str:
+                seen: Set[str] = set()
+                cur = lbl
+                while cur in alias and cur not in seen:
+                    seen.add(cur)
+                    cur = alias[cur]
+                return cur
+
+            for idx, ln in enumerate(lines):
+                parsed = _parse_asm_instruction(ln)
+                if parsed is None:
+                    continue
+                mnem, ops = parsed
+                if len(ops) == 1 and _ASM_LABEL_NAME_RE.match(ops[0]):
+                    mapped = _resolve_alias(ops[0])
+                    if mapped != ops[0]:
+                        lines[idx] = _render_instruction(mnem, [mapped], ln)
+                        stats["threaded_jump_targets"] += 1
+                        changed = True
+        _record_pass(round_idx + 1, "E/label-collapse", _before_e, stats)
+
+        # Pass F: collapse back-to-back unconditional jumps.
+        _before_f = dict(stats)
+        for idx, ln in enumerate(lines):
+            parsed = _parse_asm_instruction(ln)
+            if parsed is None:
+                continue
+            mnem, _ops = parsed
+            if mnem != "jmp":
+                continue
+            nxt = _next_code_index(lines, idx + 1)
+            if nxt >= 0:
+                p2 = _parse_asm_instruction(lines[nxt])
+                if p2 is not None and p2[0] == "jmp":
+                    lines[idx] = ""
+                    stats["collapsed_redundant_jumps"] += 1
+                    changed = True
+        _record_pass(round_idx + 1, "F/jump-collapse", _before_f, stats)
+
+        if not changed:
+            break
+
+    # Final formatting cleanup.
+    optimized: List[str] = []
+    blank_run = 0
+    for ln in lines:
+        if ln.strip() == "":
+            blank_run += 1
+            if blank_run > 1:
+                stats["collapsed_blank_runs"] += 1
+                continue
+        else:
+            blank_run = 0
+        optimized.append(ln)
+
+    pass_logs.append(f"rounds_run={rounds_run}")
+
+    return "\n".join(optimized), stats, pass_logs
 
 
 class FunctionEmitter:
@@ -8884,6 +9289,41 @@ class Compiler:
 
     _import_resolve_cache: Dict[Tuple[Path, str], Path] = {}
 
+    @staticmethod
+    def _parse_directive_target_and_rest(line: str, keyword: str, *, path: Path, line_no: int) -> Optional[Tuple[str, str]]:
+        """Parse `<keyword> <target> [remainder]` where target may be quoted."""
+        text = line.lstrip()
+        if not text.startswith(keyword):
+            return None
+        if len(text) > len(keyword) and not text[len(keyword)].isspace():
+            return None
+
+        pos = len(keyword)
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            raise ParseError(f"empty {keyword} target in {path}:{line_no}")
+
+        if text[pos] == '"':
+            pos += 1
+            start = pos
+            while pos < len(text) and text[pos] != '"':
+                pos += 1
+            if pos >= len(text):
+                raise ParseError(f"unterminated quoted {keyword} target in {path}:{line_no}")
+            target = text[start:pos]
+            pos += 1
+        else:
+            start = pos
+            while pos < len(text) and not text[pos].isspace():
+                pos += 1
+            target = text[start:pos]
+
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        remainder = text[pos:]
+        return target, remainder
+
     def _preprocess_c_header(self, header_path: Path, raw_text: str) -> str:
         """Try running the C preprocessor on a header file for accurate parsing.
 
@@ -9127,6 +9567,16 @@ class Compiler:
                 file_line_no += 1
                 continue
 
+            if stripped[:7] == "define " or stripped == "define":
+                symbol = stripped[7:].strip() if len(stripped) > 7 else ""
+                if not symbol:
+                    raise ParseError(f"define missing symbol name at {path}:{file_line_no}")
+                symbol_name = symbol.split(None, 1)[0]
+                self.defines.add(symbol_name)
+                _out_append("")
+                file_line_no += 1
+                continue
+
             if not in_py_block and stripped[:3] == ":py" and "{" in stripped:
                 in_py_block = True
                 brace_depth = 0
@@ -9185,16 +9635,21 @@ class Compiler:
                     in_py_block = False
                 continue
 
-            if stripped[:7] == "import ":
-                target = stripped.split(None, 1)[1].strip()
-                if not target:
-                    raise ParseError(f"empty import target in {path}:{file_line_no}")
+            parsed_import = self._parse_directive_target_and_rest(
+                line,
+                "import",
+                path=path,
+                line_no=file_line_no,
+            )
+            if parsed_import is not None:
+                target, remainder = parsed_import
 
                 # begin_segment_if_needed inline
                 if segment_start_global is None:
                     segment_start_global = len(out_lines) + 1
                     segment_start_local = file_line_no
                 _out_append("")
+                source_line_no = file_line_no
                 file_line_no += 1
                 # close_segment_if_open inline
                 if segment_start_global is not None:
@@ -9210,14 +9665,24 @@ class Compiler:
 
                 target_path = self._resolve_import_target(path, target)
                 self._append_file_with_imports(target_path, out_lines, spans, seen)
+
+                # Allow `import <path> <statements...>`; keep trailing statements.
+                if remainder:
+                    if segment_start_global is None:
+                        segment_start_global = len(out_lines) + 1
+                        segment_start_local = source_line_no
+                    _out_append(remainder)
                 continue
 
-            if stripped[:9] == 'cimport "' or stripped[:9] == "cimport \"":
+            parsed_cimport = self._parse_directive_target_and_rest(
+                line,
+                "cimport",
+                path=path,
+                line_no=file_line_no,
+            )
+            if parsed_cimport is not None:
+                header_target, remainder = parsed_cimport
                 # cimport "header.h" — extract extern declarations from a C header
-                m_cimport = re.match(r'cimport\s+"([^"]+)"', stripped)
-                if not m_cimport:
-                    raise ParseError(f"invalid cimport syntax at {path}:{file_line_no}")
-                header_target = m_cimport.group(1)
                 header_path = self._resolve_import_target(path, header_target)
                 try:
                     header_text = header_path.read_text()
@@ -9234,6 +9699,7 @@ class Compiler:
                 if segment_start_global is None:
                     segment_start_global = len(out_lines) + 1
                     segment_start_local = file_line_no
+                source_line_no = file_line_no
                 # Replace the cimport line with the extracted extern + struct declarations
                 for ext_line in extern_lines:
                     _out_append(ext_line)
@@ -9241,6 +9707,13 @@ class Compiler:
                     _out_append(st_line)
                 _out_append("")  # blank line after externs
                 file_line_no += 1
+
+                # Keep optional trailing statements after cimport on the same line.
+                if remainder:
+                    _out_append(remainder)
+                    if segment_start_global is None:
+                        segment_start_global = len(out_lines) + 1
+                        segment_start_local = source_line_no
                 continue
 
             # begin_segment_if_needed inline
@@ -9291,6 +9764,7 @@ class BuildCache:
         folding: bool,
         peephole: bool,
         auto_inline: bool,
+        asm_post_opt: bool,
         string_deduplication: bool,
         entry_mode: str,
     ) -> str:
@@ -9303,6 +9777,7 @@ class BuildCache:
         return self._hash_str(
             f"debug={debug},folding={folding},"
             f"peephole={peephole},auto_inline={auto_inline},"
+            f"asm_post_opt={asm_post_opt},"
             f"string_deduplication={string_deduplication},"
             f"entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
         )
@@ -10526,6 +11001,23 @@ def _run_docs_tui(
             ),
         },
         {
+            "name": "cstruct ... end",
+            "category": "Definitions",
+            "syntax": "cstruct <Name>\n  cfield <field> <c_type>\n  ...\nend",
+            "summary": "Define a C-compatible struct with ABI-aligned layout.",
+            "detail": (
+                "Computes offsets, alignment, and final struct size using C ABI rules. "
+                "Generates <Name>.size, <Name>.align, <Name>.<field>.size, and "
+                "<Name>.<field>.offset for every field. Accessors @/! are generated "
+                "for 8-byte fields.\n\n"
+                "Example:\n"
+                "  cstruct Pair\n"
+                "    cfield left long\n"
+                "    cfield right long\n"
+                "  end"
+            ),
+        },
+        {
             "name": "if ... end",
             "category": "Control Flow",
             "syntax": "<cond> if <body> end\n<cond> if <then> else <otherwise> end",
@@ -10533,7 +11025,8 @@ def _run_docs_tui(
             "detail": (
                 "Pops the top of stack. If non-zero, executes the `then` branch; "
                 "otherwise executes the `else` branch (if present).\n\n"
-                "For else-if chains, place `if` on the same line as `else`:\n"
+                "For else-if chains, place `if` on the same line as `else` "
+                "(backward-compatible style):\n"
                 "  <cond1> if\n"
                 "    ... branch 1 ...\n"
                 "  else <cond2> if\n"
@@ -10541,6 +11034,9 @@ def _run_docs_tui(
                 "  else\n"
                 "    ... fallback ...\n"
                 "  end\n\n"
+                "The parser also accepts flexible shorthand where chained if/else "
+                "blocks may close with fewer explicit `end` tokens; omitted trailing "
+                "if/else closes are resolved automatically.\n\n"
                 "Example:\n"
                 "  dup 0 > if \"positive\" puts else \"non-positive\" puts end"
             ),
@@ -10593,6 +11089,16 @@ def _run_docs_tui(
                 "    dup 0 == if drop exit end\n"
                 "    process\n"
                 "  again"
+            ),
+        },
+        {
+            "name": "continue",
+            "category": "Control Flow",
+            "syntax": "continue",
+            "summary": "Jump to the next iteration of a begin/again loop.",
+            "detail": (
+                "Valid only inside `begin ... again`. Emits a jump to the loop head. "
+                "Using it outside a begin/again loop is a parse error."
             ),
         },
         {
@@ -10650,6 +11156,29 @@ def _run_docs_tui(
                 "  2. Relative to the importing file\n"
                 "  3. Each include path (defaults: project root, ./stdlib)\n\n"
                 "Each file is included at most once per compilation unit."
+            ),
+        },
+        {
+            "name": "cimport",
+            "category": "Modules",
+            "syntax": "cimport \"header.h\"",
+            "summary": "Import C declarations and auto-generate extern/cstruct forms.",
+            "detail": (
+                "Reads a C header, preprocesses it, then injects generated `extern` "
+                "declarations and `cstruct` definitions into the token stream. "
+                "Resolution follows normal import search rules."
+            ),
+        },
+        {
+            "name": "ifdef / ifndef / elsedef / endif",
+            "category": "Modules",
+            "syntax": "ifdef <NAME> ... elsedef ... endif\nifndef <NAME> ... elsedef ... endif",
+            "summary": "Conditional source inclusion based on -D symbols.",
+            "detail": (
+                "Source preprocessing evaluates these directives before tokenization. "
+                "Symbols may be defined via CLI `-D NAME` and source-level "
+                "`define NAME`. `elsedef` flips the current branch. "
+                "Nested conditionals are supported."
             ),
         },
         {
@@ -10760,6 +11289,16 @@ def _run_docs_tui(
             "detail": (
                 "Runs the named word immediately during compilation, "
                 "but its definition is also emitted for runtime use."
+            ),
+        },
+        {
+            "name": "here",
+            "category": "Modifiers",
+            "syntax": "here",
+            "summary": "Push current source location string.",
+            "detail": (
+                "Immediate word that pushes `file:line:column` for the current parse "
+                "location as a string literal. Useful for diagnostics and assertions."
             ),
         },
         {
@@ -11771,6 +12310,35 @@ def _run_docs_tui(
         "    and skips recompilation when source files haven't\n"
         "    changed. Disable with --no-cache if needed.\n"
         "\n"
+        "  HOW DO I DO A CHECK-ONLY BUILD?\n"
+        "\n"
+        "    Use --check to parse/compile/validate without emitting\n"
+        "    final artifacts. This is equivalent to enabling\n"
+        "    --no-artifact after successful compilation.\n"
+        "\n"
+        "      python3 main.py prog.sl --check\n"
+        "\n"
+        "  HOW DO CONDITIONAL DIRECTIVES WORK?\n"
+        "\n"
+        "    Use ifdef/ifndef/elsedef/endif in source and pass\n"
+        "    -D NAME (repeatable) on the CLI, or add `define NAME`\n"
+        "    in source. Directives are\n"
+        "    resolved during preprocessing before tokenization.\n"
+        "\n"
+        "      ifdef DEBUG\n"
+        "        \"debug path\" puts\n"
+        "      elsedef\n"
+        "        \"release path\" puts\n"
+        "      endif\n"
+        "\n"
+        "  HOW DO I CONTROL WARNINGS?\n"
+        "\n"
+        "    Enable categories with -W (repeatable), and promote\n"
+        "    warnings to errors with --Werror.\n"
+        "\n"
+        "      python3 main.py prog.sl -W redefine -W stack-depth\n"
+        "      python3 main.py prog.sl -W all --Werror\n"
+        "\n"
         "  HOW DO I DUMP THE CONTROL-FLOW GRAPH?\n"
         "\n"
         "    Use --dump-cfg to produce a Graphviz DOT file:\n"
@@ -11805,8 +12373,8 @@ def _run_docs_tui(
         "    1. READER/TOKENIZER\n"
         "       Splits source into whitespace-delimited tokens.\n"
         "       Tracks line, column, and byte offsets per token.\n"
-        "       Comment lines (starting with #) in word bodies are\n"
-        "       preserved as metadata but not compiled.\n"
+        "       Line comments (starting with #) are discarded by the\n"
+        "       tokenizer and do not become runtime operations.\n"
         "\n"
         "    2. IMPORT RESOLUTION\n"
         "       'import' and 'cimport' directives are resolved\n"
@@ -11832,8 +12400,17 @@ def _run_docs_tui(
         "\n"
         "    5. NASM + LINKER\n"
         "       The assembly is assembled by NASM into an object\n"
-        "       file, then linked (via ld or ld.ldd) into the final\n"
+        "       file, then linked (via ld or ld.lld) into the final\n"
         "       binary.\n"
+        "\n"
+        "  CONFORMANCE NOTES\n"
+        "\n"
+        "    - A program is considered conforming when accepted by\n"
+        "      the reference parser/preprocessor in this repository.\n"
+        "    - Runtime behavior is defined by emitted x86-64 code\n"
+        "      plus imported stdlib words.\n"
+        "    - If docs and implementation diverge, implementation\n"
+        "      behavior is authoritative until docs are updated.\n"
         "\n"
         "───────────────────────────────────────────────────────────────\n"
         "\n"
@@ -11887,7 +12464,7 @@ def _run_docs_tui(
         "        swap nip  -> drop\n"
         "\n"
         "    LOOP UNROLLING\n"
-        "      Small deterministic loops (e.g., '4 for ... next')\n"
+        "      Small deterministic loops (e.g., '4 for ... end')\n"
         "      are unrolled into straight-line code when the\n"
         "      iteration count is known at compile time.\n"
         "\n"
@@ -11957,6 +12534,12 @@ def _run_docs_tui(
         "    - The build cache tracks file mtimes and a hash of\n"
         "      compiler flags. CT side effects invalidate the\n"
         "      cache for that file.\n"
+        "\n"
+        "    - Unsafe and implementation-defined behavior is\n"
+        "      intentional: raw memory access, inline asm, syscalls,\n"
+        "      external calls, exact label layout, and optimization\n"
+        "      interactions are programmer-visible and may vary with\n"
+        "      flags and code shape.\n"
         "\n"
         "═══════════════════════════════════════════════════════════════\n"
     )
@@ -13088,6 +13671,7 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--no-loop-unroll", action="store_true", help="disable loop unrolling optimization")
     parser.add_argument("--no-auto-inline", action="store_true", help="disable auto-inlining of small asm bodies")
     parser.add_argument("--no-string-dedup", action="store_true", help="disable string literal deduplication in emitted data section")
+    parser.add_argument("--no-asm-opt", action="store_true", help="disable post-emission assembly optimization pass")
     parser.add_argument("-O0", dest="O0", action="store_true", help="disable all optimizations")
     parser.add_argument("-O2", dest="O2", action="store_true", help="fast mode: disable all optimizations and checks")
     parser.add_argument("-v", "--verbose", type=int, default=0, metavar="LEVEL", help="verbosity level (1=summary+timing, 2=per-function/DCE, 3=full debug, 4=optimization detail)")
@@ -13200,6 +13784,7 @@ def cli(argv: Sequence[str]) -> int:
         peephole_enabled = False
         loop_unroll_enabled = False
         auto_inline_enabled = False
+        asm_post_opt_enabled = False
         string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = False
         stack_check_enabled = False
@@ -13208,6 +13793,7 @@ def cli(argv: Sequence[str]) -> int:
         peephole_enabled = False
         loop_unroll_enabled = False
         auto_inline_enabled = not args.no_auto_inline
+        asm_post_opt_enabled = False
         string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = not args.no_extern_type_check
         stack_check_enabled = not args.no_stack_check
@@ -13216,6 +13802,7 @@ def cli(argv: Sequence[str]) -> int:
         peephole_enabled = not args.no_peephole
         loop_unroll_enabled = not args.no_loop_unroll
         auto_inline_enabled = not args.no_auto_inline
+        asm_post_opt_enabled = not args.no_asm_opt
         string_deduplication_enabled = not args.no_string_dedup
         extern_type_check_enabled = not args.no_extern_type_check
         stack_check_enabled = not args.no_stack_check
@@ -13356,6 +13943,7 @@ def cli(argv: Sequence[str]) -> int:
                 folding_enabled,
                 peephole_enabled,
                 auto_inline_enabled,
+                asm_post_opt_enabled,
                 string_deduplication_enabled,
                 entry_mode,
             )
@@ -13388,11 +13976,27 @@ def cli(argv: Sequence[str]) -> int:
                         folding_enabled,
                         peephole_enabled,
                         auto_inline_enabled,
+                        asm_post_opt_enabled,
                         string_deduplication_enabled,
                         entry_mode,
                     )
                 has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
                 cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
+
+            if asm_post_opt_enabled:
+                optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(asm_text)
+                if optimized_asm != asm_text:
+                    asm_text = optimized_asm
+                if verbosity >= 1:
+                    changed = sum(asm_opt_stats.values())
+                    print(f"[v1] asm post-opt: {changed} rewrite(s)")
+                if verbosity >= 2:
+                    for key in sorted(asm_opt_stats):
+                        if asm_opt_stats[key]:
+                            print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
+                if verbosity >= 4:
+                    for msg in asm_opt_pass_logs:
+                        print(f"[v4] asm post-opt {msg}")
 
         if cfg_output is not None:
             cfg_output.parent.mkdir(parents=True, exist_ok=True)

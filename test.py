@@ -622,6 +622,15 @@ class TestRunner:
         expected_clean = expected_text.rstrip("\n")
         if expected_clean == actual_clean:
             return "passed", "", None
+        if (
+            label == "compile"
+            and self.args.ct_run_main
+            and expected_clean
+            and actual_clean.endswith(expected_clean)
+        ):
+            # --ct-run-main may prepend program output to compile stdout.
+            # Treat expected compile text as authoritative suffix.
+            return "passed", "", None
         if self.args.update and create_on_update:
             write_text(expected_path, normalized_actual)
             return "updated", f"updated {expected_path.name}", None

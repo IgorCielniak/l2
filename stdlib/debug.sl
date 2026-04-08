@@ -64,6 +64,61 @@ word frdump
 	"]\n" write_buf
 end
 
+#exec_word_ptr [* | ptr] -> [*]
+:asm exec_word_ptr {
+	mov rax, [r12]
+	add r12, 8
+	lea rbx, [rel .ret]
+	push rbx
+	jmp rax
+.ret:
+}
+;
+
+#trace [* | ptr] -> [*]
+word trace
+	>r
+	depth >r
+
+	"trace before depth: " write_buf
+	r@ puti cr
+	"trace before elements:\n" write_buf
+	r@ dup 0 > if
+		dump
+	else
+		drop
+		"<empty>\n" write_buf
+	end
+
+	1 rpick exec_word_ptr
+
+	depth dup >r
+	"trace after depth: " write_buf
+	dup puti cr
+	"trace after elements:\n" write_buf
+	dup 0 > if
+		dump
+	else
+		drop
+		"<empty>\n" write_buf
+	end
+
+	r> r>
+	2dup -
+	"trace delta: " write_buf
+	dup 0 >= if
+		"+" write_buf
+	end
+	dup puti
+	" (before " write_buf
+	1 pick puti
+	", after " write_buf
+	2 pick puti
+	")\n" write_buf
+	drop drop drop
+	rdrop
+end
+
 #int3 [*] -> [*]
 :asm int3 {
 	int3

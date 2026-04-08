@@ -98,6 +98,17 @@
 }
 ;
 
+#depth [*] -> [* | n]
+:asm depth {
+    extern dstack_top
+    lea rax, [rel dstack_top]
+    sub rax, r12
+    shr rax, 3
+    sub r12, 8
+    mov [r12], rax
+}
+;
+
 #over [*, x1 | x2] -> [*, x1, x2 | x1]
 :asm over {
     mov rax, [r12 + 8]     ; get second item

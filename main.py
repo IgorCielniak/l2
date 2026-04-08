@@ -13,6 +13,7 @@ from __future__ import annotations
 import bisect
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 TYPE_CHECKING = False
@@ -291,7 +292,10 @@ class Reader:
             token_re = self._build_token_re()
             self._token_re = token_re
         # Pre-compute line start offsets for O(1) amortized line/column lookup
-        _line_starts = [0] + [m.end() for m in _RE_NEWLINE.finditer(source)]
+        _line_starts = [0]
+        _line_starts_append = _line_starts.append
+        for _m in _RE_NEWLINE.finditer(source):
+            _line_starts_append(_m.end())
         _n_lines = len(_line_starts)
         result: List[Token] = []
         _append = result.append
@@ -476,6 +480,32 @@ _PEEPHOLE_CANCEL_PAIRS = frozenset({
 })
 _PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
 _DEFAULT_CONTROL_WORDS = frozenset({"if", "else", "for", "while", "do"})
+
+_PARSE_PRIORITY_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "inline", "priority"})
+
+_PARSE_KW_LIST_BEGIN = 1
+_PARSE_KW_LIST_END = 2
+_PARSE_KW_WORD = 3
+_PARSE_KW_END = 4
+_PARSE_KW_ASM = 5
+_PARSE_KW_PY = 6
+_PARSE_KW_EXTERN = 7
+_PARSE_KW_PRIORITY = 8
+_PARSE_KW_RET = 9
+_PARSE_KW_BSS_LIST_BEGIN = 10
+
+_PARSE_KEYWORD_DISPATCH = {
+    "[": _PARSE_KW_LIST_BEGIN,
+    "]": _PARSE_KW_LIST_END,
+    "word": _PARSE_KW_WORD,
+    "end": _PARSE_KW_END,
+    ":asm": _PARSE_KW_ASM,
+    ":py": _PARSE_KW_PY,
+    "extern": _PARSE_KW_EXTERN,
+    "priority": _PARSE_KW_PRIORITY,
+    "ret": _PARSE_KW_RET,
+    "{": _PARSE_KW_BSS_LIST_BEGIN,
+}
 
 
 class Op:
@@ -1093,38 +1123,34 @@ class Parser:
         self._pending_inline_definition = False
         self._pending_priority = None
 
-        _priority_keywords = {
-            "word", ":asm", ":py", "extern", "inline", "priority",
-        }
-
-        # Sentinel values for dispatch actions
-        _KW_LIST_BEGIN = 1
-        _KW_LIST_END = 2
-        _KW_WORD = 3
-        _KW_END = 4
-        _KW_ASM = 5
-        _KW_PY = 6
-        _KW_EXTERN = 7
-        _KW_PRIORITY = 8
-        _KW_RET = 9
-        _KW_BSS_LIST_BEGIN = 10
-        _keyword_dispatch = {
-            "[": _KW_LIST_BEGIN, "]": _KW_LIST_END, "word": _KW_WORD,
-            "end": _KW_END, ":asm": _KW_ASM, ":py": _KW_PY,
-            "extern": _KW_EXTERN, "priority": _KW_PRIORITY, "ret": _KW_RET,
-            "{": _KW_BSS_LIST_BEGIN,
-        }
-        _kw_get = _keyword_dispatch.get
+        _priority_keywords = _PARSE_PRIORITY_KEYWORDS
+        _kw_get = _PARSE_KEYWORD_DISPATCH.get
         _tokens = self.tokens
+        _run_token_hook = self._run_token_hook
+        _handle_macro_recording = self._handle_macro_recording
+        _handle_list_begin = self._handle_list_begin
+        _handle_list_end = self._handle_list_end
+        _consume_pending_inline = self._consume_pending_inline
+        _begin_definition = self._begin_definition
+        _handle_flexible_end = self._handle_flexible_end
+        _try_end_definition = self._try_end_definition
+        _parse_asm_definition = self._parse_asm_definition
+        _parse_py_definition = self._parse_py_definition
+        _parse_extern = self._parse_extern
+        _parse_priority_directive = self._parse_priority_directive
+        _handle_ret = self._handle_ret
+        _parse_bss_list_literal = self._parse_bss_list_literal
+        _try_handle_builtin_control = self._try_handle_builtin_control
+        _handle_token = self._handle_token
         try:
             while self.pos < len(_tokens):
               try:
                 token = _tokens[self.pos]
                 self.pos += 1
                 self._last_token = token
-                if self.token_hook and self._run_token_hook(token):
+                if self.token_hook and _run_token_hook(token):
                     continue
-                if self._handle_macro_recording(token):
+                if _handle_macro_recording(token):
                     continue
                 lexeme = token.lexeme
                 if self._pending_priority is not None and lexeme not in _priority_keywords:
@@ -1133,38 +1159,38 @@ class Parser:
                     )
                 kw = _kw_get(lexeme)
                 if kw is not None:
-                    if kw == _KW_LIST_BEGIN:
-                        self._handle_list_begin()
-                    elif kw == _KW_LIST_END:
-                        self._handle_list_end(token)
-                    elif kw == _KW_WORD:
-                        inline_def = self._consume_pending_inline()
-                        self._begin_definition(token, terminator="end", inline=inline_def)
-                    elif kw == _KW_END:
+                    if kw == _PARSE_KW_LIST_BEGIN:
+                        _handle_list_begin()
+                    elif kw == _PARSE_KW_LIST_END:
+                        _handle_list_end(token)
+                    elif kw == _PARSE_KW_WORD:
+                        inline_def = _consume_pending_inline()
+                        _begin_definition(token, terminator="end", inline=inline_def)
+                    elif kw == _PARSE_KW_END:
                         if self.control_stack:
-                            self._handle_flexible_end(token)
-                        elif self._try_end_definition(token):
+                            _handle_flexible_end(token)
+                        elif _try_end_definition(token):
                             pass
                         else:
                             raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
-                    elif kw == _KW_ASM:
-                        self._parse_asm_definition(token)
+                    elif kw == _PARSE_KW_ASM:
+                        _parse_asm_definition(token)
                         _tokens = self.tokens
-                    elif kw == _KW_PY:
-                        self._parse_py_definition(token)
+                    elif kw == _PARSE_KW_PY:
+                        _parse_py_definition(token)
                         _tokens = self.tokens
-                    elif kw == _KW_EXTERN:
-                        self._parse_extern(token)
-                    elif kw == _KW_PRIORITY:
-                        self._parse_priority_directive(token)
-                    elif kw == _KW_RET:
-                        self._handle_ret(token)
-                    elif kw == _KW_BSS_LIST_BEGIN:
-                        self._parse_bss_list_literal(token)
+                    elif kw == _PARSE_KW_EXTERN:
+                        _parse_extern(token)
+                    elif kw == _PARSE_KW_PRIORITY:
+                        _parse_priority_directive(token)
+                    elif kw == _PARSE_KW_RET:
+                        _handle_ret(token)
+                    elif kw == _PARSE_KW_BSS_LIST_BEGIN:
+                        _parse_bss_list_literal(token)
                     continue
-                if self._try_handle_builtin_control(token):
+                if _try_handle_builtin_control(token):
                     continue
-                if self._handle_token(token):
+                if _handle_token(token):
                     _tokens = self.tokens
               except CompileTimeError:
                 raise
@@ -1602,30 +1628,38 @@ class Parser:
     def _handle_token(self, token: Token) -> bool:
         """Handle a token. Returns True if the token list was modified (macro expansion)."""
         lexeme = token.lexeme
+        lexeme_len = len(lexeme)
         first = lexeme[0]
+        _append_op = self._append_op
+        _try_literal = self._try_literal
+        words = self.dictionary.words
         # Fast-path: inline integer literal parse (most common literal type)
-        if first.isdigit() or first == '-' or first == '+':
+        if first.isdigit() or (
+            (first == '-' or first == '+')
+            and lexeme_len > 1
+            and (lexeme[1].isdigit() or (lexeme_len > 2 and lexeme[1] == '0' and lexeme[2] in 'xXoObB'))
+        ):
             try:
                 value = int(lexeme, 0)
-                self._append_op(_make_literal_op(value))
+                _append_op(_make_literal_op(value))
                 return False
             except ValueError:
                 pass
             # Fall through to float/string check
-            if self._try_literal(token):
+            if _try_literal(token):
                 return False
         elif first == '"' or first == '.' or first == "'":
-            if self._try_literal(token):
+            if _try_literal(token):
                 return False
 
         if first == '&':
             target_name = lexeme[1:]
             if not target_name:
                 raise ParseError(f"missing word name after '&' at {token.line}:{token.column}")
-            self._append_op(_make_op("word_ptr", target_name))
+            _append_op(_make_op("word_ptr", target_name))
             return False
 
-        word = self.dictionary.words.get(lexeme)
+        word = words.get(lexeme)
         if word is not None:
             if word.macro_expansion is not None:
                 args = self._collect_macro_args(word.macro_params, word_name=word.name, call_token=token)
@@ -1636,12 +1670,12 @@ class Parser:
                     produced = word.macro(MacroContext(self))
                     if produced:
                         for node in produced:
-                            self._append_op(node)
+                            _append_op(node)
                 else:
                     self._execute_immediate_word(word)
                 return False
 
-        self._append_op(_make_word_op(lexeme))
+        _append_op(_make_word_op(lexeme))
         return False
 
     def _execute_immediate_word(self, word: Word) -> None:
@@ -2414,6 +2448,10 @@ class CompileTimeVM:
 
             # BSS symbol table for JIT [rel SYMBOL] patching
             self._bss_symbols = {
+                "dstack": ctypes.addressof(self._native_data_stack),
+                "dstack_top": self._native_data_top,
+                "rstack": ctypes.addressof(self._native_return_stack),
+                "rstack_top": self._native_return_top,
                 "data_start": self.memory.data_start,
                 "data_end": self.memory.data_start + self.memory._data_offset if self.memory._data_offset else self.memory.data_end,
                 "print_buf": self.memory.print_buf_addr,
@@ -2492,6 +2530,10 @@ class CompileTimeVM:
             self.r13 = self._native_return_top
 
             self._bss_symbols = {
+                "dstack": ctypes.addressof(self._native_data_stack),
+                "dstack_top": self._native_data_top,
+                "rstack": ctypes.addressof(self._native_return_stack),
+                "rstack_top": self._native_return_top,
                 "data_start": self.memory.data_start,
                 "data_end": self.memory.data_start + self.memory._data_offset if self.memory._data_offset else self.memory.data_end,
                 "print_buf": self.memory.print_buf_addr,
@@ -4640,6 +4682,15 @@ _ASM_LABEL_ONLY_RE = re.compile(r"^\s*([A-Za-z0-9_.$@]+):\s*$")
 _ASM_GLOBAL_RE = re.compile(r"^\s*global\s+([A-Za-z0-9_.$@]+)\s*$", re.IGNORECASE)
 _ASM_JUMP_RE = re.compile(r"^j([a-z]+)$", re.IGNORECASE)
 _ASM_LABEL_NAME_RE = re.compile(r"^[A-Za-z0-9_.$@]+$")
+_ASM_LEA_SELF_RE = re.compile(r"^\[\s*([A-Za-z0-9_.$@]+)\s*\]$")
+_ASM_REL_LABEL_REF_RE = re.compile(r"(?:\brel\s+|\brip\s*\+\s*)([A-Za-z0-9_.$@]+)", re.IGNORECASE)
+_ASM_INVERT_JCC: Dict[str, str] = {
+    "je": "jne", "jne": "je", "jz": "jnz", "jnz": "jz",
+    "jg": "jle", "jge": "jl", "jl": "jge", "jle": "jg",
+    "ja": "jbe", "jae": "jb", "jb": "jae", "jbe": "ja",
+    "jo": "jno", "jno": "jo", "js": "jns", "jns": "js",
+    "jp": "jnp", "jnp": "jp",
+}
 
 
 def _split_asm_comment(line: str) -> Tuple[str, str]:
@@ -4679,19 +4730,51 @@ def _render_instruction(mnemonic: str, operands: Sequence[str], original: str) -
 
 
 def _invert_jcc(mnemonic: str) -> Optional[str]:
-    inv: Dict[str, str] = {
-        "je": "jne", "jne": "je", "jz": "jnz", "jnz": "jz",
-        "jg": "jle", "jge": "jl", "jl": "jge", "jle": "jg",
-        "ja": "jbe", "jae": "jb", "jb": "jae", "jbe": "ja",
-        "jo": "jno", "jno": "jo", "js": "jns", "jns": "js",
-        "jp": "jnp", "jnp": "jp",
-    }
-    return inv.get(mnemonic.lower())
+    return _ASM_INVERT_JCC.get(mnemonic.lower())
 
 
-def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[str]]:
+def optimize_emitted_asm_text(
+    asm_text: str,
+    *,
+    collect_pass_logs: bool = False,
+) -> Tuple[str, Dict[str, int], List[str]]:
     """Run an extensive but conservative post-emission optimization pass."""
     lines = asm_text.splitlines()
+    _PARSE_SENTINEL = object()
+    _parse_cache: Dict[str, object] = {}
+    _is_code_cache: Dict[str, bool] = {}
+    _label_only_cache: Dict[str, object] = {}
+
+    def _parse_cached(line: str) -> Optional[Tuple[str, List[str]]]:
+        cached = _parse_cache.get(line, _PARSE_SENTINEL)
+        if cached is _PARSE_SENTINEL:
+            parsed = _parse_asm_instruction(line)
+            _parse_cache[line] = parsed if parsed is not None else None
+            return parsed
+        return cached if cached is not None else None
+
+    def _is_code_line(line: str) -> bool:
+        cached = _is_code_cache.get(line)
+        if cached is not None:
+            return cached
+        s = line.lstrip()
+        is_code = bool(s and not s.startswith(";"))
+        _is_code_cache[line] = is_code
+        return is_code
+
+    def _label_only(line: str) -> Optional[str]:
+        cached = _label_only_cache.get(line, _PARSE_SENTINEL)
+        if cached is _PARSE_SENTINEL:
+            s = line.strip()
+            label: Optional[str] = None
+            if s.endswith(":"):
+                candidate = s[:-1]
+                if _ASM_LABEL_NAME_RE.match(candidate):
+                    label = candidate
+            _label_only_cache[line] = label if label is not None else None
+            return label
+        return cached if cached is not None else None
+
     stats: Dict[str, int] = {
         "removed_nops": 0,
         "removed_self_moves": 0,
@@ -4708,8 +4791,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
     def _next_code_index(arr: Sequence[str], i: int) -> int:
         j = i
         while j < len(arr):
-            s = arr[j].strip()
-            if s and not s.startswith(";"):
+            if _is_code_line(arr[j]):
                 return j
             j += 1
         return -1
@@ -4717,9 +4799,9 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
     def _collect_label_positions(arr: Sequence[str]) -> Dict[str, int]:
         pos: Dict[str, int] = {}
         for idx, ln in enumerate(arr):
-            m = _ASM_LABEL_ONLY_RE.match(ln.strip())
-            if m is not None:
-                pos[m.group(1)] = idx
+            label = _label_only(ln)
+            if label is not None:
+                pos[label] = idx
         return pos
 
     def _resolve_jmp_chain(target: str, arr: Sequence[str], lbl_pos: Dict[str, int]) -> str:
@@ -4733,7 +4815,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
             nxt = _next_code_index(arr, idx + 1)
             if nxt < 0:
                 return cur
-            parsed = _parse_asm_instruction(arr[nxt])
+            parsed = _parse_cached(arr[nxt])
             if parsed is None:
                 return cur
             mnem, ops = parsed
@@ -4745,6 +4827,8 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
     pass_logs: List[str] = []
 
     def _record_pass(round_no: int, pass_name: str, before: Dict[str, int], after: Dict[str, int]) -> None:
+        if not collect_pass_logs:
+            return
         delta_parts: List[str] = []
         for key in sorted(after):
             delta = after[key] - before.get(key, 0)
@@ -4765,7 +4849,10 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         _before_a = dict(stats)
         stage_a: List[str] = []
         for ln in lines:
-            parsed = _parse_asm_instruction(ln)
+            if not _is_code_line(ln):
+                stage_a.append(ln)
+                continue
+            parsed = _parse_cached(ln)
             if parsed is None:
                 stage_a.append(ln)
                 continue
@@ -4779,7 +4866,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
                 changed = True
                 continue
             if mnem == "lea" and len(ops) == 2:
-                m_lea = re.match(r"^\[\s*([A-Za-z0-9_.$@]+)\s*\]$", ops[1])
+                m_lea = _ASM_LEA_SELF_RE.match(ops[1])
                 if m_lea is not None and m_lea.group(1) == ops[0]:
                     stats["removed_self_moves"] += 1
                     changed = True
@@ -4800,7 +4887,9 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         _before_b = dict(stats)
         lbl_pos = _collect_label_positions(lines)
         for i, ln in enumerate(list(lines)):
-            parsed = _parse_asm_instruction(ln)
+            if not _is_code_line(ln):
+                continue
+            parsed = _parse_cached(ln)
             if parsed is None:
                 continue
             mnem, ops = parsed
@@ -4817,8 +4906,8 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
                 if mnem == "jmp":
                     j = _next_code_index(lines, i + 1)
                     if j >= 0:
-                        m_lbl = _ASM_LABEL_ONLY_RE.match(lines[j].strip())
-                        if m_lbl is not None and m_lbl.group(1) == new_target:
+                        label = _label_only(lines[j])
+                        if label is not None and label == new_target:
                             lines[i] = ""
                             stats["removed_jump_to_next_label"] += 1
                             changed = True
@@ -4829,12 +4918,9 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         stage_c: List[str] = []
         unreachable = False
         for ln in lines:
-            stripped = ln.strip()
-            if stripped:
-                m_lbl = _ASM_LABEL_ONLY_RE.match(stripped)
-                if m_lbl is not None:
-                    unreachable = False
-            parsed = _parse_asm_instruction(ln)
+            if _label_only(ln) is not None:
+                unreachable = False
+            parsed = _parse_cached(ln)
             if unreachable and parsed is not None:
                 stage_c.append("")
                 stats["removed_unreachable_after_terminator"] += 1
@@ -4852,7 +4938,10 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         _before_d = dict(stats)
         i = 0
         while i < len(lines):
-            parsed = _parse_asm_instruction(lines[i])
+            if not _is_code_line(lines[i]):
+                i += 1
+                continue
+            parsed = _parse_cached(lines[i])
             if parsed is None:
                 i += 1
                 continue
@@ -4865,7 +4954,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
             if j < 0:
                 i += 1
                 continue
-            parsed_j = _parse_asm_instruction(lines[j])
+            parsed_j = _parse_cached(lines[j])
             if parsed_j is None or parsed_j[0] != "jmp" or len(parsed_j[1]) != 1:
                 i += 1
                 continue
@@ -4873,8 +4962,8 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
             if k < 0:
                 i += 1
                 continue
-            m_lbl = _ASM_LABEL_ONLY_RE.match(lines[k].strip())
-            if m_lbl is None or m_lbl.group(1) != ops[0]:
+            label = _label_only(lines[k])
+            if label is None or label != ops[0]:
                 i += 1
                 continue
 
@@ -4888,22 +4977,48 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         # Pass E: collapse duplicate adjacent labels and retarget branches.
         _before_e = dict(stats)
         alias: Dict[str, str] = {}
+        _fast_ref_counts: Dict[str, int] = {}
+        for _ln in lines:
+            _parsed = _parse_cached(_ln)
+            if _parsed is None:
+                continue
+            _mnem, _ops = _parsed
+            for _op in _ops:
+                if _ASM_LABEL_NAME_RE.match(_op):
+                    _fast_ref_counts[_op] = _fast_ref_counts.get(_op, 0) + 1
+                else:
+                    for _mref in _ASM_REL_LABEL_REF_RE.finditer(_op):
+                        _lbl = _mref.group(1)
+                        _fast_ref_counts[_lbl] = _fast_ref_counts.get(_lbl, 0) + 1
+        _ref_memo: Dict[str, bool] = {}
+        _label_ref_pat_cache: Dict[str, re.Pattern[str]] = {}
 
         def _label_is_referenced(label: str, arr: Sequence[str], def_idx: int) -> bool:
-            pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
+            cached = _ref_memo.get(label)
+            if cached is not None:
+                return cached
+            if _fast_ref_counts.get(label, 0) > 0:
+                _ref_memo[label] = True
+                return True
+            pat = _label_ref_pat_cache.get(label)
+            if pat is None:
+                pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
+                _label_ref_pat_cache[label] = pat
             for li, ltxt in enumerate(arr):
                 if li == def_idx:
                     continue
                 if not ltxt.strip():
                     continue
                 if pat.search(ltxt):
+                    _ref_memo[label] = True
                     return True
+            _ref_memo[label] = False
             return False
 
         i = 0
         while i < len(lines):
-            m1 = _ASM_LABEL_ONLY_RE.match(lines[i].strip()) if lines[i].strip() else None
-            if m1 is None:
+            src_label = _label_only(lines[i])
+            if src_label is None:
                 i += 1
                 continue
             j = i + 1
@@ -4912,12 +5027,10 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
                 if not sj or sj.startswith(";"):
                     j += 1
                     continue
-                m2 = _ASM_LABEL_ONLY_RE.match(sj)
-                if m2 is not None:
-                    src_lbl = m1.group(1)
-                    dst_lbl = m2.group(1)
-                    if not _label_is_referenced(src_lbl, lines, i):
-                        alias[src_lbl] = dst_lbl
+                dst_label = _label_only(lines[j])
+                if dst_label is not None:
+                    if not _label_is_referenced(src_label, lines, i):
+                        alias[src_label] = dst_label
                         lines[i] = ""
                         stats["removed_redundant_labels"] += 1
                         changed = True
@@ -4934,7 +5047,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
                 return cur
 
             for idx, ln in enumerate(lines):
-                parsed = _parse_asm_instruction(ln)
+                parsed = _parse_cached(ln)
                 if parsed is None:
                     continue
                 mnem, ops = parsed
@@ -4949,7 +5062,9 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
         # Pass F: collapse back-to-back unconditional jumps.
         _before_f = dict(stats)
         for idx, ln in enumerate(lines):
-            parsed = _parse_asm_instruction(ln)
+            if not _is_code_line(ln):
+                continue
+            parsed = _parse_cached(ln)
             if parsed is None:
                 continue
             mnem, _ops = parsed
@@ -4957,7 +5072,7 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
                 continue
             nxt = _next_code_index(lines, idx + 1)
             if nxt >= 0:
-                p2 = _parse_asm_instruction(lines[nxt])
+                p2 = _parse_cached(lines[nxt])
                 if p2 is not None and p2[0] == "jmp":
                     lines[idx] = ""
                     stats["collapsed_redundant_jumps"] += 1
@@ -4980,7 +5095,8 @@ def optimize_emitted_asm_text(asm_text: str) -> Tuple[str, Dict[str, int], List[
             blank_run = 0
         optimized.append(ln)
 
-    pass_logs.append(f"rounds_run={rounds_run}")
+    if collect_pass_logs:
+        pass_logs.append(f"rounds_run={rounds_run}")
 
     return "\n".join(optimized), stats, pass_logs
 
@@ -6804,7 +6920,7 @@ class Assembler:
             # stub now (after definitions) so the emitter does not
             # produce duplicate `_start` labels.
             if is_program and not (user_has_start or getattr(self, "_emitted_start", False)):
-                _start_lines = [
+                emission.text.extend([
                     "; __ORIGIN__ default_stub",
                     "global _start",
                     "_start:",
@@ -6815,22 +6931,19 @@ class Assembler:
                     "    mov [rel sys_argv], rsi",
                     "    ; initialize data/return stack pointers",
                     "    lea r12, [rel dstack_top]",
-                    "    mov r15, r12",
                     "    lea r13, [rel rstack_top]",
                     f"    call {sanitize_label('main')}",
                     "    mov rax, 0",
-                    "    cmp r12, r15",
+                    "    lea rcx, [rel dstack_top]",
+                    "    cmp r12, rcx",
                     "    je .no_exit_value",
                     "    mov rax, [r12]",
                     "    add r12, 8",
                     ".no_exit_value:",
-                ]
-                _start_lines.extend([
                     "    mov rdi, rax",
                     "    mov rax, 60",
                     "    syscall",
                 ])
-                emission.text.extend(_start_lines)
 
             self._emit_variables(module.variables)
 
@@ -8590,8 +8703,7 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    push r12",
         "    push r13",
         "    push r14",
-        "    push r15",
-        "    sub rsp, 16",
+        "    sub rsp, 24",
         "    mov [rsp], rdx",        # save output-struct pointer
         "    mov r12, rdi",          # data stack
         "    mov r13, rsi",          # return stack
@@ -8610,12 +8722,10 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    jle _count_clamped",
         "    mov rcx, 6",
         "_count_clamped:",
-        # Save syscall num in r15
-        "    mov r15, rax",
         # Check for exit (60) / exit_group (231)
-        "    cmp r15, 60",
+        "    cmp rax, 60",
         "    je _do_exit",
-        "    cmp r15, 231",
+        "    cmp rax, 231",
         "    je _do_exit",
         # Clear syscall arg registers
         "    xor rdi, rdi",
@@ -8655,7 +8765,6 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    mov rdi, [r12]",
         "    add r12, 8",
         "_skip_rdi:",
-        "    mov rax, r15",          # syscall number
         "    syscall",
         # Push result
         "    sub r12, 8",
@@ -8681,8 +8790,7 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    mov qword [rax+16], 1", # exit_flag = 1
         "    mov [rax+24], rbx",     # exit_code
         "_stub_epilogue:",
-        "    add rsp, 16",
-        "    pop r15",
+        "    add rsp, 24",
         "    pop r14",
         "    pop r13",
         "    pop r12",
@@ -9202,8 +9310,7 @@ def _extract_struct_fields(body: str) -> List[Tuple[str, str]]:
         if not field_name or not re.match(r"^[A-Za-z_]\w*$", field_name):
             continue
         # Check if pointer
-        is_ptr = "*" in decl
-        if is_ptr:
+        if "*" in decl:
             fields.append((field_name, "ptr"))
             continue
         # Build type from all tokens except field name
@@ -9246,6 +9353,90 @@ class Compiler:
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
         self._loaded_files: Set[Path] = set()
         self.defines: Set[str] = set(defines or [])
+        self._last_loaded_path: Optional[Path] = None
+        self._last_loaded_source: Optional[str] = None
+        self._last_loaded_spans: Optional[List[FileSpan]] = None
+        # Populated from source-level `flags ...` pragmas while loading files.
+        self.source_link_flags: List[str] = []
+        self.source_include_paths: List[Path] = []
+        self.source_cli_flags: List[str] = []
+
+    def _reset_source_flag_state(self) -> None:
+        self.source_link_flags.clear()
+        self.source_include_paths.clear()
+        self.source_cli_flags.clear()
+
+    def _load_source_graph(self, path: Path) -> Tuple[str, List[FileSpan]]:
+        resolved = path.resolve()
+        source, spans = self._load_with_imports(resolved)
+        self._last_loaded_path = resolved
+        self._last_loaded_source = source
+        self._last_loaded_spans = spans
+        return source, spans
+
+    def _record_source_link_flag(self, flag: str) -> None:
+        if flag and flag not in self.source_link_flags:
+            self.source_link_flags.append(flag)
+
+    def _record_source_cli_flag(self, flag: str) -> None:
+        if flag:
+            self.source_cli_flags.append(flag)
+
+    def _add_source_include_path(self, raw_path: str, *, base_path: Path) -> None:
+        include_path = Path(raw_path).expanduser()
+        if not include_path.is_absolute():
+            include_path = (base_path.parent / include_path).resolve()
+        else:
+            include_path = include_path.resolve()
+        if include_path not in self.include_paths:
+            self.include_paths.append(include_path)
+            # Resolution depends on include paths; invalidate old resolutions.
+            self._import_resolve_cache.clear()
+        if include_path not in self.source_include_paths:
+            self.source_include_paths.append(include_path)
+
+    def _apply_flags_directive(self, payload: str, *, path: Path, line_no: int) -> None:
+        text = payload.strip()
+        if not text:
+            raise ParseError(f"flags directive missing arguments at {path}:{line_no}")
+        try:
+            tokens = shlex.split(text, posix=True)
+        except ValueError as exc:
+            raise ParseError(f"invalid flags directive at {path}:{line_no}: {exc}") from exc
+
+        # Allow a quoted shell-style bundle like: flags "-lc -lm -L. -I."
+        if len(tokens) == 1 and re.search(r"\s-[A-Za-z]", tokens[0]):
+            try:
+                tokens = shlex.split(tokens[0], posix=True)
+            except ValueError as exc:
+                raise ParseError(f"invalid flags directive at {path}:{line_no}: {exc}") from exc
+
+        if not tokens:
+            raise ParseError(f"flags directive missing arguments at {path}:{line_no}")
+
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("-I", "--include"):
+                i += 1
+                if i >= len(tokens):
+                    raise ParseError(f"{tok} requires a path in flags directive at {path}:{line_no}")
+                self._add_source_include_path(tokens[i], base_path=path)
+                i += 1
+                continue
+            if tok.startswith("-I") and len(tok) > 2:
+                self._add_source_include_path(tok[2:], base_path=path)
+                i += 1
+                continue
+            if tok.startswith("--include="):
+                self._add_source_include_path(tok.split("=", 1)[1], base_path=path)
+                i += 1
+                continue
+
+            # Everything else is treated as a linker/runtime flag token.
+            self._record_source_link_flag(tok)
+            self._record_source_cli_flag(tok)
+            i += 1
 
     def compile_source(
         self,
@@ -9262,14 +9453,31 @@ class Compiler:
 
     def parse_file(self, path: Path) -> None:
         """Parse a source file to populate the dictionary without emitting assembly."""
-        source, spans = self._load_with_imports(path.resolve())
+        self._reset_source_flag_state()
+        source, spans = self._load_source_graph(path)
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         self.parser.parse(tokens, source)
 
     def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
-        source, spans = self._load_with_imports(path.resolve())
+        self._reset_source_flag_state()
+        source, spans = self._load_source_graph(path)
         return self.compile_source(source, spans=spans, debug=debug, entry_mode=entry_mode)
+
+    def collect_source_flags(self, path: Path) -> None:
+        """Load source/import graph only to collect source-level pragma flags."""
+        self._reset_source_flag_state()
+        self._load_source_graph(path)
+
+    def compile_preloaded(self, *, debug: bool = False, entry_mode: str = "program") -> Emission:
+        if self._last_loaded_source is None or self._last_loaded_spans is None:
+            raise CompileError("no preloaded source available")
+        return self.compile_source(
+            self._last_loaded_source,
+            spans=self._last_loaded_spans,
+            debug=debug,
+            entry_mode=entry_mode,
+        )
 
     def run_compile_time_word(self, name: str, *, libs: Optional[List[str]] = None) -> None:
         word = self.dictionary.lookup(name)
@@ -9290,9 +9498,16 @@ class Compiler:
     _import_resolve_cache: Dict[Tuple[Path, str], Path] = {}
 
     @staticmethod
-    def _parse_directive_target_and_rest(line: str, keyword: str, *, path: Path, line_no: int) -> Optional[Tuple[str, str]]:
+    def _parse_directive_target_and_rest(
+        line: str,
+        keyword: str,
+        *,
+        path: Path,
+        line_no: int,
+        line_already_lstripped: bool = False,
+    ) -> Optional[Tuple[str, str]]:
         """Parse `<keyword> <target> [remainder]` where target may be quoted."""
-        text = line.lstrip()
+        text = line if line_already_lstripped else line.lstrip()
         if not text.startswith(keyword):
             return None
         if len(text) > len(keyword) and not text[len(keyword)].isspace():
@@ -9507,6 +9722,32 @@ class Compiler:
         except FileNotFoundError as exc:
             raise ParseError(f"cannot import {path}: {exc}") from exc
 
+        # Fast path for files without preprocessor/import directives.
+        # This avoids line-by-line scanning for the common plain-source case.
+        if (
+            "import" not in contents
+            and "define" not in contents
+            and "ifdef" not in contents
+            and "ifndef" not in contents
+            and "elsedef" not in contents
+            and "endif" not in contents
+            and "flags" not in contents
+            and ":py" not in contents
+        ):
+            lines = contents.splitlines()
+            if lines:
+                start_line = len(out_lines) + 1
+                out_lines.extend(lines)
+                spans.append(
+                    FileSpan(
+                        path=path,
+                        start_line=start_line,
+                        end_line=len(out_lines) + 1,
+                        local_start_line=1,
+                    )
+                )
+            return
+
         in_py_block = False
         brace_depth = 0
         string_char = None
@@ -9522,19 +9763,32 @@ class Compiler:
         # ifdef/ifndef/else/endif conditional compilation stack
         # Each entry is True (include lines) or False (skip lines)
         _ifdef_stack: List[bool] = []
-
-        def _ifdef_active() -> bool:
-            return all(_ifdef_stack)
+        _ifdef_inactive = 0
 
         for line in contents.splitlines():
-            stripped = line.strip()
+            lstripped = line.lstrip()
+            # Hot path: ordinary source line with no directive prefix.
+            if not in_py_block and _ifdef_inactive == 0:
+                lead = lstripped[:1]
+                if lead not in ("i", "c", "d", "f", "e", ":"):
+                    if segment_start_global is None:
+                        segment_start_global = len(out_lines) + 1
+                        segment_start_local = file_line_no
+                    _out_append(line)
+                    file_line_no += 1
+                    continue
+
+            stripped = lstripped.rstrip()
 
             # --- Conditional compilation directives ---
             if stripped[:6] == "ifdef " or stripped == "ifdef":
                 name = stripped[6:].strip() if len(stripped) > 6 else ""
                 if not name:
                     raise ParseError(f"ifdef missing symbol name at {path}:{file_line_no}")
-                _ifdef_stack.append(name in self.defines if _ifdef_active() else False)
+                branch_active = name in self.defines if _ifdef_inactive == 0 else False
+                _ifdef_stack.append(branch_active)
+                if not branch_active:
+                    _ifdef_inactive += 1
                 _out_append("")  # placeholder to keep line numbers aligned
                 file_line_no += 1
                 continue
@@ -9542,27 +9796,38 @@ class Compiler:
                 name = stripped[7:].strip() if len(stripped) > 7 else ""
                 if not name:
                     raise ParseError(f"ifndef missing symbol name at {path}:{file_line_no}")
-                _ifdef_stack.append(name not in self.defines if _ifdef_active() else False)
+                branch_active = name not in self.defines if _ifdef_inactive == 0 else False
+                _ifdef_stack.append(branch_active)
+                if not branch_active:
+                    _ifdef_inactive += 1
                 _out_append("")
                 file_line_no += 1
                 continue
             if stripped == "elsedef":
                 if not _ifdef_stack:
                     raise ParseError(f"elsedef without matching ifdef/ifndef at {path}:{file_line_no}")
-                _ifdef_stack[-1] = not _ifdef_stack[-1]
+                was_active = _ifdef_stack[-1]
+                now_active = not was_active
+                _ifdef_stack[-1] = now_active
+                if was_active and not now_active:
+                    _ifdef_inactive += 1
+                elif (not was_active) and now_active:
+                    _ifdef_inactive -= 1
                 _out_append("")
                 file_line_no += 1
                 continue
             if stripped == "endif":
                 if not _ifdef_stack:
                     raise ParseError(f"endif without matching ifdef/ifndef at {path}:{file_line_no}")
-                _ifdef_stack.pop()
+                popped = _ifdef_stack.pop()
+                if not popped:
+                    _ifdef_inactive -= 1
                 _out_append("")
                 file_line_no += 1
                 continue
 
             # If inside a false ifdef branch, skip the line
-            if not _ifdef_active():
+            if _ifdef_inactive:
                 _out_append("")
                 file_line_no += 1
                 continue
@@ -9573,6 +9838,13 @@ class Compiler:
                     raise ParseError(f"define missing symbol name at {path}:{file_line_no}")
                 symbol_name = symbol.split(None, 1)[0]
                 self.defines.add(symbol_name)
+                _out_append("")
+                file_line_no += 1
+                continue
+
+            if lstripped.startswith("flags") and (len(lstripped) == 5 or lstripped[5].isspace()):
+                payload = lstripped[5:].strip()
+                self._apply_flags_directive(payload, path=path, line_no=file_line_no)
                 _out_append("")
                 file_line_no += 1
                 continue
@@ -9635,12 +9907,15 @@ class Compiler:
                     in_py_block = False
                 continue
 
-            parsed_import = self._parse_directive_target_and_rest(
-                line,
-                "import",
-                path=path,
-                line_no=file_line_no,
-            )
+            parsed_import = None
+            if lstripped.startswith("import"):
+                parsed_import = self._parse_directive_target_and_rest(
+                    lstripped,
+                    "import",
+                    path=path,
+                    line_no=file_line_no,
+                    line_already_lstripped=True,
+                )
             if parsed_import is not None:
                 target, remainder = parsed_import
 
@@ -9674,12 +9949,15 @@ class Compiler:
                     _out_append(remainder)
                 continue
 
-            parsed_cimport = self._parse_directive_target_and_rest(
-                line,
-                "cimport",
-                path=path,
-                line_no=file_line_no,
-            )
+            parsed_cimport = None
+            if lstripped.startswith("cimport"):
+                parsed_cimport = self._parse_directive_target_and_rest(
+                    lstripped,
+                    "cimport",
+                    path=path,
+                    line_no=file_line_no,
+                    line_already_lstripped=True,
+                )
             if parsed_cimport is not None:
                 header_target, remainder = parsed_cimport
                 # cimport "header.h" — extract extern declarations from a C header
@@ -11156,6 +11434,22 @@ def _run_docs_tui(
                 "  2. Relative to the importing file\n"
                 "  3. Each include path (defaults: project root, ./stdlib)\n\n"
                 "Each file is included at most once per compilation unit."
+            ),
+        },
+        {
+            "name": "flags",
+            "category": "Modules",
+            "syntax": "flags <token...> | flags \"<token...>\"",
+            "summary": "Provide linker/include flags from source.",
+            "detail": (
+                "Processed during source loading before tokenization. "
+                "Supports shell-like token splitting. "
+                "`-I`/`--include` update import search paths (relative to the "
+                "current file when not absolute). Other tokens are forwarded "
+                "as linker/runtime library flags.\n\n"
+                "Examples:\n"
+                "  flags -lc -lm -L. -I.\n"
+                "  flags \"-lc -lm -L. -I.\""
             ),
         },
         {
@@ -13754,19 +14048,37 @@ def cli(argv: Sequence[str]) -> int:
         help="treat all warnings as errors",
     )
 
+    def _consume_unknown_link_tokens(raw_tokens: Sequence[str], *, strict_long_opts: bool) -> List[str]:
+        """Parse unknown args as linker/library-style tokens."""
+        out: List[str] = []
+        i = 0
+        while i < len(raw_tokens):
+            tok = raw_tokens[i]
+            if tok in ("-l", "-L"):
+                if i + 1 >= len(raw_tokens):
+                    parser.error(f"{tok} requires a value")
+                out.append(f"{tok}{raw_tokens[i + 1]}")
+                i += 2
+                continue
+            if tok.startswith(("-l", "-L", "-Wl,")):
+                out.append(tok)
+                i += 1
+                continue
+            if tok.startswith("--"):
+                if strict_long_opts:
+                    parser.error(f"unknown option in flags pragma: {tok}")
+                i += 1
+                continue
+            # Single-dash passthrough or raw library/path token.
+            out.append(tok)
+            i += 1
+        return out
+
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
-    # Collect any -l flags from unknown args (e.g. -lfoo or -l foo)
-    i = 0
-    while i < len(unknown):
-        if unknown[i] == "-l" and i + 1 < len(unknown):
-            args.libs.append(unknown[i + 1])
-            i += 2
-        elif unknown[i].startswith("-l"):
-            args.libs.append(unknown[i][2:])
-            i += 1
-        else:
-            i += 1
+    for lib_tok in _consume_unknown_link_tokens(unknown, strict_long_opts=False):
+        if lib_tok not in args.libs:
+            args.libs.append(lib_tok)
 
     if args.script:
         args.no_artifact = True
@@ -13855,6 +14167,7 @@ def cli(argv: Sequence[str]) -> int:
         else:
             cfg_output = Path(args.dump_cfg)
 
+    output_was_auto = False
     if not args.repl and args.output is None and not args.no_artifact:
         stem = args.source.stem
         default_outputs = {
@@ -13864,29 +14177,10 @@ def cli(argv: Sequence[str]) -> int:
             "obj": Path(f"{stem}.o"),
         }
         args.output = default_outputs[artifact_kind]
+        output_was_auto = True
 
     if not args.repl and artifact_kind in {"static", "obj"} and args.libs:
         print("[warn] --libs ignored for static/object outputs")
-
-    ct_run_libs: List[str] = list(args.libs)
-    if args.source is not None:
-        for lib in _load_sidecar_meta_libs(args.source):
-            if lib not in args.libs:
-                args.libs.append(lib)
-            if lib not in ct_run_libs:
-                ct_run_libs.append(lib)
-
-    if args.ct_run_main and args.source is not None:
-        import subprocess
-        try:
-            ct_sidecar = _build_ct_sidecar_shared(args.source, args.temp_dir)
-        except subprocess.CalledProcessError as exc:
-            print(f"[error] failed to build compile-time sidecar library: {exc}")
-            return 1
-        if ct_sidecar is not None:
-            so_lib = str(ct_sidecar.resolve())
-            if so_lib not in ct_run_libs:
-                ct_run_libs.append(so_lib)
 
     compiler = Compiler(
         include_paths=[Path("."), Path("./stdlib"), *args.include_paths],
@@ -13932,6 +14226,194 @@ def cli(argv: Sequence[str]) -> int:
         if args.repl:
             return run_repl(compiler, args.temp_dir, args.libs, debug=args.debug, initial_source=args.source)
 
+        if args.source is not None:
+            # Two passes allow `flags -D ...` / `flags -I ...` to expose
+            # additional pragma-controlled sections/imports on the second pass.
+            for _ in range(2):
+                compiler.defines = set(args.defines)
+                compiler.collect_source_flags(args.source)
+                changed = False
+
+                for include_path in compiler.source_include_paths:
+                    if include_path not in args.include_paths:
+                        args.include_paths.append(include_path)
+                        changed = True
+
+                if compiler.source_cli_flags:
+                    probe_tokens = [str(args.source), *compiler.source_cli_flags]
+                    src_args, src_unknown = parser.parse_known_args(probe_tokens)
+                    defaults = {
+                        action.dest: action.default
+                        for action in parser._actions
+                        if getattr(action, "dest", None) and action.dest != "help"
+                    }
+                    # Flags that don't make sense from source-level pragmas.
+                    skip_dests = {
+                        "source",
+                        "clean",
+                        "docs",
+                        "repl",
+                        "docs_root",
+                        "docs_query",
+                        "docs_all",
+                        "docs_include_tests",
+                    }
+                    for dest, default in defaults.items():
+                        if dest in skip_dests:
+                            continue
+                        cur_val = getattr(args, dest)
+                        src_val = getattr(src_args, dest)
+                        if isinstance(default, list):
+                            for item in src_val:
+                                if item not in cur_val:
+                                    cur_val.append(item)
+                                    changed = True
+                            continue
+
+                        if dest == "output" and output_was_auto and src_val != default:
+                            setattr(args, dest, src_val)
+                            output_was_auto = False
+                            changed = True
+                            continue
+
+                        if cur_val == default and src_val != default:
+                            setattr(args, dest, src_val)
+                            changed = True
+
+                    for lib_tok in _consume_unknown_link_tokens(src_unknown, strict_long_opts=True):
+                        if lib_tok not in args.libs:
+                            args.libs.append(lib_tok)
+                            changed = True
+
+                for flag in compiler.source_link_flags:
+                    if flag not in args.libs:
+                        args.libs.append(flag)
+                        changed = True
+
+                if args.script:
+                    if not args.no_artifact or not args.ct_run_main:
+                        changed = True
+                    args.no_artifact = True
+                    args.ct_run_main = True
+
+                if args.check and not args.no_artifact:
+                    args.no_artifact = True
+                    changed = True
+
+                if not changed:
+                    break
+
+        if args.macro_expansion_limit < 1:
+            parser.error("--macro-expansion-limit must be >= 1")
+
+        artifact_kind = args.artifact
+        if args.O2:
+            folding_enabled = False
+            peephole_enabled = False
+            loop_unroll_enabled = False
+            auto_inline_enabled = False
+            asm_post_opt_enabled = False
+            string_deduplication_enabled = not args.no_string_dedup
+            extern_type_check_enabled = False
+            stack_check_enabled = False
+        elif args.O0:
+            folding_enabled = False
+            peephole_enabled = False
+            loop_unroll_enabled = False
+            auto_inline_enabled = not args.no_auto_inline
+            asm_post_opt_enabled = False
+            string_deduplication_enabled = not args.no_string_dedup
+            extern_type_check_enabled = not args.no_extern_type_check
+            stack_check_enabled = not args.no_stack_check
+        else:
+            folding_enabled = not args.no_folding
+            peephole_enabled = not args.no_peephole
+            loop_unroll_enabled = not args.no_loop_unroll
+            auto_inline_enabled = not args.no_auto_inline
+            asm_post_opt_enabled = not args.no_asm_opt
+            string_deduplication_enabled = not args.no_string_dedup
+            extern_type_check_enabled = not args.no_extern_type_check
+            stack_check_enabled = not args.no_stack_check
+        verbosity = args.verbose
+
+        if args.ct_run_main and artifact_kind != "exe":
+            parser.error("--ct-run-main requires --artifact exe")
+        if artifact_kind != "exe" and (args.run or args.dbg):
+            parser.error("--run/--dbg are only available when --artifact exe is selected")
+        if args.no_artifact and (args.run or args.dbg):
+            parser.error("--run/--dbg are not available with --no-artifact")
+
+        if output_was_auto and not args.repl and not args.no_artifact:
+            stem = args.source.stem
+            default_outputs = {
+                "exe": Path("a.out"),
+                "shared": Path(f"lib{stem}.so"),
+                "static": Path(f"lib{stem}.a"),
+                "obj": Path(f"{stem}.o"),
+            }
+            args.output = default_outputs[artifact_kind]
+
+        normalized_include_paths: List[Path] = []
+        for include_base in [Path("."), Path("./stdlib"), *args.include_paths]:
+            resolved = include_base.expanduser().resolve()
+            if resolved not in normalized_include_paths:
+                normalized_include_paths.append(resolved)
+        compiler.include_paths = normalized_include_paths
+        compiler._import_resolve_cache.clear()
+        compiler.defines = set(args.defines)
+        compiler.parser.macro_expansion_limit = args.macro_expansion_limit
+        compiler.parser.macro_preview = args.macro_preview
+
+        compiler.assembler.enable_constant_folding = folding_enabled
+        compiler.assembler.enable_peephole_optimization = peephole_enabled
+        compiler.assembler.enable_loop_unroll = loop_unroll_enabled
+        compiler.assembler.enable_auto_inline = auto_inline_enabled
+        compiler.assembler.enable_string_deduplication = string_deduplication_enabled
+        compiler.assembler.enable_extern_type_check = extern_type_check_enabled
+        compiler.assembler.enable_stack_check = stack_check_enabled
+        compiler.assembler.verbosity = verbosity
+
+        warnings_set = set(args.warnings)
+        werror = args.Werror
+        if "error" in warnings_set:
+            warnings_set.discard("error")
+            werror = True
+        if werror and not warnings_set:
+            warnings_set.add("all")
+        compiler.parser._warnings_enabled = warnings_set
+        compiler.parser._werror = werror
+        if warnings_set or werror:
+            def _dict_warn_cb(name: str, priority: int) -> None:
+                compiler.parser._warn(
+                    compiler.parser._last_token, "redefine",
+                    f"redefining word {name} (priority {priority})",
+                )
+            compiler.parser.dictionary.warn_callback = _dict_warn_cb
+        else:
+            compiler.parser.dictionary.warn_callback = None
+
+        ct_run_libs = list(args.libs)
+        if args.source is not None:
+            for lib in _load_sidecar_meta_libs(args.source):
+                if lib not in args.libs:
+                    args.libs.append(lib)
+                if lib not in ct_run_libs:
+                    ct_run_libs.append(lib)
+
+        cfg_output = None
+        if args.dump_cfg is not None:
+            if args.repl:
+                parser.error("--dump-cfg is not available with --repl")
+            if args.source is None:
+                parser.error("--dump-cfg requires a source file")
+            if args.dump_cfg == "__AUTO__":
+                cfg_output = args.temp_dir / f"{args.source.stem}.cfg.dot"
+            else:
+                cfg_output = Path(args.dump_cfg)
+            compiler.assembler._need_cfg = True
+        else:
+            compiler.assembler._need_cfg = False
+
         entry_mode = "program" if artifact_kind == "exe" else "library"
 
         # --- assembly-level cache check ---
@@ -13959,7 +14441,10 @@ def cli(argv: Sequence[str]) -> int:
             if verbosity >= 1:
                 import time as _time_mod
                 _compile_t0 = _time_mod.perf_counter()
-            emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
+            if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
+                emission = compiler.compile_preloaded(debug=args.debug, entry_mode=entry_mode)
+            else:
+                emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
 
             # Snapshot assembly text *before* ct-run-main JIT execution, which may
             # corrupt Python heap objects depending on memory layout.
@@ -13984,7 +14469,10 @@ def cli(argv: Sequence[str]) -> int:
                 cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
 
             if asm_post_opt_enabled:
-                optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(asm_text)
+                optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
+                    asm_text,
+                    collect_pass_logs=(verbosity >= 4),
+                )
                 if optimized_asm != asm_text:
                     asm_text = optimized_asm
                 if verbosity >= 1:
@@ -13997,6 +14485,64 @@ def cli(argv: Sequence[str]) -> int:
                 if verbosity >= 4:
                     for msg in asm_opt_pass_logs:
                         print(f"[v4] asm post-opt {msg}")
+
+        # Merge source-level `flags ...` pragmas into effective linker flags.
+        if compiler.source_link_flags:
+            for flag in compiler.source_link_flags:
+                if flag not in args.libs:
+                    args.libs.append(flag)
+                if flag not in ct_run_libs:
+                    ct_run_libs.append(flag)
+
+        def _normalize_ct_runtime_libs(raw_libs: List[str]) -> List[str]:
+            out: List[str] = []
+            seen: Set[str] = set()
+            for lib in raw_libs:
+                token = str(lib).strip()
+                if not token:
+                    continue
+                # Linker/search/include-only flags are not directly loadable via ctypes.
+                if token.startswith(("-L", "-Wl,")):
+                    continue
+                if token == "-I" or token.startswith("-I") or token.startswith("--include"):
+                    continue
+                if token.startswith("-l:"):
+                    token = token[3:]
+                elif token.startswith("-l") and len(token) > 2:
+                    token = token[2:]
+                if token and token not in seen:
+                    out.append(token)
+                    seen.add(token)
+            return out
+
+        ct_run_libs = _normalize_ct_runtime_libs(ct_run_libs)
+        if args.ct_run_main:
+            # For CT execution, when a static archive path is provided,
+            # also try loading a sibling shared object path.
+            expanded_ct_libs: List[str] = []
+            seen_ct_libs: Set[str] = set()
+            for lib in ct_run_libs:
+                if lib not in seen_ct_libs:
+                    expanded_ct_libs.append(lib)
+                    seen_ct_libs.add(lib)
+                if lib.endswith(".a"):
+                    so_variant = lib[:-2] + ".so"
+                    if so_variant not in seen_ct_libs:
+                        expanded_ct_libs.append(so_variant)
+                        seen_ct_libs.add(so_variant)
+            ct_run_libs = expanded_ct_libs
+
+        if args.ct_run_main and args.source is not None:
+            import subprocess
+            try:
+                ct_sidecar = _build_ct_sidecar_shared(args.source, args.temp_dir)
+            except subprocess.CalledProcessError as exc:
+                print(f"[error] failed to build compile-time sidecar library: {exc}")
+                return 1
+            if ct_sidecar is not None:
+                so_lib = str(ct_sidecar.resolve())
+                if so_lib not in ct_run_libs:
+                    ct_run_libs.append(so_lib)
 
         if cfg_output is not None:
             cfg_output.parent.mkdir(parents=True, exist_ok=True)
@@ -14077,14 +14623,24 @@ def cli(argv: Sequence[str]) -> int:
     # --- incremental: skip linker if output newer than .o AND same source ---
     # Track which .o produced the output so switching source files forces relink.
     link_stamp = args.temp_dir / f"{args.output.name}.link_src"
+
+    link_fingerprint_parts = [
+        f"obj={obj_path.resolve()}",
+        f"artifact={artifact_kind}",
+        f"debug={int(bool(args.debug))}",
+    ]
+    for lib in args.libs:
+        link_fingerprint_parts.append(f"lib={lib}")
+    link_fingerprint = "\n".join(link_fingerprint_parts)
+
     need_link = need_nasm or not args.output.exists() or args.no_cache
     if not need_link:
-        # Check that the output was linked from the same .o last time.
+        # Check that the output was linked from the same inputs/config last time.
         try:
             recorded = link_stamp.read_text()
         except OSError:
             recorded = ""
-        if recorded != str(obj_path.resolve()):
+        if recorded != link_fingerprint:
             need_link = True
     if not need_link:
         try:
@@ -14118,7 +14674,7 @@ def cli(argv: Sequence[str]) -> int:
             )
 
     if need_link:
-        link_stamp.write_text(str(obj_path.resolve()))
+        link_stamp.write_text(link_fingerprint)
         print(f"[info] built {args.output}")
     else:
         print(f"[info] {args.output} is up to date")

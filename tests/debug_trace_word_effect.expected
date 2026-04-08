@@ -1,0 +1,16 @@
+trace before depth: 0
+trace before elements:
+<empty>
+trace after depth: 2
+trace after elements:
+20
+10
+trace delta: +2 (before 0, after 2)
+trace before depth: 2
+trace before elements:
+20
+10
+trace after depth: 1
+trace after elements:
+10
+trace delta: -1 (before 2, after 1)

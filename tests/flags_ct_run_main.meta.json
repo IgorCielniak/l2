@@ -1,0 +1,4 @@
+{
+  "description": "Source flags pragma enables ct-run-main without CLI flag",
+  "compile_only": true
+}

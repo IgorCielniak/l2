@@ -32,5 +32,5 @@ jobs:
           pip install keystone-engine
 
       - name: Run tests
-        run: python3 test.py && python3 test.py --ct-run-main
+        run: python3 test.py -v && python3 test.py --ct-run-main -v
         timeout-minutes: 30

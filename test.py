@@ -154,6 +154,12 @@ class TestCaseConfig:
     requires: List[str] = field(default_factory=list)
     libs: List[str] = field(default_factory=list)
     compile_args: List[str] = field(default_factory=list)
+    run_example: bool = False
+    smoke_run: bool = False
+    stdout_regex: Optional[str] = None
+    stderr_regex: Optional[str] = None
+    runtime_timeout: Optional[float] = None
+    use_l2eval: bool = False
 
     @classmethod
     def from_meta(cls, data: Dict[str, Any]) -> "TestCaseConfig":
@@ -214,6 +220,29 @@ class TestCaseConfig:
             if not isinstance(ca, list) or not all(isinstance(item, str) for item in ca):
                 raise ValueError("compile_args must be a list of strings")
             cfg.compile_args = list(ca)
+        if "run_example" in data:
+            cfg.run_example = bool(data["run_example"])
+        if "smoke_run" in data:
+            cfg.smoke_run = bool(data["smoke_run"])
+        if "stdout_regex" in data:
+            val = data["stdout_regex"]
+            if not isinstance(val, str):
+                raise ValueError("stdout_regex must be a string")
+            re.compile(val)
+            cfg.stdout_regex = val
+        if "stderr_regex" in data:
+            val = data["stderr_regex"]
+            if not isinstance(val, str):
+                raise ValueError("stderr_regex must be a string")
+            re.compile(val)
+            cfg.stderr_regex = val
+        if "runtime_timeout" in data:
+            timeout = float(data["runtime_timeout"])
+            if timeout <= 0:
+                raise ValueError("runtime_timeout must be > 0")
+            cfg.runtime_timeout = timeout
+        if "use_l2eval" in data:
+            cfg.use_l2eval = bool(data["use_l2eval"])
         return cfg
 
 
@@ -272,11 +301,15 @@ class TestRunner:
         self.root = root
         self.args = args
         self.tests_dir = resolve_path(root, args.tests_dir)
+        self.examples_dir = resolve_path(root, args.examples_dir)
         self.build_dir = resolve_path(root, args.build_dir)
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.main_py = self.root / "main.py"
+        self.l2eval_builder = self.root / "tools" / "build_l2eval_lib.sh"
         self.base_env = os.environ.copy()
         self._module_cache: Dict[str, bool] = {}
+        self.run_example_patterns = list(args.run_example or [])
+        self._l2eval_ready = False
         extra_entries = list(DEFAULT_EXTRA_TESTS)
         if args.extra:
             extra_entries.extend(args.extra)
@@ -287,6 +320,8 @@ class TestRunner:
         sources: List[Path] = []
         if self.tests_dir.exists():
             sources.extend(sorted(self.tests_dir.glob("*.sl")))
+        if not self.args.no_compile_examples and self.examples_dir.exists():
+            sources.extend(sorted(self.examples_dir.rglob("*.sl")))
         for entry in self.extra_sources:
             if entry.is_dir():
                 sources.extend(sorted(entry.glob("*.sl")))
@@ -319,6 +354,20 @@ class TestRunner:
             relative = source.as_posix()
         if relative.endswith(".sl"):
             relative = relative[:-3]
+        if self._is_example_source(source):
+            should_run_example = self._should_run_example(relative, config)
+            if not should_run_example:
+                config.compile_only = True
+                if "--check" not in config.compile_args:
+                    config.compile_args.append("--check")
+            elif (
+                not source.with_suffix(".expected").exists()
+                and not source.with_suffix(".stderr").exists()
+                and config.stdout_regex is None
+                and config.stderr_regex is None
+            ):
+                # Allow opt-in runnable examples without fixture files.
+                config.smoke_run = True
         return TestCase(
             name=relative,
             source=source,
@@ -333,6 +382,18 @@ class TestRunner:
             build_dir=self.build_dir,
             config=config,
         )
+
+    def _is_example_source(self, source: Path) -> bool:
+        try:
+            source.relative_to(self.examples_dir)
+        except ValueError:
+            return False
+        return True
+
+    def _should_run_example(self, case_name: str, config: TestCaseConfig) -> bool:
+        if config.run_example:
+            return True
+        return bool(self.run_example_patterns and match_patterns(case_name, self.run_example_patterns))
 
     def run(self) -> int:
         if not self.tests_dir.exists():
@@ -409,8 +470,13 @@ class TestRunner:
             message = f"expected exit {case.config.expected_exit}, got {run_proc.returncode}"
             details = self._format_process_output(run_proc)
             return CaseResult(case, "failed", "run", message, details, duration)
-        if case.source.stem == "nob_test":
+
+        if case.config.stdout_regex is not None:
+            status, note, details = self._check_regex_stream("stdout", case.config.stdout_regex, run_proc.stdout)
+        elif case.source.stem == "nob_test":
             status, note, details = self._compare_nob_test_stdout(case, run_proc.stdout)
+        elif case.config.smoke_run and not case.expected_stdout.exists():
+            status, note, details = "passed", "", None
         else:
             status, note, details = self._compare_stream(
                 case,
@@ -424,14 +490,25 @@ class TestRunner:
             return CaseResult(case, status, "stdout", note, details, duration)
         if status == "updated" and note:
             updated_notes.append(note)
-        stderr_status, stderr_note, stderr_details = self._compare_stream(
-            case,
-            "stderr",
-            case.expected_stderr,
-            run_proc.stderr,
-            create_on_update=True,
-            ignore_when_missing=True,
-        )
+
+        if case.config.stderr_regex is not None:
+            stderr_status, stderr_note, stderr_details = self._check_regex_stream("stderr", case.config.stderr_regex, run_proc.stderr)
+        elif case.config.smoke_run and not case.expected_stderr.exists():
+            if run_proc.stderr.strip():
+                stderr_status = "failed"
+                stderr_note = "unexpected stderr output during smoke run"
+                stderr_details = run_proc.stderr
+            else:
+                stderr_status, stderr_note, stderr_details = "passed", "", None
+        else:
+            stderr_status, stderr_note, stderr_details = self._compare_stream(
+                case,
+                "stderr",
+                case.expected_stderr,
+                run_proc.stderr,
+                create_on_update=True,
+                ignore_when_missing=True,
+            )
         if stderr_status == "failed":
             duration = time.perf_counter() - start
             return CaseResult(case, stderr_status, "stderr", stderr_note, stderr_details, duration)
@@ -440,7 +517,8 @@ class TestRunner:
         duration = time.perf_counter() - start
         if updated_notes:
             return CaseResult(case, "updated", "compare", "; ".join(updated_notes), details=None, duration=duration)
-        return CaseResult(case, "passed", "run", "ok", details=None, duration=duration)
+        message = "smoke-run ok" if case.config.smoke_run else "ok"
+        return CaseResult(case, "passed", "run", message, details=None, duration=duration)
 
     def _compile(self, case: TestCase, *, extra_libs: Optional[Sequence[str]] = None) -> subprocess.CompletedProcess[str]:
         cmd = [
@@ -456,15 +534,16 @@ class TestRunner:
         for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
         cmd.extend(case.config.compile_args)
-        if self.args.ct_run_main:
+        if self.args.ct_run_main and not self._is_example_source(case.source):
             cmd.append("--ct-run-main")
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
         # When --ct-run-main is used, the compiler executes main at compile time,
         # so it may need stdin data that would normally go to the binary.
         compile_input = None
-        if self.args.ct_run_main and case.stdin_data() is not None:
-            compile_input = case.stdin_data()
+        stdin_data = case.stdin_data()
+        if self.args.ct_run_main and not self._is_example_source(case.source) and stdin_data is not None:
+            compile_input = stdin_data
         return subprocess.run(
             cmd,
             cwd=self.root,
@@ -476,6 +555,9 @@ class TestRunner:
 
     def _prepare_case_native_libs(self, case: TestCase) -> List[str]:
         """Build optional per-test native C fixtures and return linkable artifacts."""
+        if case.config.use_l2eval:
+            return self._prepare_l2eval_libs(case)
+
         c_source = case.source.with_suffix(".c")
         if not c_source.exists():
             return []
@@ -524,24 +606,94 @@ class TestRunner:
 
         return [str(archive_path.resolve())]
 
+    def _prepare_l2eval_libs(self, case: TestCase) -> List[str]:
+        lib_path = (self.root / "build" / "libl2eval.a").resolve()
+
+        if not self._l2eval_ready:
+            if not lib_path.exists():
+                if not self.l2eval_builder.exists():
+                    raise RuntimeError(f"missing l2eval builder script: {self.l2eval_builder}")
+
+                cmd = ["bash", str(self.l2eval_builder)]
+                if self.args.verbose:
+                    print(f"{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
+
+                proc = subprocess.run(
+                    cmd,
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    env=self._env_for(case),
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError("failed to build l2eval library:\n" + self._format_process_output(proc))
+
+            self._l2eval_ready = True
+
+        if not lib_path.exists():
+            raise RuntimeError(f"l2eval library missing after build: {lib_path}")
+        return [str(lib_path), "c"]
+
     def _run_binary(self, case: TestCase) -> subprocess.CompletedProcess[str]:
         runtime_cmd = [self._runtime_entry(case), *case.runtime_args()]
         runtime_cmd = wrap_runtime_command(runtime_cmd)
         if self.args.verbose:
             print(f"{format_status('CMD', 'blue')} {quote_cmd(runtime_cmd)}")
-        proc = subprocess.run(
-            runtime_cmd,
-            cwd=self.root,
-            capture_output=True,
-            env=self._env_for(case),
-            input=case.stdin_data().encode("utf-8") if case.stdin_data() is not None else None,
-        )
+        stdin_data = case.stdin_data()
+        timeout = case.config.runtime_timeout if case.config.runtime_timeout is not None else self.args.runtime_timeout
+        try:
+            proc = subprocess.run(
+                runtime_cmd,
+                cwd=self.root,
+                capture_output=True,
+                env=self._env_for(case),
+                input=stdin_data.encode("utf-8") if stdin_data is not None else None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout_text: str
+            stderr_text: str
+            raw_stdout = exc.stdout
+            raw_stderr = exc.stderr
+            if isinstance(raw_stdout, bytes):
+                stdout_text = raw_stdout.decode("utf-8", errors="replace")
+            else:
+                stdout_text = raw_stdout or ""
+            if isinstance(raw_stderr, bytes):
+                stderr_text = raw_stderr.decode("utf-8", errors="replace")
+            else:
+                stderr_text = raw_stderr or ""
+            if stderr_text and not stderr_text.endswith("\n"):
+                stderr_text += "\n"
+            if timeout is not None:
+                stderr_text += f"<timed out after {timeout}s>"
+            else:
+                stderr_text += "<timed out>"
+            return subprocess.CompletedProcess(
+                args=runtime_cmd,
+                returncode=124,
+                stdout=stdout_text,
+                stderr=stderr_text,
+            )
         return subprocess.CompletedProcess(
             args=proc.args,
             returncode=proc.returncode,
             stdout=proc.stdout.decode("utf-8", errors="replace"),
             stderr=proc.stderr.decode("utf-8", errors="replace"),
         )
+
+    def _check_regex_stream(self, label: str, pattern: str, actual_text: str) -> Tuple[str, str, Optional[str]]:
+        normalized = normalize_text(actual_text)
+        if re.search(pattern, normalized, re.MULTILINE):
+            return "passed", "", None
+        details = textwrap.dedent(
+            f"""\
+            pattern: {pattern!r}
+            actual {label}:
+            {normalized if normalized else '(empty)'}
+            """
+        ).rstrip()
+        return "failed", f"{label} regex mismatch", details
 
     def _runtime_entry(self, case: TestCase) -> str:
         binary = case.binary_path
@@ -790,12 +942,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run L2 compiler tests")
     parser.add_argument("patterns", nargs="*", help="glob or substring filters for test names")
     parser.add_argument("--tests-dir", default="tests", help="directory containing .sl test files")
+    parser.add_argument("--examples-dir", default="examples", help="directory containing .sl examples to compile-check")
+    parser.add_argument("--no-compile-examples", action="store_true", help="skip compile-only checks for examples")
+    parser.add_argument("--run-example", action="append", default=[], help="pattern for example cases to run instead of compile-only (repeatable)")
     parser.add_argument("--build-dir", default="build", help="directory for compiled binaries")
     parser.add_argument("--extra", action="append", help="additional .sl files or directories to treat as tests")
     parser.add_argument("--list", action="store_true", help="list tests and exit")
     parser.add_argument("--update", action="store_true", help="update expectation files with actual output")
     parser.add_argument("--stop-on-fail", action="store_true", help="stop after the first failure")
     parser.add_argument("--ct-run-main", action="store_true", help="execute each test's 'main' via the compile-time VM during compilation")
+    parser.add_argument("--runtime-timeout", type=float, default=None, help="timeout in seconds for runtime execution")
     parser.add_argument("-v", "--verbose", action="store_true", help="show compiler/runtime commands")
     return parser.parse_args(argv)
 

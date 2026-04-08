@@ -19,23 +19,13 @@ import mem.sl
 
 #__hm_hash [* | key] -> [* | hash]
 # Integer hash (splitmix64-style mixing)
-:asm __hm_hash {
-    mov rax, [r12]
-    mov rcx, rax
-    shr rcx, 30
-    xor rax, rcx
-    mov rcx, 0xbf58476d1ce4e5b9
-    imul rax, rcx
-    mov rcx, rax
-    shr rcx, 27
-    xor rax, rcx
-    mov rcx, 0x94d049bb133111eb
-    imul rax, rcx
-    mov rcx, rax
-    shr rcx, 31
-    xor rax, rcx
-    mov [r12], rax
-} ;
+word __hm_hash
+    dup 30 shr bxor
+    0xbf58476d1ce4e5b9 *
+    dup 27 shr bxor
+    0x94d049bb133111eb *
+    dup 31 shr bxor
+end
 
 # ── Accessors ─────────────────────────────────────────────────
 
@@ -187,186 +177,49 @@ end
 
 #__hm_rehash [* | hm] -> [* | hm]
 # Double capacity and re-insert all live entries.
-# Strategy: create new map, copy entries, swap internals, free old arrays.
-:asm __hm_rehash {
-    push r14                   ; save callee-saved regs
-    push r15
-    mov rbx, [r12]            ; hm
+# Strategy: create a new map, insert live entries with hm_set,
+# then swap internals and free the temporary/new header.
+word __hm_rehash
+    dup hm_keys >r
+    dup hm_vals >r
+    dup hm_flags >r
+    dup hm_capacity >r
 
-    ; Load old state
-    mov r8, [rbx + 8]         ; old_cap
-    mov r9, [rbx + 16]        ; old_keys
-    mov r10, [rbx + 24]       ; old_vals
-    mov r11, [rbx + 32]       ; old_flags
+    r@ 2 * hm_new
+    3 rpick 2 rpick 1 rpick
 
-    ; New capacity = old_cap * 2
-    mov rdi, r8
-    shl rdi, 1                ; new_cap
+    r@ for
+        dup c@ 1 == if
+            2 pick @
+            2 pick @
+            5 pick
+            -rot
+            hm_set
+            drop
+        end
+        rot 8 + -rot
+        swap 8 + swap
+        1 +
+    end
 
-    ; Save hm, old_cap, old_keys, old_vals, old_flags, new_cap on x86 stack
-    push rbx
-    push r8
-    push r9
-    push r10
-    push r11
-    push rdi
+    drop drop drop
 
-    ; Allocate new_keys = alloc(new_cap * 8)
-    ; mmap(0, size, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
-    mov rax, 9
-    xor rdi, rdi
-    mov rsi, [rsp]            ; new_cap
-    shl rsi, 3                ; new_cap * 8
-    mov rdx, 3
-    mov r10, 34
-    push r8                   ; save r8
-    mov r8, -1
-    xor r9, r9
-    syscall
-    pop r8
-    push rax                  ; save new_keys
+    3 rpick r@ 8 * free
+    2 rpick r@ 8 * free
+    1 rpick r@ free
 
-    ; Allocate new_vals = alloc(new_cap * 8)
-    mov rax, 9
-    xor rdi, rdi
-    mov rsi, [rsp + 8]        ; new_cap
-    shl rsi, 3
-    mov rdx, 3
-    mov r10, 34
-    push r8
-    mov r8, -1
-    xor r9, r9
-    syscall
-    pop r8
-    push rax                  ; save new_vals
+    dup @ 2 pick swap !
+    dup 8 + @ 2 pick 8 + swap !
+    dup 16 + @ 2 pick 16 + swap !
+    dup 24 + @ 2 pick 24 + swap !
+    dup 32 + @ 2 pick 32 + swap !
 
-    ; Allocate new_flags = alloc(new_cap)
-    mov rax, 9
-    xor rdi, rdi
-    mov rsi, [rsp + 16]       ; new_cap
-    mov rdx, 3
-    mov r10, 34
-    push r8
-    mov r8, -1
-    xor r9, r9
-    syscall
-    pop r8
-    push rax                  ; save new_flags
+    swap >r
+    40 free
+    r>
 
-    ; Stack: new_flags, new_vals, new_keys, new_cap, old_flags, old_vals, old_keys, old_cap, hm
-    ; Offsets: [rsp]=new_flags, [rsp+8]=new_vals, [rsp+16]=new_keys
-    ;          [rsp+24]=new_cap, [rsp+32]=old_flags, [rsp+40]=old_vals
-    ;          [rsp+48]=old_keys, [rsp+56]=old_cap, [rsp+64]=hm
-
-    mov r14, [rsp + 24]       ; new_cap
-    dec r14                    ; new_mask
-
-    ; Re-insert loop: for i in 0..old_cap
-    xor rcx, rcx              ; i = 0
-    mov r8, [rsp + 56]        ; old_cap
-.rehash_loop:
-    cmp rcx, r8
-    jge .rehash_done
-
-    ; Check old_flags[i]
-    mov rdi, [rsp + 32]       ; old_flags
-    movzx eax, byte [rdi + rcx]
-    cmp eax, 1                ; live?
-    jne .rehash_next
-
-    ; Get key and val
-    mov rdi, [rsp + 48]       ; old_keys
-    mov rsi, [rdi + rcx*8]    ; key
-    mov rdi, [rsp + 40]       ; old_vals
-    mov rdx, [rdi + rcx*8]    ; val
-
-    ; Hash key to find slot in new map
-    push rcx
-    push rsi
-    push rdx
-
-    ; Hash rsi (key)
-    mov rax, rsi
-    mov rbx, rax
-    shr rbx, 30
-    xor rax, rbx
-    mov rbx, 0xbf58476d1ce4e5b9
-    imul rax, rbx
-    mov rbx, rax
-    shr rbx, 27
-    xor rax, rbx
-    mov rbx, 0x94d049bb133111eb
-    imul rax, rbx
-    mov rbx, rax
-    shr rbx, 31
-    xor rax, rbx
-    and rax, r14              ; slot = hash & new_mask
-
-    ; Linear probe (new map is all empty, so first empty slot is fine)
-    mov rdi, [rsp + 24]       ; new_flags (3 pushes offset: +24)
-.probe_new:
-    movzx ebx, byte [rdi + rax]
-    cmp ebx, 0
-    je .probe_found
-    inc rax
-    and rax, r14
-    jmp .probe_new
-.probe_found:
-    ; Store key, val, flag
-    pop rdx                    ; val
-    pop rsi                    ; key
-    mov rdi, [rsp + 16 + 8]   ; new_keys (adjusted for 1 remaining push: rcx)
-    mov [rdi + rax*8], rsi
-    mov rdi, [rsp + 8 + 8]    ; new_vals
-    mov [rdi + rax*8], rdx
-    mov rdi, [rsp + 0 + 8]    ; new_flags
-    mov byte [rdi + rax], 1
-    pop rcx                    ; restore i
-
-.rehash_next:
-    inc rcx
-    jmp .rehash_loop
-
-.rehash_done:
-    ; Free old arrays
-    ; munmap(old_keys, old_cap * 8)
-    mov rax, 11
-    mov rdi, [rsp + 48]       ; old_keys
-    mov rsi, [rsp + 56]       ; old_cap
-    shl rsi, 3
-    syscall
-
-    ; munmap(old_vals, old_cap * 8)
-    mov rax, 11
-    mov rdi, [rsp + 40]       ; old_vals
-    mov rsi, [rsp + 56]
-    shl rsi, 3
-    syscall
-
-    ; munmap(old_flags, old_cap)
-    mov rax, 11
-    mov rdi, [rsp + 32]       ; old_flags
-    mov rsi, [rsp + 56]       ; old_cap
-    syscall
-
-    ; Update hm header
-    mov rbx, [rsp + 64]       ; hm
-    mov rax, [rsp + 24]       ; new_cap
-    mov [rbx + 8], rax
-    mov rax, [rsp + 16]       ; new_keys
-    mov [rbx + 16], rax
-    mov rax, [rsp + 8]        ; new_vals
-    mov [rbx + 24], rax
-    mov rax, [rsp]            ; new_flags
-    mov [rbx + 32], rax
-
-    ; Clean up x86 stack (9 pushes + 2 callee-saved)
-    add rsp, 72
-    pop r15
-    pop r14
-
-    ; hm is still on r12 stack, unchanged
-} ;
+    rdrop rdrop rdrop rdrop
+end
 
 # ── Public API ────────────────────────────────────────────────
 
@@ -440,13 +293,10 @@ end
 
 #__hm_bzero [*, len | addr] -> [*]
 # Zero len bytes at addr
-:asm __hm_bzero {
-    mov rdi, [r12]        ; addr
-    mov rcx, [r12 + 8]    ; len
-    add r12, 16
-    xor al, al
-    rep stosb
-} ;
+word __hm_bzero
+    swap
+    0 memset_bytes
+end
 
 #hm_clear [* | hm] -> [*]
 # Remove all entries without freeing the map.

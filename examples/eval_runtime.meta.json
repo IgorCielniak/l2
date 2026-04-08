@@ -1,0 +1,7 @@
+{
+  "description": "runnable check for runtime l2_eval extern wiring",
+  "run_example": true,
+  "use_l2eval": true,
+  "stdout_regex": "^3\\n?$",
+  "runtime_timeout": 5
+}

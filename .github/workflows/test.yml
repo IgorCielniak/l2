@@ -7,7 +7,29 @@ on:
     branches: [main]
 
 jobs:
+  build-l2eval:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Build l2eval static library
+        run: bash tools/build_l2eval_lib.sh
+
+      - name: Upload l2eval artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: l2eval-static
+          path: build/libl2eval.a
+          if-no-files-found: error
+
   test:
+    needs: build-l2eval
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -31,6 +53,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install keystone-engine
 
+      - name: Download l2eval artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: l2eval-static
+          path: build
+
       - name: Run tests
         run: python3 test.py -v && python3 test.py --ct-run-main -v
         timeout-minutes: 30
+
+      - name: Run integrity checks
+        run: |
+          python3 main.py --check-integrity
+          python3 main.py tests/hello.sl --check-integrity
+        timeout-minutes: 20

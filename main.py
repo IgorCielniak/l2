@@ -10,11 +10,14 @@ This file now contains working scaffolding for:
 
 from __future__ import annotations
 
+import ast
 import bisect
+import inspect
 import os
 import re
 import shlex
 import sys
+import textwrap
 from pathlib import Path
 TYPE_CHECKING = False
 if TYPE_CHECKING:
@@ -368,10 +371,21 @@ _OP_STR_TO_INT = {
     "ret": OP_RET,
 }
 
-
-def _is_scalar_literal(node: Op) -> bool:
-    return node._opcode == OP_LITERAL and not isinstance(node.data, str)
-
+_OP_INTEGRITY_DOCS: Dict[str, str] = {
+    "word": "Call a named word.",
+    "literal": "Push a literal value onto the stack.",
+    "word_ptr": "Push a callable word pointer.",
+    "for_begin": "Open a counted loop frame.",
+    "for_end": "Close/iterate a counted loop frame.",
+    "branch_zero": "Conditional branch when top-of-stack is zero.",
+    "jump": "Unconditional branch.",
+    "label": "Branch target marker.",
+    "list_begin": "Begin list literal capture.",
+    "list_end": "Finish list literal capture.",
+    "list_literal": "Emit a static list literal.",
+    "bss_list_literal": "Emit/initialize a BSS-backed list literal.",
+    "ret": "Return from the current word.",
+}
 
 _RE_REWRITE_CAPTURE_TOKEN = re.compile(r"^\$(\*?)([A-Za-z_][A-Za-z0-9_]*|\d+)(?::([A-Za-z_][A-Za-z0-9_-]*))?$")
 _REWRITE_CAPTURE_CONSTRAINTS = frozenset({
@@ -612,7 +626,8 @@ class Module:
 class MacroDefinition:
     __slots__ = (
         'name', 'tokens', 'param_count', 'ordered_params', 'variadic_param',
-        'asm_brace_depth', 'awaiting_asm_body', 'awaiting_asm_terminator'
+        'asm_brace_depth', 'awaiting_asm_body', 'awaiting_asm_terminator',
+        'nested_macro_depth'
     )
 
     def __init__(
@@ -633,6 +648,9 @@ class MacroDefinition:
         self.asm_brace_depth = 0
         self.awaiting_asm_body = False
         self.awaiting_asm_terminator = False
+        # While recording an outer macro body, semicolons that close nested
+        # macro definitions must not terminate the outer definition.
+        self.nested_macro_depth = 0
 
 
 class RewriteRule:
@@ -2421,6 +2439,11 @@ class Parser:
                 return True
             rec.awaiting_asm_terminator = False
 
+        if lex == "macro" and rec.asm_brace_depth == 0:
+            rec.nested_macro_depth += 1
+            rec.tokens.append(lex)
+            return True
+
         if lex == "{" and rec.asm_brace_depth > 0:
             rec.asm_brace_depth += 1
             rec.tokens.append(lex)
@@ -2434,7 +2457,11 @@ class Parser:
             return True
 
         if lex == ";" and rec.asm_brace_depth == 0:
-            self._finish_macro_recording(token)
+            if rec.nested_macro_depth > 0:
+                rec.nested_macro_depth -= 1
+                rec.tokens.append(lex)
+            else:
+                self._finish_macro_recording(token)
         else:
             rec.tokens.append(lex)
         return True
@@ -6568,6 +6595,8 @@ class Assembler:
             return f"list_literal {data}"
         if kind == OP_BSS_LIST_LITERAL:
             return f"bss_list_literal {data}"
+        if kind == OP_RET:
+            return "ret"
         return f"{node.op}" if data is None else f"{node.op} {data!r}"
 
     @staticmethod
@@ -8832,6 +8861,7 @@ def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
         raise ParseError("macro name missing after 'macro'")
     name_token = parser.next_token()
     param_count = 0
+    arity_token: Optional[Token] = None
     explicit_signature = False
     ordered_params: Optional[List[str]] = None
     variadic_param: Optional[str] = None
@@ -8840,6 +8870,7 @@ def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
         try:
             param_count = int(peek.lexeme, 0)
             parser.next_token()
+            arity_token = peek
             explicit_signature = True
         except ValueError:
             pass
@@ -8898,6 +8929,31 @@ def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
         ordered_params = ordered
         variadic_param = variadic
         param_count = len(ordered)
+
+    # Compatibility shorthand for generated nested macros:
+    #   macro <name> <value> ;
+    # When emitted from macro expansion, treat this as a 0-arg macro whose
+    # body is `<value>` instead of an arity-only empty macro definition.
+    if (
+        explicit_signature
+        and arity_token is not None
+        and ordered_params is None
+        and variadic_param is None
+        and param_count != 0
+    ):
+        tail = parser.peek_token()
+        if (
+            tail is not None
+            and tail.lexeme == ";"
+            and (name_token.expansion_depth > 0 or arity_token.expansion_depth > 0)
+        ):
+            parser.next_token()  # consume ';'
+            word = Word(name=name_token.lexeme)
+            word.macro_expansion = [arity_token.lexeme]
+            word.macro_params = 0
+            parser.dictionary.register(word)
+            parser._macro_signatures[name_token.lexeme] = (tuple(), None)
+            return None
 
     if ordered_params is None:
         ordered_params = [str(i) for i in range(param_count)]
@@ -9654,6 +9710,77 @@ def _ct_word_exists(vm: CompileTimeVM) -> None:
     vm.push(1 if vm.parser.word_exists(name) else 0)
 
 
+def _ct_list_words(vm: CompileTimeVM) -> None:
+    vm.push(sorted(vm.dictionary.words.keys()))
+
+
+def _ct_introspection_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Token):
+        return value.lexeme
+    if isinstance(value, Word):
+        return value.name
+    if isinstance(value, list):
+        return [_ct_introspection_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_ct_introspection_value(item) for item in value]
+    if isinstance(value, dict):
+        snapshot: Dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, (bool, int, float, str)):
+                snap_key = key
+            elif isinstance(key, Token):
+                snap_key = key.lexeme
+            elif isinstance(key, Word):
+                snap_key = key.name
+            else:
+                snap_key = str(key)
+            snapshot[snap_key] = _ct_introspection_value(item)
+        return snapshot
+    return repr(value)
+
+
+def _ct_get_word_body(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = vm.dictionary.lookup(name)
+    if word is None:
+        vm.push(None)
+        return
+
+    if word.macro_expansion is not None:
+        vm.push([_ct_introspection_value(item) for item in word.macro_expansion])
+        return
+
+    definition = word.definition
+    if isinstance(definition, Definition):
+        vm.push(
+            [
+                {
+                    "op": node.op,
+                    "data": _ct_introspection_value(node.data),
+                }
+                for node in definition.body
+            ]
+        )
+        return
+
+    vm.push(None)
+
+
+def _ct_get_word_asm(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = vm.dictionary.lookup(name)
+    if word is None:
+        vm.push(None)
+        return
+    definition = word.definition
+    if isinstance(definition, AsmDefinition):
+        vm.push(definition.body)
+        return
+    vm.push(None)
+
+
 def _ct_parser_pos(vm: CompileTimeVM) -> None:
     vm.push(vm.parser.pos)
 
@@ -10235,7 +10362,10 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-register-text-macro", _ct_register_text_macro, compile_only=True)
     register("ct-register-text-macro-signature", _ct_register_text_macro_signature, compile_only=True)
     register("ct-unregister-word", _ct_unregister_word, compile_only=True)
+    register("ct-list-words", _ct_list_words, compile_only=True)
     register("ct-word-exists?", _ct_word_exists, compile_only=True)
+    register("ct-get-word-body", _ct_get_word_body, compile_only=True)
+    register("ct-get-word-asm", _ct_get_word_asm, compile_only=True)
     register("use-l2-ct", _ct_use_l2_compile_time, compile_only=True)
     word_use_l2 = dictionary.lookup("use-l2-ct")
     if word_use_l2:
@@ -12561,8 +12691,12 @@ def _run_docs_tui(
             "summary": "Define substitution macros and pattern-matching macros.",
             "detail": (
                 "Records raw tokens until `;`. Macros are token-level "
-                "substitutions (no evaluation/hygiene step), and macro "
-                "definitions cannot nest.\n\n"
+                "substitutions (no evaluation/hygiene step).\n\n"
+                "Compatibility shorthand for generated nested macros:\n"
+                "  macro <name> <value> ;\n"
+                "When emitted by macro expansion, this is treated as a "
+                "0-arg macro whose body is `<value>` (not as an arity-only "
+                "empty macro definition).\n\n"
                 "Supported placeholders:\n"
                 "  $0, $1, ...  positional arguments (legacy form)\n"
                 "  $name        named argument from signature form\n"
@@ -13577,15 +13711,26 @@ def _run_docs_tui(
         "    `param-spec` is a list of identifiers. Prefix one with\n"
         "    `*` or `...` to mark it variadic (must be last).\n"
         "\n"
+        "  ct-list-words        [*] -> [* | list]\n"
         "  ct-unregister-word    [* | name] -> [* | flag]\n"
         "  ct-word-exists?       [* | name] -> [* | flag]\n"
+        "  ct-get-word-body      [* | name] -> [* | body-or-nil]\n"
+        "  ct-get-word-asm       [* | name] -> [* | asm-or-nil]\n"
         "    Remove words from the dictionary or query presence.\n"
+        "    `ct-get-word-body` returns macro expansion lists for text\n"
+        "    macros, or a list of op-maps ({op,data}) for high-level\n"
+        "    words. Returns nil when unavailable.\n"
         "\n"
         "  Macro definition syntax:\n"
         "    macro name 2                ... ;   # legacy positional arity\n"
         "    macro name (a b)            ... ;   # named parameters\n"
         "    macro name (head *rest)     ... ;   # variadic capture\n"
         "    (variadic parameter must be last)\n"
+        "\n"
+        "  Compatibility shorthand for generated nested macros:\n"
+        "    macro <name> <value> ;\n"
+        "    When emitted by macro expansion, this form defines a\n"
+        "    0-arg macro with body `<value>`.\n"
         "\n"
         "  Macro placeholders:\n"
         "    $0, $1 ... (legacy positional)\n"
@@ -13794,6 +13939,10 @@ def _run_docs_tui(
         "    substituted literally wherever the macro is invoked.\n"
         "    Only exact `$<number>` tokens are replaced (for example\n"
         "    $0, $1). Bare `$` tokens remain unchanged for asm use.\n"
+        "    Compatibility shorthand for generated nested macros:\n"
+        "      macro <name> <value> ;\n"
+        "    If this is emitted by macro expansion, it defines a\n"
+        "    0-arg macro with body `<value>`.\n"
         "    Use --macro-preview to print each expansion.\n"
         "\n"
         "      macro BUFFER_SIZE 0 4096 ;\n"
@@ -13897,6 +14046,10 @@ def _run_docs_tui(
         "  add-token             Token           [* | s] -> [*]\n"
         "  add-token-chars       Token           [* | s] -> [*]\n"
         "  emit-definition       Token           [*, name | body] -> [*]\n"
+        "  ct-list-words         Meta            [*] -> [* | list]\n"
+        "  ct-word-exists?       Meta            [* | name] -> [* | flag]\n"
+        "  ct-get-word-body      Meta            [* | name] -> [* | body]\n"
+        "  ct-get-word-asm       Meta            [* | name] -> [* | asm]\n"
         "  ct-control-frame-new  Control         [* | type] -> [* | frame]\n"
         "  ct-control-get        Control         [*, frame | key] -> [* | value]\n"
         "  ct-control-set        Control         [*, frame, key | value] -> [* | frame]\n"
@@ -15382,10 +15535,551 @@ def run_docs_explorer(
     return _run_docs_tui(entries, initial_query=initial_query, reload_fn=_reload)
 
 
+def _integrity_opcode_symbols() -> Set[str]:
+    return {
+        name
+        for name, value in globals().items()
+        if name.startswith("OP_") and isinstance(value, int) and name != "OP_OTHER"
+    }
+
+
+def _integrity_symbols_in_object(obj: Any) -> Set[str]:
+    try:
+        source = inspect.getsource(obj)
+    except Exception:
+        return set()
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return set()
+    seen: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id.startswith("OP_"):
+            seen.add(node.id)
+    return seen
+
+
+def _run_integrity_cfg_format_checks(errors: List[str]) -> None:
+    asm = Assembler(Dictionary())
+    cases: List[Tuple[Op, str]] = [
+        (_make_op("literal", 123), "push 123"),
+        (_make_word_op("dup"), "dup"),
+        (_make_op("word_ptr", "dup"), "&dup"),
+        (_make_op("branch_zero", "L0"), "branch_zero"),
+        (_make_op("jump", "L0"), "jump"),
+        (_make_op("label", "L0"), ".L0:"),
+        (_make_op("for_begin", {"loop": "L", "end": "E"}), "for"),
+        (_make_op("for_end", {"loop": "L", "end": "E"}), "end  (for)"),
+        (_make_op("list_begin", "L"), "list_begin"),
+        (_make_op("list_end", "L"), "list_end"),
+        (_make_op("list_literal", [1, 2]), "list_literal [1, 2]"),
+        (_make_op("bss_list_literal", {"size": 2, "values": [1]}), "bss_list_literal {'size': 2, 'values': [1]}"),
+        (_make_op("ret"), "ret"),
+    ]
+    for node, expected in cases:
+        actual = asm._format_cfg_op(node)
+        if actual != expected:
+            errors.append(
+                f"Assembler._format_cfg_op mismatch for '{node.op}': expected {expected!r}, got {actual!r}"
+            )
+
+
+def _run_integrity_vm_semantic_checks(errors: List[str]) -> None:
+    dictionary = bootstrap_dictionary()
+    parser = Parser(dictionary, Reader())
+    vm = parser.compile_time_vm
+
+    vm_probe_word_name = "__integrity_vm_word__"
+    if dictionary.lookup(vm_probe_word_name) is None:
+        dictionary.register(
+            Word(
+                name=vm_probe_word_name,
+                definition=Definition(
+                    name=vm_probe_word_name,
+                    body=[_make_literal_op(9)],
+                ),
+            )
+        )
+
+    loop_data = {"loop": "VM_LOOP", "end": "VM_END"}
+    vm_cases: List[Dict[str, Any]] = [
+        {
+            "name": "word_call",
+            "nodes": [_make_word_op(vm_probe_word_name)],
+            "initial_stack": [],
+            "check": lambda run_vm: None if run_vm.stack == [9] else f"expected [9], got {run_vm.stack!r}",
+        },
+        {
+            "name": "literal_push",
+            "nodes": [_make_literal_op(7)],
+            "initial_stack": [],
+            "check": lambda run_vm: None if run_vm.stack == [7] else f"expected [7], got {run_vm.stack!r}",
+        },
+        {
+            "name": "word_ptr_handle",
+            "nodes": [_make_op("word_ptr", vm_probe_word_name)],
+            "initial_stack": [],
+            "check": lambda run_vm: (
+                None
+                if len(run_vm.stack) == 1
+                and isinstance(run_vm.stack[0], int)
+                and isinstance(run_vm._resolve_handle(run_vm.stack[0]), Word)
+                and run_vm._resolve_handle(run_vm.stack[0]).name == vm_probe_word_name
+                else f"word_ptr did not resolve to {vm_probe_word_name!r}: stack={run_vm.stack!r}"
+            ),
+        },
+        {
+            "name": "branch_zero_taken",
+            "nodes": [
+                _make_op("branch_zero", "VM_LABEL"),
+                _make_literal_op(111),
+                _make_op("label", "VM_LABEL"),
+                _make_literal_op(222),
+            ],
+            "initial_stack": [0],
+            "check": lambda run_vm: None if run_vm.stack == [222] else f"expected [222], got {run_vm.stack!r}",
+        },
+        {
+            "name": "branch_zero_not_taken",
+            "nodes": [
+                _make_op("branch_zero", "VM_LABEL"),
+                _make_literal_op(111),
+                _make_op("label", "VM_LABEL"),
+                _make_literal_op(222),
+            ],
+            "initial_stack": [1],
+            "check": lambda run_vm: None if run_vm.stack == [111, 222] else f"expected [111, 222], got {run_vm.stack!r}",
+        },
+        {
+            "name": "jump",
+            "nodes": [
+                _make_op("jump", "VM_JUMP"),
+                _make_literal_op(1),
+                _make_op("label", "VM_JUMP"),
+                _make_literal_op(2),
+            ],
+            "initial_stack": [],
+            "check": lambda run_vm: None if run_vm.stack == [2] else f"expected [2], got {run_vm.stack!r}",
+        },
+        {
+            "name": "for_loop_counted",
+            "nodes": [
+                _make_op("for_begin", loop_data),
+                _make_literal_op(1),
+                _make_op("for_end", loop_data),
+            ],
+            "initial_stack": [2],
+            "check": lambda run_vm: None if run_vm.stack == [1, 1] else f"expected [1, 1], got {run_vm.stack!r}",
+        },
+        {
+            "name": "for_loop_zero_skips",
+            "nodes": [
+                _make_op("for_begin", loop_data),
+                _make_literal_op(1),
+                _make_op("for_end", loop_data),
+            ],
+            "initial_stack": [0],
+            "check": lambda run_vm: None if run_vm.stack == [] else f"expected [], got {run_vm.stack!r}",
+        },
+        {
+            "name": "list_begin_end",
+            "nodes": [
+                _make_op("list_begin", "VM_LIST"),
+                _make_literal_op(4),
+                _make_literal_op(5),
+                _make_op("list_end", "VM_LIST"),
+            ],
+            "initial_stack": [],
+            "check": lambda run_vm: _integrity_check_heap_list(run_vm, [4, 5]),
+        },
+        {
+            "name": "list_literal",
+            "nodes": [_make_op("list_literal", [4, 5])],
+            "initial_stack": [],
+            "check": lambda run_vm: _integrity_check_heap_list(run_vm, [4, 5]),
+        },
+        {
+            "name": "bss_list_literal",
+            "nodes": [_make_op("bss_list_literal", {"size": 4, "values": [9]})],
+            "initial_stack": [],
+            "check": lambda run_vm: _integrity_check_heap_list(run_vm, [9, 0, 0, 0]),
+        },
+        {
+            "name": "ret_terminates",
+            "nodes": [_make_literal_op(1), _make_op("ret"), _make_literal_op(2)],
+            "initial_stack": [],
+            "check": lambda run_vm: None if run_vm.stack == [1] else f"expected [1], got {run_vm.stack!r}",
+        },
+    ]
+
+    for case in vm_cases:
+        vm.reset()
+        vm.runtime_mode = False
+        vm.stack.extend(list(case["initial_stack"]))
+        try:
+            vm._execute_nodes(case["nodes"])
+        except Exception as exc:
+            errors.append(f"VM semantic case '{case['name']}' failed with exception: {exc}")
+            continue
+
+        try:
+            check_err = case["check"](vm)
+        except Exception as exc:
+            errors.append(f"VM semantic case '{case['name']}' validation crashed: {exc}")
+            continue
+
+        if check_err:
+            errors.append(f"VM semantic case '{case['name']}' failed: {check_err}")
+
+
+def _integrity_check_heap_list(vm: CompileTimeVM, expected: List[int]) -> Optional[str]:
+    if len(vm.stack) != 1:
+        return f"expected single pointer on stack, got {vm.stack!r}"
+    addr = vm.stack[0]
+    if not isinstance(addr, int):
+        return f"expected list pointer int, got {type(addr).__name__}"
+    try:
+        length = CTMemory.read_qword(addr)
+        values = [CTMemory.read_qword(addr + 8 + i * 8) for i in range(max(0, length))]
+    except Exception as exc:
+        return f"failed to read list memory at {addr}: {exc}"
+    if length != len(expected):
+        return f"expected length {len(expected)}, got {length}"
+    if values != expected:
+        return f"expected values {expected!r}, got {values!r}"
+    return None
+
+
+def _run_integrity_assembler_semantic_checks(errors: List[str]) -> None:
+    dictionary = bootstrap_dictionary()
+    probe_target = "__integrity_probe_target"
+    if dictionary.lookup(probe_target) is None:
+        dictionary.register(Word(name=probe_target))
+
+    asm_cases: List[Dict[str, Any]] = [
+        {
+            "name": "word_call",
+            "nodes": [_make_word_op(probe_target)],
+            "required": [f"call {sanitize_label(probe_target)}"],
+        },
+        {
+            "name": "literal_int",
+            "nodes": [_make_literal_op(7)],
+            "required": ["mov qword [r12], 7"],
+        },
+        {
+            "name": "word_ptr",
+            "nodes": [_make_op("word_ptr", probe_target)],
+            "required": [f"mov qword [r12], {sanitize_label(probe_target)}"],
+        },
+        {
+            "name": "branch_zero",
+            "nodes": [_make_op("branch_zero", "L0")],
+            "required": ["test rax, rax", "jz L0"],
+        },
+        {
+            "name": "jump",
+            "nodes": [_make_op("jump", "L0")],
+            "required": ["jmp L0"],
+        },
+        {
+            "name": "label",
+            "nodes": [_make_op("label", "L0")],
+            "required": ["L0:"],
+        },
+        {
+            "name": "for_pair",
+            "nodes": [
+                _make_op("for_begin", {"loop": "LOOP0", "end": "END0"}),
+                _make_op("for_end", {"loop": "LOOP0", "end": "END0"}),
+            ],
+            "required": ["jle END0", "LOOP0:", "jg LOOP0", "END0:"],
+        },
+        {
+            "name": "list_begin_end",
+            "nodes": [_make_op("list_begin", "LIST0"), _make_op("list_end", "LIST0")],
+            "required": ["; list begin", "; list end", "LIST0_copy_loop:", "LIST0_copy_done:"],
+        },
+        {
+            "name": "list_literal",
+            "nodes": [_make_op("list_literal", [1, 2])],
+            "required": ["mov qword [rax], 2", "mov qword [rax + 8], 1", "mov qword [rax + 16], 2"],
+        },
+        {
+            "name": "bss_list_literal",
+            "nodes": [_make_op("bss_list_literal", {"size": 2, "values": [1]})],
+            "required": ["; bss list literal", "mov qword [rax], 2", "mov qword [rax + 8], 1", "mov qword [rax + 16], 0"],
+        },
+        {
+            "name": "ret",
+            "nodes": [_make_op("ret")],
+            "required": ["ret"],
+            "check": lambda text_blob: None if text_blob.count("\n    ret") >= 2 else "expected explicit ret plus function epilogue ret",
+        },
+    ]
+
+    for case in asm_cases:
+        asm = Assembler(dictionary)
+        text: List[str] = []
+        definition = Definition(name=f"__integrity_asm_case_{case['name']}", body=case["nodes"])
+        try:
+            asm._emit_definition(definition, text, debug=False)
+        except Exception as exc:
+            errors.append(f"Assembler semantic case '{case['name']}' failed with exception: {exc}")
+            continue
+
+        text_blob = "\n".join(text)
+        missing = [snippet for snippet in case["required"] if snippet not in text_blob]
+        if missing:
+            errors.append(
+                f"Assembler semantic case '{case['name']}' missing output: " + ", ".join(missing)
+            )
+            continue
+
+        check_fn = case.get("check")
+        if check_fn is not None:
+            try:
+                check_err = check_fn(text_blob)
+            except Exception as exc:
+                errors.append(f"Assembler semantic case '{case['name']}' validation crashed: {exc}")
+                continue
+            if check_err:
+                errors.append(f"Assembler semantic case '{case['name']}' failed: {check_err}")
+
+
+def _run_integrity_roundtrip_checks(errors: List[str]) -> None:
+    import subprocess
+    import tempfile
+
+    repo_root = Path(__file__).resolve().parent
+    include_paths = [repo_root, repo_root / "stdlib"]
+
+    probes: List[Tuple[str, str, str]] = [
+        (
+            "for_sum",
+            """
+import stdlib.sl
+
+word main
+    0
+    5 for
+        1 +
+    end
+    puti cr
+end
+""".lstrip(),
+            "5\n",
+        ),
+        (
+            "if_else",
+            """
+import stdlib.sl
+
+word main
+    0 if
+        11
+    else
+        22
+    end
+    puti cr
+end
+""".lstrip(),
+            "22\n",
+        ),
+        (
+            "asm_word",
+            """
+import stdlib.sl
+
+:asm emit42 {
+    mov rax, 42
+    sub r12, 8
+    mov [r12], rax
+} ;
+
+word main
+    emit42
+    puti cr
+end
+""".lstrip(),
+            "42\n",
+        ),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="l2_integrity_roundtrip_") as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        for name, source_text, expected_stdout in probes:
+            src_path = temp_dir / f"{name}.sl"
+            asm_path = temp_dir / f"{name}.asm"
+            obj_path = temp_dir / f"{name}.o"
+            exe_path = temp_dir / f"{name}.out"
+
+            src_path.write_text(source_text)
+
+            try:
+                compiler = Compiler(include_paths=include_paths)
+                emission = compiler.compile_file(src_path, debug=False, entry_mode="program")
+                asm_text = emission.snapshot()
+                if not asm_text.strip():
+                    errors.append(f"round-trip probe '{name}' produced empty assembly")
+                    continue
+
+                asm_path.write_text(asm_text)
+                run_nasm(asm_path, obj_path, debug=False, asm_text=asm_text)
+                run_linker(obj_path, exe_path, debug=False, libs=[], shared=False)
+            except Exception as exc:
+                errors.append(f"round-trip probe '{name}' failed during build: {exc}")
+                continue
+
+            try:
+                proc = subprocess.run(
+                    [str(exe_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception as exc:
+                errors.append(f"round-trip probe '{name}' failed to execute: {exc}")
+                continue
+
+            if proc.returncode != 0:
+                errors.append(
+                    f"round-trip probe '{name}' exited with code {proc.returncode}; stderr={proc.stderr!r}"
+                )
+                continue
+
+            if proc.stdout != expected_stdout:
+                errors.append(
+                    f"round-trip probe '{name}' stdout mismatch: expected {expected_stdout!r}, got {proc.stdout!r}"
+                )
+
+
+def _run_integrity_failure_injection_checks(errors: List[str]) -> None:
+    repo_root = Path(__file__).resolve().parent
+    include_paths = [repo_root, repo_root / "stdlib"]
+
+    failure_cases: List[Dict[str, Any]] = [
+        {
+            "name": "parse_unexpected_end",
+            "source": "end\n",
+            "expected_exc": ParseError,
+            "message_contains": "compilation failed with",
+            "diag_contains": "unexpected 'end'",
+        },
+        {
+            "name": "parse_unterminated_macro",
+            "source": "macro m 0 1\n",
+            "expected_exc": ParseError,
+            "message_contains": "compilation failed with",
+            "diag_contains": "unterminated macro definition",
+        },
+        {
+            "name": "compile_unknown_word",
+            "source": "word main\n    __integrity_missing_word__\nend\n",
+            "expected_exc": CompileError,
+            "message_contains": "unknown word '__integrity_missing_word__'",
+        },
+        {
+            "name": "compile_compile_only_word",
+            "source": "word main\n    nil\nend\n",
+            "expected_exc": CompileError,
+            "message_contains": "compile-time only",
+        },
+    ]
+
+    for case in failure_cases:
+        compiler = Compiler(include_paths=include_paths)
+        try:
+            compiler.compile_source(case["source"], debug=False, entry_mode="program")
+        except Exception as exc:
+            expected_exc = case["expected_exc"]
+            if not isinstance(exc, expected_exc):
+                errors.append(
+                    f"failure-injection case '{case['name']}' raised {type(exc).__name__}, expected {expected_exc.__name__}"
+                )
+                continue
+
+            message = str(exc)
+            needle = case.get("message_contains")
+            if needle and needle not in message:
+                errors.append(
+                    f"failure-injection case '{case['name']}' message mismatch: expected substring {needle!r}, got {message!r}"
+                )
+
+            diag_needle = case.get("diag_contains")
+            if diag_needle:
+                diagnostics = [d.message for d in compiler.parser.diagnostics if getattr(d, "level", "error") == "error"]
+                if not any(diag_needle in d for d in diagnostics):
+                    errors.append(
+                        f"failure-injection case '{case['name']}' missing diagnostic containing {diag_needle!r}; got {diagnostics!r}"
+                    )
+        else:
+            errors.append(f"failure-injection case '{case['name']}' expected failure but compilation succeeded")
+
+
+def _run_integrity_checks() -> None:
+    errors: List[str] = []
+
+    opcode_symbols = _integrity_opcode_symbols()
+    opcode_values = {globals()[name] for name in opcode_symbols}
+    mapped_values = set(_OP_STR_TO_INT.values())
+
+    missing_from_mapping = sorted(opcode_values - mapped_values)
+    extra_in_mapping = sorted(mapped_values - opcode_values)
+    if missing_from_mapping or extra_in_mapping:
+        if missing_from_mapping:
+            errors.append(
+                "opcode mapping missing values: " + ", ".join(str(v) for v in missing_from_mapping)
+            )
+        if extra_in_mapping:
+            errors.append(
+                "opcode mapping contains unknown values: " + ", ".join(str(v) for v in extra_in_mapping)
+            )
+
+    documented_ops = set(_OP_INTEGRITY_DOCS.keys())
+    defined_ops = set(_OP_STR_TO_INT.keys())
+    missing_docs = sorted(defined_ops - documented_ops)
+    extra_docs = sorted(documented_ops - defined_ops)
+    if missing_docs:
+        errors.append("missing opcode docs entries: " + ", ".join(missing_docs))
+    if extra_docs:
+        errors.append("stale opcode docs entries: " + ", ".join(extra_docs))
+
+    coverage_targets: List[Tuple[str, Any]] = [
+        ("CompileTimeVM._execute_nodes", CompileTimeVM._execute_nodes),
+        ("Assembler._emit_node", Assembler._emit_node),
+        ("Assembler._format_cfg_op", Assembler._format_cfg_op),
+    ]
+    for target_name, target_obj in coverage_targets:
+        seen_symbols = _integrity_symbols_in_object(target_obj)
+        missing_symbols = sorted(opcode_symbols - seen_symbols)
+        if missing_symbols:
+            errors.append(
+                f"{target_name} missing opcode coverage: " + ", ".join(missing_symbols)
+            )
+
+    _run_integrity_cfg_format_checks(errors)
+    _run_integrity_vm_semantic_checks(errors)
+    _run_integrity_assembler_semantic_checks(errors)
+    _run_integrity_roundtrip_checks(errors)
+    _run_integrity_failure_injection_checks(errors)
+
+    if errors:
+        details = "\n".join(f"  - {msg}" for msg in errors)
+        raise CompileError("integrity assertions failed:\n" + details)
+
+
 def cli(argv: Sequence[str]) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
-    parser.add_argument("source", type=Path, nargs="?", default=None, help="input .sl file (optional when --clean is used)")
+    parser.add_argument(
+        "source",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="input .sl file (optional with --clean, --repl, --docs, or standalone --check-integrity)",
+    )
     parser.add_argument("-o", dest="output", type=Path, default=None, help="output path (defaults vary by artifact)")
     parser.add_argument(
         "-I",
@@ -15478,6 +16172,11 @@ def cli(argv: Sequence[str]) -> int:
         "--check",
         action="store_true",
         help="validate source without producing artifacts (parse + compile only)",
+    )
+    parser.add_argument(
+        "--check-integrity",
+        action="store_true",
+        help="run internal compiler integrity assertions (opcode docs + coverage checks)",
     )
     parser.add_argument(
         "-W",
@@ -15598,6 +16297,17 @@ def cli(argv: Sequence[str]) -> int:
             include_private=args.docs_all,
             include_tests=args.docs_include_tests,
         )
+
+    if args.source is None and args.check_integrity and not args.repl:
+        if args.dump_cfg is not None:
+            parser.error("--dump-cfg requires a source file")
+        try:
+            _run_integrity_checks()
+        except CompileError as exc:
+            print(f"[error] {exc}")
+            return 1
+        print("ok")
+        return 0
 
     if args.source is None and not args.repl:
         parser.error("the following arguments are required: source")
@@ -15836,6 +16546,10 @@ def cli(argv: Sequence[str]) -> int:
             compiler.parser.dictionary.warn_callback = _dict_warn_cb
         else:
             compiler.parser.dictionary.warn_callback = None
+
+        if args.check_integrity:
+            _run_integrity_checks()
+            print("ok")
 
         ct_run_libs = list(args.libs)
         if args.source is not None:

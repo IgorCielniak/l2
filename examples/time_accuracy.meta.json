@@ -1,0 +1,6 @@
+{
+  "description": "runnable smoke check for monotonic sleep timing",
+  "run_example": true,
+  "stdout_regex": "^\\d+\\n?$",
+  "runtime_timeout": 10
+}

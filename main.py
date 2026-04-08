@@ -373,7 +373,12 @@ def _is_scalar_literal(node: Op) -> bool:
     return node._opcode == OP_LITERAL and not isinstance(node.data, str)
 
 
-_RE_MACRO_ARG_TOKEN = re.compile(r"^\$(\d+)$")
+_RE_REWRITE_CAPTURE_TOKEN = re.compile(r"^\$(\*?)([A-Za-z_][A-Za-z0-9_]*|\d+)(?::([A-Za-z_][A-Za-z0-9_-]*))?$")
+_REWRITE_CAPTURE_CONSTRAINTS = frozenset({
+    "", "any", "ident", "identifier", "id", "word",
+    "int", "integer", "float", "number", "numeric",
+    "string", "str", "char", "chr", "literal",
+})
 _ASM_LINE_STARTERS: Set[str] = {
     "mov", "movzx", "movsx", "movsxd", "lea", "push", "pop", "add", "sub", "imul", "mul", "idiv", "div",
     "and", "or", "xor", "not", "neg", "inc", "dec", "cmp", "test", "call", "jmp", "je", "jne", "jg",
@@ -605,15 +610,50 @@ class Module:
 
 
 class MacroDefinition:
-    __slots__ = ('name', 'tokens', 'param_count', 'asm_brace_depth', 'awaiting_asm_body', 'awaiting_asm_terminator')
+    __slots__ = (
+        'name', 'tokens', 'param_count', 'ordered_params', 'variadic_param',
+        'asm_brace_depth', 'awaiting_asm_body', 'awaiting_asm_terminator'
+    )
 
-    def __init__(self, name: str, tokens: List[str], param_count: int = 0) -> None:
+    def __init__(
+        self,
+        name: str,
+        tokens: List[str],
+        param_count: int = 0,
+        ordered_params: Optional[List[str]] = None,
+        variadic_param: Optional[str] = None,
+    ) -> None:
         self.name = name
         self.tokens = tokens
         self.param_count = param_count
+        if ordered_params is None:
+            ordered_params = [str(i) for i in range(param_count)]
+        self.ordered_params = ordered_params
+        self.variadic_param = variadic_param
         self.asm_brace_depth = 0
         self.awaiting_asm_body = False
         self.awaiting_asm_terminator = False
+
+
+class RewriteRule:
+    __slots__ = ('name', 'pattern', 'replacement', 'priority', 'order', 'enabled')
+
+    def __init__(
+        self,
+        name: str,
+        pattern: Sequence[str],
+        replacement: Sequence[str],
+        *,
+        priority: int = 0,
+        order: int = 0,
+        enabled: bool = True,
+    ) -> None:
+        self.name = name
+        self.pattern = tuple(pattern)
+        self.replacement = tuple(replacement)
+        self.priority = int(priority)
+        self.order = int(order)
+        self.enabled = bool(enabled)
 
 
 class StructField:
@@ -691,6 +731,97 @@ class MacroContext:
 
     def set_token_hook(self, handler: Optional[str]) -> None:
         self._parser.token_hook = handler
+
+    def add_reader_rewrite(
+        self,
+        pattern: Sequence[str],
+        replacement: Sequence[str],
+        *,
+        name: Optional[str] = None,
+        priority: int = 0,
+    ) -> str:
+        return self._parser.add_rewrite_rule(
+            "reader",
+            pattern,
+            replacement,
+            name=name,
+            priority=priority,
+        )
+
+    def add_grammar_rewrite(
+        self,
+        pattern: Sequence[str],
+        replacement: Sequence[str],
+        *,
+        name: Optional[str] = None,
+        priority: int = 0,
+    ) -> str:
+        return self._parser.add_rewrite_rule(
+            "grammar",
+            pattern,
+            replacement,
+            name=name,
+            priority=priority,
+        )
+
+    def remove_reader_rewrite(self, name: str) -> bool:
+        return self._parser.remove_rewrite_rule("reader", name)
+
+    def remove_grammar_rewrite(self, name: str) -> bool:
+        return self._parser.remove_rewrite_rule("grammar", name)
+
+    def clear_reader_rewrites(self) -> int:
+        return self._parser.clear_rewrite_rules("reader")
+
+    def clear_grammar_rewrites(self) -> int:
+        return self._parser.clear_rewrite_rules("grammar")
+
+    def list_reader_rewrites(self) -> List[str]:
+        return self._parser.list_rewrite_rules("reader")
+
+    def list_grammar_rewrites(self) -> List[str]:
+        return self._parser.list_rewrite_rules("grammar")
+
+    def set_reader_rewrite_enabled(self, name: str, enabled: bool) -> bool:
+        return self._parser.set_rewrite_rule_enabled("reader", name, enabled)
+
+    def set_grammar_rewrite_enabled(self, name: str, enabled: bool) -> bool:
+        return self._parser.set_rewrite_rule_enabled("grammar", name, enabled)
+
+    def set_reader_rewrite_priority(self, name: str, priority: int) -> bool:
+        return self._parser.set_rewrite_rule_priority("reader", name, priority)
+
+    def set_grammar_rewrite_priority(self, name: str, priority: int) -> bool:
+        return self._parser.set_rewrite_rule_priority("grammar", name, priority)
+
+    def set_macro_expansion_limit(self, limit: int) -> None:
+        self._parser.set_macro_expansion_limit(limit)
+
+    def macro_expansion_limit(self) -> int:
+        return self._parser.macro_expansion_limit
+
+    def set_macro_preview(self, enabled: bool) -> None:
+        self._parser.set_macro_preview(enabled)
+
+    def macro_preview(self) -> bool:
+        return self._parser.macro_preview
+
+    def register_text_macro(self, name: str, param_count: int, expansion: Sequence[str]) -> None:
+        self._parser.register_text_macro(name, param_count, expansion)
+
+    def register_text_macro_signature(
+        self,
+        name: str,
+        param_spec: Sequence[str],
+        expansion: Sequence[str],
+    ) -> None:
+        self._parser.register_text_macro_signature(name, param_spec, expansion)
+
+    def unregister_word(self, name: str) -> bool:
+        return self._parser.unregister_word(name)
+
+    def word_exists(self, name: str) -> bool:
+        return self._parser.word_exists(name)
 
     def new_label(self, prefix: str) -> str:
         return self._parser._new_label(prefix)
@@ -848,6 +979,11 @@ class Parser:
         self.block_openers: Set[str] = {"word", "with", "for", "while", "begin"}
         self.control_overrides: Set[str] = set()
         self._warned_control_overrides: Set[str] = set()
+        self.reader_rewrite_rules: List[RewriteRule] = []
+        self.grammar_rewrite_rules: List[RewriteRule] = []
+        self._rewrite_rule_counter: int = 0
+        self._macro_signatures: Dict[str, Tuple[Tuple[str, ...], Optional[str]]] = {}
+        self._pattern_macro_rules: Dict[str, List[str]] = {}
         self.label_counter = 0
         self.token_hook: Optional[str] = None
         self._last_token: Optional[Token] = None
@@ -963,6 +1099,570 @@ class Parser:
 
     def most_recent_definition(self) -> Optional[Word]:
         return self.last_defined
+
+    @staticmethod
+    def _rewrite_lexeme_from_value(value: Any) -> str:
+        if isinstance(value, Token):
+            return value.lexeme
+        if isinstance(value, str):
+            return value
+        raise ParseError("rewrite pattern/replacement items must be strings or tokens")
+
+    def _normalize_rewrite_lexemes(self, values: Sequence[Any], *, field: str) -> List[str]:
+        lexemes: List[str] = []
+        for value in values:
+            lex = self._rewrite_lexeme_from_value(value)
+            if not lex:
+                raise ParseError(f"rewrite {field} cannot contain empty tokens")
+            lexemes.append(lex)
+        return lexemes
+
+    @staticmethod
+    def _parse_rewrite_capture(piece: str) -> Optional[Tuple[bool, str, str]]:
+        match = _RE_REWRITE_CAPTURE_TOKEN.fullmatch(piece)
+        if match is None:
+            return None
+        variadic = bool(match.group(1))
+        name = match.group(2)
+        constraint = (match.group(3) or "").lower()
+        return variadic, name, constraint
+
+    @staticmethod
+    def _rewrite_capture_equals(existing: Any, incoming: Any) -> bool:
+        if isinstance(existing, tuple):
+            if isinstance(incoming, tuple):
+                return existing == incoming
+            return len(existing) == 1 and existing[0] == incoming
+        if isinstance(incoming, tuple):
+            return len(incoming) == 1 and incoming[0] == existing
+        return existing == incoming
+
+    @staticmethod
+    def _rewrite_constraint_matches(lexeme: str, constraint: str) -> bool:
+        if not constraint or constraint == "any":
+            return True
+        if constraint in ("ident", "identifier", "id", "word"):
+            return _is_identifier(lexeme)
+        if constraint in ("int", "integer"):
+            try:
+                int(lexeme, 0)
+                return True
+            except ValueError:
+                return False
+        if constraint == "float":
+            lower = lexeme.lower()
+            if "." not in lexeme and "e" not in lower:
+                return False
+            try:
+                float(lexeme)
+                return True
+            except ValueError:
+                return False
+        if constraint in ("number", "numeric"):
+            try:
+                int(lexeme, 0)
+                return True
+            except ValueError:
+                try:
+                    float(lexeme)
+                    return True
+                except ValueError:
+                    return False
+        if constraint in ("string", "str"):
+            return len(lexeme) >= 2 and lexeme[0] == '"' and lexeme[-1] == '"'
+        if constraint in ("char", "chr"):
+            return len(lexeme) >= 2 and lexeme[0] == "'" and lexeme[-1] == "'"
+        if constraint == "literal":
+            if len(lexeme) >= 2 and ((lexeme[0] == '"' and lexeme[-1] == '"') or (lexeme[0] == "'" and lexeme[-1] == "'")):
+                return True
+            try:
+                int(lexeme, 0)
+                return True
+            except ValueError:
+                try:
+                    float(lexeme)
+                    return True
+                except ValueError:
+                    return False
+        return False
+
+    def _validate_rewrite_rule(self, pattern: Sequence[str], replacement: Sequence[str], *, stage: str) -> None:
+        capture_shapes: Dict[str, bool] = {}
+        has_non_variadic_piece = False
+
+        for piece in pattern:
+            parsed = self._parse_rewrite_capture(piece)
+            if parsed is None:
+                has_non_variadic_piece = True
+                continue
+            variadic, name, constraint = parsed
+            if constraint not in _REWRITE_CAPTURE_CONSTRAINTS:
+                raise ParseError(
+                    f"rewrite rule ({stage}) uses unknown constraint '{constraint}' in '{piece}'"
+                )
+            prev_shape = capture_shapes.get(name)
+            if prev_shape is None:
+                capture_shapes[name] = variadic
+            elif prev_shape != variadic:
+                raise ParseError(
+                    f"rewrite rule ({stage}) capture '{name}' mixes variadic and single-token forms"
+                )
+            if not variadic:
+                has_non_variadic_piece = True
+
+        if not has_non_variadic_piece:
+            raise ParseError(
+                f"rewrite rule ({stage}) must contain at least one non-variadic pattern token"
+            )
+
+        for piece in replacement:
+            parsed = self._parse_rewrite_capture(piece)
+            if parsed is None:
+                continue
+            _, name, constraint = parsed
+            if constraint:
+                raise ParseError(
+                    f"rewrite replacement capture '{piece}' must not include constraints"
+                )
+            if name not in capture_shapes:
+                raise ParseError(
+                    f"rewrite replacement references unknown capture '{piece}'"
+                )
+
+    def _rewrite_bucket(self, stage: str) -> List[RewriteRule]:
+        if stage == "reader":
+            return self.reader_rewrite_rules
+        if stage == "grammar":
+            return self.grammar_rewrite_rules
+        raise ParseError(f"unknown rewrite stage '{stage}'")
+
+    def add_rewrite_rule(
+        self,
+        stage: str,
+        pattern: Sequence[Any],
+        replacement: Sequence[Any],
+        *,
+        name: Optional[str] = None,
+        priority: int = 0,
+        enabled: bool = True,
+    ) -> str:
+        pattern_lex = self._normalize_rewrite_lexemes(pattern, field="pattern")
+        if not pattern_lex:
+            raise ParseError("rewrite pattern cannot be empty")
+        replacement_lex = self._normalize_rewrite_lexemes(replacement, field="replacement")
+        self._validate_rewrite_rule(pattern_lex, replacement_lex, stage=stage)
+
+        bucket = self._rewrite_bucket(stage)
+
+        rule_name = (name or "").strip()
+        if not rule_name:
+            while True:
+                candidate = f"{stage}-rewrite-{self._rewrite_rule_counter}"
+                self._rewrite_rule_counter += 1
+                if all(rule.name != candidate for rule in bucket):
+                    rule_name = candidate
+                    break
+
+        order = self._rewrite_rule_counter
+        self._rewrite_rule_counter += 1
+        rule = RewriteRule(
+            rule_name,
+            pattern_lex,
+            replacement_lex,
+            priority=priority,
+            order=order,
+            enabled=enabled,
+        )
+
+        for idx, existing in enumerate(bucket):
+            if existing.name == rule_name:
+                bucket[idx] = rule
+                break
+        else:
+            bucket.append(rule)
+        bucket.sort(key=lambda r: (-r.priority, r.order))
+        return rule_name
+
+    def remove_rewrite_rule(self, stage: str, name: str) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        for idx, rule in enumerate(bucket):
+            if rule.name == name:
+                del bucket[idx]
+                return True
+        return False
+
+    def clear_rewrite_rules(self, stage: str) -> int:
+        bucket = self._rewrite_bucket(stage)
+        count = len(bucket)
+        bucket.clear()
+        return count
+
+    def list_rewrite_rules(self, stage: str) -> List[str]:
+        bucket = self._rewrite_bucket(stage)
+        return [rule.name for rule in bucket]
+
+    def set_rewrite_rule_enabled(self, stage: str, name: str, enabled: bool) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                rule.enabled = bool(enabled)
+                return True
+        return False
+
+    def get_rewrite_rule_enabled(self, stage: str, name: str) -> Optional[bool]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return bool(rule.enabled)
+        return None
+
+    def set_rewrite_rule_priority(self, stage: str, name: str, priority: int) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                rule.priority = int(priority)
+                bucket.sort(key=lambda r: (-r.priority, r.order))
+                return True
+        return False
+
+    def get_rewrite_rule_priority(self, stage: str, name: str) -> Optional[int]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return int(rule.priority)
+        return None
+
+    def set_macro_expansion_limit(self, limit: int) -> None:
+        if limit < 1:
+            raise ParseError("macro expansion limit must be >= 1")
+        self.macro_expansion_limit = int(limit)
+
+    def set_macro_preview(self, enabled: bool) -> None:
+        self.macro_preview = bool(enabled)
+
+    def register_text_macro(self, name: str, param_count: int, expansion: Sequence[Any]) -> None:
+        param_count_i = int(param_count)
+        self.register_text_macro_signature(
+            name,
+            [str(i) for i in range(max(0, param_count_i))],
+            expansion,
+        )
+
+    def register_text_macro_signature(
+        self,
+        name: str,
+        param_spec: Sequence[Any],
+        expansion: Sequence[Any],
+    ) -> None:
+        if not name:
+            raise ParseError("macro name cannot be empty")
+
+        param_tokens = self._normalize_rewrite_lexemes(param_spec, field="macro parameter spec")
+        ordered_params: List[str] = []
+        seen: Set[str] = set()
+        variadic_param: Optional[str] = None
+        for raw in param_tokens:
+            lex = raw
+            is_variadic = False
+            if lex.startswith("*"):
+                is_variadic = True
+                lex = lex[1:]
+            elif lex.startswith("..."):
+                is_variadic = True
+                lex = lex[3:]
+            if not lex or (not _is_identifier(lex) and not lex.isdigit()):
+                raise ParseError(f"invalid macro parameter name '{raw}' in macro '{name}'")
+            if lex in seen:
+                raise ParseError(f"duplicate macro parameter '{lex}' in macro '{name}'")
+            seen.add(lex)
+            if is_variadic:
+                if variadic_param is not None:
+                    raise ParseError(f"macro '{name}' cannot declare multiple variadic parameters")
+                variadic_param = lex
+                continue
+            if variadic_param is not None:
+                raise ParseError(f"macro '{name}' variadic parameter must be last")
+            ordered_params.append(lex)
+
+        expansion_lex = self._normalize_rewrite_lexemes(expansion, field="macro expansion")
+        word = Word(name=name)
+        word.macro_expansion = list(expansion_lex)
+        word.macro_params = len(ordered_params)
+        self.dictionary.register(word)
+        self._macro_signatures[name] = (tuple(ordered_params), variadic_param)
+
+    def register_pattern_macro(
+        self,
+        name: str,
+        clauses: Sequence[Tuple[Sequence[Any], Sequence[Any]]],
+    ) -> None:
+        if not name:
+            raise ParseError("pattern macro name cannot be empty")
+        if not clauses:
+            raise ParseError(f"macro '{name}' requires at least one pattern clause")
+
+        self.unregister_pattern_macro(name)
+
+        rule_names: List[str] = []
+        for idx, (pattern, replacement) in enumerate(clauses):
+            pattern_lex = self._normalize_rewrite_lexemes(
+                pattern,
+                field=f"macro '{name}' pattern",
+            )
+            if not pattern_lex:
+                raise ParseError(f"macro '{name}' clause {idx + 1} has an empty pattern")
+            replacement_lex = self._normalize_rewrite_lexemes(
+                replacement,
+                field=f"macro '{name}' replacement",
+            )
+            rule_name = f"pattern-macro:{name}:{idx}"
+            added = self.add_rewrite_rule(
+                "grammar",
+                [name, *pattern_lex],
+                replacement_lex,
+                name=rule_name,
+            )
+            rule_names.append(added)
+
+        self._pattern_macro_rules[name] = rule_names
+
+    def unregister_pattern_macro(self, name: str) -> bool:
+        removed = False
+        rule_names = self._pattern_macro_rules.pop(name, None)
+        if rule_names is None:
+            prefix = f"pattern-macro:{name}:"
+            for rule in list(self.grammar_rewrite_rules):
+                if rule.name.startswith(prefix):
+                    if self.remove_rewrite_rule("grammar", rule.name):
+                        removed = True
+            return removed
+
+        for rule_name in rule_names:
+            if self.remove_rewrite_rule("grammar", rule_name):
+                removed = True
+        return removed
+
+    def unregister_word(self, name: str) -> bool:
+        if name not in self.dictionary.words:
+            return False
+        del self.dictionary.words[name]
+        self._macro_signatures.pop(name, None)
+        self.unregister_pattern_macro(name)
+        if self.token_hook == name:
+            self.token_hook = None
+        return True
+
+    def word_exists(self, name: str) -> bool:
+        return name in self.dictionary.words
+
+    def _macro_signature_for_word(self, word: Word) -> Tuple[Tuple[str, ...], Optional[str]]:
+        signature = self._macro_signatures.get(word.name)
+        if signature is not None:
+            return signature
+        ordered = tuple(str(i) for i in range(max(0, int(word.macro_params))))
+        return ordered, None
+
+    def _looks_like_pattern_macro_definition(self) -> bool:
+        """Heuristically detect pattern-macro clauses in a `macro` body.
+
+        Pattern mode is considered when top-level clause arrows (`=>`) are
+        present and we can see either:
+        - two top-level `;` tokens (clause terminator + macro terminator), or
+        - legacy `end` terminator after at least one clause.
+        """
+        pos = self.pos
+        token_count = len(self.tokens)
+        if pos >= token_count:
+            return False
+
+        asm_brace_depth = 0
+        awaiting_asm_body = False
+        awaiting_asm_terminator = False
+        saw_arrow = False
+        clause_semicolons = 0
+        definition_starters = {"word", ":asm", ":py", "extern", "inline"}
+
+        while pos < token_count:
+            tok = self.tokens[pos]
+            lex = tok.lexeme
+            pos += 1
+
+            if awaiting_asm_body:
+                if lex == "{":
+                    asm_brace_depth += 1
+                    awaiting_asm_body = False
+                continue
+
+            if lex == ":asm":
+                awaiting_asm_body = True
+                continue
+
+            if awaiting_asm_terminator:
+                awaiting_asm_terminator = False
+                continue
+
+            if lex == "{" and asm_brace_depth > 0:
+                asm_brace_depth += 1
+                continue
+
+            if lex == "}" and asm_brace_depth > 0:
+                asm_brace_depth -= 1
+                if asm_brace_depth == 0:
+                    awaiting_asm_terminator = True
+                continue
+
+            if asm_brace_depth > 0:
+                continue
+
+            if lex == "=>":
+                saw_arrow = True
+                continue
+
+            if lex == ";":
+                if not saw_arrow:
+                    return False
+                clause_semicolons += 1
+                if clause_semicolons >= 2:
+                    return True
+                continue
+
+            if lex == "end":
+                if saw_arrow and clause_semicolons >= 1:
+                    return True
+                return False
+
+            if tok.column == 0 and lex in definition_starters:
+                return saw_arrow
+
+        return False
+
+        return False
+
+    def _consume_macro_argument_group(self, *, word_name: str, call_token: Token) -> List[str]:
+        if self._eof():
+            raise ParseError(
+                f"macro '{word_name}' at {call_token.line}:{call_token.column} invocation missing argument"
+            )
+        first = self._consume()
+        opener_to_closer = {"(": ")", "[": "]", "{": "}"}
+        close = opener_to_closer.get(first.lexeme)
+        if close is None:
+            return [first.lexeme]
+
+        stack: List[str] = [close]
+        out: List[str] = [first.lexeme]
+        while stack:
+            if self._eof():
+                raise ParseError(
+                    f"macro '{word_name}' at {call_token.line}:{call_token.column} has unterminated grouped argument"
+                )
+            tok = self._consume()
+            out.append(tok.lexeme)
+            closer = opener_to_closer.get(tok.lexeme)
+            if closer is not None:
+                stack.append(closer)
+                continue
+            if tok.lexeme == stack[-1]:
+                stack.pop()
+        return out
+
+    def _collect_macro_callstyle_args(self, *, word_name: str, call_token: Token) -> List[List[str]]:
+        open_tok = self._consume()
+        if open_tok.lexeme != "(":
+            raise ParseError(
+                f"internal macro parser error for '{word_name}': expected '(' but got '{open_tok.lexeme}'"
+            )
+
+        args: List[List[str]] = []
+        current: List[str] = []
+        opener_to_closer = {"(": ")", "[": "]", "{": "}"}
+        stack: List[str] = []
+
+        while True:
+            if self._eof():
+                raise ParseError(
+                    f"macro '{word_name}' at {call_token.line}:{call_token.column} has unterminated '(' call syntax"
+                )
+            tok = self._consume()
+            lex = tok.lexeme
+
+            closer = opener_to_closer.get(lex)
+            if closer is not None:
+                stack.append(closer)
+                current.append(lex)
+                continue
+
+            if stack and lex == stack[-1]:
+                stack.pop()
+                current.append(lex)
+                continue
+
+            if not stack and lex == ",":
+                if not current:
+                    raise ParseError(
+                        f"macro '{word_name}' at {call_token.line}:{call_token.column} has empty call argument"
+                    )
+                args.append(current)
+                current = []
+                continue
+
+            if not stack and lex == ")":
+                if current:
+                    args.append(current)
+                elif args:
+                    raise ParseError(
+                        f"macro '{word_name}' at {call_token.line}:{call_token.column} has trailing comma in call arguments"
+                    )
+                break
+
+            current.append(lex)
+
+        return args
+
+    def _collect_macro_call_args(
+        self,
+        word: Word,
+        call_token: Token,
+    ) -> Dict[str, Any]:
+        ordered, variadic = self._macro_signature_for_word(word)
+        required = len(ordered)
+
+        callstyle = (not self._eof()) and (self.peek_token().lexeme == "(")
+        if callstyle:
+            groups = self._collect_macro_callstyle_args(word_name=word.name, call_token=call_token)
+        else:
+            groups = [
+                self._consume_macro_argument_group(word_name=word.name, call_token=call_token)
+                for _ in range(required)
+            ]
+            if variadic is not None:
+                while not self._eof():
+                    nxt = self.peek_token()
+                    if nxt is None or nxt.line != call_token.line:
+                        break
+                    groups.append(self._consume_macro_argument_group(word_name=word.name, call_token=call_token))
+
+        if variadic is None and len(groups) != required:
+            raise ParseError(
+                f"macro '{word.name}' at {call_token.line}:{call_token.column} expects {required} argument(s), got {len(groups)}"
+            )
+        if variadic is not None and len(groups) < required:
+            raise ParseError(
+                f"macro '{word.name}' at {call_token.line}:{call_token.column} expects at least {required} argument(s), got {len(groups)}"
+            )
+
+        captures: Dict[str, Any] = {}
+        for idx, name in enumerate(ordered):
+            arg_tokens = groups[idx]
+            captures[name] = list(arg_tokens)
+            captures[str(idx)] = list(arg_tokens)
+
+        if variadic is not None:
+            tail_groups = [list(group) for group in groups[required:]]
+            captures[variadic] = tail_groups
+            captures[str(required)] = tail_groups
+
+        return captures
 
     def allocate_variable(self, name: str) -> Tuple[str, str]:
         if name in self.variable_labels:
@@ -1126,7 +1826,10 @@ class Parser:
         _priority_keywords = _PARSE_PRIORITY_KEYWORDS
         _kw_get = _PARSE_KEYWORD_DISPATCH.get
         _tokens = self.tokens
+        _reader_rewrite_rules = self.reader_rewrite_rules
+        _grammar_rewrite_rules = self.grammar_rewrite_rules
         _run_token_hook = self._run_token_hook
+        _try_apply_rewrite_rules = self._try_apply_rewrite_rules
         _handle_macro_recording = self._handle_macro_recording
         _handle_list_begin = self._handle_list_begin
         _handle_list_end = self._handle_list_end
@@ -1148,9 +1851,15 @@ class Parser:
                 token = _tokens[self.pos]
                 self.pos += 1
                 self._last_token = token
+                if _reader_rewrite_rules and _try_apply_rewrite_rules("reader", token):
+                    _tokens = self.tokens
+                    continue
                 if self.token_hook and _run_token_hook(token):
                     continue
                 if _handle_macro_recording(token):
+                    continue
+                if _grammar_rewrite_rules and _try_apply_rewrite_rules("grammar", token):
+                    _tokens = self.tokens
                     continue
                 lexeme = token.lexeme
                 if self._pending_priority is not None and lexeme not in _priority_keywords:
@@ -1323,7 +2032,6 @@ class Parser:
         return False
 
     def _handle_builtin_if(self, token: Token) -> None:
-        # Support shorthand `else <cond> if` by sharing the previous else-end label.
         if self.control_stack:
             top = self.control_stack[-1]
             if (
@@ -1662,8 +2370,8 @@ class Parser:
         word = words.get(lexeme)
         if word is not None:
             if word.macro_expansion is not None:
-                args = self._collect_macro_args(word.macro_params, word_name=word.name, call_token=token)
-                self._inject_macro_tokens(word, token, args)
+                captures = self._collect_macro_call_args(word, token)
+                self._inject_macro_tokens(word, token, captures)
                 return True
             if word.immediate:
                 if word.macro:
@@ -1734,12 +2442,12 @@ class Parser:
     def _maybe_expand_macro(self, token: Token) -> bool:
         word = self.dictionary.lookup(token.lexeme)
         if word and word.macro_expansion is not None:
-            args = self._collect_macro_args(word.macro_params, word_name=word.name, call_token=token)
-            self._inject_macro_tokens(word, token, args)
+            captures = self._collect_macro_call_args(word, token)
+            self._inject_macro_tokens(word, token, captures)
             return True
         return False
 
-    def _inject_macro_tokens(self, word: Word, token: Token, args: List[str]) -> None:
+    def _inject_macro_tokens(self, word: Word, token: Token, captures: Dict[str, Any]) -> None:
         next_depth = token.expansion_depth + 1
         if next_depth > self.macro_expansion_limit:
             raise ParseError(
@@ -1747,17 +2455,41 @@ class Parser:
             )
         replaced: List[str] = []
         for lex in word.macro_expansion or []:
-            arg_match = _RE_MACRO_ARG_TOKEN.fullmatch(lex)
-            if arg_match is not None:
-                idx = int(arg_match.group(1))
-                if idx < 0 or idx >= len(args):
-                    raise ParseError(
-                        f"macro '{word.name}' references argument {lex}, "
-                        f"but call provided only {len(args)} argument(s)"
-                    )
-                replaced.append(args[idx])
-            else:
+            parsed = self._parse_rewrite_capture(lex)
+            if parsed is None:
                 replaced.append(lex)
+                continue
+            variadic, key, constraint = parsed
+            if constraint:
+                raise ParseError(
+                    f"macro '{word.name}' expansion placeholder '{lex}' cannot include a type constraint"
+                )
+            if key not in captures:
+                raise ParseError(
+                    f"macro '{word.name}' references argument '{lex}', but the argument is not available"
+                )
+            captured = captures[key]
+            if variadic:
+                if isinstance(captured, list) and captured and isinstance(captured[0], list):
+                    for group in captured:
+                        replaced.extend(group)
+                elif isinstance(captured, list):
+                    replaced.extend(captured)
+                else:
+                    raise ParseError(
+                        f"macro '{word.name}' variadic placeholder '{lex}' resolved to unsupported value"
+                    )
+                continue
+
+            if isinstance(captured, list) and captured and isinstance(captured[0], list):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{lex}' is variadic; use '$*{key}' to splice all arguments"
+                )
+            if not isinstance(captured, list):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{lex}' resolved to unsupported value"
+                )
+            replaced.extend(captured)
         if self.macro_preview:
             preview = " ".join(replaced)
             if len(preview) > 240:
@@ -1778,29 +2510,23 @@ class Parser:
         ]
         self.tokens[self.pos:self.pos] = insertion
 
-    def _collect_macro_args(
+    def _start_macro_recording(
         self,
-        count: int,
+        name: str,
+        param_count: int,
         *,
-        word_name: Optional[str] = None,
-        call_token: Optional[Token] = None,
-    ) -> List[str]:
-        args: List[str] = []
-        for _ in range(count):
-            if self._eof():
-                if word_name is not None and call_token is not None:
-                    raise ParseError(
-                        f"macro '{word_name}' at {call_token.line}:{call_token.column} "
-                        f"expects {count} argument(s), got {len(args)}"
-                    )
-                raise ParseError("macro invocation missing arguments")
-            args.append(self._consume().lexeme)
-        return args
-
-    def _start_macro_recording(self, name: str, param_count: int) -> None:
+        ordered_params: Optional[List[str]] = None,
+        variadic_param: Optional[str] = None,
+    ) -> None:
         if self.macro_recording is not None:
             raise ParseError("nested macro definitions are not supported")
-        self.macro_recording = MacroDefinition(name=name, tokens=[], param_count=param_count)
+        self.macro_recording = MacroDefinition(
+            name=name,
+            tokens=[],
+            param_count=param_count,
+            ordered_params=ordered_params,
+            variadic_param=variadic_param,
+        )
 
     def _finish_macro_recording(self, token: Token) -> None:
         if self.macro_recording is None:
@@ -1809,8 +2535,12 @@ class Parser:
         self.macro_recording = None
         word = Word(name=macro_def.name)
         word.macro_expansion = list(macro_def.tokens)
-        word.macro_params = macro_def.param_count
+        word.macro_params = len(macro_def.ordered_params)
         self.dictionary.register(word)
+        self._macro_signatures[macro_def.name] = (
+            tuple(macro_def.ordered_params),
+            macro_def.variadic_param,
+        )
 
     def _push_control(self, entry: Dict[str, str]) -> None:
         if "line" not in entry or "column" not in entry:
@@ -1840,6 +2570,183 @@ class Parser:
         label = f"L_{prefix}_{self.label_counter}"
         self.label_counter += 1
         return label
+
+    def _try_apply_rewrite_rules(self, stage: str, token: Token) -> bool:
+        rules = self._rewrite_bucket(stage)
+        if not rules:
+            return False
+
+        start = self.pos - 1
+        if start < 0:
+            return False
+        tokens = self.tokens
+        token_count = len(tokens)
+        token_lexeme = token.lexeme
+
+        for rule in rules:
+            if not rule.enabled:
+                continue
+            pattern = rule.pattern
+            if not pattern:
+                continue
+
+            parsed_pattern = [self._parse_rewrite_capture(piece) for piece in pattern]
+            first_parsed = parsed_pattern[0]
+            if first_parsed is None and pattern[0] != token_lexeme:
+                continue
+
+            min_suffix = [0] * (len(pattern) + 1)
+            for idx in range(len(pattern) - 1, -1, -1):
+                parsed = parsed_pattern[idx]
+                min_suffix[idx] = min_suffix[idx + 1] + (0 if (parsed is not None and parsed[0]) else 1)
+
+            if start + min_suffix[0] > token_count:
+                continue
+
+            def _match(
+                pat_idx: int,
+                tok_idx: int,
+                captures: Dict[str, Any],
+                max_depth: int,
+            ) -> Optional[Tuple[int, Dict[str, Any], int]]:
+                if pat_idx == len(pattern):
+                    return tok_idx, captures, max_depth
+
+                piece = pattern[pat_idx]
+                parsed = parsed_pattern[pat_idx]
+                if parsed is None:
+                    if tok_idx >= token_count:
+                        return None
+                    cur_tok = tokens[tok_idx]
+                    if cur_tok.lexeme != piece:
+                        return None
+                    next_depth = max(max_depth, cur_tok.expansion_depth)
+                    return _match(pat_idx + 1, tok_idx + 1, captures, next_depth)
+
+                variadic, key, constraint = parsed
+                if not variadic:
+                    if tok_idx >= token_count:
+                        return None
+                    cur_tok = tokens[tok_idx]
+                    if not self._rewrite_constraint_matches(cur_tok.lexeme, constraint):
+                        return None
+                    prev = captures.get(key)
+                    candidate = cur_tok.lexeme
+                    if prev is not None and not self._rewrite_capture_equals(prev, candidate):
+                        return None
+                    next_captures = captures
+                    if prev is None:
+                        next_captures = dict(captures)
+                        next_captures[key] = candidate
+                    next_depth = max(max_depth, cur_tok.expansion_depth)
+                    return _match(pat_idx + 1, tok_idx + 1, next_captures, next_depth)
+
+                min_rest = min_suffix[pat_idx + 1]
+                max_take = token_count - tok_idx - min_rest
+                if max_take < 0:
+                    return None
+
+                prev = captures.get(key)
+                for take in range(max_take, -1, -1):
+                    chunk_lexemes = tuple(tokens[tok_idx + i].lexeme for i in range(take))
+                    if constraint and not all(
+                        self._rewrite_constraint_matches(lex, constraint)
+                        for lex in chunk_lexemes
+                    ):
+                        continue
+
+                    if prev is not None and not self._rewrite_capture_equals(prev, chunk_lexemes):
+                        continue
+
+                    next_captures = captures
+                    if prev is None:
+                        next_captures = dict(captures)
+                        next_captures[key] = chunk_lexemes
+
+                    next_depth = max_depth
+                    for i in range(take):
+                        d = tokens[tok_idx + i].expansion_depth
+                        if d > next_depth:
+                            next_depth = d
+
+                    result = _match(pat_idx + 1, tok_idx + take, next_captures, next_depth)
+                    if result is not None:
+                        return result
+                return None
+
+            matched = _match(0, start, {}, token.expansion_depth)
+            if matched is None:
+                continue
+
+            end, captures, max_depth = matched
+
+            replaced: List[str] = []
+            parsed_replacement = [self._parse_rewrite_capture(piece) for piece in rule.replacement]
+            for piece, parsed in zip(rule.replacement, parsed_replacement):
+                if parsed is None:
+                    replaced.append(piece)
+                    continue
+                variadic, key, constraint = parsed
+                if constraint:
+                    raise ParseError(
+                        f"rewrite rule '{rule.name}' replacement placeholder '{piece}' must not include constraints"
+                    )
+                if key not in captures:
+                    raise ParseError(
+                        f"rewrite rule '{rule.name}' references capture '{piece}' "
+                        f"that is not bound in pattern"
+                    )
+                value = captures[key]
+                if variadic:
+                    if isinstance(value, tuple):
+                        replaced.extend(value)
+                    else:
+                        replaced.append(value)
+                    continue
+
+                if isinstance(value, tuple):
+                    if len(value) != 1:
+                        raise ParseError(
+                            f"rewrite rule '{rule.name}' placeholder '{piece}' matches multiple tokens; use '$*{key}'"
+                        )
+                    replaced.append(value[0])
+                else:
+                    replaced.append(value)
+
+            next_depth = max_depth + 1
+            if next_depth > self.macro_expansion_limit:
+                raise ParseError(
+                    f"rewrite expansion depth limit ({self.macro_expansion_limit}) exceeded "
+                    f"while applying '{rule.name}'"
+                )
+
+            template = tokens[start]
+            insertion = [
+                Token(
+                    lexeme=lex,
+                    line=template.line,
+                    column=template.column,
+                    start=template.start,
+                    end=template.end,
+                    expansion_depth=next_depth,
+                )
+                for lex in replaced
+            ]
+
+            if self.macro_preview:
+                preview = " ".join(replaced)
+                if len(preview) > 240:
+                    preview = preview[:237] + "..."
+                sys.stderr.write(
+                    f"[rewrite-preview] {rule.name} ({stage}) at "
+                    f"{template.line}:{template.column} -> {preview}\n"
+                )
+
+            tokens[start:end] = insertion
+            self.pos = start
+            return True
+
+        return False
 
     def _run_token_hook(self, token: Token) -> bool:
         if not self.token_hook:
@@ -7925,16 +8832,175 @@ def macro_begin_text_macro(ctx: MacroContext) -> Optional[List[Op]]:
         raise ParseError("macro name missing after 'macro'")
     name_token = parser.next_token()
     param_count = 0
+    explicit_signature = False
+    ordered_params: Optional[List[str]] = None
+    variadic_param: Optional[str] = None
     peek = parser.peek_token()
     if peek is not None:
         try:
             param_count = int(peek.lexeme, 0)
             parser.next_token()
+            explicit_signature = True
         except ValueError:
-            param_count = 0
-    parser._start_macro_recording(name_token.lexeme, param_count)
+            pass
+
+    if not explicit_signature and parser._looks_like_pattern_macro_definition():
+        clauses = _parse_pattern_macro_clauses(parser, name_token.lexeme, keyword="macro")
+        parser.register_pattern_macro(name_token.lexeme, clauses)
+        return None
+
+    if not explicit_signature and peek is not None and peek.lexeme == "(":
+        parser.next_token()  # consume '('
+        explicit_signature = True
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        variadic: Optional[str] = None
+        while True:
+            if parser._eof():
+                raise ParseError(
+                    f"unterminated macro signature for '{name_token.lexeme}'"
+                )
+            tok = parser.next_token()
+            lex = tok.lexeme
+            if lex == ")":
+                break
+            if lex == ",":
+                continue
+            is_variadic = False
+            if lex.startswith("*"):
+                is_variadic = True
+                lex = lex[1:]
+            elif lex.startswith("..."):
+                is_variadic = True
+                lex = lex[3:]
+            if not lex or not _is_identifier(lex):
+                raise ParseError(
+                    f"invalid macro parameter name '{tok.lexeme}' in macro '{name_token.lexeme}'"
+                )
+            if lex in seen:
+                raise ParseError(
+                    f"duplicate macro parameter '{lex}' in macro '{name_token.lexeme}'"
+                )
+            seen.add(lex)
+            if is_variadic:
+                if variadic is not None:
+                    raise ParseError(
+                        f"macro '{name_token.lexeme}' cannot declare multiple variadic parameters"
+                    )
+                variadic = lex
+            else:
+                if variadic is not None:
+                    raise ParseError(
+                        f"macro '{name_token.lexeme}' variadic parameter must be last"
+                    )
+                ordered.append(lex)
+
+        ordered_params = ordered
+        variadic_param = variadic
+        param_count = len(ordered)
+
+    if ordered_params is None:
+        ordered_params = [str(i) for i in range(param_count)]
+    parser._start_macro_recording(
+        name_token.lexeme,
+        param_count,
+        ordered_params=ordered_params,
+        variadic_param=variadic_param,
+    )
     return None
 
+
+def _parse_pattern_macro_clauses(
+    parser: Parser,
+    name: str,
+    *,
+    keyword: str,
+) -> List[Tuple[List[str], List[str]]]:
+    clauses: List[Tuple[List[str], List[str]]] = []
+
+    while True:
+        if parser._eof():
+            raise ParseError(f"unterminated {keyword} '{name}' (missing ';' terminator)")
+
+        peek = parser.peek_token()
+        if peek is not None and peek.lexeme == ";":
+            parser.next_token()
+            break
+        if peek is not None and peek.lexeme == "end":
+            # Backward compatibility with old pattern-macro terminator.
+            parser.next_token()
+            break
+
+        pattern: List[str] = []
+        while True:
+            if parser._eof():
+                raise ParseError(f"unterminated {keyword} clause in '{name}' (missing '=>')")
+            tok = parser.next_token()
+            lex = tok.lexeme
+            if lex == "=>":
+                break
+            if lex == ";":
+                raise ParseError(
+                    f"{keyword} '{name}' pattern cannot contain ';' before '=>'; "
+                    f"close clause with ';' after replacement"
+                )
+            if lex == "end":
+                raise ParseError(f"unterminated {keyword} clause in '{name}' (missing '=>')")
+            pattern.append(lex)
+
+        if not pattern:
+            raise ParseError(f"{keyword} '{name}' has an empty pattern before '=>'")
+
+        replacement: List[str] = []
+        asm_brace_depth = 0
+        awaiting_asm_body = False
+        awaiting_asm_terminator = False
+        while True:
+            if parser._eof():
+                raise ParseError(f"unterminated {keyword} clause in '{name}' (missing ';')")
+            tok = parser.next_token()
+            lex = tok.lexeme
+
+            if awaiting_asm_body:
+                if lex == "{":
+                    asm_brace_depth += 1
+                    awaiting_asm_body = False
+                replacement.append(lex)
+                continue
+
+            if lex == ":asm":
+                awaiting_asm_body = True
+                replacement.append(lex)
+                continue
+
+            if awaiting_asm_terminator:
+                replacement.append(lex)
+                awaiting_asm_terminator = False
+                continue
+
+            if lex == "{" and asm_brace_depth > 0:
+                asm_brace_depth += 1
+                replacement.append(lex)
+                continue
+
+            if lex == "}" and asm_brace_depth > 0:
+                asm_brace_depth -= 1
+                replacement.append(lex)
+                if asm_brace_depth == 0:
+                    awaiting_asm_terminator = True
+                continue
+
+            if lex == ";" and asm_brace_depth == 0:
+                break
+
+            replacement.append(lex)
+
+        clauses.append((pattern, replacement))
+
+    if not clauses:
+        raise ParseError(f"{keyword} '{name}' requires at least one clause")
+
+    return clauses
 
 def _struct_emit_definition(tokens: List[Token], template: Token, name: str, body: Sequence[str]) -> None:
     def make_token(lexeme: str) -> Token:
@@ -8430,6 +9496,192 @@ def _ct_add_token_chars(vm: CompileTimeVM) -> None:
     vm.parser.reader.add_token_chars(chars)
 
 
+def _ct_add_reader_rewrite(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="reader rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="reader rewrite pattern")
+    vm.push(vm.parser.add_rewrite_rule("reader", pattern, replacement))
+
+
+def _ct_add_reader_rewrite_named(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="reader rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="reader rewrite pattern")
+    name = vm.pop_str()
+    vm.push(vm.parser.add_rewrite_rule("reader", pattern, replacement, name=name))
+
+
+def _ct_add_reader_rewrite_priority(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="reader rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="reader rewrite pattern")
+    priority = vm.pop_int()
+    vm.push(vm.parser.add_rewrite_rule("reader", pattern, replacement, priority=priority))
+
+
+def _ct_remove_reader_rewrite(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.remove_rewrite_rule("reader", name) else 0)
+
+
+def _ct_clear_reader_rewrites(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.clear_rewrite_rules("reader"))
+
+
+def _ct_list_reader_rewrites(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.list_rewrite_rules("reader"))
+
+
+def _ct_set_reader_rewrite_enabled(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="reader rewrite enabled flag")
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_rewrite_rule_enabled("reader", name, enabled) else 0)
+
+
+def _ct_get_reader_rewrite_enabled(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    enabled = vm.parser.get_rewrite_rule_enabled("reader", name)
+    if enabled is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(1 if enabled else 0)
+        vm.push(1)
+
+
+def _ct_set_reader_rewrite_priority(vm: CompileTimeVM) -> None:
+    priority = vm.pop_int()
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_rewrite_rule_priority("reader", name, priority) else 0)
+
+
+def _ct_get_reader_rewrite_priority(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    priority = vm.parser.get_rewrite_rule_priority("reader", name)
+    if priority is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(priority)
+        vm.push(1)
+
+
+def _ct_add_grammar_rewrite(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="grammar rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="grammar rewrite pattern")
+    vm.push(vm.parser.add_rewrite_rule("grammar", pattern, replacement))
+
+
+def _ct_add_grammar_rewrite_named(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="grammar rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="grammar rewrite pattern")
+    name = vm.pop_str()
+    vm.push(vm.parser.add_rewrite_rule("grammar", pattern, replacement, name=name))
+
+
+def _ct_add_grammar_rewrite_priority(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="grammar rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="grammar rewrite pattern")
+    priority = vm.pop_int()
+    vm.push(vm.parser.add_rewrite_rule("grammar", pattern, replacement, priority=priority))
+
+
+def _ct_remove_grammar_rewrite(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.remove_rewrite_rule("grammar", name) else 0)
+
+
+def _ct_clear_grammar_rewrites(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.clear_rewrite_rules("grammar"))
+
+
+def _ct_list_grammar_rewrites(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.list_rewrite_rules("grammar"))
+
+
+def _ct_set_grammar_rewrite_enabled(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="grammar rewrite enabled flag")
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_rewrite_rule_enabled("grammar", name, enabled) else 0)
+
+
+def _ct_get_grammar_rewrite_enabled(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    enabled = vm.parser.get_rewrite_rule_enabled("grammar", name)
+    if enabled is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(1 if enabled else 0)
+        vm.push(1)
+
+
+def _ct_set_grammar_rewrite_priority(vm: CompileTimeVM) -> None:
+    priority = vm.pop_int()
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_rewrite_rule_priority("grammar", name, priority) else 0)
+
+
+def _ct_get_grammar_rewrite_priority(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    priority = vm.parser.get_rewrite_rule_priority("grammar", name)
+    if priority is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(priority)
+        vm.push(1)
+
+
+def _ct_register_text_macro(vm: CompileTimeVM) -> None:
+    expansion = _coerce_lexeme_list(vm.pop(), field="macro expansion")
+    param_count = vm.pop_int()
+    name = vm.pop_str()
+    vm.parser.register_text_macro(name, param_count, expansion)
+
+
+def _ct_register_text_macro_signature(vm: CompileTimeVM) -> None:
+    expansion = _coerce_lexeme_list(vm.pop(), field="macro expansion")
+    param_spec = _coerce_lexeme_list(vm.pop(), field="macro parameter spec")
+    name = vm.pop_str()
+    vm.parser.register_text_macro_signature(name, param_spec, expansion)
+
+
+def _ct_unregister_word(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.unregister_word(name) else 0)
+
+
+def _ct_word_exists(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.word_exists(name) else 0)
+
+
+def _ct_parser_pos(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.pos)
+
+
+def _ct_parser_remaining(vm: CompileTimeVM) -> None:
+    vm.push(max(0, len(vm.parser.tokens) - vm.parser.pos))
+
+
+def _ct_current_token(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser._last_token)
+
+
+def _ct_set_macro_expansion_limit(vm: CompileTimeVM) -> None:
+    vm.parser.set_macro_expansion_limit(vm.pop_int())
+
+
+def _ct_get_macro_expansion_limit(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.macro_expansion_limit)
+
+
+def _ct_set_macro_preview(vm: CompileTimeVM) -> None:
+    vm.parser.set_macro_preview(_coerce_bool(vm.pop(), field="macro preview flag"))
+
+
+def _ct_get_macro_preview(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.macro_preview else 0)
+
+
 def _ct_shunt(vm: CompileTimeVM) -> None:
     """Convert an infix token list (strings) to postfix using +,-,*,/,%."""
     ops: List[str] = []
@@ -8516,6 +9768,27 @@ def _ct_inject_tokens(vm: CompileTimeVM) -> None:
     if not all(isinstance(item, Token) for item in tokens):
         raise ParseError("inject-tokens expects a list of tokens")
     vm.parser.inject_token_objects(tokens)
+
+
+def _coerce_lexeme_list(value: Any, *, field: str) -> List[str]:
+    items = _ensure_list(value)
+    out: List[str] = []
+    for item in items:
+        if isinstance(item, Token):
+            out.append(item.lexeme)
+        elif isinstance(item, str):
+            out.append(item)
+        else:
+            raise ParseError(f"{field} expects list elements that are strings or tokens")
+    return out
+
+
+def _coerce_bool(value: Any, *, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    raise ParseError(f"{field} expects integer/boolean value")
 
 
 def _ct_emit_definition(vm: CompileTimeVM) -> None:
@@ -8927,11 +10200,42 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("token-from-lexeme", _ct_token_from_lexeme, compile_only=True)
     register("next-token", _ct_next_token, compile_only=True)
     register("peek-token", _ct_peek_token, compile_only=True)
+    register("ct-current-token", _ct_current_token, compile_only=True)
+    register("ct-parser-pos", _ct_parser_pos, compile_only=True)
+    register("ct-parser-remaining", _ct_parser_remaining, compile_only=True)
     register("inject-tokens", _ct_inject_tokens, compile_only=True)
     register("add-token", _ct_add_token, compile_only=True)
     register("add-token-chars", _ct_add_token_chars, compile_only=True)
+    register("ct-add-reader-rewrite", _ct_add_reader_rewrite, compile_only=True)
+    register("ct-add-reader-rewrite-named", _ct_add_reader_rewrite_named, compile_only=True)
+    register("ct-add-reader-rewrite-priority", _ct_add_reader_rewrite_priority, compile_only=True)
+    register("ct-remove-reader-rewrite", _ct_remove_reader_rewrite, compile_only=True)
+    register("ct-clear-reader-rewrites", _ct_clear_reader_rewrites, compile_only=True)
+    register("ct-list-reader-rewrites", _ct_list_reader_rewrites, compile_only=True)
+    register("ct-set-reader-rewrite-enabled", _ct_set_reader_rewrite_enabled, compile_only=True)
+    register("ct-get-reader-rewrite-enabled", _ct_get_reader_rewrite_enabled, compile_only=True)
+    register("ct-set-reader-rewrite-priority", _ct_set_reader_rewrite_priority, compile_only=True)
+    register("ct-get-reader-rewrite-priority", _ct_get_reader_rewrite_priority, compile_only=True)
+    register("ct-add-grammar-rewrite", _ct_add_grammar_rewrite, compile_only=True)
+    register("ct-add-grammar-rewrite-named", _ct_add_grammar_rewrite_named, compile_only=True)
+    register("ct-add-grammar-rewrite-priority", _ct_add_grammar_rewrite_priority, compile_only=True)
+    register("ct-remove-grammar-rewrite", _ct_remove_grammar_rewrite, compile_only=True)
+    register("ct-clear-grammar-rewrites", _ct_clear_grammar_rewrites, compile_only=True)
+    register("ct-list-grammar-rewrites", _ct_list_grammar_rewrites, compile_only=True)
+    register("ct-set-grammar-rewrite-enabled", _ct_set_grammar_rewrite_enabled, compile_only=True)
+    register("ct-get-grammar-rewrite-enabled", _ct_get_grammar_rewrite_enabled, compile_only=True)
+    register("ct-set-grammar-rewrite-priority", _ct_set_grammar_rewrite_priority, compile_only=True)
+    register("ct-get-grammar-rewrite-priority", _ct_get_grammar_rewrite_priority, compile_only=True)
     register("set-token-hook", _ct_set_token_hook, compile_only=True)
     register("clear-token-hook", _ct_clear_token_hook, compile_only=True)
+    register("ct-set-macro-expansion-limit", _ct_set_macro_expansion_limit, compile_only=True)
+    register("ct-get-macro-expansion-limit", _ct_get_macro_expansion_limit, compile_only=True)
+    register("ct-set-macro-preview", _ct_set_macro_preview, compile_only=True)
+    register("ct-get-macro-preview", _ct_get_macro_preview, compile_only=True)
+    register("ct-register-text-macro", _ct_register_text_macro, compile_only=True)
+    register("ct-register-text-macro-signature", _ct_register_text_macro_signature, compile_only=True)
+    register("ct-unregister-word", _ct_unregister_word, compile_only=True)
+    register("ct-word-exists?", _ct_word_exists, compile_only=True)
     register("use-l2-ct", _ct_use_l2_compile_time, compile_only=True)
     word_use_l2 = dictionary.lookup("use-l2-ct")
     if word_use_l2:
@@ -9565,25 +10869,27 @@ class Compiler:
         tried: List[Path] = []
 
         if raw.is_absolute():
-            candidate = raw
+            candidate = raw.expanduser()
             tried.append(candidate)
             if candidate.exists():
                 result = candidate.resolve()
                 self._import_resolve_cache[cache_key] = result
                 return result
 
-        candidate = (importing_file.parent / raw).resolve()
+        candidate = importing_file.parent / raw
         tried.append(candidate)
         if candidate.exists():
-            self._import_resolve_cache[cache_key] = candidate
-            return candidate
+            result = candidate.resolve()
+            self._import_resolve_cache[cache_key] = result
+            return result
 
         for base in self.include_paths:
-            candidate = (base / raw).resolve()
+            candidate = base / raw
             tried.append(candidate)
             if candidate.exists():
-                self._import_resolve_cache[cache_key] = candidate
-                return candidate
+                result = candidate.resolve()
+                self._import_resolve_cache[cache_key] = result
+                return result
 
         tried_str = "\n".join(f"  - {p}" for p in tried)
         raise ParseError(
@@ -9766,7 +11072,11 @@ class Compiler:
         _ifdef_inactive = 0
 
         for line in contents.splitlines():
-            lstripped = line.lstrip()
+            # Avoid lstrip allocation when the line is already left-aligned.
+            if line and (line[0] == " " or line[0] == "\t"):
+                lstripped = line.lstrip()
+            else:
+                lstripped = line
             # Hot path: ordinary source line with no directive prefix.
             if not in_py_block and _ifdef_inactive == 0:
                 lead = lstripped[:1]
@@ -11243,18 +12553,48 @@ def _run_docs_tui(
         {
             "name": "macro ... ;",
             "category": "Definitions",
-            "syntax": "macro <name> <param_count> <tokens...> ;",
-            "summary": "Define a text macro with positional substitution.",
+            "syntax": (
+                "macro <name> <param_count> <tokens...> ;\n"
+                "macro <name> (<params...>) <tokens...> ;\n"
+                "macro <name>\n  <pattern...> => <replacement...> ;\n  ...\n;"
+            ),
+            "summary": "Define substitution macros and pattern-matching macros.",
             "detail": (
-                "Records raw tokens until `;`. On expansion, `$0`, `$1`, ... "
-                "(exact `$<number>` tokens only) are replaced by positional "
-                "arguments. A bare `$` token is left unchanged (useful in asm). "
-                "Macros cannot nest.\n\n"
+                "Records raw tokens until `;`. Macros are token-level "
+                "substitutions (no evaluation/hygiene step), and macro "
+                "definitions cannot nest.\n\n"
+                "Supported placeholders:\n"
+                "  $0, $1, ...  positional arguments (legacy form)\n"
+                "  $name        named argument from signature form\n"
+                "  $*name       splice all tokens captured by variadic arg\n"
+                "A bare `$` token is copied unchanged (useful inside :asm).\n\n"
+                "Call styles:\n"
+                "  prefix:  m a b\n"
+                "  call:    m(a, b, expr)\n"
+                "In prefix form, fixed arguments are consumed first; if a "
+                "variadic parameter exists, additional arguments are consumed "
+                "from the same line.\n\n"
+                "Pattern mode is detected automatically when a macro body uses "
+                "`=>` clauses and closes with a trailing `;`. In this mode each clause is "
+                "registered as a grammar-stage rewrite rule prefixed by macro name.\n"
+                "Clause form:\n"
+                "  <pattern...> => <replacement...> ;\n"
+                "Pattern captures:\n"
+                "  $x       single-token capture\n"
+                "  $*xs     variadic capture\n"
+                "  $x:int   constrained capture\n"
+                "Repeated capture names enforce equality. Clauses are tried "
+                "top-to-bottom.\n\n"
                 "Use --macro-preview to print fully expanded macro tokens "
                 "during parsing.\n\n"
                 "Example:\n"
-                "  macro max2 2 $0 $1 > if $0 else $1 end ;\n"
-                "  5 3 max2   # leaves 5 on stack"
+                "  macro max2 (lhs rhs) $lhs $rhs > if $lhs else $rhs end ;\n"
+                "  max2(5, 3)   # leaves 5 on stack\n\n"
+                "Pattern example:\n"
+                "  macro simplify\n"
+                "    $x:int + 0 => $x ;\n"
+                "    0 + $x:int => $x ;\n"
+                "  ;"
             ),
         },
         {
@@ -12175,6 +13515,111 @@ def _run_docs_tui(
         "  add-token-chars     [* | str] -> [*]\n"
         "    Register each character of the string as a token\n"
         "    separator character.\n"
+        "\n"
+        "  ct-add-reader-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
+        "    Install a reader-stage rewrite rule. Pattern and replacement\n"
+        "    are lists of token lexemes. Capture placeholders like\n"
+        "    $x or $0 bind one token in the pattern and can be reused\n"
+        "    in the replacement.\n"
+        "\n"
+        "  ct-add-grammar-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
+        "    Install a grammar-stage rewrite rule (runs after token hook\n"
+        "    and before normal token handling).\n"
+        "\n"
+        "  ct-add-reader-rewrite-named  [*, name, pattern | replacement] -> [* | name]\n"
+        "  ct-add-grammar-rewrite-named [*, name, pattern | replacement] -> [* | name]\n"
+        "    Named variants that replace any existing rule with the same\n"
+        "    name.\n"
+        "\n"
+        "  ct-remove-reader-rewrite   [* | name] -> [* | flag]\n"
+        "  ct-remove-grammar-rewrite  [* | name] -> [* | flag]\n"
+        "  ct-clear-reader-rewrites   [*] -> [* | count]\n"
+        "  ct-clear-grammar-rewrites  [*] -> [* | count]\n"
+        "  ct-list-reader-rewrites    [*] -> [* | list]\n"
+        "  ct-list-grammar-rewrites   [*] -> [* | list]\n"
+        "    Manage rewrite rules at compile time.\n"
+        "\n"
+        "  ct-add-reader-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
+        "  ct-add-grammar-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
+        "    Install rewrite rules with explicit priority. Higher priority\n"
+        "    rules are tried first.\n"
+        "\n"
+        "  ct-set-reader-rewrite-enabled  [*, name | flag] -> [* | ok]\n"
+        "  ct-set-grammar-rewrite-enabled [*, name | flag] -> [* | ok]\n"
+        "  ct-get-reader-rewrite-enabled  [* | name] -> [*, flag | found]\n"
+        "  ct-get-grammar-rewrite-enabled [* | name] -> [*, flag | found]\n"
+        "    Enable/disable rules and query rule status.\n"
+        "\n"
+        "  ct-set-reader-rewrite-priority  [*, name | priority] -> [* | ok]\n"
+        "  ct-set-grammar-rewrite-priority [*, name | priority] -> [* | ok]\n"
+        "  ct-get-reader-rewrite-priority  [* | name] -> [*, priority | found]\n"
+        "  ct-get-grammar-rewrite-priority [* | name] -> [*, priority | found]\n"
+        "    Adjust/query rewrite priority after registration.\n"
+        "\n"
+        "  ct-current-token      [*] -> [* | token]\n"
+        "  ct-parser-pos         [*] -> [* | n]\n"
+        "  ct-parser-remaining   [*] -> [* | n]\n"
+        "    Parser introspection helpers for advanced metaprogramming.\n"
+        "\n"
+        "  ct-set-macro-expansion-limit [* | n] -> [*]\n"
+        "  ct-get-macro-expansion-limit [*] -> [* | n]\n"
+        "    Configure/query parser macro+rewrite expansion guard limit.\n"
+        "\n"
+        "  ct-set-macro-preview   [* | flag] -> [*]\n"
+        "  ct-get-macro-preview   [*] -> [* | flag]\n"
+        "    Enable/query preview tracing for macro+rewrite expansions.\n"
+        "\n"
+        "  ct-register-text-macro [*, name, params | expansion-list] -> [*]\n"
+        "    Programmatically register a text macro from compile-time code.\n"
+        "\n"
+        "  ct-register-text-macro-signature [*, name, param-spec | expansion-list] -> [*]\n"
+        "    Register a text macro with explicit parameter names.\n"
+        "    `param-spec` is a list of identifiers. Prefix one with\n"
+        "    `*` or `...` to mark it variadic (must be last).\n"
+        "\n"
+        "  ct-unregister-word    [* | name] -> [* | flag]\n"
+        "  ct-word-exists?       [* | name] -> [* | flag]\n"
+        "    Remove words from the dictionary or query presence.\n"
+        "\n"
+        "  Macro definition syntax:\n"
+        "    macro name 2                ... ;   # legacy positional arity\n"
+        "    macro name (a b)            ... ;   # named parameters\n"
+        "    macro name (head *rest)     ... ;   # variadic capture\n"
+        "    (variadic parameter must be last)\n"
+        "\n"
+        "  Macro placeholders:\n"
+        "    $0, $1 ... (legacy positional)\n"
+        "    $name      named parameter\n"
+        "    $*name     splice variadic capture\n"
+        "    bare '$'   preserved as-is\n"
+        "\n"
+        "  Macro call styles:\n"
+        "    m a b            # prefix style (legacy)\n"
+        "    m(a, b, expr)    # call style with grouped arguments\n"
+        "    Prefix style consumes fixed args first; for variadic macros,\n"
+        "    additional args are consumed from the same source line.\n"
+        "    Call style uses commas and supports nested (), [], {} groups.\n"
+        "\n"
+        "  Pattern macro syntax:\n"
+        "    macro name\n"
+        "      pattern => replacement ;\n"
+        "      ...\n"
+        "    ;\n"
+        "    Pattern mode is selected automatically when `=>` clauses\n"
+        "    are present and the macro closes with trailing `;`.\n"
+        "    Pattern macros compile to grammar-stage rewrite rules\n"
+        "    prefixed by macro name. Patterns support captures\n"
+        "    ($x, $*xs, $x:int) and repeated capture equality.\n"
+        "    Clauses are matched top-to-bottom.\n"
+        "    Common constraints: ident int float number string\n"
+        "    char literal (and aliases id/identifier/word, integer,\n"
+        "    numeric, str, chr).\n"
+        "    Use --macro-preview to debug match/rewrite expansions.\n"
+        "    Example:\n"
+        "      macro simplify\n"
+        "        $x:int + 0 => $x ;\n"
+        "        0 + $x:int => $x ;\n"
+        "      ;\n"
         "\n"
         "  emit-definition     [*, name | body-list] -> [*]\n"
         "    Emit a word definition dynamically. `name` is a token or\n"

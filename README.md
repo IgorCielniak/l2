@@ -31,6 +31,137 @@ python3 main.py examples/snake.sl -o snake
 python3 test.py
 ```
 
+## Metaprogramming Guide
+
+L2 has two complementary metaprogramming layers:
+
+1. Text macros (`macro ... ;`) for syntax-level expansion.
+2. Compile-time VM words (`compile-time`, `ct-*`) for programmable parser/compiler control.
+
+### Why this is useful in practice
+
+- Build mini-DSLs without changing compiler source.
+- Generate repetitive code while keeping final assembly explicit.
+- Add project-local syntax sugar that compiles away completely.
+- Control parser behavior for advanced transforms (token hooks and rewrites).
+
+### Text Macros: Legacy and Advanced Forms
+
+Legacy positional form still works:
+
+```l2
+macro twice 1
+	$0 $0 +
+;
+```
+
+Named parameters improve readability:
+
+```l2
+macro add2 (lhs rhs)
+	$lhs $rhs +
+;
+```
+
+Variadic parameters capture a tail of arguments:
+
+```l2
+macro emit_all (head *tail)
+	$head $*tail
+;
+```
+
+Parameter/placeholder rules:
+
+- `$0`, `$1`, ...: positional placeholders (legacy-compatible).
+- `$name`: named placeholder.
+- `$*name`: splice variadic capture.
+- Variadic parameter must be last in the signature.
+
+### Macro Call Styles
+
+Prefix style (classic):
+
+```l2
+add2 10 32
+```
+
+Call style with comma-separated arguments:
+
+```l2
+add2(10, 32)
+```
+
+Call style is useful when an argument is a token sequence:
+
+```l2
+macro sum3 (a b c)
+	$a $b + $c +
+;
+
+sum3(20 1 +, 10, 11)
+```
+
+### Pattern-Matching Macros
+
+L2 now supports clause-based pattern macros inside normal `macro` definitions:
+
+```l2
+macro simplify
+	$x:int + 0 => $x ;
+	0 + $x:int => $x ;
+;
+```
+
+Behavior:
+
+- Clauses are checked in definition order.
+- Captures support rewrite syntax: `$x`, `$*xs`, `$x:int`.
+- Reusing the same capture name in one pattern enforces equality.
+- Pattern macros terminate with a trailing `;` after the final clause.
+- Under the hood, this compiles to grammar-stage rewrite rules.
+
+### Compile-Time Registration APIs
+
+You can define text macros from compile-time code:
+
+- `ct-register-text-macro`: register by positional arity.
+- `ct-register-text-macro-signature`: register with named/variadic parameter spec.
+
+Example:
+
+```l2
+word setup-macros
+	"sum2"                                # name
+	list-new "x" list-append "y" list-append
+	list-new "$x" list-append "$y" list-append "+" list-append
+	ct-register-text-macro-signature
+end
+compile-time setup-macros
+```
+
+### Rewrite Rules (Reader/Grammar Stages)
+
+For deeper syntax customization, use compile-time rewrites:
+
+- Reader-stage rewrites: token stream rewrites after lexing.
+- Grammar-stage rewrites: rewrites before normal parse handling.
+
+Core tools include:
+
+- `ct-add-reader-rewrite`, `ct-add-grammar-rewrite`
+- named/priority variants
+- enable/disable, list, clear, remove, and priority query/update words
+
+These are best for local syntax normalization patterns and DSL sugar.
+
+### Safety and Debugging Controls
+
+- `ct-set-macro-expansion-limit` / `ct-get-macro-expansion-limit`
+- `ct-set-macro-preview` / `ct-get-macro-preview`
+
+Use preview when developing complex expansions; keep limits sensible to avoid accidental recursive explosion.
+
 ## Runtime Eval Library (From main.c)
 
 You can build a C library from [main.c](main.c) and call into L2 compilation/evaluation at runtime.

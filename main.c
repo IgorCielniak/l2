@@ -10,8 +10,13 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
+
+int l2_cli(int argc, char **argv);
+int l2_eval(const char *source, long source_len);
+int l2_eval_cstr(const char *source);
 
 static void *xmalloc(size_t size) {
     void *ptr = malloc(size);
@@ -152,7 +157,8 @@ typedef enum {
     OP_FOR_BEGIN,
     OP_FOR_END,
     OP_LIST_BEGIN,
-    OP_LIST_END
+    OP_LIST_END,
+    OP_RET
 } OpKind;
 
 typedef enum {
@@ -925,6 +931,7 @@ static bool is_identifier(const char *text) {
 }
 
 static char *path_basename(const char *path);
+static char *path_join(const char *a, const char *b);
 
 static SourceLocation *location_for_token(Parser *parser, Token token) {
     for (size_t i = 0; i < parser->file_spans.len; i++) {
@@ -1250,6 +1257,9 @@ static Token ct_pop_token(CompileTimeVM *vm) {
         return tok;
     }
     ct_trace_error(vm, "expected token on compile-time stack");
+    Token tok = {0};
+    tok.lexeme = str_dup("");
+    return tok;
 }
 
 static void ct_word_call(CompileTimeVM *vm, Word *word);
@@ -1398,6 +1408,9 @@ static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
                 ip++;
             }
             continue;
+        }
+        if (node.kind == OP_RET) {
+            return;
         }
         ip++;
     }
@@ -2688,6 +2701,9 @@ static void emit_op(EmitContext *ctx, FunctionEmitter *builder, Op *op, StrVec *
             free(list_done);
             free(list_loop);
             break;
+        case OP_RET:
+            emit_line(builder, "    ret");
+            break;
     }
 }
 
@@ -2952,6 +2968,118 @@ static void run_cmd(char *const argv[]) {
     }
 }
 
+static int run_cmd_status(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[error] fork failed: %s\n", strerror(errno));
+        return 127;
+    }
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        fprintf(stderr, "[error] failed to exec %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "[error] waitpid failed: %s\n", strerror(errno));
+        return 127;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 127;
+}
+
+static int run_l2_cli_in_child(int argc, char **argv) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[error] fork failed: %s\n", strerror(errno));
+        return 127;
+    }
+    if (pid == 0) {
+        int rc = l2_cli(argc, argv);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "[error] waitpid failed: %s\n", strerror(errno));
+        return 127;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 127;
+}
+
+static char *make_eval_workdir(void) {
+    char *tmpl = str_dup("/tmp/l2eval_XXXXXX");
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        fprintf(stderr, "[error] mkstemp failed: %s\n", strerror(errno));
+        free(tmpl);
+        return NULL;
+    }
+    close(fd);
+    if (unlink(tmpl) != 0) {
+        fprintf(stderr, "[error] unlink failed for %s: %s\n", tmpl, strerror(errno));
+        free(tmpl);
+        return NULL;
+    }
+    if (mkdir(tmpl, 0700) != 0) {
+        fprintf(stderr, "[error] mkdir failed for %s: %s\n", tmpl, strerror(errno));
+        free(tmpl);
+        return NULL;
+    }
+    return tmpl;
+}
+
+static int remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir(path);
+        if (!dir) {
+            return -1;
+        }
+        int rc = 0;
+        struct dirent *ent = NULL;
+        while ((ent = readdir(dir)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+            char *child = path_join(path, ent->d_name);
+            if (remove_tree(child) != 0) {
+                rc = -1;
+            }
+            free(child);
+        }
+        closedir(dir);
+        if (rmdir(path) != 0) {
+            rc = -1;
+        }
+        return rc;
+    }
+    return unlink(path) == 0 ? 0 : -1;
+}
+
+static void cleanup_eval_workdir(const char *work_dir) {
+    if (!work_dir) {
+        return;
+    }
+    if (!str_starts_with(work_dir, "/tmp/l2eval_")) {
+        return;
+    }
+    (void)remove_tree(work_dir);
+}
+
 static void run_nasm(const char *asm_path, const char *obj_path, bool debug) {
     char *argv[8];
     int idx = 0;
@@ -3099,6 +3227,26 @@ static char *path_join(const char *a, const char *b) {
     return str_printf("%s%s%s", a, has_sep ? "" : "/", b);
 }
 
+static char *l2_default_root_dir(void) {
+    const char *env_root = getenv("L2_ROOT");
+    if (env_root && env_root[0] != '\0') {
+        return str_dup(env_root);
+    }
+#ifdef L2_SOURCE_ROOT
+    if (L2_SOURCE_ROOT[0] != '\0') {
+        return str_dup(L2_SOURCE_ROOT);
+    }
+#endif
+    if (__FILE__[0] == '/') {
+        return path_dirname(__FILE__);
+    }
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        return str_dup(cwd);
+    }
+    return str_dup(".");
+}
+
 static char *resolve_import(const char *base_dir, const char *import_path, StrVec *include_dirs) {
     if (!import_path || !*import_path) {
         return NULL;
@@ -3187,6 +3335,22 @@ static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visi
                 }
                 VEC_PUSH(&parts, str_dup("\n"));
                 (*line_counter)++;
+
+                const char *remainder = end;
+                while (*remainder && isspace((unsigned char)*remainder)) {
+                    remainder++;
+                }
+                if (*remainder && *remainder != '#') {
+                    if (!span_active) {
+                        span_start = *line_counter;
+                        span_local_start = local_line;
+                        span_active = true;
+                    }
+                    VEC_PUSH(&parts, str_dup(remainder));
+                    VEC_PUSH(&parts, str_dup("\n"));
+                    (*line_counter)++;
+                }
+
                 local_line++;
                 free(resolved);
                 free(import_path);
@@ -4173,6 +4337,13 @@ static void parser_handle_token(Parser *parser, Token token) {
         return;
     }
 
+    if (strcmp(token.lexeme, "ret") == 0) {
+        Op op = {0};
+        op.kind = OP_RET;
+        parser_emit_op(parser, op);
+        return;
+    }
+
     if (strcmp(token.lexeme, "struct") == 0) {
         parser_handle_struct(parser);
         return;
@@ -4249,7 +4420,7 @@ static void parser_handle_token(Parser *parser, Token token) {
     parser_emit_op(parser, op);
 }
 
-int main(int argc, char **argv) {
+int l2_cli(int argc, char **argv) {
     StrVec inputs;
     StrVec include_dirs;
     StrVec libs;
@@ -4382,3 +4553,95 @@ int main(int argc, char **argv) {
     run_linker(obj_path, output, debug, &libs, false, parser.uses_libc);
     return 0;
 }
+
+int l2_eval(const char *source, long source_len) {
+    int result = -1;
+    char *owned_source = NULL;
+    char *work_dir = NULL;
+    char *source_path = NULL;
+    char *output_path = NULL;
+    char *temp_dir = NULL;
+    char *root_dir = NULL;
+    char *stdlib_dir = NULL;
+
+    if (!source) {
+        fprintf(stderr, "[error] l2_eval received null source\n");
+        return -1;
+    }
+    if (source_len < 0) {
+        fprintf(stderr, "[error] l2_eval received negative source length\n");
+        return -1;
+    }
+
+    size_t src_len = (size_t)source_len;
+    owned_source = (char *)xmalloc(src_len + 1);
+    memcpy(owned_source, source, src_len);
+    owned_source[src_len] = '\0';
+
+    work_dir = make_eval_workdir();
+    if (!work_dir) {
+        goto cleanup;
+    }
+
+    source_path = str_printf("%s/input.sl", work_dir);
+    output_path = str_printf("%s/input.out", work_dir);
+    temp_dir = str_printf("%s/build", work_dir);
+    root_dir = l2_default_root_dir();
+    stdlib_dir = path_join(root_dir, "stdlib");
+    write_file(source_path, owned_source);
+    free(owned_source);
+    owned_source = NULL;
+
+    char *compile_argv[] = {
+        "l2-eval",
+        "-I",
+        root_dir,
+        "-I",
+        stdlib_dir,
+        source_path,
+        "-o",
+        output_path,
+        "--temp-dir",
+        temp_dir,
+        NULL,
+    };
+    int compile_status = run_l2_cli_in_child(10, compile_argv);
+    if (compile_status != 0) {
+        result = -compile_status;
+        goto cleanup;
+    }
+
+    char *run_argv[] = {
+        output_path,
+        NULL,
+    };
+    result = run_cmd_status(run_argv);
+
+cleanup:
+    if (owned_source) {
+        free(owned_source);
+    }
+    if (work_dir) {
+        cleanup_eval_workdir(work_dir);
+    }
+    free(source_path);
+    free(output_path);
+    free(temp_dir);
+    free(root_dir);
+    free(stdlib_dir);
+    free(work_dir);
+    return result;
+}
+
+int l2_eval_cstr(const char *source) {
+    if (!source) {
+        return -1;
+    }
+    return l2_eval(source, (long)strlen(source));
+}
+
+#ifndef L2_AS_LIBRARY
+int main(int argc, char **argv) {
+    return l2_cli(argc, argv);
+}
+#endif

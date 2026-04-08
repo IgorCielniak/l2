@@ -14629,8 +14629,27 @@ def cli(argv: Sequence[str]) -> int:
         f"artifact={artifact_kind}",
         f"debug={int(bool(args.debug))}",
     ]
+
+    def _lib_file_from_token(tok: str) -> Optional[Path]:
+        if tok.startswith("-l:") and len(tok) > 3:
+            return Path(tok[3:]).expanduser()
+        if tok.startswith("-"):
+            return None
+        return Path(tok).expanduser()
+
     for lib in args.libs:
         link_fingerprint_parts.append(f"lib={lib}")
+        lib_file = _lib_file_from_token(lib)
+        if lib_file is None:
+            continue
+        try:
+            resolved = lib_file.resolve()
+            st = resolved.stat()
+        except OSError:
+            continue
+        link_fingerprint_parts.append(
+            f"libfile={resolved}:mtime_ns={st.st_mtime_ns}:size={st.st_size}"
+        )
     link_fingerprint = "\n".join(link_fingerprint_parts)
 
     need_link = need_nasm or not args.output.exists() or args.no_cache

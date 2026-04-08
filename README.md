@@ -31,6 +31,66 @@ python3 main.py examples/snake.sl -o snake
 python3 test.py
 ```
 
+## Runtime Eval Library (From main.c)
+
+You can build a C library from [main.c](main.c) and call into L2 compilation/evaluation at runtime.
+
+### 1. Build the library
+
+```bash
+./tools/build_l2eval_lib.sh
+```
+
+This produces:
+
+- [build/libl2eval.a](build/libl2eval.a)
+- [build/libl2eval.so](build/libl2eval.so)
+
+### 2. Use from C
+
+Public header: [libs/l2eval.h](libs/l2eval.h)
+
+Example:
+
+```c
+#include <stdio.h>
+#include "libs/l2eval.h"
+
+int main(void) {
+		int rc = l2_eval_cstr("word main 0 end");
+		printf("rc=%d\n", rc);
+		return 0;
+}
+```
+
+Build and run:
+
+```bash
+cc -O2 host.c -I. -Lbuild -ll2eval -Wl,-rpath,$PWD/build -o host
+./host
+```
+
+### 3. Use from L2 code
+
+L2 string literals push two values: `(addr len)`. The runtime `l2_eval` API expects exactly those two arguments.
+
+Example source: [examples/eval_runtime.sl](examples/eval_runtime.sl)
+
+```l2
+extern l2_eval 2 1
+
+word main
+	"import stdlib.sl word main 1 2 + puti cr end" l2_eval
+end
+```
+
+Build and run (static link path shown):
+
+```bash
+python3 main.py examples/eval_runtime.sl -o /tmp/eval_runtime build/libl2eval.a -lc
+/tmp/eval_runtime
+```
+
 ## Core Tenets
 
 1. **SIMPLICITY OVER CONVENIENCE** — No garbage collector, no hidden magic. You own every allocation and every free.

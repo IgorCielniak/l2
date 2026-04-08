@@ -113,4 +113,4 @@ L2 is for programmers who want to understand every byte their program emits, and
 
 ## License
 
-CC BY-NC-SA 4.0 — See [LICENSE](LICENSE)
+Apache-2.0 — See [LICENSE](LICENSE)

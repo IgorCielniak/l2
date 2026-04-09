@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import ast
 import bisect
-import inspect
 import os
-import random
 import re
 import shlex
 import sys
@@ -24,12 +22,26 @@ TYPE_CHECKING = False
 if TYPE_CHECKING:
     from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
 
-try:  # lazy optional import; required for compile-time :asm execution
-    from keystone import Ks, KsError, KS_ARCH_X86, KS_MODE_64
-except Exception:  # pragma: no cover - optional dependency
-    Ks = None
-    KsError = Exception
-    KS_ARCH_X86 = KS_MODE_64 = None
+Ks = None
+KsError = Exception
+KS_ARCH_X86 = KS_MODE_64 = None
+_KEYSTONE_IMPORT_ATTEMPTED = False
+
+def _ensure_keystone() -> bool:
+    """Lazily import keystone to keep startup overhead low on plain builds."""
+    global Ks, KsError, KS_ARCH_X86, KS_MODE_64, _KEYSTONE_IMPORT_ATTEMPTED
+    if _KEYSTONE_IMPORT_ATTEMPTED:
+        return Ks is not None
+    _KEYSTONE_IMPORT_ATTEMPTED = True
+    try:
+        from keystone import Ks as _Ks, KsError as _KsError, KS_ARCH_X86 as _KS_ARCH_X86, KS_MODE_64 as _KS_MODE_64
+    except Exception:  # pragma: no cover - optional dependency
+        return False
+    Ks = _Ks
+    KsError = _KsError
+    KS_ARCH_X86 = _KS_ARCH_X86
+    KS_MODE_64 = _KS_MODE_64
+    return True
 
 # Pre-compiled regex patterns used by JIT and BSS code
 _RE_REL_PAT = re.compile(r'\[rel\s+(\w+)\]')
@@ -3930,7 +3942,7 @@ class CompileTimeVM:
 
     def _compile_jit(self, word: Word) -> Any:
         """Assemble an :asm word into executable memory and return a ctypes callable."""
-        if Ks is None:
+        if not _ensure_keystone():
             raise ParseError("keystone-engine is required for JIT execution")
         definition = word.definition
         if not isinstance(definition, AsmDefinition):
@@ -4397,7 +4409,7 @@ class CompileTimeVM:
         defn = word.definition
         if not isinstance(defn, Definition):
             return None
-        if Ks is None:
+        if not _ensure_keystone():
             return None
 
         # Guard against infinite recursion (recursive words)
@@ -4721,7 +4733,7 @@ class CompileTimeVM:
 
     def _run_asm_definition(self, word: Word) -> None:
         definition = word.definition
-        if Ks is None:
+        if not _ensure_keystone():
             raise ParseError("keystone is required for compile-time :asm execution; install keystone-engine")
         if not isinstance(definition, AsmDefinition):  # pragma: no cover - defensive
             raise ParseError(f"word '{word.name}' has no asm body")
@@ -5014,7 +5026,7 @@ class CompileTimeVM:
 
     def _compile_merged_jit(self, words: List[Word], cache_key: str) -> Any:
         """Compile multiple asm word bodies into a single JIT function."""
-        if Ks is None:
+        if not _ensure_keystone():
             raise ParseError("keystone-engine is required for JIT execution")
 
         bss = self._bss_symbols
@@ -5692,6 +5704,11 @@ def optimize_emitted_asm_text(
     _parse_cache: Dict[str, object] = {}
     _is_code_cache: Dict[str, bool] = {}
     _label_only_cache: Dict[str, object] = {}
+    _hint_cache: Dict[str, str] = {}
+
+    _PASS_A_CANDIDATES = {
+        "nop", "mov", "xchg", "lea", "add", "sub", "or", "xor", "shl", "shr", "sar", "imul", "mul"
+    }
 
     def _parse_cached(line: str) -> Optional[Tuple[str, List[str]]]:
         cached = _parse_cache.get(line, _PARSE_SENTINEL)
@@ -5722,6 +5739,25 @@ def optimize_emitted_asm_text(
             _label_only_cache[line] = label if label is not None else None
             return label
         return cached if cached is not None else None
+
+    def _instr_hint(line: str) -> str:
+        """Best-effort mnemonic-like token for quick pass filtering."""
+        cached = _hint_cache.get(line)
+        if cached is not None:
+            return cached
+        s = line.lstrip()
+        if not s or s.startswith(";") or s.startswith("%"):
+            _hint_cache[line] = ""
+            return ""
+        end = 0
+        n = len(s)
+        while end < n and s[end] not in " \t;":
+            end += 1
+        tok = s[:end].lower()
+        if not tok or tok.endswith(":"):
+            tok = ""
+        _hint_cache[line] = tok
+        return tok
 
     stats: Dict[str, int] = {
         "removed_nops": 0,
@@ -5763,6 +5799,8 @@ def optimize_emitted_asm_text(
             nxt = _next_code_index(arr, idx + 1)
             if nxt < 0:
                 return cur
+            if _instr_hint(arr[nxt]) != "jmp":
+                return cur
             parsed = _parse_cached(arr[nxt])
             if parsed is None:
                 return cur
@@ -5797,7 +5835,8 @@ def optimize_emitted_asm_text(
         _before_a = dict(stats)
         stage_a: List[str] = []
         for ln in lines:
-            if not _is_code_line(ln):
+            hint = _instr_hint(ln)
+            if hint not in _PASS_A_CANDIDATES:
                 stage_a.append(ln)
                 continue
             parsed = _parse_cached(ln)
@@ -5835,7 +5874,8 @@ def optimize_emitted_asm_text(
         _before_b = dict(stats)
         lbl_pos = _collect_label_positions(lines)
         for i, ln in enumerate(list(lines)):
-            if not _is_code_line(ln):
+            hint = _instr_hint(ln)
+            if not hint or hint[0] != "j":
                 continue
             parsed = _parse_cached(ln)
             if parsed is None:
@@ -5868,6 +5908,9 @@ def optimize_emitted_asm_text(
         for ln in lines:
             if _label_only(ln) is not None:
                 unreachable = False
+            if not _is_code_line(ln):
+                stage_c.append(ln)
+                continue
             parsed = _parse_cached(ln)
             if unreachable and parsed is not None:
                 stage_c.append("")
@@ -5886,7 +5929,8 @@ def optimize_emitted_asm_text(
         _before_d = dict(stats)
         i = 0
         while i < len(lines):
-            if not _is_code_line(lines[i]):
+            hint_i = _instr_hint(lines[i])
+            if not hint_i or hint_i[0] != "j" or hint_i == "jmp":
                 i += 1
                 continue
             parsed = _parse_cached(lines[i])
@@ -5900,6 +5944,9 @@ def optimize_emitted_asm_text(
                 continue
             j = _next_code_index(lines, i + 1)
             if j < 0:
+                i += 1
+                continue
+            if _instr_hint(lines[j]) != "jmp":
                 i += 1
                 continue
             parsed_j = _parse_cached(lines[j])
@@ -5924,104 +5971,116 @@ def optimize_emitted_asm_text(
 
         # Pass E: collapse duplicate adjacent labels and retarget branches.
         _before_e = dict(stats)
-        alias: Dict[str, str] = {}
-        _fast_ref_counts: Dict[str, int] = {}
+        # Skip expensive label-alias analysis when there are no adjacent labels.
+        has_adjacent_labels = False
+        prev_label_pending = False
         for _ln in lines:
-            _parsed = _parse_cached(_ln)
-            if _parsed is None:
+            lbl = _label_only(_ln)
+            if lbl is not None:
+                if prev_label_pending:
+                    has_adjacent_labels = True
+                    break
+                prev_label_pending = True
                 continue
-            _mnem, _ops = _parsed
-            for _op in _ops:
-                if _ASM_LABEL_NAME_RE.match(_op):
-                    _fast_ref_counts[_op] = _fast_ref_counts.get(_op, 0) + 1
-                else:
-                    for _mref in _ASM_REL_LABEL_REF_RE.finditer(_op):
-                        _lbl = _mref.group(1)
-                        _fast_ref_counts[_lbl] = _fast_ref_counts.get(_lbl, 0) + 1
-        _ref_memo: Dict[str, bool] = {}
-        _label_ref_pat_cache: Dict[str, re.Pattern[str]] = {}
+            s = _ln.strip()
+            if not s or s.startswith(";"):
+                continue
+            prev_label_pending = False
 
-        def _label_is_referenced(label: str, arr: Sequence[str], def_idx: int) -> bool:
-            cached = _ref_memo.get(label)
-            if cached is not None:
-                return cached
-            if _fast_ref_counts.get(label, 0) > 0:
-                _ref_memo[label] = True
-                return True
-            pat = _label_ref_pat_cache.get(label)
-            if pat is None:
-                pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
-                _label_ref_pat_cache[label] = pat
-            for li, ltxt in enumerate(arr):
-                if li == def_idx:
+        if not has_adjacent_labels:
+            _record_pass(round_idx + 1, "E/label-collapse", _before_e, stats)
+        else:
+            alias: Dict[str, str] = {}
+            _fast_ref_counts: Dict[str, int] = {}
+            for _ln in lines:
+                _parsed = _parse_cached(_ln)
+                if _parsed is None:
                     continue
-                if not ltxt.strip():
-                    continue
-                if pat.search(ltxt):
+                _mnem, _ops = _parsed
+                for _op in _ops:
+                    if _ASM_LABEL_NAME_RE.match(_op):
+                        _fast_ref_counts[_op] = _fast_ref_counts.get(_op, 0) + 1
+                    else:
+                        for _mref in _ASM_REL_LABEL_REF_RE.finditer(_op):
+                            _lbl = _mref.group(1)
+                            _fast_ref_counts[_lbl] = _fast_ref_counts.get(_lbl, 0) + 1
+            _ref_memo: Dict[str, bool] = {}
+            _label_ref_pat_cache: Dict[str, re.Pattern[str]] = {}
+
+            def _label_is_referenced(label: str, arr: Sequence[str], def_idx: int) -> bool:
+                cached = _ref_memo.get(label)
+                if cached is not None:
+                    return cached
+                if _fast_ref_counts.get(label, 0) > 0:
                     _ref_memo[label] = True
                     return True
-            _ref_memo[label] = False
-            return False
+                pat = _label_ref_pat_cache.get(label)
+                if pat is None:
+                    pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
+                    _label_ref_pat_cache[label] = pat
+                for li, ltxt in enumerate(arr):
+                    if li == def_idx:
+                        continue
+                    if not ltxt.strip():
+                        continue
+                    if pat.search(ltxt):
+                        _ref_memo[label] = True
+                        return True
+                _ref_memo[label] = False
+                return False
 
-        i = 0
-        while i < len(lines):
-            src_label = _label_only(lines[i])
-            if src_label is None:
-                i += 1
-                continue
-            j = i + 1
-            while j < len(lines):
-                sj = lines[j].strip()
-                if not sj or sj.startswith(";"):
-                    j += 1
+            i = 0
+            while i < len(lines):
+                src_label = _label_only(lines[i])
+                if src_label is None:
+                    i += 1
                     continue
-                dst_label = _label_only(lines[j])
-                if dst_label is not None:
-                    if not _label_is_referenced(src_label, lines, i):
-                        alias[src_label] = dst_label
-                        lines[i] = ""
-                        stats["removed_redundant_labels"] += 1
-                        changed = True
-                break
-            i = j
+                j = i + 1
+                while j < len(lines):
+                    sj = lines[j].strip()
+                    if not sj or sj.startswith(";"):
+                        j += 1
+                        continue
+                    dst_label = _label_only(lines[j])
+                    if dst_label is not None:
+                        if not _label_is_referenced(src_label, lines, i):
+                            alias[src_label] = dst_label
+                            lines[i] = ""
+                            stats["removed_redundant_labels"] += 1
+                            changed = True
+                    break
+                i = j
 
-        if alias:
-            def _resolve_alias(lbl: str) -> str:
-                seen: Set[str] = set()
-                cur = lbl
-                while cur in alias and cur not in seen:
-                    seen.add(cur)
-                    cur = alias[cur]
-                return cur
+            if alias:
+                def _resolve_alias(lbl: str) -> str:
+                    seen: Set[str] = set()
+                    cur = lbl
+                    while cur in alias and cur not in seen:
+                        seen.add(cur)
+                        cur = alias[cur]
+                    return cur
 
-            for idx, ln in enumerate(lines):
-                parsed = _parse_cached(ln)
-                if parsed is None:
-                    continue
-                mnem, ops = parsed
-                if len(ops) == 1 and _ASM_LABEL_NAME_RE.match(ops[0]):
-                    mapped = _resolve_alias(ops[0])
-                    if mapped != ops[0]:
-                        lines[idx] = _render_instruction(mnem, [mapped], ln)
-                        stats["threaded_jump_targets"] += 1
-                        changed = True
-        _record_pass(round_idx + 1, "E/label-collapse", _before_e, stats)
+                for idx, ln in enumerate(lines):
+                    parsed = _parse_cached(ln)
+                    if parsed is None:
+                        continue
+                    mnem, ops = parsed
+                    if len(ops) == 1 and _ASM_LABEL_NAME_RE.match(ops[0]):
+                        mapped = _resolve_alias(ops[0])
+                        if mapped != ops[0]:
+                            lines[idx] = _render_instruction(mnem, [mapped], ln)
+                            stats["threaded_jump_targets"] += 1
+                            changed = True
+            _record_pass(round_idx + 1, "E/label-collapse", _before_e, stats)
 
         # Pass F: collapse back-to-back unconditional jumps.
         _before_f = dict(stats)
         for idx, ln in enumerate(lines):
-            if not _is_code_line(ln):
-                continue
-            parsed = _parse_cached(ln)
-            if parsed is None:
-                continue
-            mnem, _ops = parsed
-            if mnem != "jmp":
+            if _instr_hint(ln) != "jmp":
                 continue
             nxt = _next_code_index(lines, idx + 1)
             if nxt >= 0:
-                p2 = _parse_cached(lines[nxt])
-                if p2 is not None and p2[0] == "jmp":
+                if _instr_hint(lines[nxt]) == "jmp":
                     lines[idx] = ""
                     stats["collapsed_redundant_jumps"] += 1
                     changed = True
@@ -10122,7 +10181,7 @@ def _rt_syscall(vm: CompileTimeVM) -> None:
 
 def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
     """JIT-compile a native syscall stub that intercepts exit/exit_group."""
-    if Ks is None:
+    if not _ensure_keystone():
         raise ParseError("keystone-engine is required for JIT syscall execution")
 
     # The stub uses the same wrapper convention as _compile_jit:
@@ -15617,6 +15676,7 @@ def _integrity_opcode_symbols() -> Set[str]:
 
 def _integrity_symbols_in_object(obj: Any) -> Set[str]:
     try:
+        import inspect
         source = inspect.getsource(obj)
     except Exception:
         return set()
@@ -16157,6 +16217,7 @@ end
 
 
 def _run_integrity_python_interpreter_differential_checks(errors: List[str]) -> None:
+    import random
     dictionary = bootstrap_dictionary()
     parser = Parser(dictionary, Reader())
     vm = parser.compile_time_vm
@@ -16622,7 +16683,206 @@ def _run_integrity_checks() -> None:
         raise CompileError("integrity assertions failed:\n" + details)
 
 
+def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
+    """Fast path for benchmark-style invocations.
+
+    Supported shape only:
+      python main.py <source>.sl --no-cache
+
+    Any other option shape falls back to the full argparse-driven CLI.
+    """
+    source_token: Optional[str] = None
+    saw_no_cache = False
+    for tok in argv:
+        if tok == "--no-cache":
+            saw_no_cache = True
+            continue
+        if tok.startswith("-"):
+            return None
+        if source_token is None:
+            source_token = tok
+            continue
+        return None
+
+    if not saw_no_cache or source_token is None:
+        return None
+
+    source = Path(source_token)
+    if source.suffix.lower() != ".sl":
+        return None
+
+    include_paths = [Path("."), Path("./stdlib")]
+    compiler = Compiler(
+        include_paths=include_paths,
+        macro_expansion_limit=DEFAULT_MACRO_EXPANSION_LIMIT,
+        macro_preview=False,
+        defines=[],
+    )
+    compiler.assembler.enable_constant_folding = True
+    compiler.assembler.enable_peephole_optimization = True
+    compiler.assembler.enable_loop_unroll = True
+    compiler.assembler.enable_auto_inline = True
+    compiler.assembler.enable_string_deduplication = True
+    compiler.assembler.enable_extern_type_check = True
+    compiler.assembler.enable_stack_check = True
+    compiler.assembler.verbosity = 0
+    compiler.parser._warnings_enabled = set()
+    compiler.parser._werror = False
+    compiler.parser.dictionary.warn_callback = None
+
+    libs: List[str] = []
+
+    try:
+        compiler.collect_source_flags(source)
+        # Source-level CLI flags can imply complex option semantics; keep full CLI for those.
+        if compiler.source_cli_flags:
+            return None
+
+        normalized_include_paths: List[Path] = []
+        for include_base in [Path("."), Path("./stdlib"), *compiler.source_include_paths]:
+            resolved = include_base.expanduser().resolve()
+            if resolved not in normalized_include_paths:
+                normalized_include_paths.append(resolved)
+        compiler.include_paths = normalized_include_paths
+        compiler._import_resolve_cache.clear()
+
+        for flag in compiler.source_link_flags:
+            if flag not in libs:
+                libs.append(flag)
+        for lib in _load_sidecar_meta_libs(source):
+            if lib not in libs:
+                libs.append(lib)
+
+        if compiler._last_loaded_path == source.resolve() and compiler._last_loaded_source is not None:
+            emission = compiler.compile_preloaded(debug=False, entry_mode="program")
+        else:
+            emission = compiler.compile_file(source, debug=False, entry_mode="program")
+        asm_text = emission.snapshot()
+    except (ParseError, CompileError, CompileTimeError) as exc:
+        use_color = sys.stderr.isatty()
+        diags = getattr(compiler.parser, "diagnostics", [])
+        if diags:
+            for diag in diags:
+                print(diag.format(color=use_color), file=sys.stderr)
+            error_count = sum(1 for d in diags if d.level == "error")
+            warn_count = sum(1 for d in diags if d.level == "warning")
+            summary_parts: List[str] = []
+            if error_count:
+                summary_parts.append(f"{error_count} error(s)")
+            if warn_count:
+                summary_parts.append(f"{warn_count} warning(s)")
+            if summary_parts:
+                print(f"\n{' and '.join(summary_parts)} emitted", file=sys.stderr)
+        else:
+            print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"[error] unexpected failure: {exc}", file=sys.stderr)
+        return 1
+
+    use_color = sys.stderr.isatty()
+    warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
+    if warnings:
+        for diag in warnings:
+            print(diag.format(color=use_color), file=sys.stderr)
+        print(f"\n{len(warnings)} warning(s) emitted", file=sys.stderr)
+
+    temp_dir = Path("build")
+    output = Path("a.out")
+    artifact_kind = "exe"
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    asm_path = temp_dir / (source.stem + ".asm")
+    obj_path = temp_dir / (source.stem + ".o")
+
+    asm_changed = True
+    if asm_path.exists():
+        try:
+            existing_asm = asm_path.read_text()
+        except OSError:
+            existing_asm = ""
+        if existing_asm == asm_text:
+            asm_changed = False
+    if asm_changed:
+        asm_path.write_text(asm_text)
+
+    need_nasm = asm_changed or not obj_path.exists()
+    if not need_nasm:
+        try:
+            need_nasm = obj_path.stat().st_mtime < asm_path.stat().st_mtime
+        except OSError:
+            need_nasm = True
+    if need_nasm:
+        run_nasm(asm_path, obj_path, debug=False)
+
+    if output.parent and not output.parent.exists():
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+    link_stamp = temp_dir / f"{output.name}.link_src"
+    link_fingerprint_parts = [
+        f"obj={obj_path.resolve()}",
+        f"artifact={artifact_kind}",
+        "debug=0",
+    ]
+
+    def _lib_file_from_token(tok: str) -> Optional[Path]:
+        if tok.startswith("-l:") and len(tok) > 3:
+            return Path(tok[3:]).expanduser()
+        if tok.startswith("-"):
+            return None
+        return Path(tok).expanduser()
+
+    for lib in libs:
+        link_fingerprint_parts.append(f"lib={lib}")
+        lib_file = _lib_file_from_token(lib)
+        if lib_file is None:
+            continue
+        try:
+            resolved = lib_file.resolve()
+            st = resolved.stat()
+        except OSError:
+            continue
+        link_fingerprint_parts.append(
+            f"libfile={resolved}:mtime_ns={st.st_mtime_ns}:size={st.st_size}"
+        )
+    link_fingerprint = "\n".join(link_fingerprint_parts)
+
+    # Keep external tool invocations incremental even in --no-cache mode.
+    # --no-cache here means "skip source/asm cache", not "force relink".
+    need_link = need_nasm or not output.exists()
+    if not need_link:
+        try:
+            recorded = link_stamp.read_text()
+        except OSError:
+            recorded = ""
+        if recorded != link_fingerprint:
+            need_link = True
+    if not need_link:
+        try:
+            need_link = output.stat().st_mtime < obj_path.stat().st_mtime
+        except OSError:
+            need_link = True
+
+    if need_link:
+        try:
+            output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        run_linker(obj_path, output, debug=False, libs=libs, shared=False)
+
+    if need_link:
+        link_stamp.write_text(link_fingerprint)
+        print(f"[info] built {output}")
+    else:
+        print(f"[info] {output} is up to date")
+    return 0
+
+
 def cli(argv: Sequence[str]) -> int:
+    quick_result = _try_quick_compile_no_cache(argv)
+    if quick_result is not None:
+        return quick_result
+
     import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument(

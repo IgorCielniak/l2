@@ -1,5 +1,6 @@
 import stdlib.sl
 import io.sl
+import linux.sl
 
 # dump takes the firts element from the stack
 # and prints that much consequent elements
@@ -152,5 +153,56 @@ word assert_msg
 	else
 		abort_msg
 	end
+end
+
+#catch_runtime_error [* | ptr] -> [* | signal]
+# Runs ptr in a forked child process and reports runtime signal number.
+# Returns:
+# - 0 when child exits normally
+# - positive signal number when child is terminated by a signal (e.g. 11 for SIGSEGV)
+# - negative errno on fork/wait4 failure
+word catch_runtime_error
+	syscall.fork
+	dup 0 < if
+		# fork failed: keep errno code, drop callback ptr
+		swap drop
+	else
+		dup 0 == if
+			# child: execute callback and exit cleanly if it returns
+			drop
+			exec_word_ptr
+			0 syscall.exit
+		else
+			# parent: wait for child and decode wait status
+			swap drop
+			mem 56 +
+			0
+			0
+			syscall.wait4
+			dup 0 < if
+			else
+				drop
+				mem 56 + @
+				128 %
+			end
+		end
+	end
+end
+
+#try [* | ptr] -> [* | ok]
+# Minimal try-like helper:
+# - returns 1 if ptr exits normally
+# - returns 0 if ptr crashes or syscall-level errors occur
+# Note: ptr executes in a forked child, so side effects are isolated.
+word try
+	catch_runtime_error
+	0 ==
+end
+
+#try_with_error [* | ptr] -> [*, signal | ok]
+# Returns both raw signal/error code and success flag (ok is top-of-stack).
+word try_with_error
+	catch_runtime_error
+	dup 0 ==
 end
 

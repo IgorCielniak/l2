@@ -1156,7 +1156,18 @@ class TestRunner:
         if case.source.stem == "nob_test" and label == "stdout":
             return self._sort_lines(text)
         if case.source.stem == "ct_test" and label == "compile":
-            return self._mask_build_path(text, case.binary_stub)
+            text = self._mask_build_path(text, case.binary_stub)
+            text = re.sub(
+                rf"(?m)^\[info\] built <build>/{re.escape(case.binary_stub)}\n?",
+                "",
+                text,
+            )
+            text = re.sub(
+                r"(?m)^\[info\] skipped artifact generation \(--no-artifact\)\n?",
+                "",
+                text,
+            )
+            return text
         if label == "compile":
             # Normalize absolute source paths to relative for stable compile error comparison
             source_dir = str(case.source.parent.resolve())

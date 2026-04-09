@@ -191,6 +191,7 @@ typedef struct {
     OpVec body;
     bool immediate;
     bool compile_only;
+    bool runtime_only;
     char *terminator;
     bool inline_def;
 } Definition;
@@ -200,6 +201,7 @@ typedef struct {
     char *body;
     bool immediate;
     bool compile_only;
+    bool runtime_only;
     bool effect_string_io;
 } AsmDefinition;
 
@@ -239,6 +241,7 @@ struct Word {
     char *name;
     bool immediate;
     bool compile_only;
+    bool runtime_only;
     bool compile_time_override;
     bool is_extern;
     int extern_inputs;
@@ -1418,6 +1421,10 @@ static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
 
 static void ct_word_call(CompileTimeVM *vm, Word *word) {
     VEC_PUSH(&vm->call_stack, str_dup(word->name));
+    if (word->runtime_only) {
+        fprintf(stderr, "[error] word '%s' is runtime-only and cannot be executed at compile time\n", word->name);
+        exit(1);
+    }
     if (word->compile_time_override) {
         if (word->ct_definition) {
             ct_execute_nodes(vm, &word->ct_definition->body);
@@ -2011,8 +2018,16 @@ static void ct_intrinsic_use_l2_ct(CompileTimeVM *vm) {
         word->name = str_dup(name);
         dictionary_register(vm->dictionary, word);
     }
+    if (word->runtime_only) {
+        fprintf(stderr, "[error] word '%s' is runtime-only and cannot be executed at compile time\n", word->name);
+        exit(1);
+    }
     word->compile_time_override = true;
     free(name);
+}
+
+static void ct_intrinsic_ct_flag(CompileTimeVM *vm) {
+    ct_stack_push(&vm->stack, ct_make_int(1));
 }
 
 static CtList *ct_list_from_tokens(const char **tokens, size_t count) {
@@ -2400,6 +2415,33 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "lexer-expect", ct_intrinsic_lexer_expect);
     register_ct_intrinsic(dict, "lexer-collect-brace", ct_intrinsic_lexer_collect_brace);
     register_ct_intrinsic(dict, "lexer-push-back", ct_intrinsic_lexer_push_back);
+
+    Word *ct_word = dictionary_lookup(dict, "CT");
+    if (!ct_word) {
+        ct_word = (Word *)xmalloc(sizeof(Word));
+        memset(ct_word, 0, sizeof(Word));
+        ct_word->name = str_dup("CT");
+        dictionary_register(dict, ct_word);
+    }
+    ct_word->ct_intrinsic = ct_intrinsic_ct_flag;
+    ct_word->compile_only = false;
+    ct_word->runtime_only = false;
+    ct_word->compile_time_override = false;
+
+    AsmDefinition *ct_asm = (AsmDefinition *)xmalloc(sizeof(AsmDefinition));
+    memset(ct_asm, 0, sizeof(AsmDefinition));
+    ct_asm->name = str_dup("CT");
+    ct_asm->body = str_dup(
+        "    sub r12, 8\n"
+        "    mov qword [r12], 0\n"
+    );
+    ct_word->asm_def = ct_asm;
+
+    Form ct_form = {0};
+    ct_form.kind = FORM_ASM;
+    ct_form.ptr = ct_asm;
+    VEC_PUSH(&parser->module.forms, ct_form);
+
     vm->dictionary = dict;
 }
 
@@ -3605,6 +3647,7 @@ static void parse_tokens(Parser *parser, const char *source) {
             word->prev_asm_def = word->asm_def;
             word->immediate = false;
             word->compile_only = false;
+            word->runtime_only = false;
             word->definition = def;
             word->asm_def = NULL;
             word->inline_def = def->inline_def;
@@ -3679,6 +3722,7 @@ static void parse_tokens(Parser *parser, const char *source) {
                 Word *word = parser->definition_stack[parser->definition_stack_len - 1];
                 def->immediate = word->immediate;
                 def->compile_only = word->compile_only;
+                def->runtime_only = word->runtime_only;
                 def->inline_def = word->inline_def;
                 Form form = {0};
                 form.kind = FORM_DEF;
@@ -3757,6 +3801,7 @@ static void parse_tokens(Parser *parser, const char *source) {
             word->prev_asm_def = word->asm_def;
             word->immediate = false;
             word->compile_only = false;
+            word->runtime_only = false;
             word->asm_def = def;
             word->definition = NULL;
             Form form = {0};
@@ -4247,6 +4292,10 @@ static void parser_handle_token(Parser *parser, Token token) {
             fprintf(stderr, "[error] immediate used without a preceding definition\n");
             exit(1);
         }
+        if (parser->last_defined->runtime_only) {
+            fprintf(stderr, "[error] word '%s' is runtime-only and cannot be immediate\n", parser->last_defined->name);
+            exit(1);
+        }
         parser->last_defined->immediate = true;
         if (parser->last_defined->definition) {
             parser->last_defined->definition->immediate = true;
@@ -4260,6 +4309,10 @@ static void parser_handle_token(Parser *parser, Token token) {
     if (strcmp(token.lexeme, "compile-only") == 0) {
         if (!parser->last_defined) {
             fprintf(stderr, "[error] compile-only used without a preceding definition\n");
+            exit(1);
+        }
+        if (parser->last_defined->runtime_only) {
+            fprintf(stderr, "[error] word '%s' is runtime-only and cannot be compile-only\n", parser->last_defined->name);
             exit(1);
         }
         parser->last_defined->compile_only = true;
@@ -4282,6 +4335,29 @@ static void parser_handle_token(Parser *parser, Token token) {
         return;
     }
 
+    if (strcmp(token.lexeme, "runtime") == 0 || strcmp(token.lexeme, "runtime-only") == 0) {
+        if (!parser->last_defined) {
+            fprintf(stderr, "[error] runtime used without a preceding definition\n");
+            exit(1);
+        }
+        if (parser->last_defined->immediate) {
+            fprintf(stderr, "[error] word '%s' is immediate and cannot be runtime-only\n", parser->last_defined->name);
+            exit(1);
+        }
+        if (parser->last_defined->compile_only) {
+            fprintf(stderr, "[error] word '%s' is compile-only and cannot be runtime-only\n", parser->last_defined->name);
+            exit(1);
+        }
+        parser->last_defined->runtime_only = true;
+        if (parser->last_defined->definition) {
+            parser->last_defined->definition->runtime_only = true;
+        }
+        if (parser->last_defined->asm_def) {
+            parser->last_defined->asm_def->runtime_only = true;
+        }
+        return;
+    }
+
     if (strcmp(token.lexeme, "compile-time") == 0) {
         Token name = parser_next_token(parser);
         if (!name.lexeme) {
@@ -4291,6 +4367,10 @@ static void parser_handle_token(Parser *parser, Token token) {
         Word *word = dictionary_lookup(parser->dictionary, name.lexeme);
         if (!word) {
             fprintf(stderr, "[error] unknown word '%s' for compile-time\n", name.lexeme);
+            exit(1);
+        }
+        if (word->runtime_only) {
+            fprintf(stderr, "[error] word '%s' is runtime-only\n", name.lexeme);
             exit(1);
         }
         ct_word_call(parser->ct_vm, word);

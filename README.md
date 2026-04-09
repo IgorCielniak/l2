@@ -131,6 +131,7 @@ You can define text macros from compile-time code:
 Example:
 
 ```l2
+# docs:skip-check
 word setup-macros
 	"sum2"                                # name
 	list-new "x" list-append "y" list-append
@@ -161,6 +162,41 @@ These are best for local syntax normalization patterns and DSL sugar.
 - `ct-set-macro-preview` / `ct-get-macro-preview`
 
 Use preview when developing complex expansions; keep limits sensible to avoid accidental recursive explosion.
+
+### Execution-Mode Markers
+
+You can explicitly control where a word is allowed to execute:
+
+- `compile-only`: word can execute only during compilation.
+- `runtime` (alias: `runtime-only`): word can execute only at runtime.
+
+Example:
+
+```l2
+word only-runtime
+	1
+end
+runtime
+```
+
+Trying to execute `only-runtime` from compile-time code now fails with a clear error.
+
+L2 also provides a `CT` word for branching on execution mode:
+
+- During compile-time execution, `CT` pushes `1`.
+- In emitted runtime code, `CT` pushes `0`.
+
+Example:
+
+```l2
+word maybe-debug
+	CT if
+		"[ct] running in compile-time VM" puts
+	else
+		"[rt] running in runtime code" puts
+	end
+end
+```
 
 ## Runtime Eval Library (From main.c)
 

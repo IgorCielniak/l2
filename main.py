@@ -14,6 +14,7 @@ import ast
 import bisect
 import inspect
 import os
+import random
 import re
 import shlex
 import sys
@@ -574,17 +575,18 @@ def _make_word_op(data: str, loc: Optional[SourceLocation] = None) -> Op:
 
 
 class Definition:
-    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'terminator', 'inline',
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'terminator', 'inline',
                  'stack_inputs', '_label_positions', '_for_pairs', '_begin_pairs',
                  '_words_resolved', '_merged_runs')
 
     def __init__(self, name: str, body: List[Op], immediate: bool = False,
-                 compile_only: bool = False, terminator: str = "end", inline: bool = False,
+                 compile_only: bool = False, runtime_only: bool = False, terminator: str = "end", inline: bool = False,
                  stack_inputs: Optional[int] = None) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
         self.compile_only = compile_only
+        self.runtime_only = runtime_only
         self.terminator = terminator
         self.inline = inline
         self.stack_inputs = stack_inputs
@@ -596,15 +598,16 @@ class Definition:
 
 
 class AsmDefinition:
-    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'inline', 'effects', '_inline_lines')
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'inline', 'effects', '_inline_lines')
 
     def __init__(self, name: str, body: str, immediate: bool = False,
-                 compile_only: bool = False, inline: bool = False,
+                 compile_only: bool = False, runtime_only: bool = False, inline: bool = False,
                  effects: Set[str] = None, _inline_lines: Optional[List[str]] = None) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
         self.compile_only = compile_only
+        self.runtime_only = runtime_only
         self.inline = inline
         self.effects = effects if effects is not None else set()
         self._inline_lines = _inline_lines
@@ -870,7 +873,7 @@ _WORD_EFFECT_ALIASES: Dict[str, str] = {
 class Word:
     __slots__ = ('name', 'priority', 'immediate', 'definition', 'macro', 'intrinsic',
                  'macro_expansion', 'macro_params', 'compile_time_intrinsic',
-                 'runtime_intrinsic', 'compile_only', 'compile_time_override',
+                 'runtime_intrinsic', 'compile_only', 'runtime_only', 'compile_time_override',
                  'is_extern', 'extern_inputs', 'extern_outputs', 'extern_signature',
                  'extern_variadic', 'inline')
 
@@ -878,7 +881,7 @@ class Word:
                  definition=None, macro=None, intrinsic=None,
                  macro_expansion=None, macro_params: int = 0,
                  compile_time_intrinsic=None, runtime_intrinsic=None,
-                 compile_only: bool = False, compile_time_override: bool = False,
+                 compile_only: bool = False, runtime_only: bool = False, compile_time_override: bool = False,
                  is_extern: bool = False, extern_inputs: int = 0, extern_outputs: int = 0,
                  extern_signature=None, extern_variadic: bool = False,
                  inline: bool = False) -> None:
@@ -893,6 +896,7 @@ class Word:
         self.compile_time_intrinsic = compile_time_intrinsic
         self.runtime_intrinsic = runtime_intrinsic
         self.compile_only = compile_only
+        self.runtime_only = runtime_only
         self.compile_time_override = compile_time_override
         self.is_extern = is_extern
         self.extern_inputs = extern_inputs
@@ -2839,7 +2843,12 @@ class Parser:
             return
         ctx.immediate = word.immediate
         ctx.compile_only = word.compile_only
+        ctx.runtime_only = word.runtime_only
         ctx.inline = word.inline
+        if word.runtime_only and (word.compile_only or word.immediate):
+            raise ParseError(
+                f"word '{word.name}' cannot be both runtime-only and compile-time-active"
+            )
         if word.compile_only or word.immediate:
             word.compile_time_override = True
             word.compile_time_intrinsic = None
@@ -2930,6 +2939,7 @@ class Parser:
         if word is candidate:
             definition.immediate = word.immediate
             definition.compile_only = word.compile_only
+            definition.runtime_only = word.runtime_only
         module = self.context_stack[-1]
         if not isinstance(module, Module):
             raise ParseError("asm definitions must be top-level forms")
@@ -3845,6 +3855,10 @@ class CompileTimeVM:
     def _call_word(self, word: Word) -> None:
         self.call_stack.append(word.name)
         try:
+            if word.runtime_only:
+                raise ParseError(
+                    f"word '{word.name}' is runtime-only and cannot be executed at compile time"
+                )
             definition = word.definition
             # In runtime_mode, prefer runtime_intrinsic (for exit/jmp/syscall
             # and __with_* variables).  All other :asm words run as native JIT.
@@ -6564,6 +6578,7 @@ class Assembler:
             body=[_make_op(node.op, node.data, node.loc) for node in definition.body],
             immediate=definition.immediate,
             compile_only=definition.compile_only,
+            runtime_only=definition.runtime_only,
             terminator=definition.terminator,
             inline=definition.inline,
         )
@@ -8671,6 +8686,8 @@ def macro_immediate(ctx: MacroContext) -> Optional[List[Op]]:
     word = parser.most_recent_definition()
     if word is None:
         raise ParseError("'immediate' must follow a definition")
+    if word.runtime_only:
+        raise ParseError(f"word '{word.name}' is runtime-only and cannot be immediate")
     word.immediate = True
     if word.definition is not None:
         word.definition.immediate = True
@@ -8682,9 +8699,26 @@ def macro_compile_only(ctx: MacroContext) -> Optional[List[Op]]:
     word = parser.most_recent_definition()
     if word is None:
         raise ParseError("'compile-only' must follow a definition")
+    if word.runtime_only:
+        raise ParseError(f"word '{word.name}' is runtime-only and cannot be compile-only")
     word.compile_only = True
     if word.definition is not None:
         word.definition.compile_only = True
+    return None
+
+
+def macro_runtime(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+    word = parser.most_recent_definition()
+    if word is None:
+        raise ParseError("'runtime' must follow a definition")
+    if word.immediate:
+        raise ParseError(f"word '{word.name}' is immediate and cannot be runtime-only")
+    if word.compile_only:
+        raise ParseError(f"word '{word.name}' is compile-only and cannot be runtime-only")
+    word.runtime_only = True
+    if word.definition is not None:
+        word.definition.runtime_only = True
     return None
 
 
@@ -8743,6 +8777,8 @@ def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
     word = parser.dictionary.lookup(name)
     if word is None:
         raise ParseError(f"unknown word '{name}' for compile-time")
+    if word.runtime_only:
+        raise ParseError(f"word '{name}' is runtime-only")
     if word.compile_only:
         raise ParseError(f"word '{name}' is compile-time only")
     parser.compile_time_vm.invoke(word)
@@ -9538,6 +9574,8 @@ def _ct_use_l2_compile_time(vm: CompileTimeVM) -> None:
         name = word.name
     if word is None:
         raise ParseError(f"unknown word '{name}' for use-l2-ct")
+    if word.runtime_only:
+        raise ParseError(f"word '{name}' is runtime-only and cannot be executed at compile time")
     word.compile_time_intrinsic = None
     word.compile_time_override = True
 
@@ -10561,10 +10599,22 @@ def macro_here(ctx: MacroContext) -> Optional[List[Op]]:
     return [_make_op("literal", f"{loc.path.name}:{loc.line}:{loc.column}")]
 
 
+def _emit_ct_runtime_flag(builder: FunctionEmitter) -> None:
+    """Emit runtime value for `CT` (0 in generated runtime code)."""
+    builder.push_literal(0)
+
+
+def _ct_push_compile_time_flag(vm: CompileTimeVM) -> None:
+    """Push compile-time value for `CT` (1 while executing in CT VM)."""
+    vm.push(1)
+
+
 def bootstrap_dictionary() -> Dictionary:
     dictionary = Dictionary()
     dictionary.register(Word(name="immediate", immediate=True, macro=macro_immediate))
     dictionary.register(Word(name="compile-only", immediate=True, macro=macro_compile_only))
+    dictionary.register(Word(name="runtime", immediate=True, macro=macro_runtime))
+    dictionary.register(Word(name="runtime-only", immediate=True, macro=macro_runtime))
     dictionary.register(Word(name="inline", immediate=True, macro=macro_inline))
     dictionary.register(Word(name="label", immediate=True, macro=macro_label))
     dictionary.register(Word(name="goto", immediate=True, macro=macro_goto))
@@ -10574,6 +10624,11 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="macro", immediate=True, macro=macro_begin_text_macro))
     dictionary.register(Word(name="struct", immediate=True, macro=macro_struct_begin))
     dictionary.register(Word(name="cstruct", immediate=True, macro=macro_cstruct_begin))
+    ct_word = Word(name="CT")
+    ct_word.intrinsic = _emit_ct_runtime_flag
+    ct_word.compile_time_intrinsic = _ct_push_compile_time_flag
+    ct_word.runtime_intrinsic = _ct_push_compile_time_flag
+    dictionary.register(ct_word)
     _register_compile_time_primitives(dictionary)
     _register_runtime_intrinsics(dictionary)
     return dictionary
@@ -11910,6 +11965,8 @@ def run_repl(
             tags.append("immediate")
         if word.compile_only:
             tags.append("compile-only")
+        if word.runtime_only:
+            tags.append("runtime-only")
         if word.inline:
             tags.append("inline")
         if word.compile_time_override:
@@ -13448,8 +13505,9 @@ def _run_docs_tui(
         "  transform the token stream, emit definitions, manipulate\n"
         "  lists and maps, and control the generated assembly output.\n"
         "\n"
-        "  All words listed below are compile-only: they exist only\n"
-        "  during compilation and produce no runtime code.\n"
+        "  Unless noted otherwise, words listed below are compile-only:\n"
+        "  they exist only during compilation and produce no runtime\n"
+        "  code.\n"
         "\n"
         "  Stack notation:  [*, deeper, deeper | top] -> [*] || [*, result]\n"
         "    *   = rest of stack (unchanged)\n"
@@ -13481,9 +13539,20 @@ def _run_docs_tui(
         "    Mark the preceding word as compile-only. It can only be\n"
         "    called during compilation, its asm is not emitted.\n"
         "\n"
+        "  runtime                                  [immediate]\n"
+        "  runtime-only                             [immediate]\n"
+        "    Mark the preceding word as runtime-only. The word may\n"
+        "    be emitted and called at runtime, but any compile-time\n"
+        "    attempt to execute it is rejected.\n"
+        "\n"
         "  inline                                   [immediate]\n"
         "    Mark a word for inline expansion: its body\n"
         "    is expanded at each call site instead of emitting a call.\n"
+        "\n"
+        "  CT                                       [runtime + compile-time]\n"
+        "    Pushes 1 when running in compile-time execution and 0 in\n"
+        "    emitted runtime code, so words can branch on execution\n"
+        "    mode explicitly.\n"
         "\n"
         "  use-l2-ct                           [immediate, compile-only]\n"
         "    Replace the built-in CT intrinsic of a word with its L2\n"
@@ -14084,6 +14153,9 @@ def _run_docs_tui(
         "  lexer-expect          Lexer           [*, lex | s] -> [*, lex | tok]\n"
         "  lexer-collect-brace   Lexer           [* | lex] -> [*, lex | list]\n"
         "  lexer-push-back       Lexer           [* | lex] -> [* | lex]\n"
+        "  runtime               Hook            [immediate]\n"
+        "  runtime-only          Hook            [immediate]\n"
+        "  CT                    Hook            [*] -> [* | flag]\n"
         "  use-l2-ct             Hook            [* | name?] -> [*]\n"
         "\n"
         "═══════════════════════════════════════════════════════════════\n"
@@ -15559,6 +15631,111 @@ def _integrity_symbols_in_object(obj: Any) -> Set[str]:
     return seen
 
 
+def _integrity_load_ct_reference_text() -> str:
+    """Load `_L2_CT_REF_TEXT` literal from this source file for integrity checks."""
+    try:
+        source = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "_L2_CT_REF_TEXT":
+                try:
+                    value = ast.literal_eval(node.value)
+                except Exception:
+                    return ""
+                if isinstance(value, str):
+                    return value
+                return ""
+    return ""
+
+
+def _integrity_doc_has_word_entry(doc_text: str, word_name: str) -> bool:
+    pattern = re.compile(rf"(?m)^\s{{2,}}{re.escape(word_name)}(?:\s+|$)")
+    return pattern.search(doc_text) is not None
+
+
+def _run_integrity_compile_time_docs_checks(errors: List[str]) -> None:
+    doc_text = _integrity_load_ct_reference_text()
+    if not doc_text.strip():
+        errors.append("failed to load built-in compile-time reference text")
+        return
+
+    dictionary = bootstrap_dictionary()
+    registered_ct_words = sorted(
+        name
+        for name, word in dictionary.words.items()
+        if word.compile_only and word.compile_time_intrinsic is not None and not name.startswith("__")
+    )
+    missing_docs = [name for name in registered_ct_words if not _integrity_doc_has_word_entry(doc_text, name)]
+    if missing_docs:
+        errors.append(
+            "compile-time reference missing registered compile-time words: "
+            + ", ".join(missing_docs)
+        )
+
+    for required in ("runtime", "CT"):
+        if not _integrity_doc_has_word_entry(doc_text, required):
+            errors.append(f"compile-time reference missing '{required}' entry")
+
+
+def _run_integrity_word_flag_checks(errors: List[str]) -> None:
+    dictionary = bootstrap_dictionary()
+    for name, word in sorted(dictionary.words.items()):
+        if word.compile_only and word.runtime_only:
+            errors.append(f"word '{name}' is both compile-only and runtime-only")
+        if word.runtime_only and word.immediate:
+            errors.append(f"word '{name}' is both runtime-only and immediate")
+        if word.runtime_only and word.compile_time_override:
+            errors.append(f"word '{name}' is runtime-only but has compile-time override enabled")
+
+    ct_word = dictionary.lookup("CT")
+    if ct_word is None:
+        errors.append("missing built-in CT word")
+        return
+    if ct_word.intrinsic is None:
+        errors.append("CT word missing runtime emission intrinsic")
+    if ct_word.compile_time_intrinsic is None:
+        errors.append("CT word missing compile-time intrinsic")
+    if ct_word.runtime_intrinsic is None:
+        errors.append("CT word missing runtime-mode compile-time intrinsic")
+
+    parser = Parser(dictionary, Reader())
+    vm = parser.compile_time_vm
+    try:
+        vm.invoke(ct_word)
+        if vm.stack != [1]:
+            errors.append(f"CT compile-time invocation expected stack [1], got {vm.stack!r}")
+    except Exception as exc:
+        errors.append(f"CT compile-time invocation failed: {exc}")
+
+    try:
+        vm.invoke(ct_word, runtime_mode=True)
+        depth = vm.native_stack_depth()
+        if depth != 1:
+            errors.append(f"CT runtime-mode compile-time invocation expected native depth 1, got {depth}")
+        elif CTMemory.read_qword(vm.r12) != 1:
+            errors.append("CT runtime-mode compile-time invocation expected top-of-stack value 1")
+    except Exception as exc:
+        errors.append(f"CT runtime-mode compile-time invocation failed: {exc}")
+
+    try:
+        asm = Assembler(dictionary)
+        emitted: List[str] = []
+        builder = FunctionEmitter(emitted)
+        asm._emit_wordref("CT", builder)
+        if not any("mov qword [r12], 0" in line for line in emitted):
+            errors.append("CT runtime emission did not push literal 0")
+    except Exception as exc:
+        errors.append(f"CT runtime emission probe failed: {exc}")
+
+
 def _run_integrity_cfg_format_checks(errors: List[str]) -> None:
     asm = Assembler(Dictionary())
     cases: List[Tuple[Op, str]] = [
@@ -15731,6 +15908,24 @@ def _run_integrity_vm_semantic_checks(errors: List[str]) -> None:
         if check_err:
             errors.append(f"VM semantic case '{case['name']}' failed: {check_err}")
 
+    runtime_only_probe = Word(
+        name="__integrity_runtime_only_probe__",
+        definition=Definition(name="__integrity_runtime_only_probe__", body=[_make_literal_op(1)]),
+        runtime_only=True,
+    )
+    dictionary.register(runtime_only_probe)
+    try:
+        vm.invoke(runtime_only_probe)
+    except CompileTimeError as exc:
+        if "runtime-only" not in str(exc):
+            errors.append(
+                "runtime-only compile-time rejection raised unexpected message: " + str(exc)
+            )
+    except Exception as exc:
+        errors.append(f"runtime-only compile-time rejection raised unexpected exception: {exc}")
+    else:
+        errors.append("runtime-only probe word executed in compile-time VM")
+
 
 def _integrity_check_heap_list(vm: CompileTimeVM, expected: List[int]) -> Optional[str]:
     if len(vm.stack) != 1:
@@ -15845,6 +16040,331 @@ def _run_integrity_assembler_semantic_checks(errors: List[str]) -> None:
                 continue
             if check_err:
                 errors.append(f"Assembler semantic case '{case['name']}' failed: {check_err}")
+
+
+def _integrity_native_stack_values(vm: CompileTimeVM) -> List[int]:
+    depth = vm.native_stack_depth()
+    top_first = [CTMemory.read_qword(vm.r12 + i * 8) for i in range(depth)]
+    return list(reversed(top_first))
+
+
+def _run_integrity_python_pipeline_checks(errors: List[str]) -> None:
+    import tempfile
+
+    repo_root = Path(__file__).resolve().parent
+    include_paths = [repo_root, repo_root / "stdlib"]
+
+    deterministic_source = """
+word __integrity_ct_flag
+    CT
+end
+compile-time __integrity_ct_flag
+
+word main
+    CT
+    0 if
+        11
+    else
+        22
+    end
+end
+""".lstrip()
+
+    try:
+        compiler_a = Compiler(include_paths=include_paths)
+        asm_a = compiler_a.compile_source(deterministic_source, debug=False, entry_mode="program").snapshot()
+        compiler_b = Compiler(include_paths=include_paths)
+        asm_b = compiler_b.compile_source(deterministic_source, debug=False, entry_mode="program").snapshot()
+    except Exception as exc:
+        errors.append(f"python pipeline determinism probe failed during compilation: {exc}")
+        return
+
+    if asm_a != asm_b:
+        errors.append("python pipeline determinism probe produced non-deterministic assembly output")
+    if "global _start" not in asm_a:
+        errors.append("python pipeline determinism probe expected program assembly to export _start")
+    if "mov qword [r12], 0" not in asm_a:
+        errors.append("python pipeline determinism probe expected CT runtime emission to push literal 0")
+    if compiler_a.parser.compile_time_vm.stack != [1]:
+        errors.append(
+            "python pipeline determinism probe expected compile-time CT stack to be [1], got "
+            + repr(compiler_a.parser.compile_time_vm.stack)
+        )
+
+    try:
+        library_asm = Compiler(include_paths=include_paths).compile_source(
+            "word helper\n    7\nend\n",
+            debug=False,
+            entry_mode="library",
+        ).snapshot()
+    except Exception as exc:
+        errors.append(f"python pipeline library-mode probe failed: {exc}")
+    else:
+        if "global _start" in library_asm:
+            errors.append("python pipeline library-mode probe unexpectedly exported _start")
+
+    try:
+        Compiler(include_paths=include_paths).compile_preloaded(debug=False, entry_mode="program")
+    except CompileError as exc:
+        if "no preloaded source available" not in str(exc):
+            errors.append(
+                "python pipeline preloaded-guard probe raised unexpected message: " + str(exc)
+            )
+    except Exception as exc:
+        errors.append(
+            "python pipeline preloaded-guard probe raised unexpected exception: "
+            + f"{type(exc).__name__}: {exc}"
+        )
+    else:
+        errors.append("python pipeline preloaded-guard probe expected compile_preloaded to fail without preload")
+
+    try:
+        Compiler(include_paths=include_paths).compile_source(
+            "word main\n    0\nend\n",
+            debug=False,
+            entry_mode="invalid",
+        )
+    except CompileError as exc:
+        if "unknown entry mode" not in str(exc):
+            errors.append("python pipeline invalid-entry probe raised unexpected message: " + str(exc))
+    except Exception as exc:
+        errors.append(
+            "python pipeline invalid-entry probe raised unexpected exception: "
+            + f"{type(exc).__name__}: {exc}"
+        )
+    else:
+        errors.append("python pipeline invalid-entry probe expected compile_source to reject unknown entry mode")
+
+    with tempfile.TemporaryDirectory(prefix="l2_integrity_pipeline_") as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        src_path = temp_dir / "pipeline_main.sl"
+        src_path.write_text("word main\n    1\nend\n", encoding="utf-8")
+
+        try:
+            compiler_file = Compiler(include_paths=include_paths)
+            snap_file = compiler_file.compile_file(src_path, debug=False, entry_mode="program").snapshot()
+
+            compiler_preloaded = Compiler(include_paths=include_paths)
+            compiler_preloaded.collect_source_flags(src_path)
+            snap_preloaded = compiler_preloaded.compile_preloaded(debug=False, entry_mode="program").snapshot()
+        except Exception as exc:
+            errors.append(f"python pipeline preloaded roundtrip probe failed: {exc}")
+        else:
+            if snap_file != snap_preloaded:
+                errors.append("python pipeline preloaded roundtrip probe produced mismatched assembly snapshots")
+            if compiler_preloaded.dictionary.lookup("main") is None:
+                errors.append("python pipeline preloaded roundtrip probe did not populate dictionary with 'main'")
+
+
+def _run_integrity_python_interpreter_differential_checks(errors: List[str]) -> None:
+    dictionary = bootstrap_dictionary()
+    parser = Parser(dictionary, Reader())
+    vm = parser.compile_time_vm
+    rng = random.Random(0x1A2B3C4D)
+
+    for idx in range(96):
+        a = rng.randint(-32, 32)
+        cond = rng.randint(0, 1)
+        on_true = rng.randint(-32, 32)
+        on_false = rng.randint(-32, 32)
+        loop_count = rng.randint(0, 6)
+        step = rng.randint(-8, 8)
+
+        else_label = f"INT_ELSE_{idx}"
+        after_label = f"INT_AFTER_{idx}"
+        loop_data = {"loop": f"INT_LOOP_{idx}", "end": f"INT_END_{idx}"}
+        name = f"__integrity_py_diff_{idx}"
+
+        nodes = [
+            _make_literal_op(a),
+            _make_literal_op(cond),
+            _make_op("branch_zero", else_label),
+            _make_literal_op(on_true),
+            _make_op("jump", after_label),
+            _make_op("label", else_label),
+            _make_literal_op(on_false),
+            _make_op("label", after_label),
+            _make_literal_op(loop_count),
+            _make_op("for_begin", loop_data),
+            _make_literal_op(step),
+            _make_op("for_end", loop_data),
+            _make_op("ret"),
+        ]
+
+        expected = [a, on_true if cond != 0 else on_false] + [step] * loop_count
+        definition = Definition(name=name, body=nodes)
+
+        word = dictionary.lookup(name)
+        if word is None:
+            word = Word(name=name, definition=definition)
+            dictionary.register(word)
+        else:
+            word.definition = definition
+            word.compile_only = False
+            word.runtime_only = False
+            word.immediate = False
+
+        try:
+            vm.invoke(word)
+            interpreted_stack = list(vm.stack)
+        except Exception as exc:
+            errors.append(
+                f"python interpreter differential case '{name}' failed in interpreted mode: {type(exc).__name__}: {exc}"
+            )
+            continue
+
+        if interpreted_stack != expected:
+            errors.append(
+                f"python interpreter differential case '{name}' interpreted mismatch: expected {expected!r}, got {interpreted_stack!r}"
+            )
+            continue
+
+        try:
+            vm.invoke(word, runtime_mode=True)
+            runtime_stack = _integrity_native_stack_values(vm)
+        except Exception as exc:
+            errors.append(
+                f"python interpreter differential case '{name}' failed in runtime_mode: {type(exc).__name__}: {exc}"
+            )
+            continue
+
+        if runtime_stack != expected:
+            errors.append(
+                f"python interpreter differential case '{name}' runtime mismatch: expected {expected!r}, got {runtime_stack!r}"
+            )
+
+    inner_name = "__integrity_py_diff_inner"
+    outer_name = "__integrity_py_diff_outer"
+    passthrough_name = "__integrity_py_diff_passthrough"
+
+    inner_word = dictionary.lookup(inner_name)
+    if inner_word is None:
+        inner_word = Word(name=inner_name)
+        dictionary.register(inner_word)
+    inner_word.definition = Definition(name=inner_name, body=[_make_literal_op(3), _make_op("ret")])
+    inner_word.compile_only = False
+    inner_word.runtime_only = False
+    inner_word.immediate = False
+
+    outer_word = dictionary.lookup(outer_name)
+    if outer_word is None:
+        outer_word = Word(name=outer_name)
+        dictionary.register(outer_word)
+    outer_word.definition = Definition(
+        name=outer_name,
+        body=[_make_word_op(inner_name), _make_literal_op(4), _make_op("ret")],
+    )
+    outer_word.compile_only = False
+    outer_word.runtime_only = False
+    outer_word.immediate = False
+
+    try:
+        vm.invoke(outer_word)
+        if vm.stack != [3, 4]:
+            errors.append(
+                f"python interpreter nested-call probe interpreted mismatch: expected [3, 4], got {vm.stack!r}"
+            )
+    except Exception as exc:
+        errors.append(
+            "python interpreter nested-call probe failed in interpreted mode: "
+            + f"{type(exc).__name__}: {exc}"
+        )
+
+    try:
+        vm.invoke(outer_word, runtime_mode=True)
+        runtime_vals = _integrity_native_stack_values(vm)
+        if runtime_vals != [3, 4]:
+            errors.append(
+                f"python interpreter nested-call probe runtime mismatch: expected [3, 4], got {runtime_vals!r}"
+            )
+    except Exception as exc:
+        errors.append(
+            "python interpreter nested-call probe failed in runtime_mode: "
+            + f"{type(exc).__name__}: {exc}"
+        )
+
+    passthrough_word = dictionary.lookup(passthrough_name)
+    if passthrough_word is None:
+        passthrough_word = Word(name=passthrough_name)
+        dictionary.register(passthrough_word)
+    passthrough_word.definition = Definition(name=passthrough_name, body=[_make_op("ret")])
+    passthrough_word.compile_only = False
+    passthrough_word.runtime_only = False
+    passthrough_word.immediate = False
+
+    try:
+        vm.invoke_with_args(passthrough_word, [7, -2, 11])
+        if vm.stack != [7, -2, 11]:
+            errors.append(
+                "python interpreter invoke_with_args probe mismatch: "
+                + f"expected [7, -2, 11], got {vm.stack!r}"
+            )
+    except Exception as exc:
+        errors.append(
+            "python interpreter invoke_with_args probe failed: "
+            + f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _run_integrity_python_repl_state_checks(errors: List[str]) -> None:
+    dictionary = bootstrap_dictionary()
+    parser = Parser(dictionary, Reader())
+    vm = parser.compile_time_vm
+
+    push7_name = "__integrity_repl_push7"
+    push9_name = "__integrity_repl_push9"
+
+    push7 = dictionary.lookup(push7_name)
+    if push7 is None:
+        push7 = Word(name=push7_name)
+        dictionary.register(push7)
+    push7.definition = Definition(name=push7_name, body=[_make_literal_op(7)])
+    push7.compile_only = False
+    push7.runtime_only = False
+    push7.immediate = False
+
+    push9 = dictionary.lookup(push9_name)
+    if push9 is None:
+        push9 = Word(name=push9_name)
+        dictionary.register(push9)
+    push9.definition = Definition(name=push9_name, body=[_make_literal_op(9)])
+    push9.compile_only = False
+    push9.runtime_only = False
+    push9.immediate = False
+
+    try:
+        vm.invoke_repl(push7)
+        first = vm.repl_stack_values()
+        vm.invoke_repl(push9)
+        second = vm.repl_stack_values()
+        vm.invoke_repl(push7)
+        third = vm.repl_stack_values()
+    except Exception as exc:
+        errors.append(f"python REPL state probe failed while invoking words: {type(exc).__name__}: {exc}")
+        return
+
+    if first != [7]:
+        errors.append(f"python REPL state probe first snapshot mismatch: expected [7], got {first!r}")
+    if second != [7, 9]:
+        errors.append(f"python REPL state probe second snapshot mismatch: expected [7, 9], got {second!r}")
+    if third != [7, 9, 7]:
+        errors.append(
+            f"python REPL state probe third snapshot mismatch: expected [7, 9, 7], got {third!r}"
+        )
+
+    vm.reset()
+    if vm.repl_stack_values() != []:
+        errors.append("python REPL state probe expected reset() to clear persistent REPL state")
+
+    try:
+        vm.invoke(push9)
+    except Exception as exc:
+        errors.append(f"python REPL state probe failed after reset in interpreted mode: {type(exc).__name__}: {exc}")
+    else:
+        if vm.stack != [9]:
+            errors.append(
+                f"python REPL state probe interpreted invoke mismatch after reset: expected [9], got {vm.stack!r}"
+            )
 
 
 def _run_integrity_roundtrip_checks(errors: List[str]) -> None:
@@ -15986,6 +16506,33 @@ def _run_integrity_failure_injection_checks(errors: List[str]) -> None:
             "expected_exc": CompileError,
             "message_contains": "compile-time only",
         },
+        {
+            "name": "parse_runtime_immediate_conflict",
+            "source": "word rt\n    1\nend\nruntime\nimmediate\nword main\n    0\nend\n",
+            "expected_exc": ParseError,
+            "message_contains": "compilation failed with",
+            "diag_contains": "runtime-only and cannot be immediate",
+        },
+        {
+            "name": "parse_runtime_compile_only_conflict",
+            "source": "word rt\n    1\nend\nruntime\ncompile-only\nword main\n    0\nend\n",
+            "expected_exc": ParseError,
+            "message_contains": "compilation failed with",
+            "diag_contains": "runtime-only and cannot be compile-only",
+        },
+        {
+            "name": "parse_compile_time_runtime_only_target",
+            "source": "word rt\n    1\nend\nruntime\nword main\n    compile-time rt\nend\n",
+            "expected_exc": ParseError,
+            "message_contains": "compilation failed with",
+            "diag_contains": "word 'rt' is runtime-only",
+        },
+        {
+            "name": "ct_use_l2_runtime_only_target",
+            "source": "word rt\n    1\nend\nruntime\nword cfg\n    \"rt\"\n    use-l2-ct\nend\ncompile-time cfg\nword main\n    0\nend\n",
+            "expected_exc": CompileTimeError,
+            "message_contains": "runtime-only and cannot be executed at compile time",
+        },
     ]
 
     for case in failure_cases:
@@ -16059,8 +16606,13 @@ def _run_integrity_checks() -> None:
                 f"{target_name} missing opcode coverage: " + ", ".join(missing_symbols)
             )
 
+    _run_integrity_compile_time_docs_checks(errors)
+    _run_integrity_word_flag_checks(errors)
+    _run_integrity_python_pipeline_checks(errors)
     _run_integrity_cfg_format_checks(errors)
     _run_integrity_vm_semantic_checks(errors)
+    _run_integrity_python_interpreter_differential_checks(errors)
+    _run_integrity_python_repl_state_checks(errors)
     _run_integrity_assembler_semantic_checks(errors)
     _run_integrity_roundtrip_checks(errors)
     _run_integrity_failure_injection_checks(errors)

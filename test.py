@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import fnmatch
+import hashlib
 import importlib.util
 import json
 import os
@@ -38,6 +40,13 @@ COLORS = {
     "blue": "\033[94m",
     "reset": "\033[0m",
 }
+
+DOC_EXAMPLES_DIRNAME = "_doc_examples"
+DOC_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+DOC_EXAMPLE_RE = re.compile(r"^\s*Example:\s*$", re.IGNORECASE)
+DOC_L2_KEYWORD_RE = re.compile(r"\b(word|macro|:asm|:py|compile-time|compile-only|runtime|runtime-only|extern|import|struct|cstruct)\b")
+DOC_PLACEHOLDER_RE = re.compile(r"<[A-Za-z_][^>\n]*>")
+DOC_SKIP_MARKER_RE = re.compile(r"(?im)^\s*(?:#\s*)?(?:docs:skip-check|l2-test:skip)\b")
 
 
 def colorize(text: str, color: str) -> str:
@@ -136,6 +145,175 @@ def read_args_file(path: Path) -> List[str]:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _doc_location_slug(location: str, *, max_len: int = 72) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", location.lower()).strip("_")
+    if not slug:
+        return "unknown"
+    if len(slug) > max_len:
+        slug = slug[:max_len].rstrip("_")
+    return slug
+
+
+def _looks_like_l2_example(snippet: str) -> bool:
+    text = snippet.strip()
+    if not text:
+        return False
+    if DOC_PLACEHOLDER_RE.search(text):
+        return False
+    if text.lstrip().startswith(("$", "python ", "python3 ", "cc ", "./")):
+        return False
+    return DOC_L2_KEYWORD_RE.search(text) is not None
+
+
+def _extract_indented_example_blocks(text: str) -> List[Tuple[str, int]]:
+    lines = text.splitlines()
+    blocks: List[Tuple[str, int]] = []
+    idx = 0
+    while idx < len(lines):
+        if DOC_EXAMPLE_RE.match(lines[idx]) is None:
+            idx += 1
+            continue
+        idx += 1
+        block_lines: List[str] = []
+        block_start_idx: Optional[int] = None
+        while idx < len(lines):
+            raw = lines[idx]
+            stripped = raw.strip()
+            if not stripped:
+                if block_lines:
+                    break
+                idx += 1
+                continue
+            if raw.startswith("  "):
+                if block_start_idx is None:
+                    block_start_idx = idx
+                block_lines.append(raw[2:])
+                idx += 1
+                continue
+            if raw.startswith("\t"):
+                if block_start_idx is None:
+                    block_start_idx = idx
+                block_lines.append(raw.lstrip("\t"))
+                idx += 1
+                continue
+            break
+        if block_lines and block_start_idx is not None:
+            block = textwrap.dedent("\n".join(block_lines)).strip()
+            if block:
+                blocks.append((block, block_start_idx + 1))
+    return blocks
+
+
+def _normalize_doc_example_source(snippet: str) -> Optional[str]:
+    text = textwrap.dedent(snippet).strip()
+    if not _looks_like_l2_example(text):
+        return None
+    lines = [line.rstrip() for line in text.splitlines()]
+    body = "\n".join(lines).strip()
+    if not body:
+        return None
+    if re.search(r"(?m)^\s*import\s+", body) is None:
+        body = "import stdlib/stdlib.sl\n\n" + body
+    return body + "\n"
+
+
+def _extract_readme_l2_examples(readme_path: Path) -> List[Tuple[str, str]]:
+    if not readme_path.exists():
+        return []
+    text = readme_path.read_text(encoding="utf-8", errors="ignore")
+    examples: List[Tuple[str, str]] = []
+    for match in DOC_FENCE_RE.finditer(text):
+        lang = match.group(1).strip().lower()
+        if lang not in {"l2", "sl"}:
+            continue
+        snippet = match.group(2).strip("\n")
+        if DOC_SKIP_MARKER_RE.search(snippet):
+            continue
+        normalized = _normalize_doc_example_source(snippet)
+        if normalized is not None:
+            start_line = text.count("\n", 0, match.start()) + 1
+            examples.append((normalized, f"README.md:L{start_line}"))
+    return examples
+
+
+def _extract_builtin_doc_examples(main_py_path: Path) -> List[Tuple[str, str]]:
+    if not main_py_path.exists():
+        return []
+    source = main_py_path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    payloads: List[Tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        target_names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if not target_names:
+            continue
+        if "_L2_CT_REF_TEXT" in target_names:
+            try:
+                value = ast.literal_eval(node.value)
+            except Exception:
+                continue
+            if isinstance(value, str):
+                payloads.append((value, f"main.py:L{node.lineno}:_L2_CT_REF_TEXT"))
+            continue
+        if "_LANG_REF_ENTRIES" in target_names:
+            try:
+                value = ast.literal_eval(node.value)
+            except Exception:
+                continue
+            if not isinstance(value, list):
+                continue
+            for idx, entry in enumerate(value, start=1):
+                if not isinstance(entry, dict):
+                    continue
+                detail = entry.get("detail")
+                if isinstance(detail, str):
+                    entry_name = entry.get("name")
+                    if not isinstance(entry_name, str) or not entry_name.strip():
+                        entry_name = f"entry{idx:03d}"
+                    payloads.append((
+                        detail,
+                        f"main.py:L{node.lineno}:_LANG_REF_ENTRIES:{entry_name.strip()}",
+                    ))
+
+    examples: List[Tuple[str, str]] = []
+    for payload, payload_loc in payloads:
+        for block, block_line in _extract_indented_example_blocks(payload):
+            normalized = _normalize_doc_example_source(block)
+            if normalized is not None:
+                examples.append((normalized, f"{payload_loc}:detail-L{block_line}"))
+    return examples
+
+
+def _extract_documentation_examples(root: Path, main_py_path: Path) -> List[Tuple[str, str, str]]:
+    readme_examples = _extract_readme_l2_examples(root / "README.md")
+    builtin_examples = _extract_builtin_doc_examples(main_py_path)
+
+    indexed: List[Tuple[str, str, str]] = []
+    seen: Set[str] = set()
+
+    def _add_many(origin: str, examples: Sequence[Tuple[str, str]]) -> None:
+        counter = 0
+        for example, location in examples:
+            digest = hashlib.sha1(example.encode("utf-8")).hexdigest()[:10]
+            if digest in seen:
+                continue
+            seen.add(digest)
+            counter += 1
+            location_slug = _doc_location_slug(location)
+            name = f"{origin}_{location_slug}_{digest}"
+            description = f"documentation example ({location})"
+            indexed.append((name, example, description))
+
+    _add_many("readme", readme_examples)
+    _add_many("builtin", builtin_examples)
+    return indexed
 
 
 @dataclass
@@ -303,6 +481,7 @@ class TestRunner:
         self.tests_dir = resolve_path(root, args.tests_dir)
         self.examples_dir = resolve_path(root, args.examples_dir)
         self.build_dir = resolve_path(root, args.build_dir)
+        self.doc_examples_dir = self.build_dir / DOC_EXAMPLES_DIRNAME
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.main_py = self.root / "main.py"
         self.l2eval_builder = self.root / "tools" / "build_l2eval_lib.sh"
@@ -320,8 +499,10 @@ class TestRunner:
         sources: List[Path] = []
         if self.tests_dir.exists():
             sources.extend(sorted(self.tests_dir.glob("*.sl")))
-        if not self.args.no_compile_examples and self.examples_dir.exists():
-            sources.extend(sorted(self.examples_dir.rglob("*.sl")))
+        if not self.args.no_compile_examples:
+            if self.examples_dir.exists():
+                sources.extend(sorted(self.examples_dir.rglob("*.sl")))
+            sources.extend(self._materialize_documentation_cases())
         for entry in self.extra_sources:
             if entry.is_dir():
                 sources.extend(sorted(entry.glob("*.sl")))
@@ -354,6 +535,8 @@ class TestRunner:
             relative = source.as_posix()
         if relative.endswith(".sl"):
             relative = relative[:-3]
+        if self._is_doc_example_source(source):
+            relative = f"docs/{source.stem}"
         if self._is_example_source(source):
             should_run_example = self._should_run_example(relative, config)
             if not should_run_example:
@@ -383,17 +566,77 @@ class TestRunner:
             config=config,
         )
 
-    def _is_example_source(self, source: Path) -> bool:
+    def _materialize_documentation_cases(self) -> List[Path]:
+        examples = _extract_documentation_examples(self.root, self.main_py)
+        if not examples:
+            return []
+        if self.doc_examples_dir.exists():
+            shutil.rmtree(self.doc_examples_dir)
+        self.doc_examples_dir.mkdir(parents=True, exist_ok=True)
+
+        created: List[Path] = []
+        for name, source_text, description in examples:
+            source_path = self.doc_examples_dir / f"{name}.sl"
+            meta_path = source_path.with_suffix(".meta.json")
+            write_text(source_path, source_text)
+            meta = {
+                "description": description,
+                "compile_only": True,
+                "compile_args": ["--artifact", "obj", "--check"],
+                "tags": ["docs", "generated"],
+            }
+            write_text(meta_path, json.dumps(meta, sort_keys=True, indent=2) + "\n")
+            created.append(source_path)
+        return created
+
+    def _is_doc_example_source(self, source: Path) -> bool:
         try:
-            source.relative_to(self.examples_dir)
+            source.relative_to(self.doc_examples_dir)
         except ValueError:
             return False
         return True
+
+    def _is_example_source(self, source: Path) -> bool:
+        for base in (self.examples_dir, self.doc_examples_dir):
+            try:
+                source.relative_to(base)
+            except ValueError:
+                continue
+            return True
+        return False
 
     def _should_run_example(self, case_name: str, config: TestCaseConfig) -> bool:
         if config.run_example:
             return True
         return bool(self.run_example_patterns and match_patterns(case_name, self.run_example_patterns))
+
+    @staticmethod
+    def _extract_artifact_from_compile_args(compile_args: Sequence[str]) -> Optional[str]:
+        artifact: Optional[str] = None
+        idx = 0
+        while idx < len(compile_args):
+            arg = compile_args[idx]
+            if arg == "--artifact":
+                if idx + 1 < len(compile_args):
+                    artifact = compile_args[idx + 1].strip()
+                    idx += 2
+                    continue
+                break
+            if arg.startswith("--artifact="):
+                artifact = arg.split("=", 1)[1].strip()
+            idx += 1
+        return artifact or None
+
+    def _script_mode_for_case(self, case: TestCase) -> bool:
+        if not self.args.script:
+            return False
+        if self._is_example_source(case.source):
+            return False
+        artifact = self._extract_artifact_from_compile_args(case.config.compile_args)
+        return artifact in (None, "exe")
+
+    def _ct_run_main_for_case(self, case: TestCase) -> bool:
+        return self.args.ct_run_main and not self._is_example_source(case.source)
 
     def run(self) -> int:
         if not self.tests_dir.exists():
@@ -440,6 +683,10 @@ class TestRunner:
         except RuntimeError as exc:
             return CaseResult(case, "failed", "fixture", str(exc))
         compile_proc = self._compile(case, extra_libs=fixture_libs)
+        if not case.config.expect_compile_error and compile_proc.returncode != 0:
+            fallback = self._compile_doc_example_fallback(case, compile_proc, fixture_libs)
+            if fallback is not None and fallback.returncode == 0:
+                compile_proc = fallback
         if case.config.expect_compile_error:
             result = self._handle_expected_compile_failure(case, compile_proc)
             result.duration = time.perf_counter() - start
@@ -459,7 +706,7 @@ class TestRunner:
         if asm_status == "failed":
             duration = time.perf_counter() - start
             return CaseResult(case, asm_status, "asm", asm_note, asm_details, duration)
-        if case.config.compile_only:
+        if case.config.compile_only or self._script_mode_for_case(case):
             duration = time.perf_counter() - start
             if updated_notes:
                 return CaseResult(case, "updated", "compile", "; ".join(updated_notes), details=None, duration=duration)
@@ -520,11 +767,18 @@ class TestRunner:
         message = "smoke-run ok" if case.config.smoke_run else "ok"
         return CaseResult(case, "passed", "run", message, details=None, duration=duration)
 
-    def _compile(self, case: TestCase, *, extra_libs: Optional[Sequence[str]] = None) -> subprocess.CompletedProcess[str]:
+    def _compile(
+        self,
+        case: TestCase,
+        *,
+        extra_libs: Optional[Sequence[str]] = None,
+        source_override: Optional[Path] = None,
+    ) -> subprocess.CompletedProcess[str]:
+        source_path = source_override or case.source
         cmd = [
             sys.executable,
             str(self.main_py),
-            str(case.source),
+            str(source_path),
             "-o",
             str(case.binary_path),
             "--no-cache",
@@ -534,7 +788,9 @@ class TestRunner:
         for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
         cmd.extend(case.config.compile_args)
-        if self.args.ct_run_main and not self._is_example_source(case.source):
+        if self._script_mode_for_case(case):
+            cmd.append("--script")
+        elif self._ct_run_main_for_case(case):
             cmd.append("--ct-run-main")
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
@@ -542,7 +798,7 @@ class TestRunner:
         # so it may need stdin data that would normally go to the binary.
         compile_input = None
         stdin_data = case.stdin_data()
-        if self.args.ct_run_main and not self._is_example_source(case.source) and stdin_data is not None:
+        if (self._ct_run_main_for_case(case) or self._script_mode_for_case(case)) and stdin_data is not None:
             compile_input = stdin_data
         return subprocess.run(
             cmd,
@@ -552,6 +808,44 @@ class TestRunner:
             input=compile_input,
             env=self._env_for(case),
         )
+
+    def _compile_doc_example_fallback(
+        self,
+        case: TestCase,
+        compile_proc: subprocess.CompletedProcess[str],
+        extra_libs: Sequence[str],
+    ) -> Optional[subprocess.CompletedProcess[str]]:
+        if not self._is_doc_example_source(case.source):
+            return None
+        combined = (compile_proc.stderr or "") + "\n" + (compile_proc.stdout or "")
+        if "top-level literals or word references are not supported yet" not in combined:
+            return None
+
+        source_text = case.source.read_text(encoding="utf-8", errors="ignore")
+        import_lines: List[str] = []
+        body_lines: List[str] = []
+        for line in source_text.splitlines():
+            if re.match(r"^\s*import\s+", line):
+                import_lines.append(line.strip())
+                continue
+            body_lines.append(line.rstrip())
+        body = "\n".join(line for line in body_lines if line.strip()).strip()
+        if not body:
+            return None
+
+        unique_imports = list(dict.fromkeys(import_lines))
+        wrapped_parts: List[str] = []
+        if unique_imports:
+            wrapped_parts.append("\n".join(unique_imports))
+            wrapped_parts.append("")
+        wrapped_parts.append("word __doc_example_main")
+        wrapped_parts.append("\n".join(f"  {line}" for line in body.splitlines()))
+        wrapped_parts.append("end")
+        wrapped_source = "\n".join(wrapped_parts).rstrip() + "\n"
+
+        wrapped_path = case.source.with_suffix(".wrapped.sl")
+        write_text(wrapped_path, wrapped_source)
+        return self._compile(case, extra_libs=extra_libs, source_override=wrapped_path)
 
     def _prepare_case_native_libs(self, case: TestCase) -> List[str]:
         """Build optional per-test native C fixtures and return linkable artifacts."""
@@ -776,7 +1070,7 @@ class TestRunner:
             return "passed", "", None
         if (
             label == "compile"
-            and self.args.ct_run_main
+            and (self._ct_run_main_for_case(case) or self._script_mode_for_case(case))
             and expected_clean
             and actual_clean.endswith(expected_clean)
         ):
@@ -943,7 +1237,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("patterns", nargs="*", help="glob or substring filters for test names")
     parser.add_argument("--tests-dir", default="tests", help="directory containing .sl test files")
     parser.add_argument("--examples-dir", default="examples", help="directory containing .sl examples to compile-check")
-    parser.add_argument("--no-compile-examples", action="store_true", help="skip compile-only checks for examples")
+    parser.add_argument(
+        "--no-compile-examples",
+        action="store_true",
+        help="skip compile-only checks for examples and extracted documentation snippets",
+    )
     parser.add_argument("--run-example", action="append", default=[], help="pattern for example cases to run instead of compile-only (repeatable)")
     parser.add_argument("--build-dir", default="build", help="directory for compiled binaries")
     parser.add_argument("--extra", action="append", help="additional .sl files or directories to treat as tests")
@@ -951,6 +1249,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--update", action="store_true", help="update expectation files with actual output")
     parser.add_argument("--stop-on-fail", action="store_true", help="stop after the first failure")
     parser.add_argument("--ct-run-main", action="store_true", help="execute each test's 'main' via the compile-time VM during compilation")
+    parser.add_argument(
+        "--script",
+        action="store_true",
+        help="compile eligible non-example tests with compiler --script mode (compile-time execution, no runtime artifact)",
+    )
     parser.add_argument("--runtime-timeout", type=float, default=None, help="timeout in seconds for runtime execution")
     parser.add_argument("-v", "--verbose", action="store_true", help="show compiler/runtime commands")
     return parser.parse_args(argv)

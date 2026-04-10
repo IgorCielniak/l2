@@ -10,11 +10,10 @@ word main
     end 2drop
 
     foreach
-        puti cr
-        1 +
-    end 2drop
+        1 + puti cr
+    end
 
-    foreachwith(i,
-        i 1 + puti cr
-    )
+    foreachwith i
+        1 i + puti cr
+    end
 end

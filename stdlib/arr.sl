@@ -223,5 +223,107 @@ word arr_find
     end rdrop -1 nip nip
 end
 
-macro foreach 0 dup @ swap 8 + swap 0 swap for 2dup 8 * + @ ;
-macro foreachwith (name *body) foreach with $name in $*body end 1 + end 2drop drop ;
+word fw-opener-lex?
+    dup "if" string= if drop 1 exit end
+    dup "for" string= if drop 1 exit end
+    dup "while" string= if drop 1 exit end
+    dup "begin" string= if drop 1 exit end
+    dup "with" string= if drop 1 exit end
+    dup "foreach" string= if drop 1 exit end
+    dup "foreachwith" string= if drop 1 exit end
+    drop 0
+end
+compile-only
+
+word fw-collect-body
+    list-new 0
+    with body depth in
+    begin
+        next-token dup nil? if
+            drop
+            "unterminated 'foreachwith' block (missing 'end')" parse-error
+        end
+        dup token-lexeme "end" string= if
+            depth 0 == if
+                drop
+                body exit
+            end
+            depth 1 - depth !
+            body swap list-append body !
+            continue
+        end
+        dup token-lexeme fw-opener-lex? if
+            depth 1 + depth !
+        end
+        body swap list-append body !
+    again
+    end
+end
+compile-only
+
+word fw-append-lex
+    swap token-from-lexeme
+    list-append
+end
+compile-only
+
+word foreach
+    fw-collect-body
+    with body in
+        list-new with out in
+            out nil "dup" fw-append-lex out !
+            out nil "@" fw-append-lex out !
+            out nil "swap" fw-append-lex out !
+            out nil "8" fw-append-lex out !
+            out nil "+" fw-append-lex out !
+            out nil "swap" fw-append-lex out !
+            out nil "0" fw-append-lex out !
+            out nil "swap" fw-append-lex out !
+            out nil "for" fw-append-lex out !
+            out nil "2dup" fw-append-lex out !
+            out nil "8" fw-append-lex out !
+            out nil "*" fw-append-lex out !
+            out nil "+" fw-append-lex out !
+            out nil "@" fw-append-lex out !
+            out body list-extend out !
+            out nil "1" fw-append-lex out !
+            out nil "+" fw-append-lex out !
+            out nil "end" fw-append-lex out !
+            out nil "2drop" fw-append-lex out !
+            out inject-tokens
+        end
+    end
+end
+immediate
+compile-only
+
+word foreachwith
+    next-token dup nil? if
+        drop
+        "missing variable name after 'foreachwith'" parse-error
+    end
+    dup token-lexeme dup identifier? 0 == if
+        drop drop
+        "invalid variable name in 'foreachwith'" parse-error
+    end
+    drop
+    >r
+
+    fw-collect-body
+    r>
+    with body name_tok in
+        list-new with out in
+            out name_tok "foreach" fw-append-lex out !
+            out name_tok "with" fw-append-lex out !
+            out name_tok list-append out !
+            out name_tok "in" fw-append-lex out !
+            out body list-extend out !
+            out name_tok "end" fw-append-lex out !
+            out name_tok "end" fw-append-lex out !
+            out name_tok "drop" fw-append-lex out !
+            out inject-tokens
+        end
+    end
+end
+immediate
+compile-only

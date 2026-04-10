@@ -17,6 +17,7 @@ At its core, L2 is more than a glorified macro assembler. Its compile-time virtu
 - GNU binutils (`ld`)
 - Linux x86-64
 - `keystone-engine` (optional, for compile-time `:asm` execution)
+- `qiling` (optional, only needed for `--ct-run-main` on non-Linux hosts such as Windows/Android). L2 uses Qiling in VM shellcode mode for runtime asm execution fallback and does not create rootfs directories.
 
 ### Building
 
@@ -29,6 +30,13 @@ python3 main.py examples/snake.sl -o snake
 
 ```bash
 python3 test.py
+```
+
+To simulate the phone/non-native `--ct-run-main` path on Linux without copying
+files to a device, force VM fallback locally:
+
+```bash
+L2_FORCE_QILING_VM=1 python3 main.py tests/hello.sl --script
 ```
 
 ## Metaprogramming Guide

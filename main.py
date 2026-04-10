@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import bisect
 import os
+import platform
 import re
 import shlex
 import sys
@@ -26,6 +27,12 @@ Ks = None
 KsError = Exception
 KS_ARCH_X86 = KS_MODE_64 = None
 _KEYSTONE_IMPORT_ATTEMPTED = False
+
+Qiling = None
+QL_VERBOSE = None
+QL_ARCH = None
+QL_OS = None
+_QILING_IMPORT_ATTEMPTED = False
 
 def _ensure_keystone() -> bool:
     """Lazily import keystone to keep startup overhead low on plain builds."""
@@ -41,6 +48,29 @@ def _ensure_keystone() -> bool:
     KsError = _KsError
     KS_ARCH_X86 = _KS_ARCH_X86
     KS_MODE_64 = _KS_MODE_64
+    return True
+
+
+def _ensure_qiling() -> bool:
+    """Lazily import Qiling for VM fallback execution on non-native hosts."""
+    global Qiling, QL_VERBOSE, QL_ARCH, QL_OS, _QILING_IMPORT_ATTEMPTED
+    if _QILING_IMPORT_ATTEMPTED:
+        return Qiling is not None
+    _QILING_IMPORT_ATTEMPTED = True
+    try:
+        from qiling import Qiling as _Qiling
+        from qiling.const import QL_VERBOSE as _QL_VERBOSE
+        try:
+            from qiling.const import QL_ARCH as _QL_ARCH, QL_OS as _QL_OS
+        except Exception:
+            _QL_ARCH = None
+            _QL_OS = None
+    except Exception:  # pragma: no cover - optional dependency
+        return False
+    Qiling = _Qiling
+    QL_VERBOSE = _QL_VERBOSE
+    QL_ARCH = _QL_ARCH
+    QL_OS = _QL_OS
     return True
 
 # Pre-compiled regex patterns used by JIT and BSS code
@@ -3894,7 +3924,7 @@ class CompileTimeVM:
                     self._run_asm_definition(word)
                 return
             # Whole-word JIT for regular definitions in runtime mode
-            if self.runtime_mode and isinstance(definition, Definition):
+            if self.runtime_mode and self._native_runtime_jit_enabled() and isinstance(definition, Definition):
                 ck = f"__defn_jit_{word.name}"
                 jf = self._jit_cache.get(ck)
                 if jf is None and ck + "_miss" not in self._jit_cache:
@@ -3928,8 +3958,264 @@ class CompileTimeVM:
 
     _JIT_FUNC_TYPE: Optional[Any] = None
 
+    @staticmethod
+    def _page_align(value: int) -> int:
+        return (value + 0xFFF) & ~0xFFF
+
+    def _native_runtime_jit_enabled(self) -> bool:
+        return _host_supports_native_ct_runtime()
+
+    def _qiling_layout(self) -> Dict[str, int]:
+        return {
+            "dstack": 0x20000000,
+            "rstack": 0x30000000,
+            "data_start": 0x40000000,
+            "persistent": 0x50000000,
+            "print_buf": 0x51000000,
+            "sys_argc": 0x52000000,
+            "sys_argv": 0x52000008,
+            "argv_block": 0x53000000,
+            "callstack": 0x60000000,
+            "out": 0x61000000,
+        }
+
+    def _qiling_bss_symbols(self, layout: Dict[str, int]) -> Dict[str, int]:
+        data_end = layout["data_start"] + (
+            self.memory._data_offset if self.memory._data_offset else self.memory.DATA_SECTION_SIZE
+        )
+        return {
+            "dstack": layout["dstack"],
+            "dstack_top": layout["dstack"] + self.NATIVE_STACK_SIZE,
+            "rstack": layout["rstack"],
+            "rstack_top": layout["rstack"] + self.NATIVE_STACK_SIZE,
+            "data_start": layout["data_start"],
+            "data_end": data_end,
+            "print_buf": layout["print_buf"],
+            "print_buf_end": layout["print_buf"] + CTMemory.PRINT_BUF_SIZE,
+            "persistent": layout["persistent"],
+            "persistent_end": layout["persistent"] + self.memory._persistent_size,
+            "sys_argc": layout["sys_argc"],
+            "sys_argv": layout["sys_argv"],
+        }
+
+    def _execute_qiling_wrapper_code(self, code: bytes, *, out_words: int) -> List[int]:
+        if not _ensure_qiling():
+            raise ParseError("qiling is required for runtime VM fallback execution; install qiling")
+        if self._native_data_stack is None or self._native_return_stack is None:
+            raise ParseError("runtime VM stacks are not initialized")
+
+        layout = self._qiling_layout()
+        ql_code = code + b"\xCC"
+        verbose = getattr(QL_VERBOSE, "DISABLED", getattr(QL_VERBOSE, "OFF", 0))
+
+        def _enum_member(enum_obj: Any, names: Sequence[str]) -> Optional[Any]:
+            if enum_obj is None:
+                return None
+            for name in names:
+                value = getattr(enum_obj, name, None)
+                if value is not None:
+                    return value
+            return None
+
+        arch_candidates: List[Any] = []
+        os_candidates: List[Any] = []
+
+        arch_enum = _enum_member(QL_ARCH, ("X8664", "X86_64", "AMD64"))
+        os_enum = _enum_member(QL_OS, ("LINUX", "Linux"))
+        if arch_enum is not None:
+            arch_candidates.append(arch_enum)
+        arch_candidates.extend(["x8664", "x86_64", "amd64", "X8664", "X86_64"])
+
+        if os_enum is not None:
+            os_candidates.append(os_enum)
+        os_candidates.extend(["linux", "Linux", "LINUX"])
+
+        ql = None
+        init_error: Optional[Exception] = None
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for arch in arch_candidates:
+            for os_name in os_candidates:
+                pair_key = (str(arch), str(os_name))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                try:
+                    ql = Qiling(code=ql_code, archtype=arch, ostype=os_name, verbose=verbose)
+                    break
+                except Exception as exc:
+                    init_error = exc
+            if ql is not None:
+                break
+
+        if ql is None:
+            if init_error is None:
+                raise ParseError("failed to initialize Qiling shellcode VM")
+            raise ParseError(f"failed to initialize Qiling shellcode VM: {init_error}") from init_error
+
+        entry = int(ql.arch.regs.arch_pc)
+        stop_addr = entry + len(code)
+        stopped = {"value": False}
+
+        def _stop_on_return(ql_obj) -> None:
+            stopped["value"] = True
+            ql_obj.emu_stop()
+
+        ql.hook_address(_stop_on_return, stop_addr)
+
+        d_host_base = ctypes.addressof(self._native_data_stack)
+        r_host_base = ctypes.addressof(self._native_return_stack)
+        d_off = self.r12 - d_host_base
+        r_off = self.r13 - r_host_base
+        if not (0 <= d_off <= self.NATIVE_STACK_SIZE and 0 <= r_off <= self.NATIVE_STACK_SIZE):
+            raise ParseError("runtime VM stack pointers out of range before Qiling execution")
+
+        def _map_and_write(addr: int, payload: bytes, label: str) -> None:
+            ql.mem.map(addr, self._page_align(max(len(payload), 1)), info=label)
+            if payload:
+                ql.mem.write(addr, payload)
+
+        _map_and_write(
+            layout["data_start"],
+            ctypes.string_at(self.memory.data_start, self.memory.DATA_SECTION_SIZE),
+            "l2.data",
+        )
+        _map_and_write(
+            layout["persistent"],
+            ctypes.string_at(self.memory.persistent_addr, self.memory._persistent_size),
+            "l2.persistent",
+        )
+        _map_and_write(
+            layout["print_buf"],
+            ctypes.string_at(self.memory.print_buf_addr, CTMemory.PRINT_BUF_SIZE),
+            "l2.print_buf",
+        )
+
+        argv_region_size = 0x20000
+        ql.mem.map(layout["argv_block"], self._page_align(argv_region_size), info="l2.argv")
+        argv_ptrs: List[int] = []
+        argv_guest_bases: List[int] = []
+        argv_cur = layout["argv_block"] + 0x1000
+        argv_limit = layout["argv_block"] + argv_region_size
+        for arg in sys.argv:
+            encoded = arg.encode("utf-8") + b"\x00"
+            if argv_cur + len(encoded) > argv_limit:
+                raise ParseError("Qiling argv region overflow")
+            ql.mem.write(argv_cur, encoded)
+            argv_ptrs.append(argv_cur)
+            argv_guest_bases.append(argv_cur)
+            argv_cur += len(encoded)
+        argv_ptrs.append(0)
+        argv_ptr_payload = b"".join(_get_struct().pack("<q", ptr) for ptr in argv_ptrs)
+        ql.mem.write(layout["argv_block"], argv_ptr_payload)
+
+        host_to_guest_ranges: List[Tuple[int, int, int]] = [
+            (d_host_base, d_host_base + self.NATIVE_STACK_SIZE, layout["dstack"]),
+            (r_host_base, r_host_base + self.NATIVE_STACK_SIZE, layout["rstack"]),
+            (self.memory.data_start, self.memory.data_start + self.memory.DATA_SECTION_SIZE, layout["data_start"]),
+            (self.memory.persistent_addr, self.memory.persistent_addr + self.memory._persistent_size, layout["persistent"]),
+            (self.memory.print_buf_addr, self.memory.print_buf_addr + CTMemory.PRINT_BUF_SIZE, layout["print_buf"]),
+            (self.memory.sys_argc_addr, self.memory.sys_argc_addr + 8, layout["sys_argc"]),
+            (self.memory.sys_argv_addr, self.memory.sys_argv_addr + 8, layout["sys_argv"]),
+        ]
+        if self.memory._sys_argv_ptrs is not None:
+            host_argv_ptr_base = ctypes.addressof(self.memory._sys_argv_ptrs)
+            host_to_guest_ranges.append((host_argv_ptr_base, host_argv_ptr_base + (len(sys.argv) + 1) * 8, layout["argv_block"]))
+            for idx, arg in enumerate(sys.argv):
+                try:
+                    host_arg_addr = int(self.memory._sys_argv_ptrs[idx])
+                except Exception:
+                    continue
+                arg_len = len(arg.encode("utf-8")) + 1
+                host_to_guest_ranges.append((host_arg_addr, host_arg_addr + arg_len, argv_guest_bases[idx]))
+
+        guest_to_host_ranges: List[Tuple[int, int, int]] = [
+            (guest_start, guest_start + (host_end - host_start), host_start)
+            for host_start, host_end, guest_start in host_to_guest_ranges
+        ]
+
+        def _translate_qword_payload(
+            payload: bytearray,
+            start_offset: int,
+            ranges: Sequence[Tuple[int, int, int]],
+        ) -> None:
+            off = max(0, start_offset - (start_offset % 8))
+            limit = len(payload)
+            while off + 8 <= limit:
+                value = _get_struct().unpack_from("<q", payload, off)[0]
+                new_value = value
+                if value >= 0:
+                    for src_start, src_end, dst_start in ranges:
+                        if src_start <= value < src_end:
+                            new_value = dst_start + (value - src_start)
+                            break
+                if new_value != value:
+                    _get_struct().pack_into("<q", payload, off, _to_i64(int(new_value)))
+                off += 8
+
+        d_payload = bytearray(ctypes.string_at(d_host_base, self.NATIVE_STACK_SIZE))
+        r_payload = bytearray(ctypes.string_at(r_host_base, self.NATIVE_STACK_SIZE))
+        _translate_qword_payload(d_payload, d_off, host_to_guest_ranges)
+        _translate_qword_payload(r_payload, r_off, host_to_guest_ranges)
+        _map_and_write(layout["dstack"], bytes(d_payload), "l2.dstack")
+        _map_and_write(layout["rstack"], bytes(r_payload), "l2.rstack")
+
+        ql.mem.map(layout["sys_argc"], self._page_align(0x1000), info="l2.sys")
+        ql.mem.write(layout["sys_argc"], _get_struct().pack("<q", len(sys.argv)))
+        ql.mem.write(layout["sys_argv"], _get_struct().pack("<q", layout["argv_block"]))
+
+        ql.mem.map(layout["out"], self._page_align(0x1000), info="l2.out")
+        ql.mem.write(layout["out"], b"\x00" * (out_words * 8))
+
+        callstack_size = 0x2000
+        ql.mem.map(layout["callstack"], self._page_align(callstack_size), info="l2.callstack")
+        rsp = layout["callstack"] + callstack_size - 8
+        ql.mem.write(rsp, _get_struct().pack("<q", stop_addr))
+
+        ql.arch.regs.rsp = rsp
+        ql.arch.regs.rbp = rsp
+        ql.arch.regs.rdi = layout["dstack"] + d_off
+        ql.arch.regs.rsi = layout["rstack"] + r_off
+        ql.arch.regs.rdx = layout["out"]
+
+        try:
+            ql.run(begin=entry)
+        except Exception as exc:
+            raise ParseError(f"Qiling VM execution failed: {exc}") from exc
+        if not stopped["value"]:
+            raise ParseError("Qiling VM execution did not return through wrapper epilogue")
+
+        out_raw = ql.mem.read(layout["out"], out_words * 8)
+        out_vals = list(_get_struct().unpack("<" + ("q" * out_words), out_raw))
+
+        new_r12 = int(out_vals[0])
+        new_r13 = int(out_vals[1])
+        if not (layout["dstack"] <= new_r12 <= layout["dstack"] + self.NATIVE_STACK_SIZE):
+            raise ParseError("Qiling VM corrupted data stack pointer")
+        if not (layout["rstack"] <= new_r13 <= layout["rstack"] + self.NATIVE_STACK_SIZE):
+            raise ParseError("Qiling VM corrupted return stack pointer")
+
+        new_d_off = new_r12 - layout["dstack"]
+        new_r_off = new_r13 - layout["rstack"]
+        d_after = bytearray(ql.mem.read(layout["dstack"], self.NATIVE_STACK_SIZE))
+        r_after = bytearray(ql.mem.read(layout["rstack"], self.NATIVE_STACK_SIZE))
+        _translate_qword_payload(d_after, min(d_off, new_d_off), guest_to_host_ranges)
+        _translate_qword_payload(r_after, min(r_off, new_r_off), guest_to_host_ranges)
+
+        ctypes.memmove(d_host_base, bytes(d_after), self.NATIVE_STACK_SIZE)
+        ctypes.memmove(r_host_base, bytes(r_after), self.NATIVE_STACK_SIZE)
+        ctypes.memmove(self.memory.data_start, ql.mem.read(layout["data_start"], self.memory.DATA_SECTION_SIZE), self.memory.DATA_SECTION_SIZE)
+        ctypes.memmove(self.memory.persistent_addr, ql.mem.read(layout["persistent"], self.memory._persistent_size), self.memory._persistent_size)
+        ctypes.memmove(self.memory.print_buf_addr, ql.mem.read(layout["print_buf"], CTMemory.PRINT_BUF_SIZE), CTMemory.PRINT_BUF_SIZE)
+
+        self.r12 = d_host_base + (new_r12 - layout["dstack"])
+        self.r13 = r_host_base + (new_r13 - layout["rstack"])
+        return out_vals
+
     def _run_jit(self, word: Word) -> None:
         """JIT-compile (once) and execute an :asm word on the native r12/r13 stacks."""
+        if not self._native_runtime_jit_enabled():
+            self._run_jit_with_qiling(word)
+            return
         func = self._jit_cache.get(word.name)
         if func is None:
             func = self._compile_jit(word)
@@ -3940,7 +4226,29 @@ class CompileTimeVM:
         self.r12 = out[0]
         self.r13 = out[1]
 
-    def _compile_jit(self, word: Word) -> Any:
+    def _run_jit_with_qiling(self, word: Word) -> None:
+        definition = word.definition
+        if not isinstance(definition, AsmDefinition):
+            raise ParseError(f"word '{word.name}' has no asm body")
+        asm_body = definition.body.strip("\n")
+        if self._is_coroutine_asm(asm_body):
+            raise ParseError("coroutine-style asm words are not supported by Qiling VM fallback")
+
+        cache_key = f"__qiling_jit_{word.name}"
+        code = self._jit_cache.get(cache_key)
+        if code is None:
+            bss = self._qiling_bss_symbols(self._qiling_layout())
+            code = self._compile_jit(word, bss_override=bss, output="bytes")
+            self._jit_cache[cache_key] = code
+        self._execute_qiling_wrapper_code(code, out_words=2)
+
+    def _compile_jit(
+        self,
+        word: Word,
+        *,
+        bss_override: Optional[Dict[str, int]] = None,
+        output: str = "callable",
+    ) -> Any:
         """Assemble an :asm word into executable memory and return a ctypes callable."""
         if not _ensure_keystone():
             raise ParseError("keystone-engine is required for JIT execution")
@@ -3950,7 +4258,7 @@ class CompileTimeVM:
         asm_body = definition.body.strip("\n")
         is_coro = self._is_coroutine_asm(asm_body)
 
-        bss = self._bss_symbols
+        bss = bss_override if bss_override is not None else self._bss_symbols
 
         # Build wrapper
         lines: List[str] = []
@@ -4069,14 +4377,19 @@ class CompileTimeVM:
                 "    ret",
             ])
 
+        if output == "bytes":
+            return self._jit_assemble_bytes(lines, word.name)
+        if output != "callable":
+            raise ParseError(f"unknown JIT output mode: {output}")
+
         ptr = self._jit_assemble_page(lines, word.name)
         if CompileTimeVM._JIT_FUNC_TYPE is None:
             CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
         func = self._JIT_FUNC_TYPE(ptr)
         return func
 
-    def _jit_assemble_page(self, lines: List[str], word_name: str) -> int:
-        """Assemble lines into an RWX page and return its address."""
+    def _jit_assemble_bytes(self, lines: List[str], word_name: str) -> bytes:
+        """Assemble lines into machine code bytes."""
         def _norm(l: str) -> str:
             l = l.split(";", 1)[0].rstrip()
             for sz in ("qword", "dword", "word", "byte"):
@@ -4093,7 +4406,11 @@ class CompileTimeVM:
             ) from exc
         if encoding is None:
             raise ParseError(f"JIT produced no code for '{word_name}'")
-        code = bytes(encoding)
+        return bytes(encoding)
+
+    def _jit_assemble_page(self, lines: List[str], word_name: str) -> int:
+        """Assemble lines into an RWX page and return its address."""
+        code = self._jit_assemble_bytes(lines, word_name)
         page_size = max(len(code), 4096)
         _libc = ctypes.CDLL(None, use_errno=True)
         _libc.mmap.restype = ctypes.c_void_p
@@ -4984,7 +5301,7 @@ class CompileTimeVM:
             defn._for_pairs = fp
             defn._begin_pairs = bp
         self._resolve_words_in_body(defn)
-        if self.runtime_mode:
+        if self.runtime_mode and self._native_runtime_jit_enabled():
             # Merged JIT runs are a performance optimization, but have shown
             # intermittent instability on some environments. Keep them opt-in.
             if os.environ.get("L2_CT_MERGED_JIT", "0") == "1":
@@ -5169,15 +5486,16 @@ class CompileTimeVM:
         _poke_return = self.poke_return
         _call_word = self._call_word
         _dict_lookup = self.dictionary.lookup
+        _native_runtime_jit = _runtime_mode and self._native_runtime_jit_enabled()
 
         # Hot JIT-call locals (avoid repeated attribute access)
         _jit_cache = self._jit_cache if _runtime_mode else None
         _jit_out2 = self._jit_out2 if _runtime_mode else None
         _jit_out2_addr = self._jit_out2_addr if _runtime_mode else 0
-        _compile_jit = self._compile_jit if _runtime_mode else None
-        _compile_merged = self._compile_merged_jit if _runtime_mode else None
+        _compile_jit = self._compile_jit if _native_runtime_jit else None
+        _compile_merged = self._compile_merged_jit if _native_runtime_jit else None
         _AsmDef = AsmDefinition
-        _merged_runs = (_defn._merged_runs if _defn is not None and _defn._merged_runs else None) if _runtime_mode else None
+        _merged_runs = (_defn._merged_runs if _defn is not None and _defn._merged_runs else None) if _native_runtime_jit else None
 
         # Inline ctypes for runtime mode — eliminates per-op function call overhead
         if _runtime_mode:
@@ -5253,7 +5571,7 @@ class CompileTimeVM:
                                 ip += 1
                                 continue
                             defn = word.definition
-                            if isinstance(defn, _AsmDef):
+                            if _native_runtime_jit and isinstance(defn, _AsmDef):
                                 wn = word.name
                                 func = _jit_cache.get(wn)
                                 if func is None:
@@ -5265,21 +5583,22 @@ class CompileTimeVM:
                                 ip += 1
                                 continue
                             # Whole-word JIT for Definition bodies
-                            ck = "__defn_jit_" + word.name
-                            jf = _jit_cache.get(ck)
-                            if jf is None and _jit_cache.get(ck + "_miss") is None:
-                                jf = self._compile_definition_jit(word)
+                            if _native_runtime_jit:
+                                ck = "__defn_jit_" + word.name
+                                jf = _jit_cache.get(ck)
+                                if jf is None and _jit_cache.get(ck + "_miss") is None:
+                                    jf = self._compile_definition_jit(word)
+                                    if jf is not None:
+                                        _jit_cache[ck] = jf
+                                        _jit_cache[ck + "_addr"] = ctypes.cast(jf, ctypes.c_void_p).value
+                                    else:
+                                        _jit_cache[ck + "_miss"] = True
                                 if jf is not None:
-                                    _jit_cache[ck] = jf
-                                    _jit_cache[ck + "_addr"] = ctypes.cast(jf, ctypes.c_void_p).value
-                                else:
-                                    _jit_cache[ck + "_miss"] = True
-                            if jf is not None:
-                                jf(self.r12, self.r13, _jit_out2_addr)
-                                self.r12 = _jit_out2[0]
-                                self.r13 = _jit_out2[1]
-                                ip += 1
-                                continue
+                                    jf(self.r12, self.r13, _jit_out2_addr)
+                                    self.r12 = _jit_out2[0]
+                                    self.r13 = _jit_out2[1]
+                                    ip += 1
+                                    continue
                         self.current_location = _node.loc
                         try:
                             _call_word(word)
@@ -10164,6 +10483,16 @@ def _rt_jmp(vm: CompileTimeVM) -> None:
 
 def _rt_syscall(vm: CompileTimeVM) -> None:
     """Execute a real Linux syscall via a JIT stub, intercepting exit/exit_group."""
+    if not vm._native_runtime_jit_enabled():
+        stub_code = vm._jit_cache.get("__syscall_stub_qiling")
+        if stub_code is None:
+            stub_code = _compile_syscall_stub_bytes(vm)
+            vm._jit_cache["__syscall_stub_qiling"] = stub_code
+        out_vals = vm._execute_qiling_wrapper_code(stub_code, out_words=4)
+        if out_vals[2] == 1:
+            raise _CTVMExit(out_vals[3])
+        return
+
     # Lazily compile the syscall JIT stub
     stub = vm._jit_cache.get("__syscall_stub")
     if stub is None:
@@ -10179,22 +10508,8 @@ def _rt_syscall(vm: CompileTimeVM) -> None:
         raise _CTVMExit(out[3])
 
 
-def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
-    """JIT-compile a native syscall stub that intercepts exit/exit_group."""
-    if not _ensure_keystone():
-        raise ParseError("keystone-engine is required for JIT syscall execution")
-
-    # The stub uses the same wrapper convention as _compile_jit:
-    #   rdi = r12 (data stack ptr), rsi = r13 (return stack ptr), rdx = output ptr
-    # Output struct: [r12, r13, exit_flag, exit_code]
-    #
-    # Stack protocol (matching _emit_syscall_intrinsic):
-    #   TOS:   syscall number -> rax
-    #   TOS-1: arg count -> rcx
-    #   then args on stack as ... arg0 arg1 ... argN (argN is top)
-    #
-
-    lines = [
+def _build_syscall_stub_lines() -> List[str]:
+    return [
         "_stub_entry:",
         "    push rbx",
         "    push r12",
@@ -10295,23 +10610,23 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    ret",
     ]
 
-    def _norm(l: str) -> str:
-        l = l.split(";", 1)[0].rstrip()
-        for sz in ("qword", "dword", "word", "byte"):
-            l = l.replace(f"{sz} [", f"{sz} ptr [")
-        return l
-    normalized = [_norm(l) for l in lines if _norm(l).strip()]
 
-    ks = Ks(KS_ARCH_X86, KS_MODE_64)
-    try:
-        encoding, _ = ks.asm("\n".join(normalized))
-    except KsError as exc:
-        debug_txt = "\n".join(normalized)
-        raise ParseError(f"JIT syscall stub assembly failed: {exc}\n--- asm ---\n{debug_txt}\n--- end ---") from exc
-    if encoding is None:
-        raise ParseError("JIT syscall stub produced no code")
+def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
+    """JIT-compile a native syscall stub that intercepts exit/exit_group."""
+    if not _ensure_keystone():
+        raise ParseError("keystone-engine is required for JIT syscall execution")
 
-    code = bytes(encoding)
+    # The stub uses the same wrapper convention as _compile_jit:
+    #   rdi = r12 (data stack ptr), rsi = r13 (return stack ptr), rdx = output ptr
+    # Output struct: [r12, r13, exit_flag, exit_code]
+    #
+    # Stack protocol (matching _emit_syscall_intrinsic):
+    #   TOS:   syscall number -> rax
+    #   TOS-1: arg count -> rcx
+    #   then args on stack as ... arg0 arg1 ... argN (argN is top)
+    #
+
+    code = vm._jit_assemble_bytes(_build_syscall_stub_lines(), "__syscall_stub")
     page_size = max(len(code), 4096)
     _libc = ctypes.CDLL(None, use_errno=True)
     _libc.mmap.restype = ctypes.c_void_p
@@ -10330,6 +10645,12 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
     func = CompileTimeVM._JIT_FUNC_TYPE(ptr)
     return func
+
+
+def _compile_syscall_stub_bytes(vm: CompileTimeVM) -> bytes:
+    if not _ensure_keystone():
+        raise ParseError("keystone-engine is required for JIT syscall execution")
+    return vm._jit_assemble_bytes(_build_syscall_stub_lines(), "__syscall_stub_qiling")
 
 
 def _register_runtime_intrinsics(dictionary: Dictionary) -> None:
@@ -11731,6 +12052,10 @@ def _find_linker() -> tuple:
 
 def _run_cmd(args: list) -> None:
     """Run a command using posix_spawn for lower overhead than subprocess."""
+    if not hasattr(os, "posix_spawn"):
+        import subprocess
+        subprocess.run(args, check=True)
+        return
     pid = os.posix_spawn(args[0], args, os.environ)
     _, status = os.waitpid(pid, 0)
     if os.WIFEXITED(status):
@@ -11774,9 +12099,29 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
         cmd.extend(["-nostdlib", "-static"])
 
     if libs:
+        def _lib_requires_dynamic_link(token: str) -> bool:
+            if not token:
+                return False
+            if token.startswith(("-L", "-Wl,")):
+                return False
+            if token.startswith("-l:"):
+                payload = token[3:]
+                return not (payload.endswith(".a") or payload.endswith(".o"))
+            if token.startswith("-l") and len(token) > 2:
+                return True
+            if token.startswith(":"):
+                payload = token[1:]
+                return not (payload.endswith(".a") or payload.endswith(".o"))
+            if token.endswith(".a") or token.endswith(".o"):
+                return False
+            if ".so" in token:
+                return True
+            # Bare names or non-static file paths are treated as dynamic.
+            return True
+
         # Determine if any libs require dynamic linking (shared libraries).
         needs_dynamic = any(
-            not (str(lib).endswith(".a") or str(lib).endswith(".o"))
+            _lib_requires_dynamic_link(str(lib))
             for lib in libs if lib
         )
         if not shared and needs_dynamic:
@@ -11812,6 +12157,30 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
         cmd.append("-g")
 
     _run_cmd(cmd)
+
+
+def _is_android_host() -> bool:
+    return bool(
+        os.environ.get("ANDROID_ROOT")
+        or os.environ.get("ANDROID_DATA")
+        or os.environ.get("TERMUX_VERSION")
+    )
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_supports_native_ct_runtime() -> bool:
+    # Handy for local reproduction of phone/non-native behavior.
+    if _env_truthy("L2_FORCE_QILING_VM"):
+        return False
+    if not sys.platform.startswith("linux"):
+        return False
+    if _is_android_host():
+        return False
+    machine = platform.machine().lower()
+    return machine in ("x86_64", "amd64")
 
 
 def build_static_library(obj_path: Path, archive_path: Path) -> None:
@@ -16923,7 +17292,14 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("--no-extern-type-check", action="store_true", help="disable extern function argument count checking")
     parser.add_argument("--no-stack-check", action="store_true", help="disable stack underflow checking for builtins")
     parser.add_argument("--no-cache", action="store_true", help="disable incremental build cache")
-    parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
+    parser.add_argument(
+        "--ct-run-main",
+        action="store_true",
+        help=(
+            "execute 'main' after parsing "
+            "(native CT VM on Linux x86-64; VM-level Qiling fallback elsewhere, no rootfs files)"
+        ),
+    )
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
     parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
     parser.add_argument(

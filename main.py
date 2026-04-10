@@ -1500,9 +1500,8 @@ class Parser:
         """Heuristically detect pattern-macro clauses in a `macro` body.
 
         Pattern mode is considered when top-level clause arrows (`=>`) are
-        present and we can see either:
-        - two top-level `;` tokens (clause terminator + macro terminator), or
-        - legacy `end` terminator after at least one clause.
+        present and we can see two top-level `;` tokens
+        (clause terminator + macro terminator).
         """
         pos = self.pos
         token_count = len(self.tokens)
@@ -1560,15 +1559,8 @@ class Parser:
                     return True
                 continue
 
-            if lex == "end":
-                if saw_arrow and clause_semicolons >= 1:
-                    return True
-                return False
-
             if tok.column == 0 and lex in definition_starters:
                 return saw_arrow
-
-        return False
 
         return False
 
@@ -9077,10 +9069,6 @@ def _parse_pattern_macro_clauses(
         if peek is not None and peek.lexeme == ";":
             parser.next_token()
             break
-        if peek is not None and peek.lexeme == "end":
-            # Backward compatibility with old pattern-macro terminator.
-            parser.next_token()
-            break
 
         pattern: List[str] = []
         while True:
@@ -9095,8 +9083,6 @@ def _parse_pattern_macro_clauses(
                     f"{keyword} '{name}' pattern cannot contain ';' before '=>'; "
                     f"close clause with ';' after replacement"
                 )
-            if lex == "end":
-                raise ParseError(f"unterminated {keyword} clause in '{name}' (missing '=>')")
             pattern.append(lex)
 
         if not pattern:

@@ -222,3 +222,6 @@ word arr_find
         swap 8 + swap rswap r> 1 + >r rswap
     end rdrop -1 nip nip
 end
+
+macro foreach 0 dup @ swap 8 + swap 0 swap for 2dup 8 * + @ ;
+macro foreachwith (name body) foreach with $name in $body end 1 + end 2drop drop ;

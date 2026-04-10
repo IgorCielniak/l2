@@ -1266,8 +1266,35 @@ static Token ct_pop_token(CompileTimeVM *vm) {
 }
 
 static void ct_word_call(CompileTimeVM *vm, Word *word);
+static char *ct_string_from_value(CtValue v);
 
 static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def) {
+    if (strcmp(word->name, "puti") == 0) {
+        int64_t v = ct_pop_int(vm);
+        fprintf(stdout, "%lld", (long long)v);
+        return true;
+    }
+    if (strcmp(word->name, "putu") == 0) {
+        int64_t v = ct_pop_int(vm);
+        fprintf(stdout, "%llu", (unsigned long long)v);
+        return true;
+    }
+    if (strcmp(word->name, "print") == 0) {
+        CtValue v = ct_stack_pop(&vm->stack);
+        if (v.kind == CT_STR) {
+            fputs(v.as.str ? v.as.str : "", stdout);
+        } else if (v.kind == CT_TOKEN) {
+            fputs(v.as.token.lexeme ? v.as.token.lexeme : "", stdout);
+        } else if (v.kind == CT_INT) {
+            fprintf(stdout, "%lld", (long long)v.as.i64);
+        } else {
+            char *txt = ct_string_from_value(v);
+            fputs(txt, stdout);
+            free(txt);
+        }
+        fputc('\n', stdout);
+        return true;
+    }
     if (asm_def && asm_def->effect_string_io) {
         CtValue v = ct_stack_pop(&vm->stack);
         if (v.kind == CT_STR) {
@@ -1276,6 +1303,12 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
                 out = stderr;
             }
             fputs(v.as.str ? v.as.str : "", out);
+        } else if (v.kind == CT_TOKEN) {
+            FILE *out = stdout;
+            if (strcmp(word->name, "ewrite_buf") == 0) {
+                out = stderr;
+            }
+            fputs(v.as.token.lexeme ? v.as.token.lexeme : "", out);
         } else {
             ct_stack_pop(&vm->stack);
         }
@@ -1782,6 +1815,30 @@ static void ct_intrinsic_list_pop_front(CompileTimeVM *vm) {
     ct_stack_push(&vm->stack, v);
 }
 
+static void ct_intrinsic_list_peek_front(CompileTimeVM *vm) {
+    CtList *list = ct_pop_list(vm);
+    CtValue v = ct_make_nil();
+    if (list->items.len) {
+        v = list->items.data[0];
+    }
+    ct_stack_push(&vm->stack, ct_make_list(list));
+    ct_stack_push(&vm->stack, v);
+}
+
+static void ct_intrinsic_list_push_front(CompileTimeVM *vm) {
+    CtValue v = ct_stack_pop(&vm->stack);
+    CtList *list = ct_pop_list(vm);
+    if (list->items.len + 1 > list->items.cap) {
+        size_t new_cap = list->items.cap ? list->items.cap * 2 : 8;
+        list->items.data = xrealloc(list->items.data, new_cap * sizeof(CtValue));
+        list->items.cap = new_cap;
+    }
+    memmove(&list->items.data[1], &list->items.data[0], list->items.len * sizeof(CtValue));
+    list->items.data[0] = v;
+    list->items.len++;
+    ct_stack_push(&vm->stack, ct_make_list(list));
+}
+
 static void ct_intrinsic_list_length(CompileTimeVM *vm) {
     CtList *list = ct_pop_list(vm);
     ct_stack_push(&vm->stack, ct_make_int((int64_t)list->items.len));
@@ -1821,6 +1878,28 @@ static void ct_intrinsic_list_extend(CompileTimeVM *vm) {
         VEC_PUSH(&list1->items, list2->items.data[i]);
     }
     ct_stack_push(&vm->stack, ct_make_list(list1));
+}
+
+static void ct_intrinsic_list_reverse(CompileTimeVM *vm) {
+    CtList *list = ct_pop_list(vm);
+    if (list->items.len > 1) {
+        size_t i = 0;
+        size_t j = list->items.len - 1;
+        while (i < j) {
+            CtValue tmp = list->items.data[i];
+            list->items.data[i] = list->items.data[j];
+            list->items.data[j] = tmp;
+            i++;
+            j--;
+        }
+    }
+    ct_stack_push(&vm->stack, ct_make_list(list));
+}
+
+static void ct_intrinsic_list_clear(CompileTimeVM *vm) {
+    CtList *list = ct_pop_list(vm);
+    list->items.len = 0;
+    ct_stack_push(&vm->stack, ct_make_list(list));
 }
 
 static void ct_intrinsic_list_last(CompileTimeVM *vm) {
@@ -1877,6 +1956,89 @@ static void ct_intrinsic_map_has(CompileTimeVM *vm) {
     free(key);
 }
 
+static void ct_intrinsic_map_length(CompileTimeVM *vm) {
+    CtMap *map = ct_pop_map(vm);
+    ct_stack_push(&vm->stack, ct_make_int((int64_t)map->len));
+}
+
+static void ct_intrinsic_map_empty(CompileTimeVM *vm) {
+    CtMap *map = ct_pop_map(vm);
+    ct_stack_push(&vm->stack, ct_make_int(map->len == 0));
+}
+
+static void ct_intrinsic_map_clear(CompileTimeVM *vm) {
+    CtMap *map = ct_pop_map(vm);
+    if (map->keys) {
+        for (size_t i = 0; i < map->cap; i++) {
+            if (map->keys[i]) {
+                free(map->keys[i]);
+                map->keys[i] = NULL;
+            }
+        }
+    }
+    map->len = 0;
+    ct_stack_push(&vm->stack, ct_make_map(map));
+}
+
+static void ct_intrinsic_map_keys(CompileTimeVM *vm) {
+    CtMap *map = ct_pop_map(vm);
+    CtList *out = ct_list_new();
+    if (map->keys) {
+        for (size_t i = 0; i < map->cap; i++) {
+            if (map->keys[i]) {
+                VEC_PUSH(&out->items, ct_make_str(map->keys[i]));
+            }
+        }
+    }
+    ct_stack_push(&vm->stack, ct_make_list(out));
+}
+
+static void ct_intrinsic_map_values(CompileTimeVM *vm) {
+    CtMap *map = ct_pop_map(vm);
+    CtList *out = ct_list_new();
+    if (map->keys) {
+        for (size_t i = 0; i < map->cap; i++) {
+            if (map->keys[i]) {
+                VEC_PUSH(&out->items, map->values[i]);
+            }
+        }
+    }
+    ct_stack_push(&vm->stack, ct_make_list(out));
+}
+
+static void ct_intrinsic_string_contains(CompileTimeVM *vm) {
+    char *needle = ct_pop_str(vm);
+    char *text = ct_pop_str(vm);
+    bool found = strstr(text, needle) != NULL;
+    free(text);
+    free(needle);
+    ct_stack_push(&vm->stack, ct_make_int(found));
+}
+
+static void ct_intrinsic_string_starts_with(CompileTimeVM *vm) {
+    char *prefix = ct_pop_str(vm);
+    char *text = ct_pop_str(vm);
+    size_t plen = strlen(prefix);
+    bool ok = strncmp(text, prefix, plen) == 0;
+    free(text);
+    free(prefix);
+    ct_stack_push(&vm->stack, ct_make_int(ok));
+}
+
+static void ct_intrinsic_string_ends_with(CompileTimeVM *vm) {
+    char *suffix = ct_pop_str(vm);
+    char *text = ct_pop_str(vm);
+    size_t slen = strlen(suffix);
+    size_t tlen = strlen(text);
+    bool ok = false;
+    if (slen <= tlen) {
+        ok = strcmp(text + (tlen - slen), suffix) == 0;
+    }
+    free(text);
+    free(suffix);
+    ct_stack_push(&vm->stack, ct_make_int(ok));
+}
+
 static void ct_intrinsic_token_lexeme(CompileTimeVM *vm) {
     Token tok = ct_pop_token(vm);
     ct_stack_push(&vm->stack, ct_make_str(tok.lexeme));
@@ -1902,6 +2064,16 @@ static void ct_intrinsic_token_from_lexeme(CompileTimeVM *vm) {
     tok.start = 0;
     tok.end = 0;
     ct_stack_push(&vm->stack, ct_make_token(tok));
+}
+
+static void ct_intrinsic_token_line(CompileTimeVM *vm) {
+    Token tok = ct_pop_token(vm);
+    ct_stack_push(&vm->stack, ct_make_int(tok.line));
+}
+
+static void ct_intrinsic_token_column(CompileTimeVM *vm) {
+    Token tok = ct_pop_token(vm);
+    ct_stack_push(&vm->stack, ct_make_int(tok.column));
 }
 
 static void ct_intrinsic_next_token(CompileTimeVM *vm) {
@@ -2373,12 +2545,19 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "string-length", ct_intrinsic_string_length);
     register_ct_intrinsic(dict, "string-append", ct_intrinsic_string_append);
     register_ct_intrinsic(dict, "string>number", ct_intrinsic_string_to_number);
+    register_ct_intrinsic(dict, "string-contains?", ct_intrinsic_string_contains);
+    register_ct_intrinsic(dict, "string-starts-with?", ct_intrinsic_string_starts_with);
+    register_ct_intrinsic(dict, "string-ends-with?", ct_intrinsic_string_ends_with);
     register_ct_intrinsic(dict, "int>string", ct_intrinsic_int_to_string);
     register_ct_intrinsic(dict, "identifier?", ct_intrinsic_identifierp);
     register_ct_intrinsic(dict, "list-new", ct_intrinsic_list_new);
     register_ct_intrinsic(dict, "list-append", ct_intrinsic_list_append);
     register_ct_intrinsic(dict, "list-pop", ct_intrinsic_list_pop);
     register_ct_intrinsic(dict, "list-pop-front", ct_intrinsic_list_pop_front);
+    register_ct_intrinsic(dict, "list-peek-front", ct_intrinsic_list_peek_front);
+    register_ct_intrinsic(dict, "list-push-front", ct_intrinsic_list_push_front);
+    register_ct_intrinsic(dict, "list-reverse", ct_intrinsic_list_reverse);
+    register_ct_intrinsic(dict, "list-clear", ct_intrinsic_list_clear);
     register_ct_intrinsic(dict, "list-length", ct_intrinsic_list_length);
     register_ct_intrinsic(dict, "list-empty?", ct_intrinsic_list_empty);
     register_ct_intrinsic(dict, "list-get", ct_intrinsic_list_get);
@@ -2390,8 +2569,15 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "map-set", ct_intrinsic_map_set);
     register_ct_intrinsic(dict, "map-get", ct_intrinsic_map_get);
     register_ct_intrinsic(dict, "map-has?", ct_intrinsic_map_has);
+    register_ct_intrinsic(dict, "map-length", ct_intrinsic_map_length);
+    register_ct_intrinsic(dict, "map-empty?", ct_intrinsic_map_empty);
+    register_ct_intrinsic(dict, "map-clear", ct_intrinsic_map_clear);
+    register_ct_intrinsic(dict, "map-keys", ct_intrinsic_map_keys);
+    register_ct_intrinsic(dict, "map-values", ct_intrinsic_map_values);
     register_ct_intrinsic(dict, "token-lexeme", ct_intrinsic_token_lexeme);
     register_ct_intrinsic(dict, "token-from-lexeme", ct_intrinsic_token_from_lexeme);
+    register_ct_intrinsic(dict, "token-line", ct_intrinsic_token_line);
+    register_ct_intrinsic(dict, "token-column", ct_intrinsic_token_column);
     register_ct_intrinsic(dict, "next-token", ct_intrinsic_next_token);
     register_ct_intrinsic(dict, "peek-token", ct_intrinsic_peek_token);
     register_ct_intrinsic(dict, "inject-tokens", ct_intrinsic_inject_tokens);
@@ -3043,6 +3229,7 @@ static int run_l2_cli_in_child(int argc, char **argv) {
     }
     if (pid == 0) {
         int rc = l2_cli(argc, argv);
+        fflush(NULL);
         _exit(rc == 0 ? 0 : 1);
     }
     int status = 0;
@@ -4511,6 +4698,8 @@ int l2_cli(int argc, char **argv) {
     const char *temp_dir = "build";
     bool emit_asm = false;
     bool debug = false;
+    bool ct_run_main = false;
+    bool no_artifact = false;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -4524,6 +4713,19 @@ int l2_cli(int argc, char **argv) {
         }
         if (strcmp(arg, "--dbg") == 0) {
             debug = true;
+            continue;
+        }
+        if (strcmp(arg, "--ct-run-main") == 0) {
+            ct_run_main = true;
+            continue;
+        }
+        if (strcmp(arg, "--no-artifact") == 0) {
+            no_artifact = true;
+            continue;
+        }
+        if (strcmp(arg, "--script") == 0) {
+            ct_run_main = true;
+            no_artifact = true;
             continue;
         }
         if ((strcmp(arg, "-I") == 0 || strcmp(arg, "--include") == 0) && i + 1 < argc) {
@@ -4559,7 +4761,7 @@ int l2_cli(int argc, char **argv) {
     }
 
     if (inputs.len == 0) {
-        fprintf(stderr, "usage: %s <source.sl> [-o output] [--emit-asm]\n", argv[0]);
+        fprintf(stderr, "usage: %s <source.sl> [-o output] [--emit-asm] [--ct-run-main] [--no-artifact] [--script]\n", argv[0]);
         return 1;
     }
 
@@ -4602,6 +4804,21 @@ int l2_cli(int argc, char **argv) {
     register_builtin_syscall(&parser);
 
     parse_tokens(&parser, combined);
+
+    if (ct_run_main) {
+        Word *entry = dictionary_lookup(&dict, "main");
+        if (!entry) {
+            fprintf(stderr, "[error] --ct-run-main requested but 'main' is not defined\n");
+            return 1;
+        }
+        ct_vm_reset(&vm);
+        ct_word_call(&vm, entry);
+    }
+
+    if (no_artifact) {
+        printf("[info] skipped artifact generation (--no-artifact)\n");
+        return 0;
+    }
 
     if (parser.uses_libc && !strvec_contains(&libs, "-lc")) {
         VEC_PUSH(&libs, str_dup("-lc"));

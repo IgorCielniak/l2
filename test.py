@@ -47,6 +47,18 @@ DOC_EXAMPLE_RE = re.compile(r"^\s*Example:\s*$", re.IGNORECASE)
 DOC_L2_KEYWORD_RE = re.compile(r"\b(word|macro|:asm|:py|compile-time|compile-only|runtime|runtime-only|extern|import|struct|cstruct)\b")
 DOC_PLACEHOLDER_RE = re.compile(r"<[A-Za-z_][^>\n]*>")
 DOC_SKIP_MARKER_RE = re.compile(r"(?im)^\s*(?:#\s*)?(?:docs:skip-check|l2-test:skip)\b")
+SCRIPT_RUNTIME_SENSITIVE_RE = re.compile(
+    r"(?m)^\s*extern\b"
+    r"|\bargv@\b"
+    r"|\bargc\b"
+    r"|\bcatch_runtime_error\b"
+    r"|\btry_with_error\b"
+    r"|\bassert_msg\b"
+    r"|\bstack_pointer\b"
+    r"|\bis_(?:mmap|brk_heap|stack)_addr\b"
+    r"|\bbrk_current\b"
+    r"|:asm\s+_start\b",
+)
 
 
 def colorize(text: str, color: str) -> str:
@@ -632,8 +644,21 @@ class TestRunner:
             return False
         if self._is_example_source(case.source):
             return False
+        if case.config.expected_exit != 0:
+            return False
+        if case.config.args is not None or case.config.stdin is not None:
+            return False
+        if case.config.use_l2eval:
+            return False
+        if case.config.libs:
+            return False
         artifact = self._extract_artifact_from_compile_args(case.config.compile_args)
-        return artifact in (None, "exe")
+        if artifact not in (None, "exe"):
+            return False
+        source_text = case.source.read_text(encoding="utf-8", errors="ignore")
+        if SCRIPT_RUNTIME_SENSITIVE_RE.search(source_text):
+            return False
+        return True
 
     def _ct_run_main_for_case(self, case: TestCase) -> bool:
         return self.args.ct_run_main and not self._is_example_source(case.source)
@@ -696,22 +721,32 @@ class TestRunner:
             duration = time.perf_counter() - start
             return CaseResult(case, "failed", "compile", f"compiler exited {compile_proc.returncode}", details, duration)
         updated_notes: List[str] = []
-        compile_status, compile_note, compile_details = self._check_compile_output(case, compile_proc)
-        if compile_status == "failed":
-            duration = time.perf_counter() - start
-            return CaseResult(case, compile_status, "compile", compile_note, compile_details, duration)
-        if compile_status == "updated" and compile_note:
-            updated_notes.append(compile_note)
+        script_mode = self._script_mode_for_case(case)
+        if not script_mode:
+            compile_status, compile_note, compile_details = self._check_compile_output(case, compile_proc)
+            if compile_status == "failed":
+                duration = time.perf_counter() - start
+                return CaseResult(case, compile_status, "compile", compile_note, compile_details, duration)
+            if compile_status == "updated" and compile_note:
+                updated_notes.append(compile_note)
         asm_status, asm_note, asm_details = self._check_asm_forbidden_patterns(case)
         if asm_status == "failed":
             duration = time.perf_counter() - start
             return CaseResult(case, asm_status, "asm", asm_note, asm_details, duration)
-        if case.config.compile_only or self._script_mode_for_case(case):
+        if case.config.compile_only:
             duration = time.perf_counter() - start
             if updated_notes:
                 return CaseResult(case, "updated", "compile", "; ".join(updated_notes), details=None, duration=duration)
             return CaseResult(case, "passed", "compile", "compile-only", details=None, duration=duration)
-        run_proc = self._run_binary(case)
+        if script_mode:
+            run_proc = subprocess.CompletedProcess(
+                args=compile_proc.args,
+                returncode=0,
+                stdout=self._script_runtime_stdout(compile_proc.stdout),
+                stderr=self._script_runtime_stderr(compile_proc.stderr),
+            )
+        else:
+            run_proc = self._run_binary(case)
         if run_proc.returncode != case.config.expected_exit:
             duration = time.perf_counter() - start
             message = f"expected exit {case.config.expected_exit}, got {run_proc.returncode}"
@@ -789,7 +824,8 @@ class TestRunner:
             cmd.extend(["-l", lib])
         cmd.extend(case.config.compile_args)
         if self._script_mode_for_case(case):
-            cmd.append("--script")
+            cmd.append("--ct-run-main")
+            cmd.append("--no-artifact")
         elif self._ct_run_main_for_case(case):
             cmd.append("--ct-run-main")
         if self.args.verbose:
@@ -975,6 +1011,28 @@ class TestRunner:
             stdout=proc.stdout.decode("utf-8", errors="replace"),
             stderr=proc.stderr.decode("utf-8", errors="replace"),
         )
+
+    @staticmethod
+    def _script_runtime_stdout(stdout_text: str) -> str:
+        """Map compiler stdout to script-mode runtime stdout.
+
+        --script semantics execute `main` at compile-time and skip artifact creation.
+        Keep program output while stripping compiler bookkeeping lines.
+        """
+        marker = "[info] skipped artifact generation (--no-artifact)"
+        if marker not in stdout_text:
+            return stdout_text
+        lines = stdout_text.splitlines(keepends=True)
+        cleaned: List[str] = []
+        for line in lines:
+            if line.strip() == marker:
+                continue
+            cleaned.append(line.replace(marker, ""))
+        return "".join(cleaned)
+
+    @staticmethod
+    def _script_runtime_stderr(stderr_text: str) -> str:
+        return stderr_text
 
     def _check_regex_stream(self, label: str, pattern: str, actual_text: str) -> Tuple[str, str, Optional[str]]:
         normalized = normalize_text(actual_text)

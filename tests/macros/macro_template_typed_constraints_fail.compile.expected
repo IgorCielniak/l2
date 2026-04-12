@@ -1,0 +1,7 @@
+error: macro 'typed_bad' placeholder '$a:int' expected 'int' token, got 'aa'
+  --> macro_template_typed_constraints_fail.sl:8:2
+    |
+  8 |   typed_bad(aa, 2) puti cr
+    |  ^^^^^^^^^
+
+1 error(s) emitted

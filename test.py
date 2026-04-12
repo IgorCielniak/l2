@@ -509,15 +509,26 @@ class TestRunner:
 
     def _discover_cases(self) -> List[TestCase]:
         sources: List[Path] = []
+        ignored_test_subdirs = {"import_helpers", "__pycache__"}
         if self.tests_dir.exists():
             sources.extend(sorted(self.tests_dir.glob("*.sl")))
+            for nested in sorted(self.tests_dir.rglob("*.sl")):
+                if nested.parent == self.tests_dir:
+                    continue
+                try:
+                    rel = nested.relative_to(self.tests_dir)
+                except ValueError:
+                    rel = nested
+                if any(part in ignored_test_subdirs for part in rel.parts):
+                    continue
+                sources.append(nested)
         if not self.args.no_compile_examples:
             if self.examples_dir.exists():
                 sources.extend(sorted(self.examples_dir.rglob("*.sl")))
             sources.extend(self._materialize_documentation_cases())
         for entry in self.extra_sources:
             if entry.is_dir():
-                sources.extend(sorted(entry.glob("*.sl")))
+                sources.extend(sorted(entry.rglob("*.sl")))
                 continue
             sources.append(entry)
 
@@ -1217,6 +1228,11 @@ class TestRunner:
             text = self._mask_build_path(text, case.binary_stub)
             text = re.sub(
                 rf"(?m)^\[info\] built <build>/{re.escape(case.binary_stub)}\n?",
+                "",
+                text,
+            )
+            text = re.sub(
+                rf"(?m)^\[info\] <build>/{re.escape(case.binary_stub)} is up to date\n?",
                 "",
                 text,
             )

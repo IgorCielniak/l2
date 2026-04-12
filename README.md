@@ -31,6 +31,53 @@ python3 main.py examples/snake.sl -o snake
 python3 test.py
 ```
 
+### Macro Expansion Profiling
+
+Use `--macro-profile` to inspect macro expansion hotness and timing during parsing:
+
+```bash
+python3 main.py tests/macro_ct_superlang.sl --no-artifact --check --macro-profile
+```
+
+Optional output targets:
+
+- `--macro-profile` or `--macro-profile stderr`: print to stderr.
+- `--macro-profile -`: print to stdout.
+- `--macro-profile build/macro_profile.txt`: write a report file.
+
+### Complete CT Function Reference
+
+The built-in Compile-Time Reference now includes an auto-generated
+`§ 18 COMPLETE CT FUNCTION INDEX` section with one explicit entry for every
+compile-time callable word (including handler name and execution flags).
+
+Open it with:
+
+```bash
+python3 main.py --docs
+```
+
+Then switch to the `Compile-Time Reference` tab.
+
+### Cache Modes (`--no-cache` vs `--force`)
+
+The compiler now has three cache-related layers:
+
+- Source graph cache: stores the preprocessed import graph (including resolved imports and source-level flags) keyed by source path, defines, include paths, and dependency state.
+- Assembly cache: stores emitted assembly snapshots keyed by dependency content and compiler/optimization flags.
+- Tool incrementality: NASM/linker reruns are skipped when inputs are unchanged.
+
+Flag behavior:
+
+- Default mode: all cache layers enabled.
+- `--no-cache`: disables source/assembly cache reads+writes, but still allows NASM/linker up-to-date checks.
+- `--force`: implies `--no-cache` and always recompiles, re-assembles, and re-links.
+
+In short:
+
+- `--no-cache` means "no compiler cache".
+- `--force` means "rebuild everything now".
+
 ## Metaprogramming Guide
 
 L2 has two complementary metaprogramming layers:
@@ -76,7 +123,120 @@ Parameter/placeholder rules:
 - `$0`, `$1`, ...: positional placeholders (legacy-compatible).
 - `$name`: named placeholder.
 - `$*name`: splice variadic capture.
+- Placeholder transforms: `$name|upper`, `$name|lower`, `$*name|join:","`.
 - Variadic parameter must be last in the signature.
+
+### Macro Template Control Flow
+
+Text macros can use compile-time control flow directly in the macro body:
+
+```l2
+macro join_with_plus (head *tail)
+	$head
+	ct-for item in tail do
+		$item +
+	end
+;
+
+macro maybe_bump (x *rest)
+	$x
+	ct-if has rest then
+		1 +
+	else
+		0 +
+	end
+;
+```
+
+Template-only control keywords:
+
+- `ct-if <cond> then ... else ... end`
+- `ct-when <cond> ... end` (single-branch shorthand)
+- `ct-unless <cond> ... end` (negated single-branch shorthand)
+- `ct-for <name> in <capture> do ... end`
+- `ct-each <name> in <capture> do ... end`
+- `ct-each <index> <name> in <capture> do ... end` (key/value mode)
+- `ct-for <name> in <capture> sep <template...> do ... end`
+- `ct-each <...> in <capture> sep <template...> do ... end`
+- `ct-let <name> <expr...> do ... end`
+- `ct-let <name> = <expr...> do ... end` (optional `=`)
+- `ct-fn <name> do ... end` (template-local function)
+- `ct-switch <expr...> do ... end`
+- `ct-case <expr...> do ... end`
+- `ct-default do ... end`
+- `ct-match <expr...> do ... end` (expression-style selector)
+- `ct-case <expr...> then <template...>` (inside `ct-match`)
+- `ct-default then <template...>` (inside `ct-match`)
+- `ct-fold <acc> <item> in <capture> with <init...> do ... end`
+- `ct-break` / `ct-continue` (inside `ct-for` / `ct-each` / `ct-fold`)
+- `ct-call <compile-time-word>`
+- `ct-include <path-token>` / `ct-import <path-token>`
+- `ct-comment ... ct-endcomment` (nestable template comments)
+- `ct-strict` / `ct-permissive` (unknown-symbol handling)
+- `ct-version <token>` (per-macro template metadata marker)
+- `ct-error <msg>` / `ct-warning <msg>` / `ct-note <msg>`
+- `emit-list <capture>` / `ct-emit-list <capture>`
+- `emit-block do ... end` / `ct-emit-block do ... end`
+
+Template parser behavior:
+
+- `ct-if` / `ct-when` / `ct-unless` / `ct-for` / `ct-each` are compile-time template directives.
+- `ct-let` creates a local template binding for the block body and supports lexical shadowing.
+- `ct-fn` defines a template-local function callable with `ct-call`.
+- `ct-switch` compares expanded token sequences and executes the first matching `ct-case`; `ct-default` is optional.
+- `ct-match` is the compact expression-style selector; case bodies run until the next `ct-case`, `ct-default`, or closing `end`.
+- `ct-fold` evaluates to the final accumulator value; each loop body result becomes the next accumulator value.
+- `ct-include` splices template nodes from a file (relative to the defining source file).
+- `ct-import` loads template helpers (for example `ct-fn`) once per expansion scope and avoids duplicate imports.
+- `ct-comment ... ct-endcomment` and `ct-#( ... ct-#)` are treated as template-only comments and do not emit runtime tokens.
+- `ct-strict` errors on unknown template symbols; `ct-permissive` treats unknown symbols as empty and emits a warning.
+- `ct-version` stores a macro-local version marker for tooling/introspection.
+- `emit-list`/`ct-emit-list` splices a capture value; `emit-block`/`ct-emit-block` emits an inline template block.
+- Placeholder transforms apply both in emitted placeholders and template guard expressions.
+- Plain runtime control tokens (`if`, `for`, `else`, `end`) are treated as ordinary output tokens.
+- Nested runtime blocks inside `ct-if` / `ct-for` are tracked so their `end` tokens do not accidentally close compile-time directives.
+
+Guard expressions support:
+
+- unary: `not`, `!`
+- binary boolean: `and`, `&&`, `or`, `||`
+- comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
+- grouping with `( ... )`
+- capture/local refs: `$x`, `name`
+- loop predicates: `first`, `last`
+- capture predicates: `has <capture>`, `empty <capture>`
+
+`ct-if` always uses expression parsing. `ct-when` / `ct-unless` keep their shorthand
+form (`has ...`, `empty ...`, etc.) and also accept expression guards when written
+with `then`.
+
+Constant-only guard subexpressions are folded during template parse.
+
+`ct-call` bridges text macros with compile-time words. The target word receives
+a context map on the CT stack:
+
+- `"macro"`: macro name
+- `"captures"`: merged capture map for current scope
+- `"loop"`: loop metadata map (`index`, `count`, `first`, `last`) or `nil`
+
+Return value from the CT word is spliced back into the macro output. It can be
+`nil`, a token/string/number, or nested lists/tuples of token-like values.
+
+These execute only during macro expansion and emit ordinary L2 tokens, so there is no runtime overhead.
+
+### Capture Toolkit
+
+The compile-time API now includes a capture/scope/hygiene toolkit for advanced macro pipelines:
+
+- Hygienic symbols: `ct-gensym`.
+- Capture namespaces in `ct-call` contexts: `args`, `locals`, `globals`.
+- Capture operators: get/has/shape/assert/count/slice/map/filter/separate/join/equal.
+- Typed placeholder constraints in text macro expansions (e.g. `$x:int`).
+- Capture normalization/pretty/clone/coercion helpers.
+- Capture schema declaration + validation (`ct-capture-schema-put`, `ct-capture-schema-validate`).
+- Lifetime/origin/taint metadata and checks for scope-aware metaprogramming.
+- Serialization/compression/hash/diff helpers for memoization and debugging.
+- Replay logs and lint checks for deterministic diagnostics.
 
 ### Macro Call Styles
 
@@ -127,6 +287,40 @@ You can define text macros from compile-time code:
 
 - `ct-register-text-macro`: register by positional arity.
 - `ct-register-text-macro-signature`: register with named/variadic parameter spec.
+- `ct-register-pattern-macro`: register pattern macro clauses programmatically.
+- `ct-unregister-pattern-macro`: remove a previously registered pattern macro.
+- `ct-word-is-text-macro`: query whether a word is a text macro.
+- `ct-word-is-pattern-macro`: query whether a word is a pattern macro.
+- `ct-get-macro-signature`: retrieve parameter names and variadic parameter.
+- `ct-get-macro-expansion` / `ct-set-macro-expansion`: inspect and update text-macro expansions.
+- `ct-clone-macro` / `ct-rename-macro`: clone/rename text or pattern macros.
+- `ct-macro-doc-get` / `ct-macro-doc-set`: attach free-form documentation strings to macros.
+- `ct-macro-attrs-get` / `ct-macro-attrs-set`: attach structured metadata maps to macros.
+- `ct-list-pattern-macros`: enumerate pattern macro names.
+- `ct-set-pattern-macro-enabled` / `ct-get-pattern-macro-enabled`: toggle/query rule activation.
+- `ct-set-pattern-macro-priority` / `ct-get-pattern-macro-priority`: adjust/query rule priority.
+- `ct-get-pattern-macro-clauses`: inspect registered clause pairs.
+
+### CT-Call Policy Controls
+
+- Typed contracts:
+	- `ct-set-ct-call-contract`, `ct-get-ct-call-contract`
+- Exception handling policy:
+	- `ct-set-ct-call-exception-policy`, `ct-get-ct-call-exception-policy`
+- Sandbox mode + allowlist:
+	- `ct-set-ct-call-sandbox-mode`, `ct-get-ct-call-sandbox-mode`
+	- `ct-set-ct-call-sandbox-allowlist`, `ct-get-ct-call-sandbox-allowlist`
+- Deterministic randomness:
+	- `ct-ctrand-seed`, `ct-ctrand-int`, `ct-ctrand-range`
+- Memoization:
+	- `ct-set-ct-call-memo`, `ct-get-ct-call-memo`
+	- `ct-clear-ct-call-memo`, `ct-get-ct-call-memo-size`
+- Side-effect log:
+	- `ct-set-ct-call-side-effects`, `ct-get-ct-call-side-effects`
+	- `ct-get-ct-call-side-effect-log`, `ct-clear-ct-call-side-effect-log`
+- Recursion and timeout guards:
+	- `ct-set-ct-call-recursion-limit`, `ct-get-ct-call-recursion-limit`
+	- `ct-set-ct-call-timeout-ms`, `ct-get-ct-call-timeout-ms`
 
 Example:
 
@@ -155,6 +349,48 @@ Core tools include:
 - enable/disable, list, clear, remove, and priority query/update words
 
 These are best for local syntax normalization patterns and DSL sugar.
+
+### Advanced Pattern/Rewrite Controls
+
+L2 now includes a richer rewrite toolchain for large macro systems:
+
+- Pattern grouping/scope activation:
+	- `ct-set-pattern-macro-group`, `ct-get-pattern-macro-group`
+	- `ct-set-pattern-macro-scope`, `ct-get-pattern-macro-scope`
+	- `ct-set-pattern-group-active`, `ct-set-pattern-scope-active`
+	- `ct-list-active-pattern-groups`, `ct-list-active-pattern-scopes`
+- Pattern clause guards and introspection:
+	- `ct-set-pattern-macro-clause-guard`
+	- `ct-get-pattern-macro-clause-details`
+- Pattern diagnostics and analysis:
+	- `ct-detect-pattern-conflicts`, `ct-detect-pattern-conflicts-named`
+	- `ct-get-rewrite-specificity`
+	- `ct-rewrite-compatibility-matrix`
+- Rewrite pipelines and matcher indexing:
+	- `ct-set-rewrite-pipeline`, `ct-get-rewrite-pipeline`
+	- `ct-set-rewrite-pipeline-active`, `ct-list-rewrite-active-pipelines`
+	- `ct-rebuild-rewrite-index`, `ct-get-rewrite-index-stats`
+- Rewrite transactions and packs:
+	- `ct-rewrite-txn-begin`, `ct-rewrite-txn-commit`, `ct-rewrite-txn-rollback`
+	- `ct-export-rewrite-pack`, `ct-import-rewrite-pack`, `ct-import-rewrite-pack-replace`
+	- `ct-get-rewrite-provenance`
+- Dry-run and fixture tooling:
+	- `ct-rewrite-dry-run`
+	- `ct-rewrite-generate-fixture`
+- Runtime safety/observability:
+	- `ct-set-rewrite-saturation`, `ct-get-rewrite-saturation`
+	- `ct-set-rewrite-max-steps`, `ct-get-rewrite-max-steps`
+	- `ct-set-rewrite-loop-detection`, `ct-get-rewrite-loop-detection`
+	- `ct-get-rewrite-loop-reports`, `ct-clear-rewrite-loop-reports`
+	- `ct-set-rewrite-trace`, `ct-get-rewrite-trace`, `ct-get-rewrite-trace-log`, `ct-clear-rewrite-trace-log`
+	- `ct-get-rewrite-profile`, `ct-clear-rewrite-profile`
+
+Pattern syntax now supports additional operators in rewrite patterns:
+
+- Negative token/capture match: `!token`, `!$x:int`
+- Optional piece: `token?`, `$x?`, `$x:int?`
+- Repetition piece: `token*`, `token+`, `$x:int*`, `$x:int+`
+- Guarded clauses in macro syntax: `... when guard_word => ... ;`
 
 ### Safety and Debugging Controls
 

@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import ast
 import bisect
+import importlib.util
 import os
+import random
 import re
 import shlex
 import sys
 import textwrap
+import time
 from pathlib import Path
 TYPE_CHECKING = False
 if TYPE_CHECKING:
@@ -48,6 +51,7 @@ _RE_REL_PAT = re.compile(r'\[rel\s+(\w+)\]')
 _RE_LABEL_PAT = re.compile(r'^(\.\w+|\w+):')
 _RE_BSS_PERSISTENT = re.compile(r'persistent:\s*resb\s+(\d+)')
 _RE_NEWLINE = re.compile('\n')
+_CT_FAST_CT_INTRINSIC_DISPATCH = {}
 # Blanking asm bodies before tokenization: the tokenizer doesn't need asm
 # content (the parser extracts it from the original source via byte offsets).
 # This removes ~75% of tokens for asm-heavy programs like game_of_life.
@@ -505,6 +509,51 @@ for _pattern, _repl in _PEEPHOLE_CLEAN_RULES:
 
 _PEEPHOLE_TERMINATORS = frozenset({OP_JUMP})
 
+_PEEPHOLE_WORD_COST: Dict[str, int] = {
+    "drop": 1,
+    "nip": 1,
+    "dup": 1,
+    "swap": 1,
+    "over": 1,
+    "2drop": 1,
+    "2dup": 1,
+    "inc": 1,
+    "dec": 1,
+    "not": 1,
+    "neg": 1,
+    "+": 2,
+    "-": 2,
+    "*": 3,
+    "/": 4,
+    "%": 4,
+    "==": 2,
+    "!=": 2,
+    "band": 2,
+    "bor": 2,
+    "bxor": 2,
+    "shl": 2,
+    "shr": 2,
+    "sar": 2,
+}
+
+
+def _peephole_sequence_cost(seq: Sequence[str]) -> int:
+    if not seq:
+        return 0
+    total = 0
+    for item in seq:
+        if item.startswith("literal_"):
+            total += 2
+            continue
+        total += int(_PEEPHOLE_WORD_COST.get(item, 3))
+    return total
+
+
+_PEEPHOLE_RULE_COST: Dict[Tuple[str, ...], int] = {
+    pattern: _peephole_sequence_cost(repl)
+    for pattern, repl in _PEEPHOLE_WORD_RULES
+}
+
 _PEEPHOLE_CANCEL_PAIRS = frozenset({
     ("not", "not"), ("neg", "neg"),
     ("bitnot", "bitnot"), ("bnot", "bnot"),
@@ -584,6 +633,12 @@ def _make_word_op(data: str, loc: Optional[SourceLocation] = None) -> Op:
     node._word_ref = None
     node._opcode = OP_WORD
     return node
+
+
+_PARSE_LITERAL_CACHE_MAX = 8192
+_PARSE_LITERAL_CACHE_MISS = object()
+_PARSE_LITERAL_NOT_LITERAL = object()
+_PARSE_LITERAL_CACHE: Dict[str, Any] = {}
 
 
 class Definition:
@@ -669,7 +724,10 @@ class MacroDefinition:
 
 
 class RewriteRule:
-    __slots__ = ('name', 'pattern', 'replacement', 'priority', 'order', 'enabled')
+    __slots__ = (
+        'name', 'pattern', 'replacement', 'priority', 'order', 'enabled',
+        'pipeline', 'guard', 'group', 'scope', 'metadata', 'provenance', 'specificity'
+    )
 
     def __init__(
         self,
@@ -680,6 +738,13 @@ class RewriteRule:
         priority: int = 0,
         order: int = 0,
         enabled: bool = True,
+        pipeline: str = "default",
+        guard: Optional[str] = None,
+        group: str = "default",
+        scope: str = "global",
+        metadata: Optional[Dict[str, Any]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+        specificity: int = 0,
     ) -> None:
         self.name = name
         self.pattern = tuple(pattern)
@@ -687,13 +752,69 @@ class RewriteRule:
         self.priority = int(priority)
         self.order = int(order)
         self.enabled = bool(enabled)
+        self.pipeline = str(pipeline or "default")
+        self.guard = str(guard) if guard else None
+        self.group = str(group or "default")
+        self.scope = str(scope or "global")
+        self.metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        self.provenance = dict(provenance) if isinstance(provenance, dict) else {}
+        self.specificity = int(specificity)
+
+
+class _MacroTemplateBreak(Exception):
+    pass
+
+
+class _MacroTemplateContinue(Exception):
+    pass
 
 
 class MacroEngine:
     """Parser-attached macro/rewrite engine for expansion-time behavior."""
 
+    _TEMPLATE_COND_STARTERS = frozenset({"has", "empty", "first", "last", "not"})
+    _TEMPLATE_RUNTIME_BLOCK_OPENERS = frozenset({"if", "for", "while", "with", "begin", "word"})
+    _TEMPLATE_DIRECTIVE_KEYWORDS = frozenset({
+        "ct-call", "ct-fn", "ct-let", "ct-switch", "ct-case", "ct-default", "ct-match", "ct-fold",
+        "ct-if", "ct-when", "ct-unless", "ct-for", "ct-each", "ct-break", "ct-continue",
+        "ct-include", "ct-import", "ct-#", "ct-#(", "ct-#)", "emit-list", "emit-block",
+        "ct-version", "ct-strict", "ct-permissive", "ct-error", "ct-warning", "ct-note",
+    })
+
     def __init__(self, parser: "Parser") -> None:
         self._parser = parser
+        self._template_function_scopes: Optional[List[Dict[str, Sequence[Any]]]] = None
+        self._template_include_cache: Dict[Path, Sequence[Any]] = {}
+        self._template_include_stack: List[Path] = []
+        self._template_import_scopes: Optional[List[Set[Path]]] = None
+        self._active_macro_token: Optional[Token] = None
+        self._template_unknown_mode: str = "strict"
+        self._template_scope_stack_arena: List[List[Dict[str, Any]]] = []
+        self._template_loop_stack_arena: List[List[Dict[str, int]]] = []
+
+    def _acquire_template_scope_stack(self) -> List[Dict[str, Any]]:
+        if self._template_scope_stack_arena:
+            stack = self._template_scope_stack_arena.pop()
+            stack.clear()
+            return stack
+        return []
+
+    def _release_template_scope_stack(self, stack: List[Dict[str, Any]]) -> None:
+        stack.clear()
+        if len(self._template_scope_stack_arena) < 8:
+            self._template_scope_stack_arena.append(stack)
+
+    def _acquire_template_loop_stack(self) -> List[Dict[str, int]]:
+        if self._template_loop_stack_arena:
+            stack = self._template_loop_stack_arena.pop()
+            stack.clear()
+            return stack
+        return []
+
+    def _release_template_loop_stack(self, stack: List[Dict[str, int]]) -> None:
+        stack.clear()
+        if len(self._template_loop_stack_arena) < 8:
+            self._template_loop_stack_arena.append(stack)
 
     def _preview_with_context(
         self,
@@ -869,15 +990,2493 @@ class MacroEngine:
         captures: Dict[str, Any] = {}
         for idx, name in enumerate(ordered):
             arg_tokens = groups[idx]
-            captures[name] = list(arg_tokens)
-            captures[str(idx)] = list(arg_tokens)
+            normalized = list(parser._intern_capture_group(arg_tokens))
+            captures[name] = normalized
+            captures[str(idx)] = list(normalized)
 
         if variadic is not None:
-            tail_groups = [list(group) for group in groups[required:]]
+            tail_groups = [list(parser._intern_capture_group(group)) for group in groups[required:]]
             captures[variadic] = tail_groups
             captures[str(required)] = tail_groups
 
         return captures
+
+    @staticmethod
+    def _macro_capture_is_group_list(value: Any) -> bool:
+        return bool(isinstance(value, list) and value and isinstance(value[0], list))
+
+    def _macro_capture_lookup(
+        self,
+        *,
+        word: Word,
+        scopes: Sequence[Dict[str, Any]],
+        key: str,
+        raw_ref: Optional[str] = None,
+        allow_missing: bool = False,
+    ) -> Any:
+        for scope in reversed(scopes):
+            if key in scope:
+                return scope[key]
+        if allow_missing:
+            return None
+        ref = raw_ref if raw_ref is not None else f"${key}"
+        raise ParseError(
+            f"macro '{word.name}' references argument '{ref}', but the argument is not available"
+        )
+
+    def _macro_capture_as_groups(self, *, word: Word, raw_ref: str, value: Any) -> List[List[str]]:
+        if isinstance(value, list):
+            if self._macro_capture_is_group_list(value):
+                return [list(group) for group in value]
+            return [[piece] for piece in value]
+        raise ParseError(
+            f"macro '{word.name}' loop source '{raw_ref}' resolved to unsupported value"
+        )
+
+    def _macro_capture_clone(self, value: Any) -> Any:
+        if isinstance(value, list):
+            return [self._macro_capture_clone(item) for item in value]
+        return value
+
+    def _macro_capture_scope_snapshot(self, scopes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        for scope in scopes:
+            for key, value in scope.items():
+                snapshot[key] = self._macro_capture_clone(value)
+        return snapshot
+
+    def _macro_template_ct_context(
+        self,
+        *,
+        word: Word,
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> Dict[str, Any]:
+        parser = self._parser
+        args_scope: Dict[str, Any] = {}
+        if scopes:
+            for key, value in scopes[0].items():
+                args_scope[key] = self._macro_capture_clone(value)
+
+        locals_scope: Dict[str, Any] = {}
+        for scope in scopes[1:]:
+            for key, value in scope.items():
+                locals_scope[key] = self._macro_capture_clone(value)
+
+        globals_scope: Dict[str, Any] = {}
+        for key, value in parser.capture_globals.items():
+            globals_scope[key] = self._macro_capture_clone(value)
+
+        origin: Dict[str, Any] = {
+            "macro": word.name,
+            "line": 0,
+            "column": 0,
+            "path": "<source>",
+            "expansion_depth": 0,
+        }
+        if self._active_macro_token is not None:
+            token = self._active_macro_token
+            loc = parser.location_for_token(token)
+            origin["line"] = token.line
+            origin["column"] = token.column
+            origin["path"] = str(loc.path)
+            origin["expansion_depth"] = token.expansion_depth
+
+        parser._capture_lifetime_counter += 1
+        lifetime_id = parser._capture_lifetime_counter
+        parser._capture_lifetime_active = lifetime_id
+
+        taint_scope: Dict[str, bool] = {}
+        for key, flagged in parser.capture_taint.get(word.name, {}).items():
+            taint_scope[str(key)] = bool(flagged)
+
+        payload: Dict[str, Any] = {
+            "macro": word.name,
+            "captures": self._macro_capture_scope_snapshot(scopes),
+            "args": args_scope,
+            "locals": locals_scope,
+            "globals": globals_scope,
+            "capture_namespaces": {
+                "args": args_scope,
+                "locals": locals_scope,
+                "globals": globals_scope,
+            },
+            "origin": origin,
+            "lifetime": lifetime_id,
+            "taint": taint_scope,
+            "loop": None,
+        }
+        if loop_stack:
+            frame = loop_stack[-1]
+            payload["loop"] = {
+                "index": frame["index"],
+                "count": frame["count"],
+                "first": frame["index"] == 0,
+                "last": frame["index"] + 1 == frame["count"],
+            }
+
+        parser.capture_replay_log.append(
+            {
+                "macro": word.name,
+                "lifetime": lifetime_id,
+                "origin": self._macro_capture_clone(origin),
+                "captures": self._macro_capture_clone(payload["captures"]),
+                "args": self._macro_capture_clone(args_scope),
+                "locals": self._macro_capture_clone(locals_scope),
+                "globals": self._macro_capture_clone(globals_scope),
+                "taint": self._macro_capture_clone(taint_scope),
+            }
+        )
+        if len(parser.capture_replay_log) > 4096:
+            del parser.capture_replay_log[:-4096]
+        return payload
+
+    def _coerce_macro_ct_emit_lexemes(self, *, word: Word, ct_word_name: str, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, Token):
+            return [value.lexeme]
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, bool):
+            return ["1" if value else "0"]
+        if isinstance(value, int):
+            return [str(value)]
+        if isinstance(value, float):
+            return [str(value)]
+        if isinstance(value, tuple):
+            out: List[str] = []
+            for item in value:
+                out.extend(self._coerce_macro_ct_emit_lexemes(word=word, ct_word_name=ct_word_name, value=item))
+            return out
+        if isinstance(value, list):
+            out: List[str] = []
+            for item in value:
+                out.extend(self._coerce_macro_ct_emit_lexemes(word=word, ct_word_name=ct_word_name, value=item))
+            return out
+        raise ParseError(
+            f"macro '{word.name}' ct-call '{ct_word_name}' returned unsupported value type "
+            f"'{type(value).__name__}'"
+        )
+
+    def _ct_call_contract_validate_payload(
+        self,
+        *,
+        word: Word,
+        ct_word_name: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        contract = self._parser._ct_call_abi_contracts.get(ct_word_name)
+        if not isinstance(contract, dict):
+            return
+        arg_kind = str(contract.get("arg_kind", contract.get("arg", "any"))).strip().lower()
+        if arg_kind in ("", "any"):
+            return
+        if arg_kind in ("map", "dict"):
+            if not isinstance(payload, dict):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' requires map payload"
+                )
+            return
+        if arg_kind in ("capture-context", "capture_context", "context"):
+            if not isinstance(payload, dict) or not isinstance(payload.get("captures"), dict):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' requires capture-context payload"
+                )
+            return
+        raise ParseError(
+            f"macro '{word.name}' ct-call '{ct_word_name}' uses unsupported arg_kind '{arg_kind}'"
+        )
+
+    def _ct_call_contract_validate_result(
+        self,
+        *,
+        word: Word,
+        ct_word_name: str,
+        result: Any,
+    ) -> None:
+        contract = self._parser._ct_call_abi_contracts.get(ct_word_name)
+        if not isinstance(contract, dict):
+            return
+
+        result_kind = str(contract.get("result_kind", contract.get("result", "any"))).strip().lower()
+        if result_kind not in ("", "any"):
+            if result_kind in ("nil", "none") and result is not None:
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' contract expected nil result"
+                )
+            elif result_kind == "scalar" and not isinstance(result, (bool, int, float, str, Token)):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' contract expected scalar result"
+                )
+            elif result_kind == "list" and not isinstance(result, list):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' contract expected list result"
+                )
+            elif result_kind in ("map", "dict") and not isinstance(result, dict):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' contract expected map result"
+                )
+            elif result_kind == "tokenish":
+                self._coerce_macro_ct_emit_lexemes(word=word, ct_word_name=ct_word_name, value=result)
+
+        result_shape = str(contract.get("result_shape", "any")).strip().lower()
+        if result_shape in ("", "any"):
+            return
+        if result_shape in ("none", "empty"):
+            if result not in (None, [], (), ""):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word_name}' contract expected empty result"
+                )
+            return
+
+        lexemes = self._coerce_macro_ct_emit_lexemes(word=word, ct_word_name=ct_word_name, value=result)
+        if result_shape in ("single", "single-token", "single_token") and len(lexemes) != 1:
+            raise ParseError(
+                f"macro '{word.name}' ct-call '{ct_word_name}' contract expected single token result"
+            )
+        if result_shape in ("multi", "multi-token", "multi_token") and len(lexemes) < 2:
+            raise ParseError(
+                f"macro '{word.name}' ct-call '{ct_word_name}' contract expected multi-token result"
+            )
+
+    def _ct_call_enforce_sandbox(self, *, word: Word, ct_word: Word) -> None:
+        parser = self._parser
+        mode = str(getattr(parser, "_ct_call_sandbox_mode", "off") or "off").strip().lower()
+        if mode == "off":
+            return
+        if mode == "allowlist":
+            allowlist = getattr(parser, "_ct_call_sandbox_allowlist", set())
+            if ct_word.name not in allowlist:
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word.name}' blocked by sandbox allowlist"
+                )
+            return
+        if mode in ("compile-only", "compile_only"):
+            if not bool(getattr(ct_word, "compile_only", False)):
+                raise ParseError(
+                    f"macro '{word.name}' ct-call '{ct_word.name}' blocked by compile-only sandbox"
+                )
+            return
+        raise ParseError(f"invalid ct-call sandbox mode '{mode}'")
+
+    def _ct_call_handle_exception(
+        self,
+        *,
+        word: Word,
+        ct_word_name: str,
+        exc: Exception,
+    ) -> Optional[List[str]]:
+        policy = str(getattr(self._parser, "_ct_call_exception_policy", "raise") or "raise").strip().lower()
+        message = f"macro '{word.name}' ct-call '{ct_word_name}' failed: {exc}"
+        if policy == "raise":
+            raise ParseError(message) from None
+        if policy == "warn":
+            self._template_warn(word=word, message=message)
+            return []
+        if policy in ("empty", "nil", "ignore"):
+            return []
+        raise ParseError(f"invalid ct-call exception policy '{policy}'")
+
+    @staticmethod
+    def _ct_call_memo_key(ct_word_name: str, payload: Dict[str, Any]) -> str:
+        import json
+
+        normalized = _capture_normalize_value(payload)
+        return f"{ct_word_name}:{json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(',', ':'))}"
+
+    def _ct_call_record_side_effect(
+        self,
+        *,
+        macro_name: str,
+        ct_word_name: str,
+        status: str,
+        memo_hit: bool,
+        duration_ms: int,
+        error: str = "",
+    ) -> None:
+        parser = self._parser
+        if not bool(getattr(parser, "_ct_call_side_effect_tracking", False)):
+            return
+        log = getattr(parser, "_ct_call_side_effect_log", None)
+        if not isinstance(log, list):
+            return
+        log.append(
+            {
+                "macro": macro_name,
+                "word": ct_word_name,
+                "status": status,
+                "memo_hit": 1 if memo_hit else 0,
+                "duration_ms": int(max(0, duration_ms)),
+                "error": error,
+            }
+        )
+        if len(log) > 4096:
+            del log[:-4096]
+
+    def _invoke_macro_ct_word(
+        self,
+        *,
+        word: Word,
+        ct_word_name: str,
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> List[str]:
+        parser = self._parser
+        ct_word = parser.dictionary.lookup(ct_word_name)
+        if ct_word is None:
+            raise ParseError(f"macro '{word.name}' ct-call references unknown word '{ct_word_name}'")
+
+        self._ct_call_enforce_sandbox(word=word, ct_word=ct_word)
+
+        payload = self._macro_template_ct_context(word=word, scopes=scopes, loop_stack=loop_stack)
+        self._ct_call_contract_validate_payload(word=word, ct_word_name=ct_word_name, payload=payload)
+
+        memo_enabled = bool(getattr(parser, "_ct_call_memo_enabled", False))
+        memo_key: Optional[str] = None
+        memo_hit = False
+        result: Any = None
+
+        if memo_enabled:
+            memo_key = self._ct_call_memo_key(ct_word_name, payload)
+            _missing = object()
+            cached = parser._ct_call_memo_cache.get(memo_key, _missing)
+            if cached is not _missing:
+                result = _capture_deep_clone(cached)
+                memo_hit = True
+
+        started = time.perf_counter()
+
+        if not memo_hit:
+            active = parser._ct_call_active
+            limit = int(getattr(parser, "_ct_call_recursion_limit", 32))
+            if limit < 1:
+                limit = 1
+            if active.count(ct_word_name) >= limit:
+                raise ParseError(
+                    f"macro '{word.name}' ct-call recursion limit ({limit}) exceeded for '{ct_word_name}'"
+                )
+
+            vm = parser.compile_time_vm
+            base_depth = len(vm.stack)
+            active.append(ct_word_name)
+            try:
+                vm.push(payload)
+                vm._call_word(ct_word)
+                if len(vm.stack) > base_depth:
+                    result = vm._resolve_handle(vm.stack[-1])
+                else:
+                    result = None
+            except Exception as exc:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                self._ct_call_record_side_effect(
+                    macro_name=word.name,
+                    ct_word_name=ct_word_name,
+                    status="error",
+                    memo_hit=False,
+                    duration_ms=elapsed_ms,
+                    error=str(exc),
+                )
+                fallback = self._ct_call_handle_exception(
+                    word=word,
+                    ct_word_name=ct_word_name,
+                    exc=exc,
+                )
+                if fallback is not None:
+                    return fallback
+                raise
+            finally:
+                del vm.stack[base_depth:]
+                active.pop()
+
+            if memo_enabled and memo_key is not None:
+                parser._ct_call_memo_cache[memo_key] = _capture_deep_clone(result)
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        timeout_ms = int(getattr(parser, "_ct_call_timeout_ms", 0))
+        if timeout_ms > 0 and elapsed_ms > timeout_ms:
+            self._ct_call_record_side_effect(
+                macro_name=word.name,
+                ct_word_name=ct_word_name,
+                status="timeout",
+                memo_hit=memo_hit,
+                duration_ms=elapsed_ms,
+                error=f"budget={timeout_ms}",
+            )
+            fallback = self._ct_call_handle_exception(
+                word=word,
+                ct_word_name=ct_word_name,
+                exc=ParseError(f"ct-call timeout budget exceeded ({elapsed_ms}ms > {timeout_ms}ms)"),
+            )
+            if fallback is not None:
+                return fallback
+            raise ParseError(
+                f"macro '{word.name}' ct-call '{ct_word_name}' timeout budget exceeded ({elapsed_ms}ms > {timeout_ms}ms)"
+            )
+
+        self._ct_call_contract_validate_result(word=word, ct_word_name=ct_word_name, result=result)
+        lexemes = self._coerce_macro_ct_emit_lexemes(word=word, ct_word_name=ct_word_name, value=result)
+        self._ct_call_record_side_effect(
+            macro_name=word.name,
+            ct_word_name=ct_word_name,
+            status="ok",
+            memo_hit=memo_hit,
+            duration_ms=elapsed_ms,
+        )
+        return lexemes
+
+    def _parse_macro_template_capture_ref(self, *, word: Word, lexeme: str, field: str) -> str:
+        parser = self._parser
+        if lexeme.startswith("$"):
+            parsed = parser._parse_rewrite_capture(lexeme)
+            if parsed is None:
+                raise ParseError(
+                    f"macro '{word.name}' has invalid {field} capture reference '{lexeme}'"
+                )
+            _, key, constraint = parsed
+            if constraint:
+                raise ParseError(
+                    f"macro '{word.name}' {field} capture '{lexeme}' cannot include a type constraint"
+                )
+            return key
+        if not lexeme:
+            raise ParseError(f"macro '{word.name}' has empty {field} capture reference")
+        return lexeme
+
+    @staticmethod
+    def _macro_template_unquote_lexeme(lexeme: str) -> str:
+        if len(lexeme) >= 2 and lexeme[0] == '"' and lexeme[-1] == '"':
+            return lexeme[1:-1]
+        return lexeme
+
+    def _template_warn(self, *, word: Word, message: str) -> None:
+        parser = self._parser
+        token = self._active_macro_token
+        if token is not None:
+            parser._record_diagnostic(token, f"macro '{word.name}': {message}", level="warning")
+
+    def _macro_capture_lookup_mode(
+        self,
+        *,
+        word: Word,
+        scopes: Sequence[Dict[str, Any]],
+        key: str,
+        raw_ref: str,
+        allow_missing: bool = False,
+    ) -> Any:
+        try:
+            return self._macro_capture_lookup(
+                word=word,
+                scopes=scopes,
+                key=key,
+                raw_ref=raw_ref,
+                allow_missing=allow_missing,
+            )
+        except ParseError:
+            if self._template_unknown_mode == "permissive":
+                self._template_warn(
+                    word=word,
+                    message=f"unknown template symbol '{raw_ref}' treated as empty in permissive mode",
+                )
+                return []
+            raise
+
+    def _macro_capture_validate_constraint(
+        self,
+        *,
+        word: Word,
+        raw_ref: str,
+        constraint: str,
+        captured: Any,
+        variadic: bool,
+    ) -> None:
+        if not constraint:
+            return
+
+        parser = self._parser
+        values: List[str] = []
+
+        if variadic:
+            if self._macro_capture_is_group_list(captured):
+                for group in captured:
+                    for piece in group:
+                        values.append(str(piece))
+            elif isinstance(captured, list):
+                for piece in captured:
+                    values.append(str(piece))
+            else:
+                raise ParseError(
+                    f"macro '{word.name}' variadic placeholder '{raw_ref}' resolved to unsupported value"
+                )
+        else:
+            if self._macro_capture_is_group_list(captured):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{raw_ref}' is variadic; use '$*' for grouped captures"
+                )
+            if not isinstance(captured, list):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{raw_ref}' resolved to unsupported value"
+                )
+            for piece in captured:
+                values.append(str(piece))
+
+        for piece in values:
+            if not parser._rewrite_constraint_matches(piece, constraint):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{raw_ref}' expected '{constraint}' token, got '{piece}'"
+                )
+
+    def _resolve_macro_template_include_path(self, *, word: Word, target: str) -> Path:
+        raw_target = self._macro_template_unquote_lexeme(target)
+        if not raw_target:
+            raise ParseError(f"macro '{word.name}' template include/import target cannot be empty")
+
+        raw_path = Path(raw_target).expanduser()
+        candidates: List[Path] = []
+
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            token = self._active_macro_token
+            if token is not None:
+                loc = self._parser.location_for_token(token)
+                if loc.path != _SOURCE_PATH:
+                    candidates.append((loc.path.parent / raw_path))
+            candidates.append(Path.cwd() / raw_path)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+
+        tried = "\n".join(f"  - {c}" for c in candidates)
+        raise ParseError(
+            f"macro '{word.name}' template include/import cannot resolve {raw_target!r}\n"
+            f"tried:\n{tried}"
+        )
+
+    def _load_macro_template_include_nodes(self, *, word: Word, target: str) -> Tuple[Path, Sequence[Any]]:
+        path = self._resolve_macro_template_include_path(word=word, target=target)
+        cached = self._template_include_cache.get(path)
+        if cached is not None:
+            return path, cached
+
+        if path in self._template_include_stack:
+            chain = " -> ".join(str(p) for p in self._template_include_stack + [path])
+            raise ParseError(f"macro '{word.name}' template include/import cycle detected: {chain}")
+
+        self._template_include_stack.append(path)
+        try:
+            source = path.read_text(encoding="utf-8")
+            include_tokens = [tok.lexeme for tok in self._parser.reader.tokenize(source)]
+            include_nodes, include_idx, include_stop = self._parse_macro_template_nodes(
+                word=word,
+                tokens=include_tokens,
+                idx=0,
+                stop_tokens=None,
+            )
+            if include_stop is not None or include_idx != len(include_tokens):
+                raise ParseError(
+                    f"macro '{word.name}' template include/import parser stopped early for {path}"
+                )
+            cached_nodes: Sequence[Any] = tuple(include_nodes)
+            self._template_include_cache[path] = cached_nodes
+            return path, cached_nodes
+        finally:
+            self._template_include_stack.pop()
+
+    def _parse_macro_template_placeholder_node(self, *, word: Word, lexeme: str) -> Optional[Any]:
+        if not lexeme.startswith("$"):
+            return None
+
+        parser = self._parser
+        parts = lexeme.split("|")
+        base = parts[0]
+        parsed = parser._parse_rewrite_capture(base)
+        if parsed is None:
+            return None
+
+        variadic, key, constraint = parsed
+        constraint = (constraint or "").lower()
+
+        if len(parts) == 1:
+            return ("cap", variadic, key, base, constraint)
+
+        transforms: List[Tuple[str, Any]] = []
+        for transform_spec in parts[1:]:
+            if transform_spec == "upper":
+                transforms.append(("upper", None))
+                continue
+            if transform_spec == "lower":
+                transforms.append(("lower", None))
+                continue
+            if transform_spec.startswith("join:"):
+                sep = transform_spec[5:]
+                sep = self._macro_template_unquote_lexeme(sep)
+                transforms.append(("join", sep))
+                continue
+            raise ParseError(
+                f"macro '{word.name}' uses unknown placeholder transform '{transform_spec}' in '{lexeme}'"
+            )
+
+        return ("capx", variadic, key, base, constraint, tuple(transforms), lexeme)
+
+    def _apply_macro_template_transforms(
+        self,
+        *,
+        word: Word,
+        source_tokens: Sequence[str],
+        transforms: Sequence[Tuple[str, Any]],
+        raw_ref: str,
+    ) -> List[str]:
+        tokens = list(source_tokens)
+        for transform, arg in transforms:
+            if transform == "upper":
+                tokens = [tok.upper() for tok in tokens]
+                continue
+            if transform == "lower":
+                tokens = [tok.lower() for tok in tokens]
+                continue
+            if transform == "join":
+                tokens = [str(arg).join(tokens)]
+                continue
+            raise ParseError(
+                f"macro '{word.name}' placeholder '{raw_ref}' has unsupported transform '{transform}'"
+            )
+        return tokens
+
+    def _collect_macro_template_metadata(self, *, word: Word, nodes: Sequence[Any]) -> Tuple[str, Optional[str]]:
+        mode = "strict"
+        version: Optional[str] = None
+        for node in nodes:
+            if not node:
+                continue
+            kind = node[0]
+            if kind == "mode":
+                mode = node[1]
+                continue
+            if kind == "version":
+                value = self._macro_template_unquote_lexeme(str(node[1]))
+                if version is not None and version != value:
+                    raise ParseError(
+                        f"macro '{word.name}' declares conflicting ct-version markers '{version}' and '{value}'"
+                    )
+                version = value
+        return mode, version
+
+    def _compile_macro_template_program(self, *, nodes: Sequence[Any]) -> Sequence[Any]:
+        # A compact immutable program representation for fast repeat expansion.
+        def _compile_seq(seq: Sequence[Any]) -> Tuple[Any, ...]:
+            compiled: List[Any] = []
+            for node in seq:
+                kind = node[0]
+                if kind in ("lit", "cap", "capx", "ct", "break", "continue", "mode", "version", "emit-list", "include", "diag"):
+                    compiled.append(tuple(node))
+                    continue
+                if kind == "fn-def":
+                    compiled.append(("fn-def", node[1], _compile_seq(node[2])))
+                    continue
+                if kind == "emit-block":
+                    compiled.append(("emit-block", _compile_seq(node[1])))
+                    continue
+                if kind == "let":
+                    compiled.append(("let", node[1], _compile_seq(node[2]), _compile_seq(node[3])))
+                    continue
+                if kind == "if":
+                    compiled.append(("if", node[1], _compile_seq(node[2]), _compile_seq(node[3])))
+                    continue
+                if kind in ("switch", "match"):
+                    compiled_cases = tuple((
+                        _compile_seq(case_expr),
+                        _compile_seq(case_body),
+                    ) for case_expr, case_body in node[2])
+                    compiled.append((kind, _compile_seq(node[1]), compiled_cases, _compile_seq(node[3])))
+                    continue
+                if kind == "fold":
+                    compiled.append(("fold", node[1], node[2], node[3], node[4], _compile_seq(node[5]), _compile_seq(node[6])))
+                    continue
+                if kind == "for":
+                    compiled.append(("for", node[1], node[2], node[3], node[4], _compile_seq(node[5]), _compile_seq(node[6])))
+                    continue
+                raise ParseError(f"internal template compile error: unsupported node '{kind}'")
+            return tuple(compiled)
+
+        return _compile_seq(nodes)
+
+    def _lookup_macro_template_function(self, name: str) -> Optional[Sequence[Any]]:
+        scopes = self._template_function_scopes
+        if not scopes:
+            return None
+        for scope in reversed(scopes):
+            body = scope.get(name)
+            if body is not None:
+                return body
+        return None
+
+    @staticmethod
+    def _macro_template_expr_parse_const_token(lex: str) -> Tuple[bool, Any]:
+        if lex == "true":
+            return True, True
+        if lex == "false":
+            return True, False
+        if len(lex) >= 2 and lex[0] == '"' and lex[-1] == '"':
+            return True, lex[1:-1]
+        try:
+            return True, int(lex, 10)
+        except Exception:
+            return False, None
+
+    def _macro_template_expr_truthy(self, value: Any) -> bool:
+        return bool(value)
+
+    def _macro_template_expr_normalize(self, value: Any) -> Any:
+        if self._macro_capture_is_group_list(value):
+            return tuple(tuple(group) for group in value)
+        if isinstance(value, list):
+            if len(value) == 1:
+                return self._macro_template_expr_normalize(value[0])
+            return tuple(self._macro_template_expr_normalize(item) for item in value)
+        if isinstance(value, str):
+            parsed, const_value = self._macro_template_expr_parse_const_token(value)
+            if parsed:
+                return const_value
+            return value
+        return value
+
+    def _macro_template_expr_compare(self, *, word: Word, op: str, left: Any, right: Any) -> bool:
+        left_norm = self._macro_template_expr_normalize(left)
+        right_norm = self._macro_template_expr_normalize(right)
+
+        if op == "==":
+            return left_norm == right_norm
+        if op == "!=":
+            return left_norm != right_norm
+
+        if op in ("<", "<=", ">", ">="):
+            if isinstance(left_norm, (int, float)) and isinstance(right_norm, (int, float)):
+                if op == "<":
+                    return left_norm < right_norm
+                if op == "<=":
+                    return left_norm <= right_norm
+                if op == ">":
+                    return left_norm > right_norm
+                return left_norm >= right_norm
+            if isinstance(left_norm, str) and isinstance(right_norm, str):
+                if op == "<":
+                    return left_norm < right_norm
+                if op == "<=":
+                    return left_norm <= right_norm
+                if op == ">":
+                    return left_norm > right_norm
+                return left_norm >= right_norm
+            raise ParseError(
+                f"macro '{word.name}' template expression uses '{op}' with unsupported values "
+                f"'{left_norm}' and '{right_norm}'"
+            )
+
+        raise ParseError(f"macro '{word.name}' template expression uses unknown comparator '{op}'")
+
+    def _macro_template_expr_fold(self, *, word: Word, expr: Any) -> Any:
+        kind = expr[0]
+
+        if kind == "not" and expr[1][0] == "const":
+            return ("const", not self._macro_template_expr_truthy(expr[1][1]))
+
+        if kind == "and":
+            left = expr[1]
+            right = expr[2]
+            if left[0] == "const":
+                if not self._macro_template_expr_truthy(left[1]):
+                    return ("const", False)
+                if right[0] == "const":
+                    return ("const", self._macro_template_expr_truthy(right[1]))
+                return right
+
+        if kind == "or":
+            left = expr[1]
+            right = expr[2]
+            if left[0] == "const":
+                if self._macro_template_expr_truthy(left[1]):
+                    return ("const", True)
+                if right[0] == "const":
+                    return ("const", self._macro_template_expr_truthy(right[1]))
+                return right
+
+        if kind == "cmp":
+            op = expr[1]
+            left = expr[2]
+            right = expr[3]
+            if left[0] == "const" and right[0] == "const":
+                return (
+                    "const",
+                    self._macro_template_expr_compare(
+                        word=word,
+                        op=op,
+                        left=left[1],
+                        right=right[1],
+                    ),
+                )
+
+        return expr
+
+    def _parse_macro_template_expr(
+        self,
+        *,
+        word: Word,
+        tokens: Sequence[str],
+        idx: int,
+        stop_tokens: Set[str],
+    ) -> Tuple[Any, int, Optional[str]]:
+        cursor = idx
+        cmp_ops = frozenset({"==", "!=", "<", "<=", ">", ">="})
+
+        def _at_stop() -> bool:
+            return cursor >= len(tokens) or tokens[cursor] in stop_tokens
+
+        def _parse_primary() -> Any:
+            nonlocal cursor
+            if _at_stop():
+                raise ParseError(f"macro '{word.name}' has incomplete template expression")
+
+            lex = tokens[cursor]
+
+            if lex == "(":
+                cursor += 1
+                inner = _parse_or()
+                if cursor >= len(tokens) or tokens[cursor] != ")":
+                    raise ParseError(f"macro '{word.name}' template expression is missing ')' ")
+                cursor += 1
+                return inner
+
+            if lex in ("has", "empty"):
+                cursor += 1
+                if _at_stop():
+                    raise ParseError(
+                        f"macro '{word.name}' condition '{lex}' requires a capture name"
+                    )
+                raw_ref = tokens[cursor]
+                key = self._parse_macro_template_capture_ref(
+                    word=word,
+                    lexeme=raw_ref,
+                    field=f"'{lex}' condition",
+                )
+                cursor += 1
+                return (lex, key, raw_ref)
+
+            if lex == "first":
+                cursor += 1
+                return ("first",)
+
+            if lex == "last":
+                cursor += 1
+                return ("last",)
+
+            if lex.startswith("$"):
+                placeholder_node = self._parse_macro_template_placeholder_node(
+                    word=word,
+                    lexeme=lex,
+                )
+                if placeholder_node is not None:
+                    if placeholder_node[0] == "capx":
+                        if len(placeholder_node) >= 7:
+                            _, _variadic, key, _base, constraint, transforms, raw_ref = placeholder_node
+                        else:
+                            _, _variadic, key, _base, transforms, raw_ref = placeholder_node
+                            constraint = ""
+                        if constraint:
+                            raise ParseError(
+                                f"macro '{word.name}' expression capture '{raw_ref}' cannot include type constraint '{constraint}'"
+                            )
+                        cursor += 1
+                        return ("var-tx", key, raw_ref, transforms)
+                    if len(placeholder_node) >= 5:
+                        _, _variadic, key, raw_ref, constraint = placeholder_node
+                    else:
+                        _, _variadic, key, raw_ref = placeholder_node
+                        constraint = ""
+                    if constraint:
+                        raise ParseError(
+                            f"macro '{word.name}' expression capture '{raw_ref}' cannot include type constraint '{constraint}'"
+                        )
+                    cursor += 1
+                    return ("var", key, raw_ref)
+
+                key = self._parse_macro_template_capture_ref(
+                    word=word,
+                    lexeme=lex,
+                    field="template expression",
+                )
+                cursor += 1
+                return ("var", key, lex)
+
+            parsed_const, const_value = self._macro_template_expr_parse_const_token(lex)
+            if parsed_const:
+                cursor += 1
+                return ("const", const_value)
+
+            cursor += 1
+            return ("var", lex, lex)
+
+        def _parse_cmp() -> Any:
+            nonlocal cursor
+            left = _parse_primary()
+            while cursor < len(tokens) and tokens[cursor] in cmp_ops:
+                op = tokens[cursor]
+                cursor += 1
+                right = _parse_primary()
+                left = self._macro_template_expr_fold(word=word, expr=("cmp", op, left, right))
+            return left
+
+        def _parse_not() -> Any:
+            nonlocal cursor
+            if cursor < len(tokens) and tokens[cursor] in ("not", "!"):
+                cursor += 1
+                expr = _parse_not()
+                return self._macro_template_expr_fold(word=word, expr=("not", expr))
+            return _parse_cmp()
+
+        def _parse_and() -> Any:
+            nonlocal cursor
+            left = _parse_not()
+            while cursor < len(tokens) and tokens[cursor] in ("and", "&&"):
+                cursor += 1
+                right = _parse_not()
+                left = self._macro_template_expr_fold(word=word, expr=("and", left, right))
+            return left
+
+        def _parse_or() -> Any:
+            nonlocal cursor
+            left = _parse_and()
+            while cursor < len(tokens) and tokens[cursor] in ("or", "||"):
+                cursor += 1
+                right = _parse_and()
+                left = self._macro_template_expr_fold(word=word, expr=("or", left, right))
+            return left
+
+        parsed = _parse_or()
+        if cursor < len(tokens) and tokens[cursor] in stop_tokens:
+            return parsed, cursor, tokens[cursor]
+        return parsed, cursor, None
+
+    def _parse_macro_template_condition(
+        self,
+        *,
+        word: Word,
+        tokens: Sequence[str],
+        idx: int,
+    ) -> Tuple[Any, int]:
+        if idx >= len(tokens):
+            raise ParseError(f"macro '{word.name}' has incomplete template condition")
+
+        lex = tokens[idx]
+        if lex == "not":
+            nested, next_idx = self._parse_macro_template_condition(word=word, tokens=tokens, idx=idx + 1)
+            return ("not", nested), next_idx
+
+        if lex == "first":
+            return ("first",), idx + 1
+
+        if lex == "last":
+            return ("last",), idx + 1
+
+        if lex in ("has", "empty"):
+            if idx + 1 >= len(tokens):
+                raise ParseError(
+                    f"macro '{word.name}' condition '{lex}' requires a capture name"
+                )
+            raw_ref = tokens[idx + 1]
+            key = self._parse_macro_template_capture_ref(
+                word=word,
+                lexeme=raw_ref,
+                field=f"'{lex}' condition",
+            )
+            return (lex, key, raw_ref), idx + 2
+
+        raise ParseError(
+            f"macro '{word.name}' uses unsupported template condition '{lex}'"
+        )
+
+    def _parse_macro_template_nodes(
+        self,
+        *,
+        word: Word,
+        tokens: Sequence[str],
+        idx: int = 0,
+        stop_tokens: Optional[Set[str]] = None,
+    ) -> Tuple[List[Any], int, Optional[str]]:
+        parser = self._parser
+        nodes: List[Any] = []
+        runtime_depth = 0
+
+        def _runtime_depth_step(lexeme: str) -> None:
+            nonlocal runtime_depth
+            if lexeme in self._TEMPLATE_RUNTIME_BLOCK_OPENERS:
+                runtime_depth += 1
+                return
+            if lexeme == "end" and runtime_depth > 0:
+                runtime_depth -= 1
+
+        while idx < len(tokens):
+            lex = tokens[idx]
+            if stop_tokens and runtime_depth == 0 and lex in stop_tokens:
+                return nodes, idx, lex
+
+            if runtime_depth == 0 and lex == "ct-#":
+                # Single-token comment marker.
+                idx += 2 if idx + 1 < len(tokens) else 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-comment":
+                # Nestable block comment: ct-comment ... ct-endcomment
+                depth = 1
+                idx += 1
+                while idx < len(tokens) and depth > 0:
+                    if tokens[idx] == "ct-comment":
+                        depth += 1
+                    elif tokens[idx] == "ct-endcomment":
+                        depth -= 1
+                    idx += 1
+                if depth != 0:
+                    raise ParseError(
+                        f"macro '{word.name}' template block comment is missing closing 'ct-endcomment'"
+                    )
+                continue
+
+            if runtime_depth == 0 and lex == "ct-endcomment":
+                raise ParseError(
+                    f"macro '{word.name}' template has unexpected 'ct-endcomment'"
+                )
+
+            if runtime_depth == 0 and lex == "ct-#(":
+                # Nestable block comment: ct-#( ... ct-#)
+                depth = 1
+                idx += 1
+                while idx < len(tokens) and depth > 0:
+                    if tokens[idx] == "ct-#(":
+                        depth += 1
+                    elif tokens[idx] == "ct-#)":
+                        depth -= 1
+                    idx += 1
+                if depth != 0:
+                    raise ParseError(
+                        f"macro '{word.name}' template block comment is missing closing 'ct-#)'"
+                    )
+                continue
+
+            if runtime_depth == 0 and lex == "ct-#)":
+                raise ParseError(
+                    f"macro '{word.name}' template has unexpected 'ct-#)'"
+                )
+
+            if lex.startswith("\\") and len(lex) > 1:
+                escaped = lex[1:]
+                nodes.append(("lit", escaped))
+                _runtime_depth_step(escaped)
+                idx += 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-call":
+                if idx + 1 >= len(tokens):
+                    raise ParseError(f"macro '{word.name}' template 'ct-call' requires a target word")
+                target = tokens[idx + 1]
+                if not target:
+                    raise ParseError(f"macro '{word.name}' template 'ct-call' target cannot be empty")
+                nodes.append(("ct", target))
+                idx += 2
+                continue
+
+            if runtime_depth == 0 and lex in ("ct-include", "ct-import"):
+                if idx + 1 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template '{lex}' requires a path token"
+                    )
+                nodes.append(("include", lex, tokens[idx + 1]))
+                idx += 2
+                continue
+
+            if runtime_depth == 0 and lex in ("emit-list", "ct-emit-list"):
+                if idx + 1 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template '{lex}' requires a capture name"
+                    )
+                raw_ref = tokens[idx + 1]
+                source_key = self._parse_macro_template_capture_ref(
+                    word=word,
+                    lexeme=raw_ref,
+                    field="emit-list source",
+                )
+                nodes.append(("emit-list", source_key, raw_ref))
+                idx += 2
+                continue
+
+            if runtime_depth == 0 and lex in ("emit-block", "ct-emit-block"):
+                cursor = idx + 1
+                if cursor < len(tokens) and tokens[cursor] in ("do", "ct-do"):
+                    cursor += 1
+                body_nodes, body_idx, body_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=cursor,
+                    stop_tokens={"end"},
+                )
+                if body_stop != "end":
+                    raise ParseError(
+                        f"macro '{word.name}' template '{lex}' is missing 'end'"
+                    )
+                nodes.append(("emit-block", body_nodes))
+                idx = body_idx + 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-version":
+                if idx + 1 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-version' requires a version token"
+                    )
+                nodes.append(("version", tokens[idx + 1]))
+                idx += 2
+                continue
+
+            if runtime_depth == 0 and lex == "ct-strict":
+                nodes.append(("mode", "strict"))
+                idx += 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-permissive":
+                nodes.append(("mode", "permissive"))
+                idx += 1
+                continue
+
+            if runtime_depth == 0 and lex in ("ct-error", "ct-warning", "ct-note"):
+                if idx + 1 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template '{lex}' requires a message token"
+                    )
+                nodes.append(("diag", lex, tokens[idx + 1], idx))
+                idx += 2
+                continue
+
+            if runtime_depth == 0 and lex == "ct-fn":
+                if idx + 2 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fn' requires '<name> do ... end'"
+                    )
+                fn_name = tokens[idx + 1]
+                if not _is_identifier(fn_name):
+                    raise ParseError(
+                        f"macro '{word.name}' template function name '{fn_name}' is not a valid identifier"
+                    )
+                cursor = idx + 2
+                if cursor >= len(tokens) or tokens[cursor] not in ("do", "ct-do"):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fn' requires 'do'"
+                    )
+                fn_body_nodes, fn_body_idx, fn_body_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=cursor + 1,
+                    stop_tokens={"end"},
+                )
+                if fn_body_stop != "end":
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fn' is missing 'end'"
+                    )
+                nodes.append(("fn-def", fn_name, fn_body_nodes))
+                idx = fn_body_idx + 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-let":
+                if idx + 2 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-let' requires a binding name and expression"
+                    )
+                binding_name = tokens[idx + 1]
+                if not _is_identifier(binding_name):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-let' binding name '{binding_name}' is not a valid identifier"
+                    )
+                cursor = idx + 2
+                if cursor < len(tokens) and tokens[cursor] == "=":
+                    cursor += 1
+
+                binding_expr_nodes, binding_expr_idx, binding_expr_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=cursor,
+                    stop_tokens={"do", "ct-do"},
+                )
+                if binding_expr_stop not in ("do", "ct-do"):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-let' is missing 'do'"
+                    )
+                if not binding_expr_nodes:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-let' requires a non-empty expression"
+                    )
+
+                body_nodes, body_idx, body_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=binding_expr_idx + 1,
+                    stop_tokens={"end"},
+                )
+                if body_stop != "end":
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-let' is missing 'end'"
+                    )
+
+                nodes.append(("let", binding_name, binding_expr_nodes, body_nodes))
+                idx = body_idx + 1
+                continue
+
+            if runtime_depth == 0 and lex == "ct-switch":
+                switch_expr_nodes, switch_expr_idx, switch_expr_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=idx + 1,
+                    stop_tokens={"do", "ct-do"},
+                )
+                if switch_expr_stop not in ("do", "ct-do"):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-switch' is missing 'do'"
+                    )
+                if not switch_expr_nodes:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-switch' requires a non-empty expression"
+                    )
+
+                cursor = switch_expr_idx + 1
+                cases: List[Any] = []
+                default_nodes: List[Any] = []
+                seen_default = False
+
+                while cursor < len(tokens):
+                    branch_lex = tokens[cursor]
+                    if branch_lex == "end":
+                        nodes.append(("switch", switch_expr_nodes, cases, default_nodes))
+                        idx = cursor + 1
+                        break
+
+                    if branch_lex == "ct-case":
+                        if seen_default:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' cannot appear after 'ct-default'"
+                            )
+                        case_expr_nodes, case_expr_idx, case_expr_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=cursor + 1,
+                            stop_tokens={"do", "ct-do"},
+                        )
+                        if case_expr_stop not in ("do", "ct-do"):
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' is missing 'do'"
+                            )
+                        if not case_expr_nodes:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' requires a non-empty expression"
+                            )
+                        case_body_nodes, case_body_idx, case_body_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=case_expr_idx + 1,
+                            stop_tokens={"end"},
+                        )
+                        if case_body_stop != "end":
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' is missing 'end'"
+                            )
+                        cases.append((case_expr_nodes, case_body_nodes))
+                        cursor = case_body_idx + 1
+                        continue
+
+                    if branch_lex == "ct-default":
+                        if seen_default:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-switch' can only have one 'ct-default'"
+                            )
+                        seen_default = True
+                        default_cursor = cursor + 1
+                        if default_cursor < len(tokens) and tokens[default_cursor] in ("do", "ct-do"):
+                            default_cursor += 1
+                        default_nodes, default_idx, default_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=default_cursor,
+                            stop_tokens={"end"},
+                        )
+                        if default_stop != "end":
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-default' is missing 'end'"
+                            )
+                        cursor = default_idx + 1
+                        continue
+
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-switch' expected 'ct-case', 'ct-default', or 'end', got '{branch_lex}'"
+                    )
+                else:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-switch' is missing 'end'"
+                    )
+                continue
+
+            if runtime_depth == 0 and lex == "ct-match":
+                match_expr_nodes, match_expr_idx, match_expr_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=idx + 1,
+                    stop_tokens={"do", "ct-do"},
+                )
+                if match_expr_stop not in ("do", "ct-do"):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-match' is missing 'do'"
+                    )
+                if not match_expr_nodes:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-match' requires a non-empty expression"
+                    )
+
+                cursor = match_expr_idx + 1
+                cases: List[Any] = []
+                default_nodes: List[Any] = []
+                seen_default = False
+
+                while cursor < len(tokens):
+                    branch_lex = tokens[cursor]
+                    if branch_lex == "end":
+                        nodes.append(("match", match_expr_nodes, cases, default_nodes))
+                        idx = cursor + 1
+                        break
+
+                    if branch_lex == "ct-case":
+                        if seen_default:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' cannot appear after 'ct-default'"
+                            )
+                        case_expr_nodes, case_expr_idx, case_expr_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=cursor + 1,
+                            stop_tokens={"then", "ct-then"},
+                        )
+                        if case_expr_stop not in ("then", "ct-then"):
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' is missing 'then'"
+                            )
+                        if not case_expr_nodes:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-case' requires a non-empty expression"
+                            )
+                        case_body_nodes, case_body_idx, case_body_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=case_expr_idx + 1,
+                            stop_tokens={"ct-case", "ct-default", "end"},
+                        )
+                        if case_body_stop is None:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-match' is missing 'end'"
+                            )
+                        cases.append((case_expr_nodes, case_body_nodes))
+                        cursor = case_body_idx
+                        continue
+
+                    if branch_lex == "ct-default":
+                        if seen_default:
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-match' can only have one 'ct-default'"
+                            )
+                        seen_default = True
+                        default_cursor = cursor + 1
+                        if default_cursor < len(tokens) and tokens[default_cursor] in ("then", "ct-then"):
+                            default_cursor += 1
+                        default_nodes, default_idx, default_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=default_cursor,
+                            stop_tokens={"end"},
+                        )
+                        if default_stop != "end":
+                            raise ParseError(
+                                f"macro '{word.name}' template 'ct-default' is missing 'end'"
+                            )
+                        cursor = default_idx
+                        continue
+
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-match' expected 'ct-case', 'ct-default', or 'end', got '{branch_lex}'"
+                    )
+                else:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-match' is missing 'end'"
+                    )
+                continue
+
+            if runtime_depth == 0 and lex == "ct-fold":
+                if idx + 5 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' requires '<acc> <item> in <capture> with <init...> do ... end'"
+                    )
+                acc_name = tokens[idx + 1]
+                item_name = tokens[idx + 2]
+                if not _is_identifier(acc_name):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' accumulator name '{acc_name}' is not a valid identifier"
+                    )
+                if not _is_identifier(item_name):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' item name '{item_name}' is not a valid identifier"
+                    )
+                if tokens[idx + 3] != "in":
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' requires 'in' after accumulator/item names"
+                    )
+                source_ref = tokens[idx + 4]
+                if tokens[idx + 5] != "with":
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' requires 'with' before initializer expression"
+                    )
+                source_key = self._parse_macro_template_capture_ref(
+                    word=word,
+                    lexeme=source_ref,
+                    field="ct-fold source",
+                )
+
+                init_nodes, init_idx, init_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=idx + 6,
+                    stop_tokens={"do", "ct-do"},
+                )
+                if init_stop not in ("do", "ct-do"):
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' is missing 'do'"
+                    )
+                if not init_nodes:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' requires a non-empty initializer expression"
+                    )
+
+                body_nodes, body_idx, body_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=init_idx + 1,
+                    stop_tokens={"end"},
+                )
+                if body_stop != "end":
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-fold' is missing 'end'"
+                    )
+
+                nodes.append(("fold", acc_name, item_name, source_key, source_ref, init_nodes, body_nodes))
+                idx = body_idx + 1
+                continue
+
+            if runtime_depth == 0 and lex in ("ct-break", "ct-continue"):
+                nodes.append(("break" if lex == "ct-break" else "continue", lex))
+                idx += 1
+                continue
+
+            if runtime_depth == 0 and lex in ("ct-if", "ct-when", "ct-unless"):
+                if idx + 1 >= len(tokens):
+                    raise ParseError(
+                        f"macro '{word.name}' template '{lex}' requires a condition"
+                    )
+
+                if lex == "ct-if":
+                    cond, cond_end, cond_stop = self._parse_macro_template_expr(
+                        word=word,
+                        tokens=tokens,
+                        idx=idx + 1,
+                        stop_tokens={"then", "ct-then"},
+                    )
+                    if cond_stop not in ("then", "ct-then"):
+                        raise ParseError(
+                            f"macro '{word.name}' template 'ct-if' requires 'then'"
+                        )
+                    cursor = cond_end + 1
+                elif tokens[idx + 1] in self._TEMPLATE_COND_STARTERS:
+                    # Backward-compatible shorthand for simple ct-when/ct-unless guards.
+                    cond, cond_end = self._parse_macro_template_condition(word=word, tokens=tokens, idx=idx + 1)
+                    cursor = cond_end
+                    if cursor < len(tokens) and tokens[cursor] in ("then", "ct-then"):
+                        cursor += 1
+                else:
+                    cond, cond_end, cond_stop = self._parse_macro_template_expr(
+                        word=word,
+                        tokens=tokens,
+                        idx=idx + 1,
+                        stop_tokens={"then", "ct-then"},
+                    )
+                    if cond_stop not in ("then", "ct-then"):
+                        raise ParseError(
+                            f"macro '{word.name}' template '{lex}' expression conditions require 'then'"
+                        )
+                    cursor = cond_end + 1
+
+                if lex in ("ct-when", "ct-unless"):
+                    body_nodes, body_idx, body_stop = self._parse_macro_template_nodes(
+                        word=word,
+                        tokens=tokens,
+                        idx=cursor,
+                        stop_tokens={"end"},
+                    )
+                    if body_stop != "end":
+                        raise ParseError(
+                            f"macro '{word.name}' template '{lex}' is missing 'end'"
+                        )
+                    if lex == "ct-when":
+                        nodes.append(("if", cond, body_nodes, []))
+                    else:
+                        nodes.append(("if", cond, [], body_nodes))
+                    idx = body_idx + 1
+                    continue
+
+                then_nodes, branch_idx, branch_stop = self._parse_macro_template_nodes(
+                    word=word,
+                    tokens=tokens,
+                    idx=cursor,
+                    stop_tokens={"else", "ct-else", "end"},
+                )
+                if branch_stop is None:
+                    raise ParseError(
+                        f"macro '{word.name}' template 'ct-if' is missing 'end'"
+                    )
+
+                else_nodes: List[Any] = []
+                if branch_stop in ("else", "ct-else"):
+                    else_nodes, branch_idx, branch_stop = self._parse_macro_template_nodes(
+                        word=word,
+                        tokens=tokens,
+                        idx=branch_idx + 1,
+                        stop_tokens={"end"},
+                    )
+                    if branch_stop != "end":
+                        raise ParseError(
+                            f"macro '{word.name}' template 'ct-if' is missing 'end'"
+                        )
+
+                nodes.append(("if", cond, then_nodes, else_nodes))
+                idx = branch_idx + 1
+                continue
+
+            if runtime_depth == 0 and lex in ("ct-for", "ct-each"):
+                key_name: Optional[str] = None
+                item_name: Optional[str] = None
+                source_ref: Optional[str] = None
+                cursor = idx
+
+                if (
+                    lex == "ct-for"
+                    and idx + 3 < len(tokens)
+                    and _is_identifier(tokens[idx + 1])
+                    and tokens[idx + 2] == "in"
+                ):
+                    item_name = tokens[idx + 1]
+                    source_ref = tokens[idx + 3]
+                    cursor = idx + 4
+                elif lex == "ct-each":
+                    if (
+                        idx + 4 < len(tokens)
+                        and _is_identifier(tokens[idx + 1])
+                        and _is_identifier(tokens[idx + 2])
+                        and tokens[idx + 3] == "in"
+                    ):
+                        key_name = tokens[idx + 1]
+                        item_name = tokens[idx + 2]
+                        source_ref = tokens[idx + 4]
+                        cursor = idx + 5
+                    elif (
+                        idx + 3 < len(tokens)
+                        and _is_identifier(tokens[idx + 1])
+                        and tokens[idx + 2] == "in"
+                    ):
+                        item_name = tokens[idx + 1]
+                        source_ref = tokens[idx + 3]
+                        cursor = idx + 4
+
+                if item_name is not None and source_ref is not None:
+                    source_key = self._parse_macro_template_capture_ref(
+                        word=word,
+                        lexeme=source_ref,
+                        field=f"{lex} source",
+                    )
+                    separator_nodes: List[Any] = []
+                    if cursor < len(tokens) and tokens[cursor] == "sep":
+                        separator_nodes, cursor, sep_stop = self._parse_macro_template_nodes(
+                            word=word,
+                            tokens=tokens,
+                            idx=cursor + 1,
+                            stop_tokens={"do", "ct-do"},
+                        )
+                        if sep_stop not in ("do", "ct-do"):
+                            raise ParseError(
+                                f"macro '{word.name}' template '{lex} ... sep' is missing 'do'"
+                            )
+                        cursor += 1
+                    elif cursor < len(tokens) and tokens[cursor] in ("do", "ct-do"):
+                        cursor += 1
+                    else:
+                        raise ParseError(
+                            f"macro '{word.name}' template '{lex}' requires 'do' (or 'sep ... do')"
+                        )
+
+                    body_nodes, body_idx, body_stop = self._parse_macro_template_nodes(
+                        word=word,
+                        tokens=tokens,
+                        idx=cursor,
+                        stop_tokens={"end"},
+                    )
+                    if body_stop != "end":
+                        raise ParseError(
+                            f"macro '{word.name}' template '{lex}' is missing 'end'"
+                        )
+
+                    nodes.append(("for", item_name, key_name, source_key, source_ref, separator_nodes, body_nodes))
+                    idx = body_idx + 1
+                    continue
+
+            placeholder_node = self._parse_macro_template_placeholder_node(word=word, lexeme=lex)
+            if placeholder_node is not None:
+                nodes.append(placeholder_node)
+                idx += 1
+                continue
+
+            parsed = parser._parse_rewrite_capture(lex)
+            if parsed is None:
+                nodes.append(("lit", lex))
+                _runtime_depth_step(lex)
+                idx += 1
+                continue
+
+            variadic, key, constraint = parsed
+            nodes.append(("cap", variadic, key, lex, (constraint or "").lower()))
+            idx += 1
+
+        return nodes, idx, None
+
+    def _eval_macro_template_condition(
+        self,
+        *,
+        word: Word,
+        cond: Any,
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> bool:
+        if isinstance(cond, tuple) and cond:
+            kind = cond[0]
+            if kind == "first":
+                if not loop_stack:
+                    raise ParseError(
+                        f"macro '{word.name}' template condition 'first' can only be used inside a for-loop"
+                    )
+                return loop_stack[-1]["index"] == 0
+            if kind == "last":
+                if not loop_stack:
+                    raise ParseError(
+                        f"macro '{word.name}' template condition 'last' can only be used inside a for-loop"
+                    )
+                frame = loop_stack[-1]
+                return frame["index"] + 1 == frame["count"]
+            if kind in ("has", "empty"):
+                key = cond[1]
+                raw_ref = cond[2]
+                value = self._macro_capture_lookup(
+                    word=word,
+                    scopes=scopes,
+                    key=key,
+                    raw_ref=raw_ref,
+                    allow_missing=True,
+                )
+                present = bool(value)
+                return present if kind == "has" else (not present)
+            if kind == "not" and isinstance(cond[1], tuple):
+                nested = cond[1]
+                nested_kind = nested[0] if nested else ""
+                if nested_kind in ("has", "empty", "first", "last"):
+                    return not self._eval_macro_template_condition(
+                        word=word,
+                        cond=nested,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                    )
+
+        value = self._eval_macro_template_expr_value(
+            word=word,
+            expr=cond,
+            scopes=scopes,
+            loop_stack=loop_stack,
+        )
+        return self._macro_template_expr_truthy(value)
+
+    def _eval_macro_template_expr_value(
+        self,
+        *,
+        word: Word,
+        expr: Any,
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> Any:
+        kind = expr[0]
+
+        if kind == "const":
+            return expr[1]
+
+        if kind == "var":
+            key = expr[1]
+            raw_ref = expr[2]
+            return self._macro_capture_lookup_mode(
+                word=word,
+                scopes=scopes,
+                key=key,
+                raw_ref=raw_ref,
+            )
+
+        if kind == "var-tx":
+            key = expr[1]
+            raw_ref = expr[2]
+            transforms = expr[3]
+            value = self._macro_capture_lookup_mode(
+                word=word,
+                scopes=scopes,
+                key=key,
+                raw_ref=raw_ref,
+            )
+            source_tokens = self._macro_template_binding_value_lexemes(
+                word=word,
+                value=value,
+                context=f"placeholder '{raw_ref}'",
+            )
+            transformed = self._apply_macro_template_transforms(
+                word=word,
+                source_tokens=source_tokens,
+                transforms=transforms,
+                raw_ref=raw_ref,
+            )
+            if len(transformed) == 1:
+                parsed_const, const_value = self._macro_template_expr_parse_const_token(transformed[0])
+                if parsed_const:
+                    return const_value
+                return transformed[0]
+            return transformed
+
+        if kind == "first":
+            if not loop_stack:
+                raise ParseError(
+                    f"macro '{word.name}' template condition 'first' can only be used inside a for-loop"
+                )
+            return loop_stack[-1]["index"] == 0
+
+        if kind == "last":
+            if not loop_stack:
+                raise ParseError(
+                    f"macro '{word.name}' template condition 'last' can only be used inside a for-loop"
+                )
+            frame = loop_stack[-1]
+            return frame["index"] + 1 == frame["count"]
+
+        if kind in ("has", "empty"):
+            key = expr[1]
+            raw_ref = expr[2]
+            value = self._macro_capture_lookup(
+                word=word,
+                scopes=scopes,
+                key=key,
+                raw_ref=raw_ref,
+                allow_missing=True,
+            )
+            present = bool(value)
+            if kind == "has":
+                return present
+            return not present
+
+        if kind == "not":
+            value = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[1],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            return not self._macro_template_expr_truthy(value)
+
+        if kind == "and":
+            left = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[1],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            if not self._macro_template_expr_truthy(left):
+                return False
+            right = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[2],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            return self._macro_template_expr_truthy(right)
+
+        if kind == "or":
+            left = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[1],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            if self._macro_template_expr_truthy(left):
+                return True
+            right = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[2],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            return self._macro_template_expr_truthy(right)
+
+        if kind == "cmp":
+            op = expr[1]
+            left = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[2],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            right = self._eval_macro_template_expr_value(
+                word=word,
+                expr=expr[3],
+                scopes=scopes,
+                loop_stack=loop_stack,
+            )
+            return self._macro_template_expr_compare(
+                word=word,
+                op=op,
+                left=left,
+                right=right,
+            )
+
+        raise ParseError(f"macro '{word.name}' has unknown template expression node kind '{kind}'")
+
+    def _eval_macro_template_binding_value(
+        self,
+        *,
+        word: Word,
+        expr_nodes: Sequence[Any],
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> Any:
+        # Preserve variadic/group-list shape for direct alias bindings.
+        if len(expr_nodes) == 1 and expr_nodes[0][0] == "cap":
+            variadic, key, raw_ref = expr_nodes[0][1], expr_nodes[0][2], expr_nodes[0][3]
+            captured = self._macro_capture_lookup_mode(word=word, scopes=scopes, key=key, raw_ref=raw_ref)
+            if variadic:
+                if isinstance(captured, list):
+                    return self._macro_capture_clone(captured)
+                raise ParseError(
+                    f"macro '{word.name}' variadic placeholder '{raw_ref}' resolved to unsupported value"
+                )
+            if self._macro_capture_is_group_list(captured):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{raw_ref}' is variadic; use '$*{key}' to splice all arguments"
+                )
+            if not isinstance(captured, list):
+                raise ParseError(
+                    f"macro '{word.name}' placeholder '{raw_ref}' resolved to unsupported value"
+                )
+            return list(captured)
+
+        return self._expand_macro_template_nodes(
+            word=word,
+            nodes=expr_nodes,
+            scopes=scopes,
+            loop_stack=loop_stack,
+        )
+
+    def _eval_macro_template_expr_lexemes(
+        self,
+        *,
+        word: Word,
+        expr_nodes: Sequence[Any],
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> List[str]:
+        return self._expand_macro_template_nodes(
+            word=word,
+            nodes=expr_nodes,
+            scopes=scopes,
+            loop_stack=loop_stack,
+        )
+
+    def _macro_template_binding_value_lexemes(
+        self,
+        *,
+        word: Word,
+        value: Any,
+        context: str,
+    ) -> List[str]:
+        if self._macro_capture_is_group_list(value):
+            out: List[str] = []
+            for group in value:
+                out.extend(group)
+            return out
+        if isinstance(value, list):
+            return list(value)
+        raise ParseError(
+            f"macro '{word.name}' template {context} resolved to unsupported value"
+        )
+
+    def _expand_macro_template_nodes_into(
+        self,
+        *,
+        word: Word,
+        nodes: Sequence[Any],
+        scopes: List[Dict[str, Any]],
+        loop_stack: List[Dict[str, int]],
+        out: List[str],
+    ) -> None:
+        out_append = out.append
+        out_extend = out.extend
+        for node in nodes:
+            kind = node[0]
+            if kind == "lit":
+                out_append(node[1])
+                continue
+
+            if kind == "cap":
+                variadic, key, raw_ref = node[1], node[2], node[3]
+                constraint = node[4] if len(node) > 4 else ""
+                captured = self._macro_capture_lookup_mode(word=word, scopes=scopes, key=key, raw_ref=raw_ref)
+                self._macro_capture_validate_constraint(
+                    word=word,
+                    raw_ref=raw_ref,
+                    constraint=constraint,
+                    captured=captured,
+                    variadic=variadic,
+                )
+                if variadic:
+                    if self._macro_capture_is_group_list(captured):
+                        for group in captured:
+                            out_extend(group)
+                    elif isinstance(captured, list):
+                        out_extend(captured)
+                    else:
+                        raise ParseError(
+                            f"macro '{word.name}' variadic placeholder '{raw_ref}' resolved to unsupported value"
+                        )
+                    continue
+
+                if self._macro_capture_is_group_list(captured):
+                    raise ParseError(
+                        f"macro '{word.name}' placeholder '{raw_ref}' is variadic; use '$*{key}' to splice all arguments"
+                    )
+                if not isinstance(captured, list):
+                    raise ParseError(
+                        f"macro '{word.name}' placeholder '{raw_ref}' resolved to unsupported value"
+                    )
+                out_extend(captured)
+                continue
+
+            if kind == "capx":
+                variadic, key, raw_ref = node[1], node[2], node[3]
+                if len(node) >= 7:
+                    constraint = node[4]
+                    transforms = node[5]
+                    raw_token = node[6]
+                else:
+                    constraint = ""
+                    transforms = node[4]
+                    raw_token = node[5]
+                captured = self._macro_capture_lookup_mode(word=word, scopes=scopes, key=key, raw_ref=raw_ref)
+                self._macro_capture_validate_constraint(
+                    word=word,
+                    raw_ref=raw_ref,
+                    constraint=constraint,
+                    captured=captured,
+                    variadic=variadic,
+                )
+                source_tokens: List[str]
+                if variadic:
+                    if self._macro_capture_is_group_list(captured):
+                        source_tokens = []
+                        for group in captured:
+                            source_tokens.extend(group)
+                    elif isinstance(captured, list):
+                        source_tokens = list(captured)
+                    else:
+                        raise ParseError(
+                            f"macro '{word.name}' variadic placeholder '{raw_ref}' resolved to unsupported value"
+                        )
+                else:
+                    if self._macro_capture_is_group_list(captured):
+                        raise ParseError(
+                            f"macro '{word.name}' placeholder '{raw_ref}' is variadic; use '$*{key}' to splice all arguments"
+                        )
+                    if not isinstance(captured, list):
+                        raise ParseError(
+                            f"macro '{word.name}' placeholder '{raw_ref}' resolved to unsupported value"
+                        )
+                    source_tokens = list(captured)
+
+                out_extend(
+                    self._apply_macro_template_transforms(
+                        word=word,
+                        source_tokens=source_tokens,
+                        transforms=transforms,
+                        raw_ref=raw_token,
+                    )
+                )
+                continue
+
+            if kind == "mode":
+                # Mode metadata is pre-applied per macro expansion.
+                continue
+
+            if kind == "version":
+                # Version marker metadata, no token emission.
+                continue
+
+            if kind == "diag":
+                diag_kind = node[1]
+                raw_message = self._macro_template_unquote_lexeme(str(node[2]))
+                span_idx = node[3]
+                text = f"macro '{word.name}' template diagnostic at span[{span_idx}]: {raw_message}"
+                if diag_kind == "ct-error":
+                    raise ParseError(text)
+                if diag_kind == "ct-warning":
+                    self._template_warn(word=word, message=text)
+                    continue
+                # ct-note: diagnostic that does not alter expansion.
+                self._template_warn(word=word, message=f"note: {text}")
+                continue
+
+            if kind == "include":
+                include_kind = node[1]
+                include_target = node[2]
+                include_path, include_nodes = self._load_macro_template_include_nodes(
+                    word=word,
+                    target=include_target,
+                )
+                if include_kind == "ct-import":
+                    import_scopes = self._template_import_scopes
+                    if import_scopes:
+                        imported = import_scopes[-1]
+                        if include_path in imported:
+                            continue
+                        imported.add(include_path)
+                self._expand_macro_template_nodes_into(
+                    word=word,
+                    nodes=include_nodes,
+                    scopes=scopes,
+                    loop_stack=loop_stack,
+                    out=out,
+                )
+                continue
+
+            if kind == "emit-list":
+                source_key = node[1]
+                raw_ref = node[2]
+                value = self._macro_capture_lookup_mode(
+                    word=word,
+                    scopes=scopes,
+                    key=source_key,
+                    raw_ref=raw_ref,
+                )
+                if self._macro_capture_is_group_list(value):
+                    for group in value:
+                        out_extend(group)
+                    continue
+                if isinstance(value, list):
+                    out_extend(value)
+                    continue
+                raise ParseError(
+                    f"macro '{word.name}' template 'emit-list' source '{raw_ref}' resolved to unsupported value"
+                )
+
+            if kind == "emit-block":
+                self._expand_macro_template_nodes_into(
+                    word=word,
+                    nodes=node[1],
+                    scopes=scopes,
+                    loop_stack=loop_stack,
+                    out=out,
+                )
+                continue
+
+            if kind == "if":
+                cond = node[1]
+                then_nodes = node[2]
+                else_nodes = node[3]
+                branch = then_nodes if self._eval_macro_template_condition(
+                    word=word,
+                    cond=cond,
+                    scopes=scopes,
+                    loop_stack=loop_stack,
+                ) else else_nodes
+                self._expand_macro_template_nodes_into(
+                    word=word,
+                    nodes=branch,
+                    scopes=scopes,
+                    loop_stack=loop_stack,
+                    out=out,
+                )
+                continue
+
+            if kind == "ct":
+                ct_word_name = node[1]
+                fn_nodes = self._lookup_macro_template_function(ct_word_name)
+                if fn_nodes is not None:
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=fn_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                else:
+                    out_extend(
+                        self._invoke_macro_ct_word(
+                            word=word,
+                            ct_word_name=ct_word_name,
+                            scopes=scopes,
+                            loop_stack=loop_stack,
+                        )
+                    )
+                continue
+
+            if kind == "fn-def":
+                fn_name = node[1]
+                fn_body_nodes = node[2]
+                scopes_stack = self._template_function_scopes
+                if not scopes_stack:
+                    raise ParseError(
+                        f"internal macro template error in '{word.name}': template function registry is unavailable"
+                    )
+                scopes_stack[-1][fn_name] = fn_body_nodes
+                continue
+
+            if kind == "let":
+                binding_name = node[1]
+                binding_expr_nodes = node[2]
+                body_nodes = node[3]
+                local_scope = {
+                    binding_name: self._eval_macro_template_binding_value(
+                        word=word,
+                        expr_nodes=binding_expr_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                    )
+                }
+                scopes.append(local_scope)
+                try:
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=body_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                finally:
+                    scopes.pop()
+                continue
+
+            if kind == "switch":
+                switch_expr_nodes = node[1]
+                cases = node[2]
+                default_nodes = node[3]
+                switch_value = tuple(
+                    self._eval_macro_template_expr_lexemes(
+                        word=word,
+                        expr_nodes=switch_expr_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                    )
+                )
+                matched = False
+                for case_expr_nodes, case_body_nodes in cases:
+                    case_value = tuple(
+                        self._eval_macro_template_expr_lexemes(
+                            word=word,
+                            expr_nodes=case_expr_nodes,
+                            scopes=scopes,
+                            loop_stack=loop_stack,
+                        )
+                    )
+                    if case_value != switch_value:
+                        continue
+                    matched = True
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=case_body_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                    break
+                if not matched and default_nodes:
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=default_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                continue
+
+            if kind == "match":
+                match_expr_nodes = node[1]
+                cases = node[2]
+                default_nodes = node[3]
+                match_value = tuple(
+                    self._eval_macro_template_expr_lexemes(
+                        word=word,
+                        expr_nodes=match_expr_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                    )
+                )
+                matched = False
+                for case_expr_nodes, case_body_nodes in cases:
+                    case_value = tuple(
+                        self._eval_macro_template_expr_lexemes(
+                            word=word,
+                            expr_nodes=case_expr_nodes,
+                            scopes=scopes,
+                            loop_stack=loop_stack,
+                        )
+                    )
+                    if case_value != match_value:
+                        continue
+                    matched = True
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=case_body_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                    break
+                if not matched and default_nodes:
+                    self._expand_macro_template_nodes_into(
+                        word=word,
+                        nodes=default_nodes,
+                        scopes=scopes,
+                        loop_stack=loop_stack,
+                        out=out,
+                    )
+                continue
+
+            if kind == "fold":
+                acc_name = node[1]
+                item_name = node[2]
+                source_key = node[3]
+                source_ref = node[4]
+                init_nodes = node[5]
+                body_nodes = node[6]
+                source_value = self._macro_capture_lookup_mode(
+                    word=word,
+                    scopes=scopes,
+                    key=source_key,
+                    raw_ref=source_ref,
+                )
+                groups = self._macro_capture_as_groups(word=word, raw_ref=source_ref, value=source_value)
+                acc_value = self._eval_macro_template_binding_value(
+                    word=word,
+                    expr_nodes=init_nodes,
+                    scopes=scopes,
+                    loop_stack=loop_stack,
+                )
+                count = len(groups)
+                for index, group in enumerate(groups):
+                    local_scope = {
+                        acc_name: self._macro_capture_clone(acc_value),
+                        item_name: list(group),
+                    }
+                    frame = {"index": index, "count": count}
+                    scopes.append(local_scope)
+                    loop_stack.append(frame)
+                    loop_control: Optional[str] = None
+                    next_acc = acc_value
+                    try:
+                        next_acc = self._eval_macro_template_binding_value(
+                            word=word,
+                            expr_nodes=body_nodes,
+                            scopes=scopes,
+                            loop_stack=loop_stack,
+                        )
+                    except _MacroTemplateContinue:
+                        loop_control = "continue"
+                    except _MacroTemplateBreak:
+                        loop_control = "break"
+                    finally:
+                        loop_stack.pop()
+                        scopes.pop()
+                    if loop_control is None:
+                        acc_value = next_acc
+                    if loop_control == "break":
+                        break
+                    if loop_control == "continue":
+                        continue
+
+                out_extend(
+                    self._macro_template_binding_value_lexemes(
+                        word=word,
+                        value=acc_value,
+                        context="ct-fold accumulator",
+                    )
+                )
+                continue
+
+            if kind == "break":
+                if not loop_stack:
+                    raise ParseError(
+                        f"macro '{word.name}' template '{node[1]}' can only be used inside ct-for/ct-each/ct-fold"
+                    )
+                raise _MacroTemplateBreak()
+
+            if kind == "continue":
+                if not loop_stack:
+                    raise ParseError(
+                        f"macro '{word.name}' template '{node[1]}' can only be used inside ct-for/ct-each/ct-fold"
+                    )
+                raise _MacroTemplateContinue()
+
+            if kind == "for":
+                item_name = node[1]
+                key_name = node[2]
+                source_key = node[3]
+                source_ref = node[4]
+                separator_nodes = node[5]
+                body_nodes = node[6]
+                source_value = self._macro_capture_lookup_mode(
+                    word=word,
+                    scopes=scopes,
+                    key=source_key,
+                    raw_ref=source_ref,
+                )
+                groups = self._macro_capture_as_groups(word=word, raw_ref=source_ref, value=source_value)
+                count = len(groups)
+                for index, group in enumerate(groups):
+                    local_scope = {item_name: list(group)}
+                    if key_name is not None:
+                        local_scope[key_name] = [str(index)]
+                    frame = {"index": index, "count": count}
+                    scopes.append(local_scope)
+                    loop_stack.append(frame)
+                    loop_control: Optional[str] = None
+                    try:
+                        if index > 0 and separator_nodes:
+                            self._expand_macro_template_nodes_into(
+                                word=word,
+                                nodes=separator_nodes,
+                                scopes=scopes,
+                                loop_stack=loop_stack,
+                                out=out,
+                            )
+                        self._expand_macro_template_nodes_into(
+                            word=word,
+                            nodes=body_nodes,
+                            scopes=scopes,
+                            loop_stack=loop_stack,
+                            out=out,
+                        )
+                    except _MacroTemplateContinue:
+                        loop_control = "continue"
+                    except _MacroTemplateBreak:
+                        loop_control = "break"
+                    finally:
+                        loop_stack.pop()
+                        scopes.pop()
+                    if loop_control == "break":
+                        break
+                    if loop_control == "continue":
+                        continue
+                continue
+
+            raise ParseError(f"internal macro template error in '{word.name}': unknown node '{kind}'")
+
+    def _expand_macro_template_nodes(
+        self,
+        *,
+        word: Word,
+        nodes: Sequence[Any],
+        scopes: Sequence[Dict[str, Any]],
+        loop_stack: Sequence[Dict[str, int]],
+    ) -> List[str]:
+        out: List[str] = []
+        scope_stack = scopes if isinstance(scopes, list) else list(scopes)
+        loop_frames = loop_stack if isinstance(loop_stack, list) else list(loop_stack)
+        self._expand_macro_template_nodes_into(
+            word=word,
+            nodes=nodes,
+            scopes=scope_stack,
+            loop_stack=loop_frames,
+            out=out,
+        )
+        return out
+
+    def expand_macro_template(
+        self,
+        word: Word,
+        captures: Dict[str, Any],
+        *,
+        call_token: Optional[Token] = None,
+    ) -> List[str]:
+        nodes = word.macro_template_ast
+        if nodes is None:
+            template_tokens = list(word.macro_expansion or [])
+            parsed_nodes, idx, stop = self._parse_macro_template_nodes(
+                word=word,
+                tokens=template_tokens,
+                idx=0,
+                stop_tokens=None,
+            )
+            if stop is not None:
+                raise ParseError(f"macro '{word.name}' has unexpected template terminator '{stop}'")
+            if idx != len(template_tokens):
+                raise ParseError(f"macro '{word.name}' template parser stopped early")
+            nodes = tuple(parsed_nodes)
+            word.macro_template_ast = nodes
+            mode, version = self._collect_macro_template_metadata(word=word, nodes=nodes)
+            word.macro_template_mode = mode
+            word.macro_template_version = version
+            word.macro_template_program = self._compile_macro_template_program(nodes=nodes)
+
+        program = word.macro_template_program or nodes
+
+        prev_fn_scopes = self._template_function_scopes
+        prev_import_scopes = self._template_import_scopes
+        prev_token = self._active_macro_token
+        prev_unknown_mode = self._template_unknown_mode
+        scope_stack = self._acquire_template_scope_stack()
+        loop_frames = self._acquire_template_loop_stack()
+        scope_stack.append(captures)
+        started_ns = time.perf_counter_ns()
+        expanded_tokens: Optional[List[str]] = None
+
+        self._template_function_scopes = [{}]
+        self._template_import_scopes = [set()]
+        self._active_macro_token = call_token
+        self._template_unknown_mode = getattr(word, "macro_template_mode", "strict") or "strict"
+        try:
+            expanded_tokens = self._expand_macro_template_nodes(
+                word=word,
+                nodes=program,
+                scopes=scope_stack,
+                loop_stack=loop_frames,
+            )
+            return expanded_tokens
+        finally:
+            if expanded_tokens is not None:
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._parser._record_macro_profile_event(
+                    word.name,
+                    emitted_tokens=len(expanded_tokens),
+                    duration_ns=elapsed_ns,
+                )
+            self._release_template_scope_stack(scope_stack)
+            self._release_template_loop_stack(loop_frames)
+            self._template_function_scopes = prev_fn_scopes
+            self._template_import_scopes = prev_import_scopes
+            self._active_macro_token = prev_token
+            self._template_unknown_mode = prev_unknown_mode
 
     def inject_macro_tokens(self, word: Word, token: Token, captures: Dict[str, Any]) -> None:
         parser = self._parser
@@ -886,55 +3485,22 @@ class MacroEngine:
             raise ParseError(
                 f"macro expansion depth limit ({parser.macro_expansion_limit}) exceeded while expanding '{word.name}'"
             )
-        replaced: List[str] = []
-        for lex in word.macro_expansion or []:
-            parsed = parser._parse_rewrite_capture(lex)
-            if parsed is None:
-                replaced.append(lex)
-                continue
-            variadic, key, constraint = parsed
-            if constraint:
-                raise ParseError(
-                    f"macro '{word.name}' expansion placeholder '{lex}' cannot include a type constraint"
-                )
-            if key not in captures:
-                raise ParseError(
-                    f"macro '{word.name}' references argument '{lex}', but the argument is not available"
-                )
-            captured = captures[key]
-            if variadic:
-                if isinstance(captured, list) and captured and isinstance(captured[0], list):
-                    for group in captured:
-                        replaced.extend(group)
-                elif isinstance(captured, list):
-                    replaced.extend(captured)
-                else:
-                    raise ParseError(
-                        f"macro '{word.name}' variadic placeholder '{lex}' resolved to unsupported value"
-                    )
-                continue
+        replaced = self.expand_macro_template(word, captures, call_token=token)
 
-            if isinstance(captured, list) and captured and isinstance(captured[0], list):
-                raise ParseError(
-                    f"macro '{word.name}' placeholder '{lex}' is variadic; use '$*{key}' to splice all arguments"
-                )
-            if not isinstance(captured, list):
-                raise ParseError(
-                    f"macro '{word.name}' placeholder '{lex}' resolved to unsupported value"
-                )
-            replaced.extend(captured)
-
-        insertion = [
-            Token(
-                lexeme=lex,
+        insertion: List[Token] = [None] * len(replaced)  # type: ignore[list-item]
+        base_column = max(1, token.column)
+        intern_lexeme = parser._intern_expansion_lexeme
+        for idx, lex in enumerate(replaced):
+            generated = Token(
+                lexeme=intern_lexeme(lex),
                 line=token.line,
-                column=token.column,
+                column=base_column + idx,
                 start=token.start,
                 end=token.end,
                 expansion_depth=next_depth,
             )
-            for lex in replaced
-        ]
+            insertion[idx] = generated
+            parser.generated_source_map[id(generated)] = (word.name, token.line, token.column, idx)
         parser.tokens[parser.pos:parser.pos] = insertion
         self._preview_with_context(kind="macro-preview", name=word.name, token=token, replaced=replaced)
 
@@ -947,26 +3513,82 @@ class MacroEngine:
         start = parser.pos - 1
         if start < 0:
             return False
+
         tokens = parser.tokens
         token_count = len(tokens)
         token_lexeme = token.lexeme
+        stage_profile = parser.rewrite_profile.setdefault(
+            stage,
+            {"attempts": 0, "matches": 0, "applied": 0, "guard_calls": 0, "guard_rejects": 0},
+        )
 
-        for rule in rules:
+        candidates = parser._rewrite_candidates_for_token(stage, token_lexeme)
+        if not candidates:
+            return False
+
+        active_pipelines = parser._active_rewrite_pipelines.get(stage, {"default"})
+        filtered: List[RewriteRule] = []
+        for rule in candidates:
             if not rule.enabled:
                 continue
+            if rule.pipeline not in active_pipelines:
+                continue
+            if stage == "grammar":
+                if rule.group not in parser._active_pattern_groups:
+                    continue
+                if rule.scope not in parser._active_pattern_scopes:
+                    continue
+            filtered.append(rule)
+
+        if not filtered:
+            return False
+
+        if parser.rewrite_saturation_strategy == "specificity":
+            filtered.sort(key=lambda r: (-int(r.priority), -int(r.specificity), int(r.order)))
+
+        window_bloom_cache: Dict[int, int] = {}
+        intern_lexeme = parser._intern_expansion_lexeme
+
+        def _matches_spec_single(spec: Dict[str, Any], lex: str) -> bool:
+            if spec["kind"] == "literal":
+                return lex == spec["literal"]
+            return parser._rewrite_constraint_matches(lex, spec.get("constraint", ""))
+
+        for rule in filtered:
+            stage_profile["attempts"] = int(stage_profile.get("attempts", 0)) + 1
+            rule_meta = rule.metadata if isinstance(rule.metadata, dict) else {}
+            rule_meta["__stat_attempts"] = int(rule_meta.get("__stat_attempts", 0)) + 1
             pattern = rule.pattern
             if not pattern:
                 continue
 
-            parsed_pattern = [parser._parse_rewrite_capture(piece) for piece in pattern]
-            first_parsed = parsed_pattern[0]
-            if first_parsed is None and pattern[0] != token_lexeme:
-                continue
+            specs = rule_meta.get("__piece_specs")
+            if not isinstance(specs, list) or len(specs) != len(pattern):
+                specs = [parser._parse_rewrite_piece(piece) for piece in pattern]
+                rule_meta["__piece_specs"] = specs
 
-            min_suffix = [0] * (len(pattern) + 1)
-            for idx in range(len(pattern) - 1, -1, -1):
-                parsed = parsed_pattern[idx]
-                min_suffix[idx] = min_suffix[idx + 1] + (0 if (parsed is not None and parsed[0]) else 1)
+            min_suffix_raw = rule_meta.get("__min_suffix")
+            if isinstance(min_suffix_raw, tuple) and len(min_suffix_raw) == len(specs) + 1:
+                min_suffix = [int(item) for item in min_suffix_raw]
+            else:
+                min_suffix = [0] * (len(specs) + 1)
+                for idx in range(len(specs) - 1, -1, -1):
+                    min_suffix[idx] = min_suffix[idx + 1] + int(specs[idx]["min_count"])
+                rule_meta["__min_suffix"] = tuple(min_suffix)
+
+            prefilter_window = int(rule_meta.get("__prefilter_window", 0) or 0)
+            prefilter_bloom = int(rule_meta.get("__prefilter_bloom", 0) or 0)
+            if prefilter_window > 0 and prefilter_bloom != 0:
+                window_end = min(token_count, start + prefilter_window)
+                cached_bloom = window_bloom_cache.get(window_end)
+                if cached_bloom is None:
+                    bloom = 0
+                    for bloom_idx in range(start, window_end):
+                        bloom |= parser._rewrite_bloom_bit(tokens[bloom_idx].lexeme)
+                    cached_bloom = bloom
+                    window_bloom_cache[window_end] = cached_bloom
+                if (cached_bloom & prefilter_bloom) != prefilter_bloom:
+                    continue
 
             if start + min_suffix[0] > token_count:
                 continue
@@ -977,59 +3599,69 @@ class MacroEngine:
                 captures: Dict[str, Any],
                 max_depth: int,
             ) -> Optional[Tuple[int, Dict[str, Any], int]]:
-                if pat_idx == len(pattern):
+                if pat_idx == len(specs):
                     return tok_idx, captures, max_depth
 
-                piece = pattern[pat_idx]
-                parsed = parsed_pattern[pat_idx]
-                if parsed is None:
+                spec = specs[pat_idx]
+                min_rest = min_suffix[pat_idx + 1]
+                max_take_budget = token_count - tok_idx - min_rest
+                if max_take_budget < int(spec["min_count"]):
+                    return None
+
+                min_take = int(spec["min_count"])
+                max_count = spec.get("max_count")
+                if max_count is None:
+                    max_take = max_take_budget
+                else:
+                    max_take = min(max_take_budget, int(max_count))
+
+                if spec.get("negated"):
+                    if min_take != 1 or max_take < 1:
+                        return None
                     if tok_idx >= token_count:
                         return None
                     cur_tok = tokens[tok_idx]
-                    if cur_tok.lexeme != piece:
+                    if _matches_spec_single(spec, cur_tok.lexeme):
                         return None
                     next_depth = max(max_depth, cur_tok.expansion_depth)
                     return _match(pat_idx + 1, tok_idx + 1, captures, next_depth)
 
-                variadic, key, constraint = parsed
-                if not variadic:
-                    if tok_idx >= token_count:
-                        return None
-                    cur_tok = tokens[tok_idx]
-                    if not parser._rewrite_constraint_matches(cur_tok.lexeme, constraint):
-                        return None
-                    prev = captures.get(key)
-                    candidate = cur_tok.lexeme
-                    if prev is not None and not parser._rewrite_capture_equals(prev, candidate):
-                        return None
-                    next_captures = captures
-                    if prev is None:
-                        next_captures = dict(captures)
-                        next_captures[key] = candidate
-                    next_depth = max(max_depth, cur_tok.expansion_depth)
-                    return _match(pat_idx + 1, tok_idx + 1, next_captures, next_depth)
+                for take in range(max_take, min_take - 1, -1):
+                    chunk_lexemes: Tuple[str, ...]
+                    if take <= 0:
+                        chunk_lexemes = tuple()
+                    else:
+                        chunk_lexemes = tuple(tokens[tok_idx + i].lexeme for i in range(take))
 
-                min_rest = min_suffix[pat_idx + 1]
-                max_take = token_count - tok_idx - min_rest
-                if max_take < 0:
-                    return None
+                    if spec["kind"] == "literal":
+                        if not all(lex == spec["literal"] for lex in chunk_lexemes):
+                            continue
+                        next_captures = captures
+                    else:
+                        if not all(_matches_spec_single(spec, lex) for lex in chunk_lexemes):
+                            continue
 
-                prev = captures.get(key)
-                for take in range(max_take, -1, -1):
-                    chunk_lexemes = tuple(tokens[tok_idx + i].lexeme for i in range(take))
-                    if constraint and not all(
-                        parser._rewrite_constraint_matches(lex, constraint)
-                        for lex in chunk_lexemes
-                    ):
-                        continue
+                        key = str(spec["name"])
+                        multi_shape = bool(
+                            spec.get("variadic")
+                            or int(spec["min_count"]) != 1
+                            or spec.get("max_count") != 1
+                        )
+                        if multi_shape:
+                            candidate: Any = tuple(chunk_lexemes)
+                        else:
+                            if len(chunk_lexemes) != 1:
+                                continue
+                            candidate = chunk_lexemes[0]
 
-                    if prev is not None and not parser._rewrite_capture_equals(prev, chunk_lexemes):
-                        continue
-
-                    next_captures = captures
-                    if prev is None:
-                        next_captures = dict(captures)
-                        next_captures[key] = chunk_lexemes
+                        prev = captures.get(key)
+                        if prev is not None and not parser._rewrite_capture_equals(prev, candidate):
+                            continue
+                        if prev is None:
+                            next_captures = dict(captures)
+                            next_captures[key] = candidate
+                        else:
+                            next_captures = captures
 
                     next_depth = max_depth
                     for i in range(take):
@@ -1047,6 +3679,44 @@ class MacroEngine:
                 continue
 
             end, captures, max_depth = matched
+            stage_profile["matches"] = int(stage_profile.get("matches", 0)) + 1
+            rule_meta["__stat_matches"] = int(rule_meta.get("__stat_matches", 0)) + 1
+
+            if rule.guard:
+                stage_profile["guard_calls"] = int(stage_profile.get("guard_calls", 0)) + 1
+                guard_word = parser.dictionary.lookup(rule.guard)
+                if guard_word is None:
+                    raise ParseError(
+                        f"rewrite rule '{rule.name}' guard word '{rule.guard}' is not defined"
+                    )
+
+                guard_payload = {
+                    "stage": stage,
+                    "rule": rule.name,
+                    "pattern": list(rule.pattern),
+                    "replacement": list(rule.replacement),
+                    "captures": {
+                        key: (list(value) if isinstance(value, tuple) else value)
+                        for key, value in captures.items()
+                    },
+                }
+
+                vm = parser.compile_time_vm
+                base_depth = len(vm.stack)
+                vm.push(guard_payload)
+                vm._call_word(guard_word)
+                if len(vm.stack) <= base_depth:
+                    raise ParseError(
+                        f"rewrite rule '{rule.name}' guard word '{rule.guard}' must leave a boolean result"
+                    )
+                guard_raw = vm.pop()
+                guard_value = vm._resolve_handle(guard_raw)
+                if len(vm.stack) > base_depth:
+                    del vm.stack[base_depth:]
+                guard_pass = bool(guard_value)
+                if not guard_pass:
+                    stage_profile["guard_rejects"] = int(stage_profile.get("guard_rejects", 0)) + 1
+                    continue
 
             replaced: List[str] = []
             parsed_replacement = [parser._parse_rewrite_capture(piece) for piece in rule.replacement]
@@ -1088,10 +3758,17 @@ class MacroEngine:
                     f"while applying '{rule.name}'"
                 )
 
+            parser._rewrite_step_count += 1
+            if parser._rewrite_step_count > int(parser.rewrite_max_steps):
+                raise ParseError(
+                    f"rewrite max-step budget ({parser.rewrite_max_steps}) exceeded while applying '{rule.name}'"
+                )
+
             template = tokens[start]
+            before_lexemes = [tok.lexeme for tok in tokens[start:end]]
             insertion = [
                 Token(
-                    lexeme=lex,
+                    lexeme=intern_lexeme(lex),
                     line=template.line,
                     column=template.column,
                     start=template.start,
@@ -1103,7 +3780,56 @@ class MacroEngine:
 
             tokens[start:end] = insertion
             parser.pos = start
-            self._preview_with_context(kind="rewrite-preview", name=f"{rule.name} ({stage})", token=template, replaced=replaced)
+            stage_profile["applied"] = int(stage_profile.get("applied", 0)) + 1
+            rule_meta["__stat_applied"] = int(rule_meta.get("__stat_applied", 0)) + 1
+
+            if parser.rewrite_trace_enabled:
+                parser.rewrite_trace_log.append(
+                    {
+                        "stage": stage,
+                        "rule": rule.name,
+                        "start": start,
+                        "end": end,
+                        "before": before_lexemes,
+                        "after": list(replaced),
+                        "priority": int(rule.priority),
+                        "specificity": int(rule.specificity),
+                    }
+                )
+                if len(parser.rewrite_trace_log) > 8192:
+                    del parser.rewrite_trace_log[:-8192]
+
+            if parser.rewrite_loop_detection:
+                state_hash = hash(tuple(tok.lexeme for tok in tokens))
+                state_key = (stage, state_hash)
+                event_desc = f"{rule.name}@{start}"
+                previous = parser._rewrite_seen_state.get(state_key)
+                if previous is not None:
+                    prev_step, prev_desc = previous
+                    report = {
+                        "stage": stage,
+                        "current_rule": rule.name,
+                        "current_step": parser._rewrite_step_count,
+                        "previous_step": prev_step,
+                        "previous_event": prev_desc,
+                        "current_event": event_desc,
+                    }
+                    parser.rewrite_loop_reports.append(report)
+                    if len(parser.rewrite_loop_reports) > 256:
+                        del parser.rewrite_loop_reports[:-256]
+                    raise ParseError(
+                        f"rewrite loop detected at stage '{stage}' while applying '{rule.name}'"
+                    )
+                parser._rewrite_seen_state[state_key] = (parser._rewrite_step_count, event_desc)
+                if len(parser._rewrite_seen_state) > 8192:
+                    parser._rewrite_seen_state.clear()
+
+            self._preview_with_context(
+                kind="rewrite-preview",
+                name=f"{rule.name} ({stage})",
+                token=template,
+                replaced=replaced,
+            )
             return True
 
         return False
@@ -1307,7 +4033,8 @@ class Word:
                  'macro_expansion', 'macro_params', 'compile_time_intrinsic',
                  'runtime_intrinsic', 'compile_only', 'runtime_only', 'compile_time_override',
                  'is_extern', 'extern_inputs', 'extern_outputs', 'extern_signature',
-                 'extern_variadic', 'inline')
+                 'extern_variadic', 'inline', 'macro_template_ast', 'macro_template_program',
+                 'macro_template_version', 'macro_template_mode')
 
     def __init__(self, name: str, priority: int = 0, immediate: bool = False,
                  definition=None, macro=None, intrinsic=None,
@@ -1316,7 +4043,10 @@ class Word:
                  compile_only: bool = False, runtime_only: bool = False, compile_time_override: bool = False,
                  is_extern: bool = False, extern_inputs: int = 0, extern_outputs: int = 0,
                  extern_signature=None, extern_variadic: bool = False,
-                 inline: bool = False) -> None:
+                 inline: bool = False, macro_template_ast: Any = None,
+                 macro_template_program: Any = None,
+                 macro_template_version: Optional[str] = None,
+                 macro_template_mode: str = "strict") -> None:
         self.name = name
         self.priority = priority
         self.immediate = immediate
@@ -1336,6 +4066,10 @@ class Word:
         self.extern_signature = extern_signature
         self.extern_variadic = extern_variadic
         self.inline = inline
+        self.macro_template_ast = macro_template_ast
+        self.macro_template_program = macro_template_program
+        self.macro_template_version = macro_template_version
+        self.macro_template_mode = macro_template_mode
 
 
 _suppress_redefine_warnings = False
@@ -1436,7 +4170,40 @@ class Parser:
         self.reader_rewrite_rules: List[RewriteRule] = []
         self.grammar_rewrite_rules: List[RewriteRule] = []
         self._rewrite_rule_counter: int = 0
+        self._rewrite_index_cache: Dict[str, Dict[str, List[RewriteRule]]] = {"reader": {}, "grammar": {}}
+        self._rewrite_wildcard_cache: Dict[str, List[RewriteRule]] = {"reader": [], "grammar": []}
+        self._rewrite_index_dirty: Set[str] = {"reader", "grammar"}
+        self._active_rewrite_pipelines: Dict[str, Set[str]] = {
+            "reader": {"default"},
+            "grammar": {"default"},
+        }
+        self._pattern_macro_groups: Dict[str, str] = {}
+        self._pattern_macro_scopes: Dict[str, str] = {}
+        self._active_pattern_groups: Set[str] = {"default"}
+        self._active_pattern_scopes: Set[str] = {"global"}
+        self.rewrite_trace_enabled: bool = False
+        self.rewrite_trace_log: List[Dict[str, Any]] = []
+        self.rewrite_profile: Dict[str, Dict[str, int]] = {
+            "reader": {"attempts": 0, "matches": 0, "applied": 0, "guard_calls": 0, "guard_rejects": 0},
+            "grammar": {"attempts": 0, "matches": 0, "applied": 0, "guard_calls": 0, "guard_rejects": 0},
+        }
+        self.rewrite_saturation_strategy: str = "first"
+        self.rewrite_max_steps: int = 100_000
+        self._rewrite_step_count: int = 0
+        self.rewrite_loop_detection: bool = True
+        self.rewrite_loop_reports: List[Dict[str, Any]] = []
+        self._rewrite_seen_state: Dict[Tuple[str, int], Tuple[int, str]] = {}
+        self._rewrite_transactions: List[Dict[str, Any]] = []
         self._macro_signatures: Dict[str, Tuple[Tuple[str, ...], Optional[str]]] = {}
+        self._expansion_lexeme_pool: Dict[str, str] = {}
+        self._capture_group_pool: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+        self._macro_hotness: Dict[str, int] = {}
+        self._macro_profile: Dict[str, Dict[str, int]] = {}
+        self._macro_profile_enabled: bool = False
+        self.enable_dead_macro_elimination: bool = False
+        self.enable_unused_rewrite_elimination: bool = False
+        self._macro_docs: Dict[str, str] = {}
+        self._macro_attrs: Dict[str, Dict[str, Any]] = {}
         self._pattern_macro_rules: Dict[str, List[str]] = {}
         self.macro_engine = MacroEngine(self)
         self.label_counter = 0
@@ -1454,10 +4221,33 @@ class Parser:
         self.cstruct_layouts: Dict[str, CStructLayout] = {}
         self._pending_inline_definition: bool = False
         self._pending_priority: Optional[int] = None
+        self.generated_source_map: Dict[int, Tuple[str, int, int, int]] = {}
+        self.capture_globals: Dict[str, Any] = {}
+        self.capture_mutability_frozen: Set[Tuple[str, str]] = set()
+        self.capture_schemas: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self.capture_taint: Dict[str, Dict[str, bool]] = {}
+        self.capture_replay_log: List[Dict[str, Any]] = []
+        self._capture_lifetime_counter: int = 0
+        self._capture_lifetime_active: int = 0
+        self._ct_call_abi_contracts: Dict[str, Dict[str, Any]] = {}
+        self._ct_call_exception_policy: str = "raise"
+        self._ct_call_sandbox_mode: str = "off"
+        self._ct_call_sandbox_allowlist: Set[str] = set()
+        self._ct_call_rng_seed: int = 0x1A2B3C4D
+        self._ct_call_rng = random.Random(self._ct_call_rng_seed)
+        self._ct_call_memo_enabled: bool = False
+        self._ct_call_memo_cache: Dict[str, Any] = {}
+        self._ct_call_side_effect_tracking: bool = False
+        self._ct_call_side_effect_log: List[Dict[str, Any]] = []
+        self._ct_call_recursion_limit: int = 32
+        self._ct_call_timeout_ms: int = 0
+        self._ct_call_active: List[str] = []
         self.diagnostics: List[Diagnostic] = []
         self._max_errors: int = 20
         self._warnings_enabled: Set[str] = set()
         self._werror: bool = False
+        # When false, parser skips per-op source location attachment for speed.
+        self.capture_op_locations: bool = True
 
     def _rebuild_span_index(self) -> None:
         """Rebuild bisect index after file_spans changes."""
@@ -1540,6 +4330,9 @@ class Parser:
 
     def inject_token_objects(self, tokens: Sequence[Token]) -> None:
         """Insert tokens at the current parse position."""
+        if isinstance(tokens, list):
+            self.tokens[self.pos:self.pos] = tokens
+            return
         self.tokens[self.pos:self.pos] = list(tokens)
 
     # Public helpers for macros ------------------------------------------------
@@ -1641,33 +4434,209 @@ class Parser:
                     return False
         return False
 
-    def _validate_rewrite_rule(self, pattern: Sequence[str], replacement: Sequence[str], *, stage: str) -> None:
-        capture_shapes: Dict[str, bool] = {}
-        has_non_variadic_piece = False
+    def _parse_rewrite_piece(self, piece: str) -> Dict[str, Any]:
+        if not piece:
+            raise ParseError("rewrite pattern pieces cannot be empty")
 
-        for piece in pattern:
-            parsed = self._parse_rewrite_capture(piece)
-            if parsed is None:
-                has_non_variadic_piece = True
-                continue
+        raw_piece = piece
+        negated = False
+        if piece.startswith("!") and len(piece) > 1:
+            negated = True
+            piece = piece[1:]
+
+        quantifier = ""
+        if len(piece) > 1 and piece[-1] in ("?", "*", "+"):
+            # Keep legacy variadic capture syntax ($*name) unambiguous.
+            if not piece.startswith("$*"):
+                quantifier = piece[-1]
+                piece = piece[:-1]
+
+        if not piece:
+            raise ParseError(f"rewrite pattern uses malformed piece '{raw_piece}'")
+
+        parsed = self._parse_rewrite_capture(piece)
+        if parsed is not None:
             variadic, name, constraint = parsed
             if constraint not in _REWRITE_CAPTURE_CONSTRAINTS:
                 raise ParseError(
-                    f"rewrite rule ({stage}) uses unknown constraint '{constraint}' in '{piece}'"
+                    f"rewrite rule uses unknown constraint '{constraint}' in '{raw_piece}'"
                 )
+            if variadic and quantifier:
+                raise ParseError(
+                    f"rewrite pattern piece '{raw_piece}' cannot combine '$*' variadic capture with quantifier"
+                )
+            if negated and variadic:
+                raise ParseError(
+                    f"rewrite pattern piece '{raw_piece}' cannot negate a variadic capture"
+                )
+            if negated and quantifier:
+                raise ParseError(
+                    f"rewrite pattern piece '{raw_piece}' cannot combine negation with quantifier"
+                )
+
+            if variadic:
+                min_count = 0
+                max_count: Optional[int] = None
+            elif quantifier == "?":
+                min_count = 0
+                max_count = 1
+            elif quantifier == "*":
+                min_count = 0
+                max_count = None
+            elif quantifier == "+":
+                min_count = 1
+                max_count = None
+            else:
+                min_count = 1
+                max_count = 1
+
+            return {
+                "raw": raw_piece,
+                "kind": "capture",
+                "negated": negated,
+                "name": name,
+                "constraint": constraint,
+                "variadic": variadic,
+                "quantifier": quantifier,
+                "min_count": min_count,
+                "max_count": max_count,
+            }
+
+        if negated and quantifier:
+            raise ParseError(
+                f"rewrite pattern piece '{raw_piece}' cannot combine negation with quantifier"
+            )
+
+        if quantifier == "?":
+            min_count = 0
+            max_count = 1
+        elif quantifier == "*":
+            min_count = 0
+            max_count = None
+        elif quantifier == "+":
+            min_count = 1
+            max_count = None
+        else:
+            min_count = 1
+            max_count = 1
+
+        return {
+            "raw": raw_piece,
+            "kind": "literal",
+            "negated": negated,
+            "literal": piece,
+            "quantifier": quantifier,
+            "min_count": min_count,
+            "max_count": max_count,
+        }
+
+    def _rewrite_pattern_min_tokens(self, pattern: Sequence[str]) -> int:
+        total = 0
+        for piece in pattern:
+            spec = self._parse_rewrite_piece(piece)
+            total += int(spec["min_count"])
+        return total
+
+    def _rewrite_pattern_specificity_score(self, pattern: Sequence[str]) -> int:
+        score = 0
+        for piece in pattern:
+            spec = self._parse_rewrite_piece(piece)
+            if spec["kind"] == "literal":
+                score += 8
+            else:
+                if spec.get("constraint"):
+                    score += 6
+                else:
+                    score += 4
+                if spec.get("variadic"):
+                    score -= 2
+
+            if spec.get("negated"):
+                score += 2
+            if spec["min_count"] == 0:
+                score -= 1
+            if spec["max_count"] is None:
+                score -= 1
+        return int(score)
+
+    def _rewrite_pattern_index_keys(self, pattern: Sequence[str]) -> Tuple[Set[str], bool]:
+        keys: Set[str] = set()
+        wildcard = False
+        for piece in pattern:
+            spec = self._parse_rewrite_piece(piece)
+            if spec["kind"] == "literal" and not spec["negated"]:
+                keys.add(str(spec["literal"]))
+            else:
+                wildcard = True
+
+            if int(spec["min_count"]) > 0:
+                break
+        return keys, wildcard
+
+    def _invalidate_rewrite_index(self, stage: Optional[str] = None) -> None:
+        if stage is None:
+            self._rewrite_index_dirty.update({"reader", "grammar"})
+            return
+        self._rewrite_index_dirty.add(stage)
+
+    def _refresh_rewrite_index(self, stage: str) -> None:
+        if stage not in self._rewrite_index_dirty:
+            return
+        bucket = self._rewrite_bucket(stage)
+        by_first: Dict[str, List[RewriteRule]] = {}
+        wildcard: List[RewriteRule] = []
+        for rule in bucket:
+            keys, needs_wildcard = self._rewrite_pattern_index_keys(rule.pattern)
+            for key in keys:
+                by_first.setdefault(key, []).append(rule)
+            if needs_wildcard or not keys:
+                wildcard.append(rule)
+        self._rewrite_index_cache[stage] = by_first
+        self._rewrite_wildcard_cache[stage] = wildcard
+        self._rewrite_index_dirty.discard(stage)
+
+    def _rewrite_candidates_for_token(self, stage: str, token_lexeme: str) -> List[RewriteRule]:
+        self._refresh_rewrite_index(stage)
+        candidates: List[RewriteRule] = []
+        seen: Set[str] = set()
+        for rule in self._rewrite_index_cache.get(stage, {}).get(token_lexeme, []):
+            if rule.name not in seen:
+                candidates.append(rule)
+                seen.add(rule.name)
+        for rule in self._rewrite_wildcard_cache.get(stage, []):
+            if rule.name not in seen:
+                candidates.append(rule)
+                seen.add(rule.name)
+        return candidates
+
+    def _validate_rewrite_rule(self, pattern: Sequence[str], replacement: Sequence[str], *, stage: str) -> None:
+        capture_shapes: Dict[str, bool] = {}
+        min_total = 0
+
+        for piece in pattern:
+            spec = self._parse_rewrite_piece(piece)
+            min_total += int(spec["min_count"])
+
+            if spec["kind"] != "capture" or spec["negated"]:
+                continue
+
+            name = str(spec["name"])
+            is_variadic_shape = bool(
+                spec.get("variadic")
+                or int(spec["min_count"]) != 1
+                or spec.get("max_count") != 1
+            )
             prev_shape = capture_shapes.get(name)
             if prev_shape is None:
-                capture_shapes[name] = variadic
-            elif prev_shape != variadic:
+                capture_shapes[name] = is_variadic_shape
+            elif prev_shape != is_variadic_shape:
                 raise ParseError(
                     f"rewrite rule ({stage}) capture '{name}' mixes variadic and single-token forms"
                 )
-            if not variadic:
-                has_non_variadic_piece = True
 
-        if not has_non_variadic_piece:
+        if min_total <= 0:
             raise ParseError(
-                f"rewrite rule ({stage}) must contain at least one non-variadic pattern token"
+                f"rewrite rule ({stage}) must consume at least one token in the minimum match path"
             )
 
         for piece in replacement:
@@ -1700,12 +4669,19 @@ class Parser:
         name: Optional[str] = None,
         priority: int = 0,
         enabled: bool = True,
+        pipeline: str = "default",
+        guard: Optional[str] = None,
+        group: str = "default",
+        scope: str = "global",
+        metadata: Optional[Dict[str, Any]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> str:
         pattern_lex = self._normalize_rewrite_lexemes(pattern, field="pattern")
         if not pattern_lex:
             raise ParseError("rewrite pattern cannot be empty")
         replacement_lex = self._normalize_rewrite_lexemes(replacement, field="replacement")
         self._validate_rewrite_rule(pattern_lex, replacement_lex, stage=stage)
+        specificity = self._rewrite_pattern_specificity_score(pattern_lex)
 
         bucket = self._rewrite_bucket(stage)
 
@@ -1718,8 +4694,73 @@ class Parser:
                     rule_name = candidate
                     break
 
-        order = self._rewrite_rule_counter
-        self._rewrite_rule_counter += 1
+        existing_order: Optional[int] = None
+        for existing in bucket:
+            if existing.name == rule_name:
+                existing_order = int(existing.order)
+                break
+
+        if existing_order is None:
+            order = self._rewrite_rule_counter
+            self._rewrite_rule_counter += 1
+        else:
+            order = existing_order
+
+        if provenance is None:
+            provenance_map: Dict[str, Any] = {
+                "stage": stage,
+                "name": rule_name,
+                "kind": "rewrite",
+            }
+            tok = self._last_token
+            if tok is not None:
+                loc = self.location_for_token(tok)
+                provenance_map.update(
+                    {
+                        "path": str(loc.path),
+                        "line": tok.line,
+                        "column": tok.column,
+                    }
+                )
+        else:
+            provenance_map = dict(provenance)
+
+        metadata_map = dict(metadata) if isinstance(metadata, dict) else {}
+        piece_specs = [self._parse_rewrite_piece(piece) for piece in pattern_lex]
+        min_suffix = [0] * (len(piece_specs) + 1)
+        for idx in range(len(piece_specs) - 1, -1, -1):
+            min_suffix[idx] = min_suffix[idx + 1] + int(piece_specs[idx]["min_count"])
+
+        max_tokens: Optional[int] = 0
+        required_literals: List[str] = []
+        for spec in piece_specs:
+            max_count = spec.get("max_count")
+            if max_tokens is not None:
+                if max_count is None:
+                    max_tokens = None
+                else:
+                    max_tokens += int(max_count)
+            if (
+                spec.get("kind") == "literal"
+                and not bool(spec.get("negated"))
+                and int(spec.get("min_count", 0)) > 0
+            ):
+                required_literals.append(str(spec.get("literal", "")))
+
+        prefilter_bloom = 0
+        prefilter_window = int(max_tokens or 0) if max_tokens is not None else 0
+        if prefilter_window > 0 and required_literals:
+            for lit in required_literals:
+                prefilter_bloom |= self._rewrite_bloom_bit(lit)
+
+        metadata_map["__piece_specs"] = piece_specs
+        metadata_map["__min_suffix"] = tuple(min_suffix)
+        metadata_map["__prefilter_window"] = prefilter_window
+        metadata_map["__prefilter_bloom"] = int(prefilter_bloom)
+        metadata_map["__stat_attempts"] = 0
+        metadata_map["__stat_matches"] = 0
+        metadata_map["__stat_applied"] = 0
+
         rule = RewriteRule(
             rule_name,
             pattern_lex,
@@ -1727,6 +4768,13 @@ class Parser:
             priority=priority,
             order=order,
             enabled=enabled,
+            pipeline=pipeline,
+            guard=guard,
+            group=group,
+            scope=scope,
+            metadata=metadata_map,
+            provenance=provenance_map,
+            specificity=specificity,
         )
 
         for idx, existing in enumerate(bucket):
@@ -1736,6 +4784,7 @@ class Parser:
         else:
             bucket.append(rule)
         bucket.sort(key=lambda r: (-r.priority, r.order))
+        self._invalidate_rewrite_index(stage)
         return rule_name
 
     def remove_rewrite_rule(self, stage: str, name: str) -> bool:
@@ -1743,6 +4792,7 @@ class Parser:
         for idx, rule in enumerate(bucket):
             if rule.name == name:
                 del bucket[idx]
+                self._invalidate_rewrite_index(stage)
                 return True
         return False
 
@@ -1750,6 +4800,7 @@ class Parser:
         bucket = self._rewrite_bucket(stage)
         count = len(bucket)
         bucket.clear()
+        self._invalidate_rewrite_index(stage)
         return count
 
     def list_rewrite_rules(self, stage: str) -> List[str]:
@@ -1761,6 +4812,7 @@ class Parser:
         for rule in bucket:
             if rule.name == name:
                 rule.enabled = bool(enabled)
+                self._invalidate_rewrite_index(stage)
                 return True
         return False
 
@@ -1777,6 +4829,7 @@ class Parser:
             if rule.name == name:
                 rule.priority = int(priority)
                 bucket.sort(key=lambda r: (-r.priority, r.order))
+                self._invalidate_rewrite_index(stage)
                 return True
         return False
 
@@ -1787,6 +4840,429 @@ class Parser:
                 return int(rule.priority)
         return None
 
+    def get_rewrite_rule_specificity(self, stage: str, name: str) -> Optional[int]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return int(rule.specificity)
+        return None
+
+    def set_rewrite_rule_pipeline(self, stage: str, name: str, pipeline: str) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        pipeline_name = str(pipeline or "default")
+        for rule in bucket:
+            if rule.name == name:
+                rule.pipeline = pipeline_name
+                self._invalidate_rewrite_index(stage)
+                return True
+        return False
+
+    def get_rewrite_rule_pipeline(self, stage: str, name: str) -> Optional[str]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return str(rule.pipeline)
+        return None
+
+    def set_rewrite_rule_guard(self, stage: str, name: str, guard: Optional[str]) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        guard_name = str(guard) if guard else None
+        for rule in bucket:
+            if rule.name == name:
+                rule.guard = guard_name
+                self._invalidate_rewrite_index(stage)
+                return True
+        return False
+
+    def get_rewrite_rule_guard(self, stage: str, name: str) -> Optional[str]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return rule.guard
+        return None
+
+    def set_rewrite_rule_group(self, stage: str, name: str, group: str) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        group_name = str(group or "default")
+        for rule in bucket:
+            if rule.name == name:
+                rule.group = group_name
+                self._invalidate_rewrite_index(stage)
+                return True
+        return False
+
+    def get_rewrite_rule_group(self, stage: str, name: str) -> Optional[str]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return str(rule.group)
+        return None
+
+    def set_rewrite_rule_scope(self, stage: str, name: str, scope: str) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        scope_name = str(scope or "global")
+        for rule in bucket:
+            if rule.name == name:
+                rule.scope = scope_name
+                self._invalidate_rewrite_index(stage)
+                return True
+        return False
+
+    def get_rewrite_rule_scope(self, stage: str, name: str) -> Optional[str]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return str(rule.scope)
+        return None
+
+    def get_rewrite_rule_provenance(self, stage: str, name: str) -> Optional[Dict[str, Any]]:
+        bucket = self._rewrite_bucket(stage)
+        for rule in bucket:
+            if rule.name == name:
+                return dict(rule.provenance)
+        return None
+
+    def set_rewrite_pipeline_active(self, stage: str, pipeline: str, enabled: bool) -> None:
+        bucket = self._rewrite_bucket(stage)
+        _ = bucket  # ensure stage validation
+        active = self._active_rewrite_pipelines.setdefault(stage, {"default"})
+        pipe = str(pipeline or "default")
+        if enabled:
+            active.add(pipe)
+        else:
+            active.discard(pipe)
+            if not active:
+                active.add("default")
+
+    def list_active_rewrite_pipelines(self, stage: str) -> List[str]:
+        bucket = self._rewrite_bucket(stage)
+        _ = bucket  # ensure stage validation
+        return sorted(self._active_rewrite_pipelines.setdefault(stage, {"default"}))
+
+    def set_pattern_group_active(self, group: str, enabled: bool) -> None:
+        grp = str(group or "default")
+        if enabled:
+            self._active_pattern_groups.add(grp)
+        else:
+            self._active_pattern_groups.discard(grp)
+            if not self._active_pattern_groups:
+                self._active_pattern_groups.add("default")
+
+    def set_pattern_scope_active(self, scope: str, enabled: bool) -> None:
+        scp = str(scope or "global")
+        if enabled:
+            self._active_pattern_scopes.add(scp)
+        else:
+            self._active_pattern_scopes.discard(scp)
+            if not self._active_pattern_scopes:
+                self._active_pattern_scopes.add("global")
+
+    def list_active_pattern_groups(self) -> List[str]:
+        return sorted(self._active_pattern_groups)
+
+    def list_active_pattern_scopes(self) -> List[str]:
+        return sorted(self._active_pattern_scopes)
+
+    def set_pattern_macro_group(self, name: str, group: str) -> bool:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return False
+        grp = str(group or "default")
+        self._pattern_macro_groups[name] = grp
+        changed = False
+        for rule_name in rule_names:
+            if self.set_rewrite_rule_group("grammar", rule_name, grp):
+                changed = True
+        return changed
+
+    def get_pattern_macro_group(self, name: str) -> Optional[str]:
+        if name in self._pattern_macro_groups:
+            return self._pattern_macro_groups[name]
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        group = self.get_rewrite_rule_group("grammar", rule_names[0])
+        if group is None:
+            return None
+        return group
+
+    def set_pattern_macro_scope(self, name: str, scope: str) -> bool:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return False
+        scp = str(scope or "global")
+        self._pattern_macro_scopes[name] = scp
+        changed = False
+        for rule_name in rule_names:
+            if self.set_rewrite_rule_scope("grammar", rule_name, scp):
+                changed = True
+        return changed
+
+    def get_pattern_macro_scope(self, name: str) -> Optional[str]:
+        if name in self._pattern_macro_scopes:
+            return self._pattern_macro_scopes[name]
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        scope = self.get_rewrite_rule_scope("grammar", rule_names[0])
+        if scope is None:
+            return None
+        return scope
+
+    @staticmethod
+    def _clone_rewrite_rule(rule: RewriteRule) -> RewriteRule:
+        return RewriteRule(
+            rule.name,
+            list(rule.pattern),
+            list(rule.replacement),
+            priority=rule.priority,
+            order=rule.order,
+            enabled=rule.enabled,
+            pipeline=rule.pipeline,
+            guard=rule.guard,
+            group=rule.group,
+            scope=rule.scope,
+            metadata=dict(rule.metadata),
+            provenance=dict(rule.provenance),
+            specificity=rule.specificity,
+        )
+
+    def _snapshot_rewrite_state(self) -> Dict[str, Any]:
+        return {
+            "reader_rules": [self._clone_rewrite_rule(rule) for rule in self.reader_rewrite_rules],
+            "grammar_rules": [self._clone_rewrite_rule(rule) for rule in self.grammar_rewrite_rules],
+            "rewrite_rule_counter": int(self._rewrite_rule_counter),
+            "pattern_macro_rules": {name: list(rules) for name, rules in self._pattern_macro_rules.items()},
+            "pattern_macro_groups": dict(self._pattern_macro_groups),
+            "pattern_macro_scopes": dict(self._pattern_macro_scopes),
+            "active_rewrite_pipelines": {
+                stage: set(values) for stage, values in self._active_rewrite_pipelines.items()
+            },
+            "active_pattern_groups": set(self._active_pattern_groups),
+            "active_pattern_scopes": set(self._active_pattern_scopes),
+            "rewrite_saturation_strategy": self.rewrite_saturation_strategy,
+            "rewrite_max_steps": int(self.rewrite_max_steps),
+            "rewrite_loop_detection": bool(self.rewrite_loop_detection),
+        }
+
+    def _restore_rewrite_state(self, snapshot: Dict[str, Any]) -> None:
+        self.reader_rewrite_rules = [self._clone_rewrite_rule(rule) for rule in snapshot.get("reader_rules", [])]
+        self.grammar_rewrite_rules = [self._clone_rewrite_rule(rule) for rule in snapshot.get("grammar_rules", [])]
+        self._rewrite_rule_counter = int(snapshot.get("rewrite_rule_counter", self._rewrite_rule_counter))
+        self._pattern_macro_rules = {
+            str(name): list(values)
+            for name, values in snapshot.get("pattern_macro_rules", {}).items()
+        }
+        self._pattern_macro_groups = {
+            str(name): str(group)
+            for name, group in snapshot.get("pattern_macro_groups", {}).items()
+        }
+        self._pattern_macro_scopes = {
+            str(name): str(scope)
+            for name, scope in snapshot.get("pattern_macro_scopes", {}).items()
+        }
+        active_pipelines = snapshot.get("active_rewrite_pipelines", {})
+        self._active_rewrite_pipelines = {
+            "reader": set(active_pipelines.get("reader", {"default"})),
+            "grammar": set(active_pipelines.get("grammar", {"default"})),
+        }
+        if not self._active_rewrite_pipelines["reader"]:
+            self._active_rewrite_pipelines["reader"].add("default")
+        if not self._active_rewrite_pipelines["grammar"]:
+            self._active_rewrite_pipelines["grammar"].add("default")
+        self._active_pattern_groups = set(snapshot.get("active_pattern_groups", {"default"}))
+        self._active_pattern_scopes = set(snapshot.get("active_pattern_scopes", {"global"}))
+        if not self._active_pattern_groups:
+            self._active_pattern_groups.add("default")
+        if not self._active_pattern_scopes:
+            self._active_pattern_scopes.add("global")
+        self.rewrite_saturation_strategy = str(
+            snapshot.get("rewrite_saturation_strategy", self.rewrite_saturation_strategy)
+        )
+        self.rewrite_max_steps = int(snapshot.get("rewrite_max_steps", self.rewrite_max_steps))
+        self.rewrite_loop_detection = bool(snapshot.get("rewrite_loop_detection", self.rewrite_loop_detection))
+        self._invalidate_rewrite_index()
+
+    def rewrite_transaction_begin(self) -> int:
+        self._rewrite_transactions.append(self._snapshot_rewrite_state())
+        return len(self._rewrite_transactions)
+
+    def rewrite_transaction_commit(self) -> bool:
+        if not self._rewrite_transactions:
+            return False
+        self._rewrite_transactions.pop()
+        return True
+
+    def rewrite_transaction_rollback(self) -> bool:
+        if not self._rewrite_transactions:
+            return False
+        snapshot = self._rewrite_transactions.pop()
+        self._restore_rewrite_state(snapshot)
+        return True
+
+    def export_rewrite_pack(self) -> Dict[str, Any]:
+        def _encode_rule(stage: str, rule: RewriteRule) -> Dict[str, Any]:
+            return {
+                "stage": stage,
+                "name": rule.name,
+                "pattern": list(rule.pattern),
+                "replacement": list(rule.replacement),
+                "priority": int(rule.priority),
+                "enabled": bool(rule.enabled),
+                "pipeline": str(rule.pipeline),
+                "guard": rule.guard,
+                "group": str(rule.group),
+                "scope": str(rule.scope),
+                "specificity": int(rule.specificity),
+                "metadata": dict(rule.metadata),
+                "provenance": dict(rule.provenance),
+            }
+
+        return {
+            "reader": [_encode_rule("reader", rule) for rule in self.reader_rewrite_rules],
+            "grammar": [_encode_rule("grammar", rule) for rule in self.grammar_rewrite_rules],
+            "pattern_macros": {name: list(values) for name, values in self._pattern_macro_rules.items()},
+            "pattern_groups": dict(self._pattern_macro_groups),
+            "pattern_scopes": dict(self._pattern_macro_scopes),
+        }
+
+    def import_rewrite_pack(self, pack: Dict[str, Any], *, replace: bool = False) -> int:
+        if not isinstance(pack, dict):
+            raise ParseError("rewrite pack import expects a map")
+
+        if replace:
+            self.clear_rewrite_rules("reader")
+            self.clear_rewrite_rules("grammar")
+            self._pattern_macro_rules.clear()
+            self._pattern_macro_groups.clear()
+            self._pattern_macro_scopes.clear()
+
+        added = 0
+        for stage in ("reader", "grammar"):
+            entries = pack.get(stage)
+            if entries is None:
+                continue
+            for entry in _ensure_list(entries):
+                row = _ensure_dict(entry)
+                self.add_rewrite_rule(
+                    stage,
+                    _coerce_lexeme_list(row.get("pattern", []), field=f"rewrite pack {stage} pattern"),
+                    _coerce_lexeme_list(row.get("replacement", []), field=f"rewrite pack {stage} replacement"),
+                    name=str(row.get("name", "") or "").strip() or None,
+                    priority=int(row.get("priority", 0)),
+                    enabled=_coerce_bool(row.get("enabled", 1), field=f"rewrite pack {stage} enabled"),
+                    pipeline=str(row.get("pipeline", "default") or "default"),
+                    guard=(str(row.get("guard")) if row.get("guard") is not None else None),
+                    group=str(row.get("group", "default") or "default"),
+                    scope=str(row.get("scope", "global") or "global"),
+                    metadata=dict(row.get("metadata", {})) if isinstance(row.get("metadata"), dict) else {},
+                    provenance=dict(row.get("provenance", {})) if isinstance(row.get("provenance"), dict) else {},
+                )
+                added += 1
+
+        pattern_macros_raw = pack.get("pattern_macros")
+        if isinstance(pattern_macros_raw, dict):
+            for name, values in pattern_macros_raw.items():
+                self._pattern_macro_rules[str(name)] = [str(v) for v in _ensure_list(values)]
+
+        pattern_groups_raw = pack.get("pattern_groups")
+        if isinstance(pattern_groups_raw, dict):
+            for name, group in pattern_groups_raw.items():
+                self._pattern_macro_groups[str(name)] = str(group)
+
+        pattern_scopes_raw = pack.get("pattern_scopes")
+        if isinstance(pattern_scopes_raw, dict):
+            for name, scope in pattern_scopes_raw.items():
+                self._pattern_macro_scopes[str(name)] = str(scope)
+
+        return added
+
+    def _rewrite_rules_compatibility(self, left: RewriteRule, right: RewriteRule) -> str:
+        left_keys, left_wild = self._rewrite_pattern_index_keys(left.pattern)
+        right_keys, right_wild = self._rewrite_pattern_index_keys(right.pattern)
+        if not left_wild and not right_wild and left_keys.isdisjoint(right_keys):
+            return "disjoint"
+        if list(left.replacement) == list(right.replacement):
+            return "equivalent"
+        return "overlap"
+
+    def detect_pattern_macro_conflicts(self, name: Optional[str] = None) -> List[Dict[str, Any]]:
+        conflicts: List[Dict[str, Any]] = []
+        if name is None:
+            names = sorted(self._pattern_macro_rules.keys())
+        else:
+            names = [name]
+
+        by_rule_name = {rule.name: rule for rule in self.grammar_rewrite_rules}
+        for macro_name in names:
+            rule_names = self._pattern_macro_rule_names(macro_name)
+            rules = [by_rule_name[rn] for rn in rule_names if rn in by_rule_name]
+            for i in range(len(rules)):
+                for j in range(i + 1, len(rules)):
+                    left = rules[i]
+                    right = rules[j]
+                    relation = self._rewrite_rules_compatibility(left, right)
+                    if relation == "disjoint":
+                        continue
+                    if left.priority != right.priority:
+                        continue
+                    conflicts.append(
+                        {
+                            "macro": macro_name,
+                            "left": left.name,
+                            "right": right.name,
+                            "relation": relation,
+                            "specificity": [int(left.specificity), int(right.specificity)],
+                        }
+                    )
+        return conflicts
+
+    def build_rewrite_compatibility_matrix(self, stage: str) -> List[Dict[str, Any]]:
+        rules = list(self._rewrite_bucket(stage))
+        matrix: List[Dict[str, Any]] = []
+        for i in range(len(rules)):
+            for j in range(i + 1, len(rules)):
+                left = rules[i]
+                right = rules[j]
+                matrix.append(
+                    {
+                        "left": left.name,
+                        "right": right.name,
+                        "relation": self._rewrite_rules_compatibility(left, right),
+                        "left_priority": int(left.priority),
+                        "right_priority": int(right.priority),
+                        "left_specificity": int(left.specificity),
+                        "right_specificity": int(right.specificity),
+                    }
+                )
+        return matrix
+
+    def clear_rewrite_trace_log(self) -> int:
+        count = len(self.rewrite_trace_log)
+        self.rewrite_trace_log.clear()
+        return count
+
+    def get_rewrite_profile_snapshot(self) -> Dict[str, Dict[str, int]]:
+        return {
+            stage: {name: int(value) for name, value in stats.items()}
+            for stage, stats in self.rewrite_profile.items()
+        }
+
+    def clear_rewrite_profile(self) -> None:
+        for stats in self.rewrite_profile.values():
+            for key in list(stats.keys()):
+                stats[key] = 0
+        for rule in self.reader_rewrite_rules:
+            if isinstance(rule.metadata, dict):
+                rule.metadata["__stat_attempts"] = 0
+                rule.metadata["__stat_matches"] = 0
+                rule.metadata["__stat_applied"] = 0
+        for rule in self.grammar_rewrite_rules:
+            if isinstance(rule.metadata, dict):
+                rule.metadata["__stat_attempts"] = 0
+                rule.metadata["__stat_matches"] = 0
+                rule.metadata["__stat_applied"] = 0
+
     def set_macro_expansion_limit(self, limit: int) -> None:
         if limit < 1:
             raise ParseError("macro expansion limit must be >= 1")
@@ -1794,6 +5270,158 @@ class Parser:
 
     def set_macro_preview(self, enabled: bool) -> None:
         self.macro_preview = bool(enabled)
+
+    @staticmethod
+    def _rewrite_bloom_bit(lexeme: str) -> int:
+        return 1 << (hash(lexeme) & 63)
+
+    def set_macro_profile_enabled(self, enabled: bool) -> None:
+        self._macro_profile_enabled = bool(enabled)
+        if not self._macro_profile_enabled:
+            self._macro_profile.clear()
+
+    def _intern_expansion_lexeme(self, lexeme: str) -> str:
+        cached = self._expansion_lexeme_pool.get(lexeme)
+        if cached is not None:
+            return cached
+        interned = sys.intern(str(lexeme))
+        self._expansion_lexeme_pool[interned] = interned
+        return interned
+
+    def _intern_capture_group(self, values: Sequence[str]) -> Tuple[str, ...]:
+        key = tuple(self._intern_expansion_lexeme(piece) for piece in values)
+        cached = self._capture_group_pool.get(key)
+        if cached is not None:
+            return cached
+        self._capture_group_pool[key] = key
+        return key
+
+    def _record_macro_profile_event(self, name: str, *, emitted_tokens: int, duration_ns: int) -> None:
+        macro_name = str(name)
+        self._macro_hotness[macro_name] = int(self._macro_hotness.get(macro_name, 0)) + 1
+        if not self._macro_profile_enabled:
+            return
+        row = self._macro_profile.get(macro_name)
+        if row is None:
+            row = {
+                "calls": 0,
+                "tokens": 0,
+                "total_ns": 0,
+                "max_ns": 0,
+            }
+            self._macro_profile[macro_name] = row
+        row["calls"] = int(row.get("calls", 0)) + 1
+        row["tokens"] = int(row.get("tokens", 0)) + int(max(0, emitted_tokens))
+        row["total_ns"] = int(row.get("total_ns", 0)) + int(max(0, duration_ns))
+        row["max_ns"] = max(int(row.get("max_ns", 0)), int(max(0, duration_ns)))
+
+    def get_macro_profile_snapshot(self) -> Dict[str, Dict[str, int]]:
+        return {
+            name: {
+                "calls": int(row.get("calls", 0)),
+                "tokens": int(row.get("tokens", 0)),
+                "total_ns": int(row.get("total_ns", 0)),
+                "max_ns": int(row.get("max_ns", 0)),
+                "hotness": int(self._macro_hotness.get(name, 0)),
+            }
+            for name, row in self._macro_profile.items()
+        }
+
+    def clear_macro_profile(self) -> None:
+        self._macro_profile.clear()
+        self._macro_hotness.clear()
+
+    def format_macro_profile(self, *, limit: int = 0) -> str:
+        rows: List[Tuple[str, Dict[str, int]]] = []
+        for name, row in self._macro_profile.items():
+            calls = int(row.get("calls", 0))
+            if calls <= 0:
+                continue
+            rows.append((name, row))
+        if not rows:
+            return "[macro-profile] no macro expansions recorded"
+
+        rows.sort(
+            key=lambda item: (
+                -int(item[1].get("calls", 0)),
+                -int(item[1].get("total_ns", 0)),
+                item[0],
+            )
+        )
+        if limit > 0:
+            rows = rows[:limit]
+
+        lines = [
+            "[macro-profile] name calls tokens total-ms avg-us max-us",
+        ]
+        for name, row in rows:
+            calls = int(row.get("calls", 0))
+            tokens = int(row.get("tokens", 0))
+            total_ns = int(row.get("total_ns", 0))
+            max_ns = int(row.get("max_ns", 0))
+            total_ms = total_ns / 1_000_000.0
+            avg_us = (total_ns / calls) / 1_000.0 if calls > 0 else 0.0
+            max_us = max_ns / 1_000.0
+            lines.append(
+                f"[macro-profile] {name} {calls} {tokens} {total_ms:.3f} {avg_us:.2f} {max_us:.2f}"
+            )
+        return "\n".join(lines)
+
+    def _eliminate_dead_macros(self) -> int:
+        to_remove: List[str] = []
+        for name, word in list(self.dictionary.words.items()):
+            if word.macro_expansion is None:
+                continue
+            if int(self._macro_hotness.get(name, 0)) > 0:
+                continue
+            if self._pattern_macro_rule_names(name):
+                continue
+            # Keep mixed-mode words (for example compile-time intrinsic aliases).
+            if word.definition is not None or word.compile_time_intrinsic is not None or word.runtime_intrinsic is not None:
+                continue
+            to_remove.append(name)
+
+        for name in to_remove:
+            self.unregister_word(name)
+        return len(to_remove)
+
+    def _eliminate_unused_rewrite_rules(self) -> int:
+        removed = 0
+        for stage in ("reader", "grammar"):
+            bucket = self._rewrite_bucket(stage)
+            if not bucket:
+                continue
+            kept: List[RewriteRule] = []
+            for rule in bucket:
+                meta = rule.metadata if isinstance(rule.metadata, dict) else {}
+                applied = int(meta.get("__stat_applied", 0))
+                if applied <= 0:
+                    removed += 1
+                    continue
+                kept.append(rule)
+            if len(kept) != len(bucket):
+                bucket[:] = kept
+                self._invalidate_rewrite_index(stage)
+                if stage == "grammar" and self._pattern_macro_rules:
+                    existing = {rule.name for rule in bucket}
+                    stale_macros: List[str] = []
+                    for macro_name, rule_names in list(self._pattern_macro_rules.items()):
+                        next_names = [rule_name for rule_name in rule_names if rule_name in existing]
+                        if next_names:
+                            self._pattern_macro_rules[macro_name] = next_names
+                        else:
+                            stale_macros.append(macro_name)
+                    for macro_name in stale_macros:
+                        self._pattern_macro_rules.pop(macro_name, None)
+                        self._pattern_macro_groups.pop(macro_name, None)
+                        self._pattern_macro_scopes.pop(macro_name, None)
+        return removed
+
+    def _finalize_parse_performance_passes(self) -> None:
+        if self.enable_dead_macro_elimination:
+            self._eliminate_dead_macros()
+        if self.enable_unused_rewrite_elimination:
+            self._eliminate_unused_rewrite_rules()
 
     def register_text_macro(self, name: str, param_count: int, expansion: Sequence[Any]) -> None:
         param_count_i = int(param_count)
@@ -1841,15 +5469,17 @@ class Parser:
 
         expansion_lex = self._normalize_rewrite_lexemes(expansion, field="macro expansion")
         word = Word(name=name)
-        word.macro_expansion = list(expansion_lex)
+        word.macro_expansion = [self._intern_expansion_lexeme(piece) for piece in expansion_lex]
         word.macro_params = len(ordered_params)
         self.dictionary.register(word)
         self._macro_signatures[name] = (tuple(ordered_params), variadic_param)
+        self._macro_hotness.pop(name, None)
+        self._macro_profile.pop(name, None)
 
     def register_pattern_macro(
         self,
         name: str,
-        clauses: Sequence[Tuple[Sequence[Any], Sequence[Any]]],
+        clauses: Sequence[Any],
     ) -> None:
         if not name:
             raise ParseError("pattern macro name cannot be empty")
@@ -1858,8 +5488,47 @@ class Parser:
 
         self.unregister_pattern_macro(name)
 
+        macro_group = self._pattern_macro_groups.get(name, "default")
+        macro_scope = self._pattern_macro_scopes.get(name, "global")
+
         rule_names: List[str] = []
-        for idx, (pattern, replacement) in enumerate(clauses):
+        for idx, clause in enumerate(clauses):
+            rule_guard: Optional[str] = None
+            rule_group = macro_group
+            rule_scope = macro_scope
+            rule_metadata: Dict[str, Any] = {
+                "macro": name,
+                "clause_index": idx,
+                "kind": "pattern-macro-clause",
+            }
+
+            if isinstance(clause, dict):
+                row = dict(clause)
+                pattern = row.get("pattern")
+                replacement = row.get("replacement")
+                guard_raw = row.get("guard")
+                if guard_raw is not None:
+                    rule_guard = str(guard_raw)
+                group_raw = row.get("group")
+                if group_raw is not None:
+                    rule_group = str(group_raw)
+                scope_raw = row.get("scope")
+                if scope_raw is not None:
+                    rule_scope = str(scope_raw)
+                extra_metadata = row.get("metadata")
+                if isinstance(extra_metadata, dict):
+                    rule_metadata.update(extra_metadata)
+            else:
+                pair = _ensure_list(clause)
+                if len(pair) not in (2, 3):
+                    raise ParseError(
+                        f"macro '{name}' clause {idx + 1} must be [pattern replacement] or [pattern replacement guard]"
+                    )
+                pattern = pair[0]
+                replacement = pair[1]
+                if len(pair) == 3 and pair[2] is not None:
+                    rule_guard = _coerce_str(pair[2])
+
             pattern_lex = self._normalize_rewrite_lexemes(
                 pattern,
                 field=f"macro '{name}' pattern",
@@ -1876,14 +5545,28 @@ class Parser:
                 [name, *pattern_lex],
                 replacement_lex,
                 name=rule_name,
+                group=rule_group,
+                scope=rule_scope,
+                guard=rule_guard,
+                metadata=rule_metadata,
+                provenance={
+                    "kind": "pattern-macro",
+                    "macro": name,
+                    "clause_index": idx,
+                    "stage": "grammar",
+                },
             )
             rule_names.append(added)
 
         self._pattern_macro_rules[name] = rule_names
+        self._pattern_macro_groups[name] = str(macro_group)
+        self._pattern_macro_scopes[name] = str(macro_scope)
 
     def unregister_pattern_macro(self, name: str) -> bool:
         removed = False
         rule_names = self._pattern_macro_rules.pop(name, None)
+        self._pattern_macro_groups.pop(name, None)
+        self._pattern_macro_scopes.pop(name, None)
         if rule_names is None:
             prefix = f"pattern-macro:{name}:"
             for rule in list(self.grammar_rewrite_rules):
@@ -1897,11 +5580,336 @@ class Parser:
                 removed = True
         return removed
 
+    @staticmethod
+    def _pattern_macro_rule_sort_key(rule_name: str) -> Tuple[int, str]:
+        try:
+            idx = int(rule_name.rsplit(":", 1)[1])
+            return idx, rule_name
+        except Exception:
+            return 1_000_000_000, rule_name
+
+    def _pattern_macro_rule_names(self, name: str) -> List[str]:
+        rule_names = self._pattern_macro_rules.get(name)
+        if rule_names is not None:
+            return list(rule_names)
+        prefix = f"pattern-macro:{name}:"
+        discovered = [
+            rule.name
+            for rule in self.grammar_rewrite_rules
+            if rule.name.startswith(prefix)
+        ]
+        discovered.sort(key=self._pattern_macro_rule_sort_key)
+        return discovered
+
+    def set_pattern_macro_enabled(self, name: str, enabled: bool) -> bool:
+        rule_names = self._pattern_macro_rule_names(name)
+        changed = False
+        for rule_name in rule_names:
+            if self.set_rewrite_rule_enabled("grammar", rule_name, enabled):
+                changed = True
+        return changed
+
+    def get_pattern_macro_enabled(self, name: str) -> Optional[bool]:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        states: List[bool] = []
+        for rule_name in rule_names:
+            state = self.get_rewrite_rule_enabled("grammar", rule_name)
+            if state is not None:
+                states.append(bool(state))
+        if not states:
+            return None
+        return all(states)
+
+    def set_pattern_macro_priority(self, name: str, priority: int) -> bool:
+        rule_names = self._pattern_macro_rule_names(name)
+        changed = False
+        for rule_name in rule_names:
+            if self.set_rewrite_rule_priority("grammar", rule_name, priority):
+                changed = True
+        return changed
+
+    def get_pattern_macro_priority(self, name: str) -> Optional[int]:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        priorities: List[int] = []
+        for rule_name in rule_names:
+            prio = self.get_rewrite_rule_priority("grammar", rule_name)
+            if prio is not None:
+                priorities.append(int(prio))
+        if not priorities:
+            return None
+        if len(set(priorities)) != 1:
+            return None
+        return priorities[0]
+
+    def get_pattern_macro_clauses(self, name: str) -> Optional[List[Tuple[List[str], List[str]]]]:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        by_name = {rule.name: rule for rule in self.grammar_rewrite_rules}
+        clauses: List[Tuple[List[str], List[str]]] = []
+        for rule_name in rule_names:
+            rule = by_name.get(rule_name)
+            if rule is None:
+                continue
+            pattern = list(rule.pattern)
+            if pattern and pattern[0] == name:
+                pattern = pattern[1:]
+            clauses.append((pattern, list(rule.replacement)))
+        if not clauses:
+            return None
+        return clauses
+
+    def get_pattern_macro_clause_details(self, name: str) -> Optional[List[Dict[str, Any]]]:
+        rule_names = self._pattern_macro_rule_names(name)
+        if not rule_names:
+            return None
+        by_name = {rule.name: rule for rule in self.grammar_rewrite_rules}
+        details: List[Dict[str, Any]] = []
+        for rule_name in rule_names:
+            rule = by_name.get(rule_name)
+            if rule is None:
+                continue
+            pattern = list(rule.pattern)
+            if pattern and pattern[0] == name:
+                pattern = pattern[1:]
+            details.append(
+                {
+                    "rule": rule.name,
+                    "pattern": pattern,
+                    "replacement": list(rule.replacement),
+                    "guard": rule.guard,
+                    "group": rule.group,
+                    "scope": rule.scope,
+                    "pipeline": rule.pipeline,
+                    "priority": int(rule.priority),
+                    "enabled": bool(rule.enabled),
+                    "specificity": int(rule.specificity),
+                    "metadata": dict(rule.metadata),
+                    "provenance": dict(rule.provenance),
+                }
+            )
+        if not details:
+            return None
+        return details
+
+    def _macro_exists(self, name: str) -> bool:
+        word = self.dictionary.lookup(name)
+        if word is not None and word.macro_expansion is not None:
+            return True
+        return bool(self._pattern_macro_rule_names(name))
+
+    def get_macro_expansion(self, name: str) -> Optional[List[str]]:
+        word = self.dictionary.lookup(name)
+        if word is None or word.macro_expansion is None:
+            return None
+        return list(word.macro_expansion)
+
+    def set_macro_expansion(self, name: str, expansion: Sequence[Any]) -> bool:
+        word = self.dictionary.lookup(name)
+        if word is None or word.macro_expansion is None:
+            return False
+        expansion_lex = self._normalize_rewrite_lexemes(expansion, field="macro expansion")
+        word.macro_expansion = [self._intern_expansion_lexeme(piece) for piece in expansion_lex]
+        word.macro_template_ast = None
+        word.macro_template_program = None
+        word.macro_template_version = None
+        word.macro_template_mode = "strict"
+        self._macro_hotness.pop(name, None)
+        self._macro_profile.pop(name, None)
+        return True
+
+    def get_macro_doc(self, name: str) -> Optional[str]:
+        value = self._macro_docs.get(name)
+        if value is None:
+            return None
+        return str(value)
+
+    def set_macro_doc(self, name: str, value: Optional[str]) -> bool:
+        if not self._macro_exists(name):
+            return False
+        if value is None:
+            self._macro_docs.pop(name, None)
+            return True
+        self._macro_docs[name] = str(value)
+        return True
+
+    def get_macro_attrs(self, name: str) -> Optional[Dict[str, Any]]:
+        value = self._macro_attrs.get(name)
+        if value is None:
+            return None
+        return {
+            str(key): _capture_deep_clone(item)
+            for key, item in value.items()
+        }
+
+    def set_macro_attrs(self, name: str, attrs: Optional[Dict[str, Any]]) -> bool:
+        if not self._macro_exists(name):
+            return False
+        if attrs is None:
+            self._macro_attrs.pop(name, None)
+            return True
+        snapshot: Dict[str, Any] = {}
+        for key, item in attrs.items():
+            snapshot[str(key)] = _capture_deep_clone(item)
+        self._macro_attrs[name] = snapshot
+        return True
+
+    def clone_macro(self, source: str, target: str) -> bool:
+        if not source or not target:
+            return False
+        if source == target:
+            return self._macro_exists(source)
+        if self._macro_exists(target) or self.dictionary.lookup(target) is not None:
+            return False
+
+        cloned = False
+        source_word = self.dictionary.lookup(source)
+        source_is_text = source_word is not None and source_word.macro_expansion is not None
+        source_pattern_details = self.get_pattern_macro_clause_details(source)
+
+        if source_is_text:
+            clone_word = Word(name=target)
+            clone_word.macro_expansion = list(source_word.macro_expansion or [])
+            clone_word.macro_params = int(source_word.macro_params)
+            self.dictionary.register(clone_word)
+            signature = self._macro_signatures.get(source)
+            if signature is not None:
+                self._macro_signatures[target] = (tuple(signature[0]), signature[1])
+            cloned = True
+
+        if source_pattern_details:
+            clauses: List[Dict[str, Any]] = []
+            for detail in source_pattern_details:
+                metadata = detail.get("metadata", {})
+                metadata_copy = dict(metadata) if isinstance(metadata, dict) else {}
+                metadata_copy["macro"] = target
+                clauses.append(
+                    {
+                        "pattern": list(detail.get("pattern", [])),
+                        "replacement": list(detail.get("replacement", [])),
+                        "guard": detail.get("guard"),
+                        "group": str(detail.get("group", "default") or "default"),
+                        "scope": str(detail.get("scope", "global") or "global"),
+                        "metadata": metadata_copy,
+                    }
+                )
+            self.register_pattern_macro(target, clauses)
+
+            by_name = {rule.name: rule for rule in self.grammar_rewrite_rules}
+            target_rule_names = self._pattern_macro_rule_names(target)
+            for idx, target_rule_name in enumerate(target_rule_names):
+                if idx >= len(source_pattern_details):
+                    break
+                detail = source_pattern_details[idx]
+                target_rule = by_name.get(target_rule_name)
+                if target_rule is None:
+                    continue
+                target_rule.priority = int(detail.get("priority", target_rule.priority))
+                target_rule.enabled = bool(detail.get("enabled", target_rule.enabled))
+                target_rule.pipeline = str(detail.get("pipeline", target_rule.pipeline) or "default")
+                target_rule.guard = (
+                    str(detail.get("guard")) if detail.get("guard") is not None else None
+                )
+                target_rule.specificity = int(detail.get("specificity", target_rule.specificity))
+
+                provenance = detail.get("provenance", {})
+                if isinstance(provenance, dict):
+                    prov_copy = dict(provenance)
+                    if "macro" in prov_copy:
+                        prov_copy["macro"] = target
+                    target_rule.provenance = prov_copy
+
+                metadata = detail.get("metadata", {})
+                if isinstance(metadata, dict):
+                    meta_copy = dict(metadata)
+                    if "macro" in meta_copy:
+                        meta_copy["macro"] = target
+                    target_rule.metadata = meta_copy
+
+            self._invalidate_rewrite_index("grammar")
+            cloned = True
+
+        if not cloned:
+            return False
+
+        if source in self._macro_docs:
+            self._macro_docs[target] = str(self._macro_docs[source])
+        if source in self._macro_attrs:
+            attrs = self._macro_attrs[source]
+            self._macro_attrs[target] = {
+                str(key): _capture_deep_clone(item)
+                for key, item in attrs.items()
+            }
+        if source in self.capture_schemas:
+            schema = self.capture_schemas[source]
+            self.capture_schemas[target] = {
+                str(key): _capture_deep_clone(item)
+                for key, item in schema.items()
+            }
+        if source in self.capture_taint:
+            taint = self.capture_taint[source]
+            self.capture_taint[target] = {
+                str(key): bool(value)
+                for key, value in taint.items()
+            }
+        if source in self._ct_call_abi_contracts:
+            contract = self._ct_call_abi_contracts[source]
+            self._ct_call_abi_contracts[target] = {
+                str(key): _capture_deep_clone(item)
+                for key, item in contract.items()
+            }
+        if source in self._macro_hotness:
+            self._macro_hotness[target] = int(self._macro_hotness[source])
+        if source in self._macro_profile:
+            self._macro_profile[target] = {
+                str(key): int(value)
+                for key, value in self._macro_profile[source].items()
+            }
+        return True
+
+    def rename_macro(self, source: str, target: str) -> bool:
+        if not source or not target:
+            return False
+        if source == target:
+            return self._macro_exists(source)
+        if self._macro_exists(target) or self.dictionary.lookup(target) is not None:
+            return False
+        if not self.clone_macro(source, target):
+            return False
+
+        source_word = self.dictionary.lookup(source)
+        if source_word is not None and source_word.macro_expansion is not None:
+            del self.dictionary.words[source]
+            self._macro_signatures.pop(source, None)
+            if self.token_hook == source:
+                self.token_hook = None
+
+        self.unregister_pattern_macro(source)
+        self._macro_docs.pop(source, None)
+        self._macro_attrs.pop(source, None)
+        self.capture_schemas.pop(source, None)
+        self.capture_taint.pop(source, None)
+        self._ct_call_abi_contracts.pop(source, None)
+        self._macro_hotness.pop(source, None)
+        self._macro_profile.pop(source, None)
+        return True
+
     def unregister_word(self, name: str) -> bool:
         if name not in self.dictionary.words:
             return False
         del self.dictionary.words[name]
         self._macro_signatures.pop(name, None)
+        self._macro_docs.pop(name, None)
+        self._macro_attrs.pop(name, None)
+        self.capture_schemas.pop(name, None)
+        self.capture_taint.pop(name, None)
+        self._ct_call_abi_contracts.pop(name, None)
+        self._macro_hotness.pop(name, None)
+        self._macro_profile.pop(name, None)
         self.unregister_pattern_macro(name)
         if self.token_hook == name:
             self.token_hook = None
@@ -2162,6 +6170,25 @@ class Parser:
         self.custom_bss = None
         self._pending_inline_definition = False
         self._pending_priority = None
+        self._rewrite_step_count = 0
+        self._rewrite_seen_state.clear()
+        self.rewrite_loop_reports.clear()
+        self._macro_hotness.clear()
+        if self._macro_profile_enabled:
+            self._macro_profile.clear()
+        for _stage_stats in self.rewrite_profile.values():
+            for _key in list(_stage_stats.keys()):
+                _stage_stats[_key] = 0
+        for _rule in self.reader_rewrite_rules:
+            if isinstance(_rule.metadata, dict):
+                _rule.metadata["__stat_attempts"] = 0
+                _rule.metadata["__stat_matches"] = 0
+                _rule.metadata["__stat_applied"] = 0
+        for _rule in self.grammar_rewrite_rules:
+            if isinstance(_rule.metadata, dict):
+                _rule.metadata["__stat_attempts"] = 0
+                _rule.metadata["__stat_matches"] = 0
+                _rule.metadata["__stat_applied"] = 0
 
         _priority_keywords = _PARSE_PRIORITY_KEYWORDS
         _kw_get = _PARSE_KEYWORD_DISPATCH.get
@@ -2274,6 +6301,8 @@ class Parser:
         error_count = sum(1 for d in self.diagnostics if d.level == "error")
         if error_count > 0:
             raise ParseError(f"compilation failed with {error_count} error(s)")
+
+        self._finalize_parse_performance_passes()
 
         module = self.context_stack.pop()
         if not isinstance(module, Module):  # pragma: no cover - defensive
@@ -2681,22 +6710,14 @@ class Parser:
         _append_op = self._append_op
         _try_literal = self._try_literal
         words = self.dictionary.words
-        # Fast-path: inline integer literal parse (most common literal type)
-        if first.isdigit() or (
-            (first == '-' or first == '+')
-            and lexeme_len > 1
-            and (lexeme[1].isdigit() or (lexeme_len > 2 and lexeme[1] == '0' and lexeme[2] in 'xXoObB'))
+        # Fast-path: cached literal parsing for numeric/quoted candidates.
+        if (
+            first.isdigit()
+            or first == '"'
+            or first == '.'
+            or first == "'"
+            or ((first == '-' or first == '+') and lexeme_len > 1)
         ):
-            try:
-                value = int(lexeme, 0)
-                _append_op(_make_literal_op(value))
-                return False
-            except ValueError:
-                pass
-            # Fall through to float/string check
-            if _try_literal(token):
-                return False
-        elif first == '"' or first == '.' or first == "'":
             if _try_literal(token):
                 return False
 
@@ -2823,13 +6844,15 @@ class Parser:
         macro_def = self.macro_recording
         self.macro_recording = None
         word = Word(name=macro_def.name)
-        word.macro_expansion = list(macro_def.tokens)
+        word.macro_expansion = [self._intern_expansion_lexeme(piece) for piece in macro_def.tokens]
         word.macro_params = len(macro_def.ordered_params)
         self.dictionary.register(word)
         self._macro_signatures[macro_def.name] = (
             tuple(macro_def.ordered_params),
             macro_def.variadic_param,
         )
+        self._macro_hotness.pop(macro_def.name, None)
+        self._macro_profile.pop(macro_def.name, None)
 
     def _push_control(self, entry: Dict[str, str]) -> None:
         if "line" not in entry or "column" not in entry:
@@ -3093,7 +7116,7 @@ class Parser:
         return dict(PY_EXEC_GLOBALS)
 
     def _append_op(self, node: Op) -> None:
-        if node.loc is None:
+        if self.capture_op_locations and node.loc is None:
             tok = self._last_token
             if tok is not None:
                 # Inlined fast path of location_for_token
@@ -3133,10 +7156,20 @@ class Parser:
 
     def _try_literal(self, token: Token) -> bool:
         lexeme = token.lexeme
+        cached = _PARSE_LITERAL_CACHE.get(lexeme, _PARSE_LITERAL_CACHE_MISS)
+        if cached is _PARSE_LITERAL_NOT_LITERAL:
+            return False
+        if cached is not _PARSE_LITERAL_CACHE_MISS:
+            self._append_op(_make_literal_op(cached))
+            return True
+
         first = lexeme[0] if lexeme else '\0'
         if first.isdigit() or first == '-' or first == '+':
             try:
                 value = int(lexeme, 0)
+                _PARSE_LITERAL_CACHE[lexeme] = value
+                if len(_PARSE_LITERAL_CACHE) > _PARSE_LITERAL_CACHE_MAX:
+                    _PARSE_LITERAL_CACHE.clear()
                 self._append_op(_make_literal_op(value))
                 return True
             except ValueError:
@@ -3147,6 +7180,9 @@ class Parser:
             try:
                 if "." in lexeme or "e" in lexeme.lower():
                     value = float(lexeme)
+                    _PARSE_LITERAL_CACHE[lexeme] = value
+                    if len(_PARSE_LITERAL_CACHE) > _PARSE_LITERAL_CACHE_MAX:
+                        _PARSE_LITERAL_CACHE.clear()
                     self._append_op(_make_literal_op(value))
                     return True
             except ValueError:
@@ -3155,15 +7191,24 @@ class Parser:
         if first == '"':
             string_value = _parse_string_literal(token)
             if string_value is not None:
+                _PARSE_LITERAL_CACHE[lexeme] = string_value
+                if len(_PARSE_LITERAL_CACHE) > _PARSE_LITERAL_CACHE_MAX:
+                    _PARSE_LITERAL_CACHE.clear()
                 self._append_op(_make_literal_op(string_value))
                 return True
 
         if first == "'":
             char_value = _parse_char_literal(token)
             if char_value is not None:
+                _PARSE_LITERAL_CACHE[lexeme] = char_value
+                if len(_PARSE_LITERAL_CACHE) > _PARSE_LITERAL_CACHE_MAX:
+                    _PARSE_LITERAL_CACHE.clear()
                 self._append_op(_make_literal_op(char_value))
                 return True
 
+        _PARSE_LITERAL_CACHE[lexeme] = _PARSE_LITERAL_NOT_LITERAL
+        if len(_PARSE_LITERAL_CACHE) > _PARSE_LITERAL_CACHE_MAX:
+            _PARSE_LITERAL_CACHE.clear()
         return False
 
     def _consume(self) -> Token:
@@ -3949,6 +7994,32 @@ class CompileTimeVM:
             if self.runtime_mode and word.runtime_intrinsic is not None:
                 word.runtime_intrinsic(self)
                 return
+
+            if (
+                not self.runtime_mode
+                and isinstance(definition, Definition)
+                and word.compile_only
+                and not word.compile_time_override
+            ):
+                body = definition.body
+                if len(body) == 1:
+                    node = body[0]
+                    if node._opcode == OP_LITERAL:
+                        self.push(node.data)
+                        return
+                    if node._opcode == OP_WORD:
+                        if node._word_ref is None:
+                            self._resolve_words_in_body(definition)
+                        ref = node._word_ref
+                        if (
+                            ref is not None
+                            and ref.compile_time_intrinsic is not None
+                            and not ref.compile_time_override
+                            and not ref.immediate
+                        ):
+                            ref.compile_time_intrinsic(self)
+                            return
+
             prefer_definition = word.compile_time_override or (isinstance(definition, Definition) and (word.immediate or word.compile_only))
             if not prefer_definition and word.compile_time_intrinsic is not None:
                 word.compile_time_intrinsic(self)
@@ -5241,6 +9312,7 @@ class CompileTimeVM:
         _poke_return = self.poke_return
         _call_word = self._call_word
         _dict_lookup = self.dictionary.lookup
+        _ct_fast_dispatch = _CT_FAST_CT_INTRINSIC_DISPATCH if not _runtime_mode else None
 
         # Hot JIT-call locals (avoid repeated attribute access)
         _jit_cache = self._jit_cache if _runtime_mode else None
@@ -5306,6 +9378,41 @@ class CompileTimeVM:
                     # Fast path: pre-resolved word reference
                     word = _node._word_ref
                     if word is not None:
+                        if not _runtime_mode and _ct_fast_dispatch is not None:
+                            fast_intrinsic = _ct_fast_dispatch.get(word.name)
+                            if (
+                                fast_intrinsic is not None
+                                and word.compile_time_intrinsic is fast_intrinsic
+                                and not word.compile_time_override
+                                and not word.immediate
+                            ):
+                                self.current_location = _node.loc
+                                self.call_stack.append(word.name)
+                                try:
+                                    fast_intrinsic(self)
+                                except _CTVMJump as jmp:
+                                    self.call_stack.pop()
+                                    ip = jmp.target_ip
+                                    continue
+                                except _CTVMReturn:
+                                    self.call_stack.pop()
+                                    return
+                                except ParseError as exc:
+                                    self.call_stack.pop()
+                                    raise CompileTimeError(
+                                        f"{exc}\ncompile-time stack: {' -> '.join(self.call_stack + [word.name])}"
+                                    ) from None
+                                except Exception as exc:
+                                    self.call_stack.pop()
+                                    raise CompileTimeError(
+                                        f"compile-time failure in '{word.name}': {exc}\n"
+                                        f"compile-time stack: {' -> '.join(self.call_stack + [word.name])}"
+                                    ) from None
+                                else:
+                                    self.call_stack.pop()
+                                ip += 1
+                                continue
+
                         if _runtime_mode:
                             ri = word.runtime_intrinsic
                             if ri is not None:
@@ -7074,40 +11181,53 @@ class Assembler:
                         idx += 1
                         continue
 
-                    # Try longest match first (max pattern len = 3)
-                    matched = False
-                    # Try window=3
+                    best_repl: Optional[Tuple[str, ...]] = None
+                    best_pat: Optional[Tuple[str, ...]] = None
+                    best_len = 0
+                    best_cost = 1_000_000
+
                     if idx + 2 < nlen:
                         b = nodes[idx + 1]
                         c = nodes[idx + 2]
                         if b._opcode == _OP_W and c._opcode == _OP_W:
-                            repl = all_rules.get((word_name, b.data, c.data))
-                            if repl is not None:
-                                base_loc = node.loc
-                                for r in repl:
-                                    if r[0] == 'l' and r[:8] == "literal_":
-                                        _opt_append(_make_literal_op(int(r[8:]), loc=base_loc))
-                                    else:
-                                        _opt_append(_make_word_op(r, base_loc))
-                                idx += 3
-                                changed = True
-                                matched = True
-                    # Try window=2
-                    if not matched and idx + 1 < nlen:
+                            pat3 = (word_name, b.data, c.data)
+                            repl3 = all_rules.get(pat3)
+                            if repl3 is not None:
+                                cost3 = int(_PEEPHOLE_RULE_COST.get(pat3, len(repl3)))
+                                best_repl = repl3
+                                best_pat = pat3
+                                best_len = 3
+                                best_cost = cost3
+
+                    if idx + 1 < nlen:
                         b = nodes[idx + 1]
                         if b._opcode == _OP_W:
-                            repl = all_rules.get((word_name, b.data))
-                            if repl is not None:
-                                base_loc = node.loc
-                                for r in repl:
-                                    if r[0] == 'l' and r[:8] == "literal_":
-                                        _opt_append(_make_literal_op(int(r[8:]), loc=base_loc))
-                                    else:
-                                        _opt_append(_make_word_op(r, base_loc))
-                                idx += 2
-                                changed = True
-                                matched = True
-                    if not matched:
+                            pat2 = (word_name, b.data)
+                            repl2 = all_rules.get(pat2)
+                            if repl2 is not None:
+                                cost2 = int(_PEEPHOLE_RULE_COST.get(pat2, len(repl2)))
+                                if (
+                                    best_repl is None
+                                    or cost2 < best_cost
+                                    or (cost2 == best_cost and 2 > best_len)
+                                ):
+                                    best_repl = repl2
+                                    best_pat = pat2
+                                    best_len = 2
+                                    best_cost = cost2
+
+                    if best_repl is not None and best_pat is not None:
+                        base_loc = node.loc
+                        for r in best_repl:
+                            if r[0] == 'l' and r[:8] == "literal_":
+                                _opt_append(_make_literal_op(int(r[8:]), loc=base_loc))
+                            else:
+                                _opt_append(_make_word_op(r, base_loc))
+                        idx += best_len
+                        changed = True
+                        continue
+
+                    if best_repl is None:
                         _opt_append(node)
                         idx += 1
                 if changed:
@@ -7337,6 +11457,56 @@ class Assembler:
                 return
             new_loc = operands[0].loc or last.loc
             nodes[-(arity + 1):] = [_make_literal_op(result, new_loc)]
+
+    def _audit_optimized_definition(self, definition: Definition) -> None:
+        labels: Set[str] = set()
+        branch_targets: Set[str] = set()
+        for_depth = 0
+        begin_depth = 0
+
+        for node in definition.body:
+            kind = node._opcode
+            if kind == OP_LABEL:
+                labels.add(str(node.data))
+                continue
+            if kind == OP_FOR_BEGIN:
+                for_depth += 1
+                continue
+            if kind == OP_FOR_END:
+                if for_depth <= 0:
+                    raise CompileError(
+                        f"optimizer audit failed in '{definition.name}': unmatched for-loop end"
+                    )
+                for_depth -= 1
+                continue
+            if kind == OP_WORD:
+                lex = str(node.data)
+                if lex == "begin":
+                    begin_depth += 1
+                elif lex == "again":
+                    if begin_depth <= 0:
+                        raise CompileError(
+                            f"optimizer audit failed in '{definition.name}': unmatched begin/again pair"
+                        )
+                    begin_depth -= 1
+                continue
+            if kind in (OP_BRANCH_ZERO, OP_JUMP):
+                branch_targets.add(str(node.data))
+
+        if for_depth != 0:
+            raise CompileError(
+                f"optimizer audit failed in '{definition.name}': unterminated for-loop after optimization"
+            )
+        if begin_depth != 0:
+            raise CompileError(
+                f"optimizer audit failed in '{definition.name}': unterminated begin/again block after optimization"
+            )
+
+        missing = sorted(target for target in branch_targets if target not in labels)
+        if missing:
+            raise CompileError(
+                f"optimizer audit failed in '{definition.name}': missing label(s) {', '.join(missing)}"
+            )
 
     def _for_pairs(self, nodes: Sequence[Op]) -> Dict[int, int]:
         stack: List[int] = []
@@ -7868,6 +12038,18 @@ class Assembler:
                             self._fold_constants_in_definition(defn)
                 if _v >= 1:
                     print(f"[v1] constant folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+
+            if _v >= 1:
+                _t0 = _time_mod.perf_counter()
+            for defn in definitions:
+                if not isinstance(defn, Definition):
+                    continue
+                if _early_reachable is not None and defn.name not in _early_reachable:
+                    continue
+                self._audit_optimized_definition(defn)
+            if _v >= 1:
+                print(f"[v1] optimizer audit: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+
             runtime_defs = [defn for defn in definitions if not getattr(defn, "compile_only", False)]
             if is_program:
                 if not any(defn.name == "main" for defn in runtime_defs):
@@ -9138,8 +13320,8 @@ def _parse_pattern_macro_clauses(
     name: str,
     *,
     keyword: str,
-) -> List[Tuple[List[str], List[str]]]:
-    clauses: List[Tuple[List[str], List[str]]] = []
+) -> List[Any]:
+    clauses: List[Any] = []
 
     while True:
         if parser._eof():
@@ -9151,12 +13333,29 @@ def _parse_pattern_macro_clauses(
             break
 
         pattern: List[str] = []
+        guard_word: Optional[str] = None
         while True:
             if parser._eof():
                 raise ParseError(f"unterminated {keyword} clause in '{name}' (missing '=>')")
             tok = parser.next_token()
             lex = tok.lexeme
             if lex == "=>":
+                break
+            if lex in ("when", "ct-when"):
+                if parser._eof():
+                    raise ParseError(
+                        f"{keyword} '{name}' clause guard is missing guard word"
+                    )
+                guard_token = parser.next_token()
+                guard_word = guard_token.lexeme
+                if parser._eof():
+                    raise ParseError(
+                        f"{keyword} '{name}' clause guard is missing '=>'"
+                    )
+                arrow = parser.next_token()
+                if arrow.lexeme != "=>":
+                    raise ParseError(
+                        f"{keyword} '{name}' clause guard must use 'when <guard> =>'")
                 break
             if lex == ";":
                 raise ParseError(
@@ -9212,7 +13411,10 @@ def _parse_pattern_macro_clauses(
 
             replacement.append(lex)
 
-        clauses.append((pattern, replacement))
+        if guard_word:
+            clauses.append([pattern, replacement, guard_word])
+        else:
+            clauses.append([pattern, replacement])
 
     if not clauses:
         raise ParseError(f"{keyword} '{name}' requires at least one clause")
@@ -9748,6 +13950,45 @@ def _ct_map_update(vm: CompileTimeVM) -> None:
     vm.push(target)
 
 
+_CT_FAST_CT_INTRINSIC_DISPATCH = {
+    "nil": _ct_nil,
+    "nil?": _ct_nil_p,
+    "list-new": _ct_list_new,
+    "list-clone": _ct_list_clone,
+    "list-append": _ct_list_append,
+    "list-pop": _ct_list_pop,
+    "list-pop-front": _ct_list_pop_front,
+    "list-peek-front": _ct_list_peek_front,
+    "list-push-front": _ct_list_push_front,
+    "list-reverse": _ct_list_reverse,
+    "list-length": _ct_list_length,
+    "list-empty?": _ct_list_empty,
+    "list-get": _ct_list_get,
+    "list-set": _ct_list_set,
+    "list-clear": _ct_list_clear,
+    "list-extend": _ct_list_extend,
+    "list-last": _ct_list_last,
+    "list-insert": _ct_list_insert,
+    "list-remove": _ct_list_remove,
+    "list-slice": _ct_list_slice,
+    "list-find": _ct_list_find,
+    "list-contains?": _ct_list_contains,
+    "list-join": _ct_list_join,
+    "map-new": _ct_map_new,
+    "map-set": _ct_map_set,
+    "map-get": _ct_map_get,
+    "map-has?": _ct_map_has,
+    "map-delete": _ct_map_delete,
+    "map-clear": _ct_map_clear,
+    "map-length": _ct_map_length,
+    "map-empty?": _ct_map_empty,
+    "map-keys": _ct_map_keys,
+    "map-values": _ct_map_values,
+    "map-clone": _ct_map_clone,
+    "map-update": _ct_map_update,
+}
+
+
 def _ct_string_eq(vm: CompileTimeVM) -> None:
     try:
         right = vm.pop_str()
@@ -10017,6 +14258,1484 @@ def _ct_register_text_macro_signature(vm: CompileTimeVM) -> None:
     vm.parser.register_text_macro_signature(name, param_spec, expansion)
 
 
+def _coerce_pattern_macro_clauses(value: Any) -> List[Any]:
+    raw_clauses = _ensure_list(value)
+    clauses: List[Any] = []
+    for idx, clause_value in enumerate(raw_clauses):
+        if isinstance(clause_value, dict):
+            row = _ensure_dict(clause_value)
+            if "pattern" not in row or "replacement" not in row:
+                raise ParseError(
+                    f"pattern macro clause {idx + 1} map must contain 'pattern' and 'replacement'"
+                )
+            pattern = _coerce_lexeme_list(row["pattern"], field=f"pattern macro clause {idx + 1} pattern")
+            replacement = _coerce_lexeme_list(row["replacement"], field=f"pattern macro clause {idx + 1} replacement")
+            entry: Dict[str, Any] = {
+                "pattern": pattern,
+                "replacement": replacement,
+            }
+            guard = row.get("guard")
+            if guard is not None:
+                entry["guard"] = _coerce_str(guard)
+            group = row.get("group")
+            if group is not None:
+                entry["group"] = _coerce_str(group)
+            scope = row.get("scope")
+            if scope is not None:
+                entry["scope"] = _coerce_str(scope)
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict):
+                entry["metadata"] = dict(metadata)
+            clauses.append(entry)
+            continue
+
+        pair = _ensure_list(clause_value)
+        if len(pair) not in (2, 3):
+            raise ParseError(
+                f"pattern macro clause {idx + 1} must be [pattern-list replacement-list] or [pattern replacement guard]"
+            )
+        pattern = _coerce_lexeme_list(pair[0], field=f"pattern macro clause {idx + 1} pattern")
+        replacement = _coerce_lexeme_list(pair[1], field=f"pattern macro clause {idx + 1} replacement")
+        if len(pair) == 3 and pair[2] is not None:
+            clauses.append([pattern, replacement, _coerce_str(pair[2])])
+        else:
+            clauses.append([pattern, replacement])
+    return clauses
+
+
+def _ct_register_pattern_macro(vm: CompileTimeVM) -> None:
+    clauses = _coerce_pattern_macro_clauses(vm.pop())
+    name = vm.pop_str()
+    vm.parser.register_pattern_macro(name, clauses)
+
+
+def _ct_unregister_pattern_macro(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.unregister_pattern_macro(name) else 0)
+
+
+def _ct_word_is_text_macro(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = vm.dictionary.lookup(name)
+    vm.push(1 if (word is not None and word.macro_expansion is not None) else 0)
+
+
+def _ct_word_is_pattern_macro(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if name in vm.parser._pattern_macro_rules else 0)
+
+
+def _ct_get_macro_signature(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = vm.dictionary.lookup(name)
+    if word is None or word.macro_expansion is None:
+        vm.push(None)
+        vm.push(None)
+        vm.push(0)
+        return
+
+    signature = vm.parser._macro_signatures.get(name)
+    if signature is not None:
+        ordered, variadic = signature
+    else:
+        ordered = tuple(str(i) for i in range(max(0, int(word.macro_params))))
+        variadic = None
+
+    vm.push(list(ordered))
+    vm.push(variadic)
+    vm.push(1)
+
+
+def _ct_get_macro_expansion(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    expansion = vm.parser.get_macro_expansion(name)
+    if expansion is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(list(expansion))
+    vm.push(1)
+
+
+def _ct_set_macro_expansion(vm: CompileTimeVM) -> None:
+    expansion = _coerce_lexeme_list(vm.pop(), field="macro expansion")
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_macro_expansion(name, expansion) else 0)
+
+
+def _ct_clone_macro(vm: CompileTimeVM) -> None:
+    target = vm.pop_str()
+    source = vm.pop_str()
+    vm.push(1 if vm.parser.clone_macro(source, target) else 0)
+
+
+def _ct_rename_macro(vm: CompileTimeVM) -> None:
+    target = vm.pop_str()
+    source = vm.pop_str()
+    vm.push(1 if vm.parser.rename_macro(source, target) else 0)
+
+
+def _ct_macro_doc_get(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    value = vm.parser.get_macro_doc(name)
+    if value is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(value)
+    vm.push(1)
+
+
+def _ct_macro_doc_set(vm: CompileTimeVM) -> None:
+    raw_value = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    doc_value: Optional[str]
+    if raw_value is None:
+        doc_value = None
+    else:
+        doc_value = _coerce_str(raw_value)
+    vm.push(1 if vm.parser.set_macro_doc(name, doc_value) else 0)
+
+
+def _ct_macro_attrs_get(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    attrs = vm.parser.get_macro_attrs(name)
+    if attrs is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(attrs)
+    vm.push(1)
+
+
+def _ct_macro_attrs_set(vm: CompileTimeVM) -> None:
+    raw_value = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    attrs_value: Optional[Dict[str, Any]]
+    if raw_value is None:
+        attrs_value = None
+    else:
+        attrs = _ensure_dict(raw_value)
+        attrs_value = {
+            str(key): _capture_deep_clone(item)
+            for key, item in attrs.items()
+        }
+    vm.push(1 if vm.parser.set_macro_attrs(name, attrs_value) else 0)
+
+
+def _ct_set_ct_call_contract(vm: CompileTimeVM) -> None:
+    raw_contract = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    if vm.dictionary.lookup(name) is None:
+        vm.push(0)
+        return
+    if raw_contract is None:
+        vm.parser._ct_call_abi_contracts.pop(name, None)
+        vm.push(1)
+        return
+    contract = _ensure_dict(raw_contract)
+    vm.parser._ct_call_abi_contracts[name] = {
+        str(key): _capture_deep_clone(item)
+        for key, item in contract.items()
+    }
+    vm.push(1)
+
+
+def _ct_get_ct_call_contract(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    contract = vm.parser._ct_call_abi_contracts.get(name)
+    if contract is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push({
+        str(key): _capture_deep_clone(item)
+        for key, item in contract.items()
+    })
+    vm.push(1)
+
+
+def _ct_set_ct_call_exception_policy(vm: CompileTimeVM) -> None:
+    policy = vm.pop_str().strip().lower()
+    if policy not in ("raise", "warn", "empty", "nil", "ignore"):
+        raise ParseError("ct-call exception policy must be one of: raise, warn, empty, nil, ignore")
+    if policy == "nil":
+        policy = "empty"
+    vm.parser._ct_call_exception_policy = policy
+
+
+def _ct_get_ct_call_exception_policy(vm: CompileTimeVM) -> None:
+    vm.push(str(vm.parser._ct_call_exception_policy))
+
+
+def _ct_set_ct_call_sandbox_mode(vm: CompileTimeVM) -> None:
+    mode = vm.pop_str().strip().lower()
+    if mode not in ("off", "allowlist", "compile-only", "compile_only"):
+        raise ParseError("ct-call sandbox mode must be one of: off, allowlist, compile-only")
+    if mode == "compile_only":
+        mode = "compile-only"
+    vm.parser._ct_call_sandbox_mode = mode
+
+
+def _ct_get_ct_call_sandbox_mode(vm: CompileTimeVM) -> None:
+    vm.push(str(vm.parser._ct_call_sandbox_mode))
+
+
+def _ct_set_ct_call_sandbox_allowlist(vm: CompileTimeVM) -> None:
+    values = _coerce_lexeme_list(vm.pop(), field="ct-call sandbox allowlist")
+    vm.parser._ct_call_sandbox_allowlist = set(values)
+    vm.push(len(vm.parser._ct_call_sandbox_allowlist))
+
+
+def _ct_get_ct_call_sandbox_allowlist(vm: CompileTimeVM) -> None:
+    vm.push(sorted(vm.parser._ct_call_sandbox_allowlist))
+
+
+def _ct_ctrand_seed(vm: CompileTimeVM) -> None:
+    seed = vm.pop_int()
+    vm.parser._ct_call_rng_seed = int(seed)
+    vm.parser._ct_call_rng.seed(int(seed))
+
+
+def _ct_ctrand_int(vm: CompileTimeVM) -> None:
+    bound = vm.pop_int()
+    if bound <= 0:
+        raise ParseError("ct-ctrand-int expects bound > 0")
+    vm.push(int(vm.parser._ct_call_rng.randrange(bound)))
+
+
+def _ct_ctrand_range(vm: CompileTimeVM) -> None:
+    hi = vm.pop_int()
+    lo = vm.pop_int()
+    if hi < lo:
+        raise ParseError("ct-ctrand-range expects lo <= hi")
+    vm.push(int(vm.parser._ct_call_rng.randint(lo, hi)))
+
+
+def _ct_set_ct_call_memo(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="ct-call memoization flag")
+    vm.parser._ct_call_memo_enabled = bool(enabled)
+
+
+def _ct_get_ct_call_memo(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser._ct_call_memo_enabled else 0)
+
+
+def _ct_clear_ct_call_memo(vm: CompileTimeVM) -> None:
+    count = len(vm.parser._ct_call_memo_cache)
+    vm.parser._ct_call_memo_cache.clear()
+    vm.push(count)
+
+
+def _ct_get_ct_call_memo_size(vm: CompileTimeVM) -> None:
+    vm.push(len(vm.parser._ct_call_memo_cache))
+
+
+def _ct_set_ct_call_side_effects(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="ct-call side-effect tracking flag")
+    vm.parser._ct_call_side_effect_tracking = bool(enabled)
+
+
+def _ct_get_ct_call_side_effects(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser._ct_call_side_effect_tracking else 0)
+
+
+def _ct_get_ct_call_side_effect_log(vm: CompileTimeVM) -> None:
+    vm.push([dict(entry) for entry in vm.parser._ct_call_side_effect_log])
+
+
+def _ct_clear_ct_call_side_effect_log(vm: CompileTimeVM) -> None:
+    count = len(vm.parser._ct_call_side_effect_log)
+    vm.parser._ct_call_side_effect_log.clear()
+    vm.push(count)
+
+
+def _ct_set_ct_call_recursion_limit(vm: CompileTimeVM) -> None:
+    limit = vm.pop_int()
+    if limit < 1:
+        raise ParseError("ct-call recursion limit must be >= 1")
+    vm.parser._ct_call_recursion_limit = int(limit)
+
+
+def _ct_get_ct_call_recursion_limit(vm: CompileTimeVM) -> None:
+    vm.push(int(vm.parser._ct_call_recursion_limit))
+
+
+def _ct_set_ct_call_timeout_ms(vm: CompileTimeVM) -> None:
+    budget = vm.pop_int()
+    if budget < 0:
+        raise ParseError("ct-call timeout budget must be >= 0")
+    vm.parser._ct_call_timeout_ms = int(budget)
+
+
+def _ct_get_ct_call_timeout_ms(vm: CompileTimeVM) -> None:
+    vm.push(int(vm.parser._ct_call_timeout_ms))
+
+
+def _ct_prepare_macro_template_introspection(vm: CompileTimeVM, name: str) -> Optional[Word]:
+    word = vm.dictionary.lookup(name)
+    if word is None:
+        return None
+
+    if word.macro_template_ast is None:
+        if word.macro_expansion is None:
+            return None
+        engine = vm.parser.macro_engine
+        template_tokens = list(word.macro_expansion)
+        parsed_nodes, idx, stop = engine._parse_macro_template_nodes(
+            word=word,
+            tokens=template_tokens,
+            idx=0,
+            stop_tokens=None,
+        )
+        if stop is not None:
+            raise ParseError(f"macro '{word.name}' has unexpected template terminator '{stop}'")
+        if idx != len(template_tokens):
+            raise ParseError(f"macro '{word.name}' template parser stopped early")
+        word.macro_template_ast = tuple(parsed_nodes)
+
+    if word.macro_template_program is None:
+        engine = vm.parser.macro_engine
+        nodes = list(word.macro_template_ast)
+        mode, version = engine._collect_macro_template_metadata(word=word, nodes=nodes)
+        word.macro_template_mode = mode
+        word.macro_template_version = version
+        word.macro_template_program = engine._compile_macro_template_program(nodes=nodes)
+    return word
+
+
+def _ct_get_macro_template_mode(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = _ct_prepare_macro_template_introspection(vm, name)
+    if word is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    mode = getattr(word, "macro_template_mode", "strict") or "strict"
+    vm.push(mode)
+    vm.push(1)
+
+
+def _ct_get_macro_template_version(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = _ct_prepare_macro_template_introspection(vm, name)
+    if word is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(getattr(word, "macro_template_version", None))
+    vm.push(1)
+
+
+def _ct_get_macro_template_program_size(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    word = _ct_prepare_macro_template_introspection(vm, name)
+    if word is None:
+        vm.push(0)
+        vm.push(0)
+        return
+    program = getattr(word, "macro_template_program", None)
+    if program is None:
+        vm.push(0)
+        vm.push(0)
+        return
+    vm.push(len(program))
+    vm.push(1)
+
+
+def _ensure_capture_context(value: Any) -> Dict[str, Any]:
+    ctx = _ensure_dict(value)
+    captures = ctx.get("captures")
+    if not isinstance(captures, dict):
+        raise ParseError("capture context missing 'captures' map")
+    return ctx
+
+
+def _capture_deep_clone(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_capture_deep_clone(item) for item in value]
+    if isinstance(value, tuple):
+        return [_capture_deep_clone(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _capture_deep_clone(key): _capture_deep_clone(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, Token):
+        return value.lexeme
+    return value
+
+
+def _capture_is_group_list(value: Any) -> bool:
+    return bool(isinstance(value, list) and value and isinstance(value[0], list))
+
+
+def _capture_piece_to_token(piece: Any, *, field: str) -> str:
+    if isinstance(piece, Token):
+        return piece.lexeme
+    if isinstance(piece, str):
+        return piece
+    if isinstance(piece, bool):
+        return "1" if piece else "0"
+    if isinstance(piece, int):
+        return str(piece)
+    raise ParseError(f"{field} expected token-like values")
+
+
+def _capture_flatten_tokens(value: Any, *, field: str) -> List[str]:
+    if value is None:
+        return []
+    if _capture_is_group_list(value):
+        out: List[str] = []
+        for idx, group in enumerate(value):
+            if not isinstance(group, list):
+                raise ParseError(f"{field} variadic group {idx + 1} is not a list")
+            for piece in group:
+                out.append(_capture_piece_to_token(piece, field=field))
+        return out
+    if isinstance(value, list):
+        return [_capture_piece_to_token(piece, field=field) for piece in value]
+    if isinstance(value, (Token, str, bool, int)):
+        return [_capture_piece_to_token(value, field=field)]
+    raise ParseError(f"{field} expected list/group-list/token-like value")
+
+
+def _capture_shape(value: Any) -> str:
+    if value is None:
+        return "none"
+    if _capture_is_group_list(value):
+        return "multi"
+    if isinstance(value, list):
+        if len(value) == 1:
+            return "single"
+        return "tokens"
+    return "scalar"
+
+
+def _capture_normalize_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Token):
+        return value.lexeme
+    if isinstance(value, list):
+        return [_capture_normalize_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_capture_normalize_value(item) for item in value]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, (bool, int, float, str)):
+                out[str(key)] = _capture_normalize_value(item)
+            elif isinstance(key, Token):
+                out[key.lexeme] = _capture_normalize_value(item)
+            else:
+                out[str(key)] = _capture_normalize_value(item)
+        return out
+    return repr(value)
+
+
+def _capture_serialize_text(value: Any) -> str:
+    import json
+
+    normalized = _capture_normalize_value(value)
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def _capture_diff_values(left: Any, right: Any, *, path: str, out: List[str]) -> None:
+    if type(left) is not type(right):
+        out.append(f"{path}: type mismatch ({type(left).__name__} != {type(right).__name__})")
+        return
+
+    if isinstance(left, dict):
+        keys = sorted(set(left.keys()) | set(right.keys()))
+        for key in keys:
+            key_path = f"{path}.{key}"
+            if key not in left:
+                out.append(f"{key_path}: missing on left")
+                continue
+            if key not in right:
+                out.append(f"{key_path}: missing on right")
+                continue
+            _capture_diff_values(left[key], right[key], path=key_path, out=out)
+        return
+
+    if isinstance(left, list):
+        max_len = max(len(left), len(right))
+        for idx in range(max_len):
+            idx_path = f"{path}[{idx}]"
+            if idx >= len(left):
+                out.append(f"{idx_path}: missing on left")
+                continue
+            if idx >= len(right):
+                out.append(f"{idx_path}: missing on right")
+                continue
+            _capture_diff_values(left[idx], right[idx], path=idx_path, out=out)
+        return
+
+    if left != right:
+        out.append(f"{path}: {left!r} != {right!r}")
+
+
+def _capture_filter_token(parser: Parser, predicate: str, token: str) -> bool:
+    if predicate == "nonempty":
+        return token != ""
+    if predicate in ("ident", "identifier"):
+        return _is_identifier(token)
+    if predicate in ("int", "integer"):
+        try:
+            int(token, 0)
+            return True
+        except Exception:
+            return False
+    if predicate in ("number", "numeric"):
+        try:
+            int(token, 0)
+            return True
+        except Exception:
+            try:
+                float(token)
+                return True
+            except Exception:
+                return False
+    if predicate in ("string", "str"):
+        return len(token) >= 2 and token[0] == '"' and token[-1] == '"'
+    if predicate in ("char", "chr"):
+        return len(token) >= 2 and token[0] == "'" and token[-1] == "'"
+    return parser._rewrite_constraint_matches(token, predicate)
+
+
+def _capture_apply_map(value: Any, op: str) -> Any:
+    def _map_token(token: str) -> str:
+        if op == "upper":
+            return token.upper()
+        if op == "lower":
+            return token.lower()
+        if op == "strip":
+            return token.strip()
+        if op in ("int-normalize", "int"):
+            try:
+                return str(int(token, 0))
+            except Exception:
+                return token
+        raise ParseError(f"unsupported capture map operation '{op}'")
+
+    if value is None:
+        return []
+    if _capture_is_group_list(value):
+        mapped: List[List[str]] = []
+        for group in value:
+            group_tokens = _capture_flatten_tokens(group, field="capture-map group")
+            mapped.append([_map_token(tok) for tok in group_tokens])
+        return mapped
+    tokens = _capture_flatten_tokens(value, field="capture-map source")
+    return [_map_token(tok) for tok in tokens]
+
+
+def _capture_apply_filter(parser: Parser, value: Any, predicate: str) -> Any:
+    if value is None:
+        return []
+    if _capture_is_group_list(value):
+        filtered: List[List[str]] = []
+        for group in value:
+            group_tokens = _capture_flatten_tokens(group, field="capture-filter group")
+            keep = [tok for tok in group_tokens if _capture_filter_token(parser, predicate, tok)]
+            if keep:
+                filtered.append(keep)
+        return filtered
+    tokens = _capture_flatten_tokens(value, field="capture-filter source")
+    return [tok for tok in tokens if _capture_filter_token(parser, predicate, tok)]
+
+
+def _ct_gensym(vm: CompileTimeVM) -> None:
+    prefix = vm.pop_str()
+    safe_prefix = re.sub(r"[^A-Za-z0-9_]", "_", prefix).strip("_")
+    if not safe_prefix:
+        safe_prefix = "g"
+
+    counter = int(getattr(vm.parser, "_ct_gensym_counter", 0))
+    while True:
+        counter += 1
+        candidate = f"{safe_prefix}_{counter}"
+        if vm.dictionary.lookup(candidate) is None:
+            break
+    setattr(vm.parser, "_ct_gensym_counter", counter)
+    vm.push(candidate)
+
+
+def _ct_capture_args(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    namespaces = ctx.get("capture_namespaces")
+    if isinstance(namespaces, dict):
+        args = namespaces.get("args")
+    else:
+        args = ctx.get("args")
+    vm.push(_capture_deep_clone(args if isinstance(args, dict) else {}))
+
+
+def _ct_capture_locals(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    namespaces = ctx.get("capture_namespaces")
+    if isinstance(namespaces, dict):
+        locals_scope = namespaces.get("locals")
+    else:
+        locals_scope = ctx.get("locals")
+    vm.push(_capture_deep_clone(locals_scope if isinstance(locals_scope, dict) else {}))
+
+
+def _ct_capture_globals(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    namespaces = ctx.get("capture_namespaces")
+    if isinstance(namespaces, dict):
+        globals_scope = namespaces.get("globals")
+    else:
+        globals_scope = ctx.get("globals")
+    vm.push(_capture_deep_clone(globals_scope if isinstance(globals_scope, dict) else {}))
+
+
+def _ct_capture_get(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    ctx = _ensure_capture_context(vm.pop())
+    captures = ctx.get("captures")
+    if isinstance(captures, dict) and name in captures:
+        vm.push(_capture_deep_clone(captures[name]))
+        vm.push(1)
+        return
+    vm.push(None)
+    vm.push(0)
+
+
+def _ct_capture_has(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    ctx = _ensure_capture_context(vm.pop())
+    captures = ctx.get("captures")
+    vm.push(1 if isinstance(captures, dict) and name in captures else 0)
+
+
+def _ct_capture_shape(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_shape(value))
+
+
+def _ct_capture_assert_shape(vm: CompileTimeVM) -> None:
+    expected = vm.pop_str().strip().lower()
+    value = vm._resolve_handle(vm.pop())
+    actual = _capture_shape(value)
+    if expected != actual:
+        raise ParseError(f"capture shape mismatch: expected '{expected}', got '{actual}'")
+
+
+def _ct_capture_count(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    if value is None:
+        vm.push(0)
+        return
+    if _capture_is_group_list(value):
+        vm.push(len(value))
+        return
+    if isinstance(value, list):
+        vm.push(len(value))
+        return
+    raise ParseError("capture-count expects list/group-list/nil value")
+
+
+def _ct_capture_slice(vm: CompileTimeVM) -> None:
+    end = vm.pop_int()
+    start = vm.pop_int()
+    value = vm._resolve_handle(vm.pop())
+    if value is None:
+        vm.push([])
+        return
+    if _capture_is_group_list(value):
+        vm.push([list(group) for group in value[start:end]])
+        return
+    if isinstance(value, list):
+        vm.push(list(value[start:end]))
+        return
+    raise ParseError("capture-slice expects list/group-list/nil value")
+
+
+def _ct_capture_map(vm: CompileTimeVM) -> None:
+    op = vm.pop_str().strip().lower()
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_apply_map(value, op))
+
+
+def _ct_capture_filter(vm: CompileTimeVM) -> None:
+    predicate = vm.pop_str().strip().lower()
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_apply_filter(vm.parser, value, predicate))
+
+
+def _ct_capture_normalize(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_normalize_value(value))
+
+
+def _ct_capture_pretty(vm: CompileTimeVM) -> None:
+    import json
+
+    value = vm._resolve_handle(vm.pop())
+    vm.push(json.dumps(_capture_normalize_value(value), sort_keys=True, ensure_ascii=True, indent=2))
+
+
+def _ct_capture_clone(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_deep_clone(value))
+
+
+def _ct_capture_global_set(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    vm.parser.capture_globals[name] = _capture_deep_clone(value)
+
+
+def _ct_capture_global_get(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    if name in vm.parser.capture_globals:
+        vm.push(_capture_deep_clone(vm.parser.capture_globals[name]))
+        vm.push(1)
+        return
+    vm.push(None)
+    vm.push(0)
+
+
+def _ct_capture_global_delete(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    existed = name in vm.parser.capture_globals
+    if existed:
+        del vm.parser.capture_globals[name]
+    vm.push(1 if existed else 0)
+
+
+def _ct_capture_global_clear(vm: CompileTimeVM) -> None:
+    count = len(vm.parser.capture_globals)
+    vm.parser.capture_globals.clear()
+    vm.push(count)
+
+
+def _ct_capture_freeze(vm: CompileTimeVM) -> None:
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+    vm.parser.capture_mutability_frozen.add((macro_name, capture_name))
+
+
+def _ct_capture_thaw(vm: CompileTimeVM) -> None:
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+    key = (macro_name, capture_name)
+    existed = key in vm.parser.capture_mutability_frozen
+    if existed:
+        vm.parser.capture_mutability_frozen.remove(key)
+    vm.push(1 if existed else 0)
+
+
+def _ct_capture_mutable(vm: CompileTimeVM) -> None:
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+    vm.push(0 if (macro_name, capture_name) in vm.parser.capture_mutability_frozen else 1)
+
+
+def _ct_capture_schema_put(vm: CompileTimeVM) -> None:
+    required = _coerce_bool(vm.pop(), field="capture schema required flag")
+    type_name = vm.pop_str().strip().lower() or "any"
+    shape = vm.pop_str().strip().lower() or "any"
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+
+    if shape not in ("any", "single", "tokens", "multi", "none", "scalar"):
+        raise ParseError(f"capture schema shape '{shape}' is not supported")
+
+    schema = vm.parser.capture_schemas.setdefault(macro_name, {})
+    schema[capture_name] = {
+        "shape": shape,
+        "type": type_name,
+        "required": bool(required),
+    }
+
+
+def _ct_capture_schema_get(vm: CompileTimeVM) -> None:
+    macro_name = vm.pop_str()
+    schema = vm.parser.capture_schemas.get(macro_name)
+    if schema is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(_capture_deep_clone(schema))
+    vm.push(1)
+
+
+def _ct_capture_schema_validate(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    macro_name = str(ctx.get("macro") or "")
+    if not macro_name:
+        raise ParseError("capture schema validation requires context with macro name")
+
+    schema = vm.parser.capture_schemas.get(macro_name)
+    if not schema:
+        vm.push(1)
+        return
+
+    captures = ctx.get("captures")
+    if not isinstance(captures, dict):
+        raise ParseError("capture schema validation requires context captures map")
+
+    errors: List[str] = []
+    for capture_name, raw_spec in schema.items():
+        spec = raw_spec if isinstance(raw_spec, dict) else {}
+        found = capture_name in captures
+        required = bool(spec.get("required", False))
+        if required and not found:
+            errors.append(f"missing required capture '{capture_name}'")
+            continue
+        if not found:
+            continue
+
+        value = captures[capture_name]
+        expected_shape = str(spec.get("shape", "any")).strip().lower()
+        if expected_shape and expected_shape != "any":
+            actual_shape = _capture_shape(value)
+            if actual_shape != expected_shape:
+                errors.append(
+                    f"capture '{capture_name}' shape mismatch: expected '{expected_shape}', got '{actual_shape}'"
+                )
+
+        expected_type = str(spec.get("type", "any")).strip().lower()
+        if expected_type and expected_type != "any":
+            try:
+                tokens = _capture_flatten_tokens(value, field=f"capture '{capture_name}'")
+            except ParseError as exc:
+                errors.append(str(exc))
+                tokens = []
+            for token in tokens:
+                if not vm.parser._rewrite_constraint_matches(token, expected_type):
+                    errors.append(
+                        f"capture '{capture_name}' expected '{expected_type}' token, got '{token}'"
+                    )
+                    break
+
+        if "mutable" in spec:
+            expected_mutable = bool(spec.get("mutable"))
+            actual_mutable = (macro_name, capture_name) not in vm.parser.capture_mutability_frozen
+            if expected_mutable != actual_mutable:
+                errors.append(
+                    f"capture '{capture_name}' mutability mismatch: expected {int(expected_mutable)}, got {int(actual_mutable)}"
+                )
+
+    if errors:
+        rendered = "\n".join(f"  - {item}" for item in errors)
+        raise ParseError(
+            f"macro '{macro_name}' capture schema validation failed:\n{rendered}"
+        )
+    vm.push(1)
+
+
+def _ct_capture_coerce_tokens(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_flatten_tokens(value, field="capture-coerce-tokens"))
+
+
+def _ct_capture_coerce_string(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    if isinstance(value, str):
+        vm.push(value)
+        return
+    vm.push(" ".join(_capture_flatten_tokens(value, field="capture-coerce-string")))
+
+
+def _ct_capture_coerce_number(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    candidate: Optional[str] = None
+    if isinstance(value, bool):
+        vm.push(1 if value else 0)
+        vm.push(1)
+        return
+    if isinstance(value, int):
+        vm.push(value)
+        vm.push(1)
+        return
+    if isinstance(value, Token):
+        candidate = value.lexeme
+    elif isinstance(value, str):
+        candidate = value
+    else:
+        tokens = _capture_flatten_tokens(value, field="capture-coerce-number")
+        if len(tokens) == 1:
+            candidate = tokens[0]
+
+    if candidate is None:
+        vm.push(0)
+        vm.push(0)
+        return
+
+    try:
+        vm.push(int(candidate, 0))
+        vm.push(1)
+    except Exception:
+        vm.push(0)
+        vm.push(0)
+
+
+def _ct_capture_lifetime(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    try:
+        lifetime = int(ctx.get("lifetime", 0))
+    except Exception:
+        lifetime = 0
+    vm.push(lifetime)
+
+
+def _ct_capture_lifetime_live(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    try:
+        lifetime = int(ctx.get("lifetime", 0))
+    except Exception:
+        lifetime = 0
+    vm.push(1 if lifetime != 0 and lifetime == vm.parser._capture_lifetime_active else 0)
+
+
+def _ct_capture_lifetime_assert(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    try:
+        lifetime = int(ctx.get("lifetime", 0))
+    except Exception:
+        lifetime = 0
+    if lifetime == 0 or lifetime != vm.parser._capture_lifetime_active:
+        raise ParseError(
+            f"capture context lifetime is stale (ctx={lifetime}, active={vm.parser._capture_lifetime_active})"
+        )
+
+
+def _ct_capture_separate(vm: CompileTimeVM) -> None:
+    separator = vm.pop_str()
+    value = vm._resolve_handle(vm.pop())
+    if value is None:
+        vm.push([])
+        return
+    if _capture_is_group_list(value):
+        out: List[str] = []
+        for idx, group in enumerate(value):
+            if idx > 0 and separator:
+                out.append(separator)
+            out.extend(_capture_flatten_tokens(group, field="capture-separate group"))
+        vm.push(out)
+        return
+    vm.push(_capture_flatten_tokens(value, field="capture-separate source"))
+
+
+def _ct_capture_join(vm: CompileTimeVM) -> None:
+    separator = vm.pop_str()
+    value = vm._resolve_handle(vm.pop())
+    if value is None:
+        vm.push("")
+        return
+    if _capture_is_group_list(value):
+        chunks: List[str] = []
+        for group in value:
+            group_tokens = _capture_flatten_tokens(group, field="capture-join group")
+            chunks.append(" ".join(group_tokens).strip())
+        vm.push(separator.join(chunks))
+        return
+    tokens = _capture_flatten_tokens(value, field="capture-join source")
+    vm.push(separator.join(tokens))
+
+
+def _ct_capture_equal(vm: CompileTimeVM) -> None:
+    right = vm._resolve_handle(vm.pop())
+    left = vm._resolve_handle(vm.pop())
+    vm.push(1 if _capture_normalize_value(left) == _capture_normalize_value(right) else 0)
+
+
+def _ct_capture_origin(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    origin = ctx.get("origin")
+    vm.push(_capture_deep_clone(origin if isinstance(origin, dict) else {}))
+
+
+def _ct_capture_taint_set(vm: CompileTimeVM) -> None:
+    flagged = _coerce_bool(vm.pop(), field="capture taint flag")
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+    scope = vm.parser.capture_taint.setdefault(macro_name, {})
+    scope[capture_name] = bool(flagged)
+
+
+def _ct_capture_taint_get(vm: CompileTimeVM) -> None:
+    capture_name = vm.pop_str()
+    macro_name = vm.pop_str()
+    scope = vm.parser.capture_taint.get(macro_name)
+    if scope is None or capture_name not in scope:
+        vm.push(0)
+        vm.push(0)
+        return
+    vm.push(1 if scope[capture_name] else 0)
+    vm.push(1)
+
+
+def _ct_capture_tainted(vm: CompileTimeVM) -> None:
+    capture_name = vm.pop_str()
+    ctx = _ensure_capture_context(vm.pop())
+    taint_scope = ctx.get("taint")
+    if isinstance(taint_scope, dict):
+        vm.push(1 if taint_scope.get(capture_name) else 0)
+        return
+    vm.push(0)
+
+
+def _ct_capture_serialize(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_serialize_text(value))
+
+
+def _ct_capture_deserialize(vm: CompileTimeVM) -> None:
+    import json
+
+    payload = vm.pop_str()
+    try:
+        vm.push(json.loads(payload))
+    except Exception as exc:
+        raise ParseError(f"capture-deserialize failed: {exc}") from exc
+
+
+def _ct_capture_compress(vm: CompileTimeVM) -> None:
+    import base64
+    import zlib
+
+    payload = vm.pop_str().encode("utf-8")
+    compressed = zlib.compress(payload, level=9)
+    vm.push(base64.b64encode(compressed).decode("ascii"))
+
+
+def _ct_capture_decompress(vm: CompileTimeVM) -> None:
+    import base64
+    import zlib
+
+    payload = vm.pop_str()
+    try:
+        raw = base64.b64decode(payload.encode("ascii"), validate=True)
+        vm.push(zlib.decompress(raw).decode("utf-8"))
+    except Exception as exc:
+        raise ParseError(f"capture-decompress failed: {exc}") from exc
+
+
+def _ct_capture_hash(vm: CompileTimeVM) -> None:
+    import hashlib
+
+    value = vm._resolve_handle(vm.pop())
+    encoded = _capture_serialize_text(value).encode("utf-8")
+    vm.push(hashlib.sha256(encoded).hexdigest())
+
+
+def _ct_capture_diff(vm: CompileTimeVM) -> None:
+    right = _capture_normalize_value(vm._resolve_handle(vm.pop()))
+    left = _capture_normalize_value(vm._resolve_handle(vm.pop()))
+    out: List[str] = []
+    _capture_diff_values(left, right, path="$", out=out)
+    vm.push(out)
+
+
+def _ct_capture_replay_log(vm: CompileTimeVM) -> None:
+    vm.push(_capture_deep_clone(vm.parser.capture_replay_log))
+
+
+def _ct_capture_replay_clear(vm: CompileTimeVM) -> None:
+    count = len(vm.parser.capture_replay_log)
+    vm.parser.capture_replay_log.clear()
+    vm.push(count)
+
+
+def _ct_capture_lint(vm: CompileTimeVM) -> None:
+    ctx = _ensure_capture_context(vm.pop())
+    captures = ctx.get("captures")
+    taint_scope = ctx.get("taint") if isinstance(ctx.get("taint"), dict) else {}
+    warnings: List[str] = []
+
+    if not isinstance(captures, dict):
+        vm.push(["capture context has invalid captures map"])
+        return
+
+    for key, value in captures.items():
+        key_text = str(key)
+        if not (_is_identifier(key_text) or key_text.isdigit()):
+            warnings.append(f"capture '{key_text}' has non-identifier key")
+        shape = _capture_shape(value)
+        if shape == "tokens" and isinstance(value, list) and not value:
+            warnings.append(f"capture '{key_text}' is an empty token list")
+        if shape == "multi":
+            for idx, group in enumerate(value):
+                if not isinstance(group, list) or not group:
+                    warnings.append(f"capture '{key_text}' has empty variadic group #{idx + 1}")
+        if isinstance(taint_scope, dict) and taint_scope.get(key_text):
+            warnings.append(f"capture '{key_text}' is tainted")
+
+    try:
+        lifetime = int(ctx.get("lifetime", 0))
+    except Exception:
+        lifetime = 0
+    if lifetime == 0 or lifetime != vm.parser._capture_lifetime_active:
+        warnings.append(
+            f"capture context lifetime is stale (ctx={lifetime}, active={vm.parser._capture_lifetime_active})"
+        )
+
+    vm.push(warnings)
+
+
+def _ct_list_pattern_macros(vm: CompileTimeVM) -> None:
+    vm.push(sorted(vm.parser._pattern_macro_rules.keys()))
+
+
+def _ct_set_pattern_macro_enabled(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="pattern macro enabled flag")
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_pattern_macro_enabled(name, enabled) else 0)
+
+
+def _ct_get_pattern_macro_enabled(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    enabled = vm.parser.get_pattern_macro_enabled(name)
+    if enabled is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(1 if enabled else 0)
+        vm.push(1)
+
+
+def _ct_set_pattern_macro_priority(vm: CompileTimeVM) -> None:
+    priority = vm.pop_int()
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_pattern_macro_priority(name, priority) else 0)
+
+
+def _ct_get_pattern_macro_priority(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    priority = vm.parser.get_pattern_macro_priority(name)
+    if priority is None:
+        vm.push(0)
+        vm.push(0)
+    else:
+        vm.push(priority)
+        vm.push(1)
+
+
+def _ct_get_pattern_macro_clauses(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    clauses = vm.parser.get_pattern_macro_clauses(name)
+    if clauses is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    encoded: List[Any] = []
+    for pattern, replacement in clauses:
+        encoded.append([list(pattern), list(replacement)])
+    vm.push(encoded)
+    vm.push(1)
+
+
+def _ct_get_pattern_macro_clause_details(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    details = vm.parser.get_pattern_macro_clause_details(name)
+    if details is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(details)
+    vm.push(1)
+
+
+def _ct_set_pattern_macro_group(vm: CompileTimeVM) -> None:
+    group = vm.pop_str()
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_pattern_macro_group(name, group) else 0)
+
+
+def _ct_get_pattern_macro_group(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    group = vm.parser.get_pattern_macro_group(name)
+    if group is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(group)
+    vm.push(1)
+
+
+def _ct_set_pattern_macro_scope(vm: CompileTimeVM) -> None:
+    scope = vm.pop_str()
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.set_pattern_macro_scope(name, scope) else 0)
+
+
+def _ct_get_pattern_macro_scope(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    scope = vm.parser.get_pattern_macro_scope(name)
+    if scope is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(scope)
+    vm.push(1)
+
+
+def _ct_set_pattern_group_active(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="pattern group enabled flag")
+    group = vm.pop_str()
+    vm.parser.set_pattern_group_active(group, enabled)
+    vm.push(1)
+
+
+def _ct_set_pattern_scope_active(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="pattern scope enabled flag")
+    scope = vm.pop_str()
+    vm.parser.set_pattern_scope_active(scope, enabled)
+    vm.push(1)
+
+
+def _ct_list_active_pattern_groups(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.list_active_pattern_groups())
+
+
+def _ct_list_active_pattern_scopes(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.list_active_pattern_scopes())
+
+
+def _ct_set_rewrite_trace(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="rewrite trace enabled flag")
+    vm.parser.rewrite_trace_enabled = bool(enabled)
+
+
+def _ct_get_rewrite_trace(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.rewrite_trace_enabled else 0)
+
+
+def _ct_get_rewrite_trace_log(vm: CompileTimeVM) -> None:
+    vm.push([dict(entry) for entry in vm.parser.rewrite_trace_log])
+
+
+def _ct_clear_rewrite_trace_log(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.clear_rewrite_trace_log())
+
+
+def _ct_detect_pattern_conflicts(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.detect_pattern_macro_conflicts())
+
+
+def _ct_detect_pattern_conflicts_named(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(vm.parser.detect_pattern_macro_conflicts(name))
+
+
+def _ct_get_rewrite_specificity(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite specificity stage")
+    value = vm.parser.get_rewrite_rule_specificity(stage, name)
+    if value is None:
+        vm.push(0)
+        vm.push(0)
+        return
+    vm.push(value)
+    vm.push(1)
+
+
+def _ct_set_pattern_macro_clause_guard(vm: CompileTimeVM) -> None:
+    guard_value = vm.pop()
+    idx = vm.pop_int()
+    name = vm.pop_str()
+    rule_names = vm.parser._pattern_macro_rule_names(name)
+    if idx < 0 or idx >= len(rule_names):
+        vm.push(0)
+        return
+    guard_name: Optional[str]
+    resolved = vm._resolve_handle(guard_value)
+    if resolved is None:
+        guard_name = None
+    else:
+        guard_name = _coerce_str(resolved)
+    ok = vm.parser.set_rewrite_rule_guard("grammar", rule_names[idx], guard_name)
+    vm.push(1 if ok else 0)
+
+
+def _ct_set_rewrite_pipeline(vm: CompileTimeVM) -> None:
+    pipeline = vm.pop_str()
+    name = vm.pop_str()
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite pipeline stage")
+    vm.push(1 if vm.parser.set_rewrite_rule_pipeline(stage, name, pipeline) else 0)
+
+
+def _ct_get_rewrite_pipeline(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite pipeline stage")
+    pipeline = vm.parser.get_rewrite_rule_pipeline(stage, name)
+    if pipeline is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(pipeline)
+    vm.push(1)
+
+
+def _ct_set_rewrite_pipeline_active(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="rewrite pipeline active flag")
+    pipeline = vm.pop_str()
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite pipeline stage")
+    vm.parser.set_rewrite_pipeline_active(stage, pipeline, enabled)
+
+
+def _ct_list_rewrite_active_pipelines(vm: CompileTimeVM) -> None:
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite pipeline stage")
+    vm.push(vm.parser.list_active_rewrite_pipelines(stage))
+
+
+def _ct_rebuild_rewrite_index(vm: CompileTimeVM) -> None:
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite index stage")
+    vm.parser._invalidate_rewrite_index(stage)
+    vm.parser._refresh_rewrite_index(stage)
+    vm.push(
+        len(vm.parser._rewrite_index_cache.get(stage, {}))
+        + len(vm.parser._rewrite_wildcard_cache.get(stage, []))
+    )
+
+
+def _ct_get_rewrite_index_stats(vm: CompileTimeVM) -> None:
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite index stage")
+    vm.parser._refresh_rewrite_index(stage)
+    keyed = vm.parser._rewrite_index_cache.get(stage, {})
+    wildcard = vm.parser._rewrite_wildcard_cache.get(stage, [])
+    vm.push(
+        {
+            "stage": stage,
+            "keys": len(keyed),
+            "keyed_rules": sum(len(values) for values in keyed.values()),
+            "wildcard_rules": len(wildcard),
+        }
+    )
+
+
+def _ct_rewrite_txn_begin(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.rewrite_transaction_begin())
+
+
+def _ct_rewrite_txn_commit(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.rewrite_transaction_commit() else 0)
+
+
+def _ct_rewrite_txn_rollback(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.rewrite_transaction_rollback() else 0)
+
+
+def _ct_export_rewrite_pack(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.export_rewrite_pack())
+
+
+def _ct_import_rewrite_pack(vm: CompileTimeVM) -> None:
+    pack = _ensure_dict(vm.pop())
+    vm.push(vm.parser.import_rewrite_pack(pack, replace=False))
+
+
+def _ct_import_rewrite_pack_replace(vm: CompileTimeVM) -> None:
+    pack = _ensure_dict(vm.pop())
+    vm.push(vm.parser.import_rewrite_pack(pack, replace=True))
+
+
+def _ct_get_rewrite_provenance(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite provenance stage")
+    provenance = vm.parser.get_rewrite_rule_provenance(stage, name)
+    if provenance is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(provenance)
+    vm.push(1)
+
+
+def _ct_rewrite_dry_run(vm: CompileTimeVM) -> None:
+    max_steps = vm.pop_int()
+    lexemes = _coerce_lexeme_list(vm.pop(), field="rewrite dry-run token list")
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite dry-run stage")
+    result, patches = _simulate_rewrite_dry_run(
+        vm.parser,
+        stage=stage,
+        lexemes=lexemes,
+        max_steps=max_steps,
+    )
+    vm.push(result)
+    vm.push(patches)
+
+
+def _ct_rewrite_generate_fixture(vm: CompileTimeVM) -> None:
+    max_steps = vm.pop_int()
+    lexemes = _coerce_lexeme_list(vm.pop(), field="rewrite fixture token list")
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite fixture stage")
+    result, patches = _simulate_rewrite_dry_run(
+        vm.parser,
+        stage=stage,
+        lexemes=lexemes,
+        max_steps=max_steps,
+    )
+    vm.push(
+        {
+            "stage": stage,
+            "input": list(lexemes),
+            "output": result,
+            "patches": patches,
+        }
+    )
+
+
+def _ct_set_rewrite_saturation(vm: CompileTimeVM) -> None:
+    strategy = vm.pop_str().strip().lower()
+    if strategy not in ("first", "specificity", "single-pass"):
+        raise ParseError("rewrite saturation strategy must be one of: first, specificity, single-pass")
+    vm.parser.rewrite_saturation_strategy = strategy
+
+
+def _ct_get_rewrite_saturation(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.rewrite_saturation_strategy)
+
+
+def _ct_set_rewrite_max_steps(vm: CompileTimeVM) -> None:
+    max_steps = vm.pop_int()
+    if max_steps < 1:
+        raise ParseError("rewrite max-step budget must be >= 1")
+    vm.parser.rewrite_max_steps = max_steps
+
+
+def _ct_get_rewrite_max_steps(vm: CompileTimeVM) -> None:
+    vm.push(int(vm.parser.rewrite_max_steps))
+
+
+def _ct_set_rewrite_loop_detection(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="rewrite loop detection flag")
+    vm.parser.rewrite_loop_detection = bool(enabled)
+
+
+def _ct_get_rewrite_loop_detection(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.rewrite_loop_detection else 0)
+
+
+def _ct_get_rewrite_loop_reports(vm: CompileTimeVM) -> None:
+    vm.push([dict(entry) for entry in vm.parser.rewrite_loop_reports])
+
+
+def _ct_clear_rewrite_loop_reports(vm: CompileTimeVM) -> None:
+    count = len(vm.parser.rewrite_loop_reports)
+    vm.parser.rewrite_loop_reports.clear()
+    vm.push(count)
+
+
+def _ct_get_rewrite_profile(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.get_rewrite_profile_snapshot())
+
+
+def _ct_clear_rewrite_profile(vm: CompileTimeVM) -> None:
+    vm.parser.clear_rewrite_profile()
+
+
+def _ct_rewrite_compatibility_matrix(vm: CompileTimeVM) -> None:
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite compatibility stage")
+    vm.push(vm.parser.build_rewrite_compatibility_matrix(stage))
+
+
 def _ct_unregister_word(vm: CompileTimeVM) -> None:
     name = vm.pop_str()
     vm.push(1 if vm.parser.unregister_word(name) else 0)
@@ -10247,6 +15966,98 @@ def _coerce_bool(value: Any, *, field: str) -> bool:
     if isinstance(value, int):
         return value != 0
     raise ParseError(f"{field} expects integer/boolean value")
+
+
+def _coerce_rewrite_stage(value: Any, *, field: str = "rewrite stage") -> str:
+    stage = _coerce_str(value).strip().lower()
+    if stage not in ("reader", "grammar"):
+        raise ParseError(f"{field} must be 'reader' or 'grammar'")
+    return stage
+
+
+def _simulate_rewrite_dry_run(
+    parser: Parser,
+    *,
+    stage: str,
+    lexemes: Sequence[str],
+    max_steps: int,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    stage = _coerce_rewrite_stage(stage)
+    if max_steps < 1:
+        raise ParseError("rewrite dry-run max_steps must be >= 1")
+
+    template = parser._last_token
+    if template is None:
+        template = Token(lexeme="", line=0, column=0, start=0, end=0)
+
+    synthetic_tokens = [
+        Token(
+            lexeme=str(lex),
+            line=template.line,
+            column=max(1, template.column + idx),
+            start=template.start,
+            end=template.end,
+            expansion_depth=template.expansion_depth,
+        )
+        for idx, lex in enumerate(lexemes)
+    ]
+
+    saved_tokens = parser.tokens
+    saved_pos = parser.pos
+    saved_last_token = parser._last_token
+    saved_trace_enabled = parser.rewrite_trace_enabled
+    saved_trace_log = list(parser.rewrite_trace_log)
+    saved_step_count = parser._rewrite_step_count
+    saved_seen_state = dict(parser._rewrite_seen_state)
+    saved_loop_reports = list(parser.rewrite_loop_reports)
+    saved_budget = parser.rewrite_max_steps
+
+    parser.tokens = synthetic_tokens
+    parser.pos = 0
+    parser._last_token = None
+    parser.rewrite_trace_enabled = True
+    parser.rewrite_trace_log = []
+    parser._rewrite_step_count = 0
+    parser._rewrite_seen_state = {}
+    parser.rewrite_loop_reports = []
+    parser.rewrite_max_steps = int(max_steps)
+    merged_trace: Optional[List[Dict[str, Any]]] = None
+
+    try:
+        made_progress = True
+        while made_progress:
+            made_progress = False
+            idx = 0
+            while idx < len(parser.tokens):
+                parser.pos = idx + 1
+                cur = parser.tokens[idx]
+                parser._last_token = cur
+                if parser.macro_engine.try_apply_rewrite_rules(stage, cur):
+                    made_progress = True
+                    idx = max(0, parser.pos)
+                    continue
+                idx += 1
+
+            if parser.rewrite_saturation_strategy == "single-pass":
+                break
+
+        result = [tok.lexeme for tok in parser.tokens]
+        patches = [dict(entry) for entry in parser.rewrite_trace_log]
+        if saved_trace_enabled:
+            merged_trace = saved_trace_log + patches
+            if len(merged_trace) > 8192:
+                merged_trace = merged_trace[-8192:]
+        return result, patches
+    finally:
+        parser.tokens = saved_tokens
+        parser.pos = saved_pos
+        parser._last_token = saved_last_token
+        parser.rewrite_trace_enabled = saved_trace_enabled
+        parser.rewrite_trace_log = merged_trace if merged_trace is not None else saved_trace_log
+        parser._rewrite_step_count = saved_step_count
+        parser._rewrite_seen_state = saved_seen_state
+        parser.rewrite_loop_reports = saved_loop_reports
+        parser.rewrite_max_steps = saved_budget
 
 
 def _ct_emit_definition(vm: CompileTimeVM) -> None:
@@ -10717,6 +16528,141 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-get-macro-preview", _ct_get_macro_preview, compile_only=True)
     register("ct-register-text-macro", _ct_register_text_macro, compile_only=True)
     register("ct-register-text-macro-signature", _ct_register_text_macro_signature, compile_only=True)
+    register("ct-register-pattern-macro", _ct_register_pattern_macro, compile_only=True)
+    register("ct-unregister-pattern-macro", _ct_unregister_pattern_macro, compile_only=True)
+    register("ct-word-is-text-macro", _ct_word_is_text_macro, compile_only=True)
+    register("ct-word-is-pattern-macro", _ct_word_is_pattern_macro, compile_only=True)
+    register("ct-get-macro-signature", _ct_get_macro_signature, compile_only=True)
+    register("ct-get-macro-expansion", _ct_get_macro_expansion, compile_only=True)
+    register("ct-set-macro-expansion", _ct_set_macro_expansion, compile_only=True)
+    register("ct-clone-macro", _ct_clone_macro, compile_only=True)
+    register("ct-rename-macro", _ct_rename_macro, compile_only=True)
+    register("ct-macro-doc-get", _ct_macro_doc_get, compile_only=True)
+    register("ct-macro-doc-set", _ct_macro_doc_set, compile_only=True)
+    register("ct-macro-attrs-get", _ct_macro_attrs_get, compile_only=True)
+    register("ct-macro-attrs-set", _ct_macro_attrs_set, compile_only=True)
+    register("ct-get-macro-template-mode", _ct_get_macro_template_mode, compile_only=True)
+    register("ct-get-macro-template-version", _ct_get_macro_template_version, compile_only=True)
+    register("ct-get-macro-template-program-size", _ct_get_macro_template_program_size, compile_only=True)
+    register("ct-set-ct-call-contract", _ct_set_ct_call_contract, compile_only=True)
+    register("ct-get-ct-call-contract", _ct_get_ct_call_contract, compile_only=True)
+    register("ct-set-ct-call-exception-policy", _ct_set_ct_call_exception_policy, compile_only=True)
+    register("ct-get-ct-call-exception-policy", _ct_get_ct_call_exception_policy, compile_only=True)
+    register("ct-set-ct-call-sandbox-mode", _ct_set_ct_call_sandbox_mode, compile_only=True)
+    register("ct-get-ct-call-sandbox-mode", _ct_get_ct_call_sandbox_mode, compile_only=True)
+    register("ct-set-ct-call-sandbox-allowlist", _ct_set_ct_call_sandbox_allowlist, compile_only=True)
+    register("ct-get-ct-call-sandbox-allowlist", _ct_get_ct_call_sandbox_allowlist, compile_only=True)
+    register("ct-ctrand-seed", _ct_ctrand_seed, compile_only=True)
+    register("ct-ctrand-int", _ct_ctrand_int, compile_only=True)
+    register("ct-ctrand-range", _ct_ctrand_range, compile_only=True)
+    register("ct-set-ct-call-memo", _ct_set_ct_call_memo, compile_only=True)
+    register("ct-get-ct-call-memo", _ct_get_ct_call_memo, compile_only=True)
+    register("ct-clear-ct-call-memo", _ct_clear_ct_call_memo, compile_only=True)
+    register("ct-get-ct-call-memo-size", _ct_get_ct_call_memo_size, compile_only=True)
+    register("ct-set-ct-call-side-effects", _ct_set_ct_call_side_effects, compile_only=True)
+    register("ct-get-ct-call-side-effects", _ct_get_ct_call_side_effects, compile_only=True)
+    register("ct-get-ct-call-side-effect-log", _ct_get_ct_call_side_effect_log, compile_only=True)
+    register("ct-clear-ct-call-side-effect-log", _ct_clear_ct_call_side_effect_log, compile_only=True)
+    register("ct-set-ct-call-recursion-limit", _ct_set_ct_call_recursion_limit, compile_only=True)
+    register("ct-get-ct-call-recursion-limit", _ct_get_ct_call_recursion_limit, compile_only=True)
+    register("ct-set-ct-call-timeout-ms", _ct_set_ct_call_timeout_ms, compile_only=True)
+    register("ct-get-ct-call-timeout-ms", _ct_get_ct_call_timeout_ms, compile_only=True)
+    register("ct-gensym", _ct_gensym, compile_only=True)
+    register("ct-capture-args", _ct_capture_args, compile_only=True)
+    register("ct-capture-locals", _ct_capture_locals, compile_only=True)
+    register("ct-capture-globals", _ct_capture_globals, compile_only=True)
+    register("ct-capture-get", _ct_capture_get, compile_only=True)
+    register("ct-capture-has?", _ct_capture_has, compile_only=True)
+    register("ct-capture-shape", _ct_capture_shape, compile_only=True)
+    register("ct-capture-assert-shape", _ct_capture_assert_shape, compile_only=True)
+    register("ct-capture-count", _ct_capture_count, compile_only=True)
+    register("ct-capture-slice", _ct_capture_slice, compile_only=True)
+    register("ct-capture-map", _ct_capture_map, compile_only=True)
+    register("ct-capture-filter", _ct_capture_filter, compile_only=True)
+    register("ct-capture-normalize", _ct_capture_normalize, compile_only=True)
+    register("ct-capture-pretty", _ct_capture_pretty, compile_only=True)
+    register("ct-capture-clone", _ct_capture_clone, compile_only=True)
+    register("ct-capture-global-set", _ct_capture_global_set, compile_only=True)
+    register("ct-capture-global-get", _ct_capture_global_get, compile_only=True)
+    register("ct-capture-global-delete", _ct_capture_global_delete, compile_only=True)
+    register("ct-capture-global-clear", _ct_capture_global_clear, compile_only=True)
+    register("ct-capture-freeze", _ct_capture_freeze, compile_only=True)
+    register("ct-capture-thaw", _ct_capture_thaw, compile_only=True)
+    register("ct-capture-mutable?", _ct_capture_mutable, compile_only=True)
+    register("ct-capture-schema-put", _ct_capture_schema_put, compile_only=True)
+    register("ct-capture-schema-get", _ct_capture_schema_get, compile_only=True)
+    register("ct-capture-schema-validate", _ct_capture_schema_validate, compile_only=True)
+    register("ct-capture-coerce-tokens", _ct_capture_coerce_tokens, compile_only=True)
+    register("ct-capture-coerce-string", _ct_capture_coerce_string, compile_only=True)
+    register("ct-capture-coerce-number", _ct_capture_coerce_number, compile_only=True)
+    register("ct-capture-lifetime", _ct_capture_lifetime, compile_only=True)
+    register("ct-capture-lifetime-live?", _ct_capture_lifetime_live, compile_only=True)
+    register("ct-capture-lifetime-assert", _ct_capture_lifetime_assert, compile_only=True)
+    register("ct-capture-separate", _ct_capture_separate, compile_only=True)
+    register("ct-capture-join", _ct_capture_join, compile_only=True)
+    register("ct-capture-equal?", _ct_capture_equal, compile_only=True)
+    register("ct-capture-origin", _ct_capture_origin, compile_only=True)
+    register("ct-capture-taint-set", _ct_capture_taint_set, compile_only=True)
+    register("ct-capture-taint-get", _ct_capture_taint_get, compile_only=True)
+    register("ct-capture-tainted?", _ct_capture_tainted, compile_only=True)
+    register("ct-capture-serialize", _ct_capture_serialize, compile_only=True)
+    register("ct-capture-deserialize", _ct_capture_deserialize, compile_only=True)
+    register("ct-capture-compress", _ct_capture_compress, compile_only=True)
+    register("ct-capture-decompress", _ct_capture_decompress, compile_only=True)
+    register("ct-capture-hash", _ct_capture_hash, compile_only=True)
+    register("ct-capture-diff", _ct_capture_diff, compile_only=True)
+    register("ct-capture-replay-log", _ct_capture_replay_log, compile_only=True)
+    register("ct-capture-replay-clear", _ct_capture_replay_clear, compile_only=True)
+    register("ct-capture-lint", _ct_capture_lint, compile_only=True)
+    register("ct-list-pattern-macros", _ct_list_pattern_macros, compile_only=True)
+    register("ct-set-pattern-macro-enabled", _ct_set_pattern_macro_enabled, compile_only=True)
+    register("ct-get-pattern-macro-enabled", _ct_get_pattern_macro_enabled, compile_only=True)
+    register("ct-set-pattern-macro-priority", _ct_set_pattern_macro_priority, compile_only=True)
+    register("ct-get-pattern-macro-priority", _ct_get_pattern_macro_priority, compile_only=True)
+    register("ct-get-pattern-macro-clauses", _ct_get_pattern_macro_clauses, compile_only=True)
+    register("ct-get-pattern-macro-clause-details", _ct_get_pattern_macro_clause_details, compile_only=True)
+    register("ct-set-pattern-macro-group", _ct_set_pattern_macro_group, compile_only=True)
+    register("ct-get-pattern-macro-group", _ct_get_pattern_macro_group, compile_only=True)
+    register("ct-set-pattern-macro-scope", _ct_set_pattern_macro_scope, compile_only=True)
+    register("ct-get-pattern-macro-scope", _ct_get_pattern_macro_scope, compile_only=True)
+    register("ct-set-pattern-group-active", _ct_set_pattern_group_active, compile_only=True)
+    register("ct-set-pattern-scope-active", _ct_set_pattern_scope_active, compile_only=True)
+    register("ct-list-active-pattern-groups", _ct_list_active_pattern_groups, compile_only=True)
+    register("ct-list-active-pattern-scopes", _ct_list_active_pattern_scopes, compile_only=True)
+    register("ct-set-pattern-macro-clause-guard", _ct_set_pattern_macro_clause_guard, compile_only=True)
+    register("ct-detect-pattern-conflicts", _ct_detect_pattern_conflicts, compile_only=True)
+    register("ct-detect-pattern-conflicts-named", _ct_detect_pattern_conflicts_named, compile_only=True)
+    register("ct-get-rewrite-specificity", _ct_get_rewrite_specificity, compile_only=True)
+    register("ct-set-rewrite-pipeline", _ct_set_rewrite_pipeline, compile_only=True)
+    register("ct-get-rewrite-pipeline", _ct_get_rewrite_pipeline, compile_only=True)
+    register("ct-set-rewrite-pipeline-active", _ct_set_rewrite_pipeline_active, compile_only=True)
+    register("ct-list-rewrite-active-pipelines", _ct_list_rewrite_active_pipelines, compile_only=True)
+    register("ct-rebuild-rewrite-index", _ct_rebuild_rewrite_index, compile_only=True)
+    register("ct-get-rewrite-index-stats", _ct_get_rewrite_index_stats, compile_only=True)
+    register("ct-rewrite-txn-begin", _ct_rewrite_txn_begin, compile_only=True)
+    register("ct-rewrite-txn-commit", _ct_rewrite_txn_commit, compile_only=True)
+    register("ct-rewrite-txn-rollback", _ct_rewrite_txn_rollback, compile_only=True)
+    register("ct-export-rewrite-pack", _ct_export_rewrite_pack, compile_only=True)
+    register("ct-import-rewrite-pack", _ct_import_rewrite_pack, compile_only=True)
+    register("ct-import-rewrite-pack-replace", _ct_import_rewrite_pack_replace, compile_only=True)
+    register("ct-get-rewrite-provenance", _ct_get_rewrite_provenance, compile_only=True)
+    register("ct-rewrite-dry-run", _ct_rewrite_dry_run, compile_only=True)
+    register("ct-rewrite-generate-fixture", _ct_rewrite_generate_fixture, compile_only=True)
+    register("ct-set-rewrite-saturation", _ct_set_rewrite_saturation, compile_only=True)
+    register("ct-get-rewrite-saturation", _ct_get_rewrite_saturation, compile_only=True)
+    register("ct-set-rewrite-max-steps", _ct_set_rewrite_max_steps, compile_only=True)
+    register("ct-get-rewrite-max-steps", _ct_get_rewrite_max_steps, compile_only=True)
+    register("ct-set-rewrite-loop-detection", _ct_set_rewrite_loop_detection, compile_only=True)
+    register("ct-get-rewrite-loop-detection", _ct_get_rewrite_loop_detection, compile_only=True)
+    register("ct-get-rewrite-loop-reports", _ct_get_rewrite_loop_reports, compile_only=True)
+    register("ct-clear-rewrite-loop-reports", _ct_clear_rewrite_loop_reports, compile_only=True)
+    register("ct-set-rewrite-trace", _ct_set_rewrite_trace, compile_only=True)
+    register("ct-get-rewrite-trace", _ct_get_rewrite_trace, compile_only=True)
+    register("ct-get-rewrite-trace-log", _ct_get_rewrite_trace_log, compile_only=True)
+    register("ct-clear-rewrite-trace-log", _ct_clear_rewrite_trace_log, compile_only=True)
+    register("ct-get-rewrite-profile", _ct_get_rewrite_profile, compile_only=True)
+    register("ct-clear-rewrite-profile", _ct_clear_rewrite_profile, compile_only=True)
+    register("ct-rewrite-compatibility-matrix", _ct_rewrite_compatibility_matrix, compile_only=True)
     register("ct-unregister-word", _ct_unregister_word, compile_only=True)
     register("ct-list-words", _ct_list_words, compile_only=True)
     register("ct-word-exists?", _ct_word_exists, compile_only=True)
@@ -11143,6 +17089,7 @@ class Compiler:
         macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
         macro_preview: bool = False,
         defines: Optional[Sequence[str]] = None,
+        source_graph_cache: Optional["SourceGraphCache"] = None,
     ) -> None:
         self.reader = Reader()
         self.dictionary = bootstrap_dictionary()
@@ -11167,6 +17114,7 @@ class Compiler:
         self.source_link_flags: List[str] = []
         self.source_include_paths: List[Path] = []
         self.source_cli_flags: List[str] = []
+        self.source_graph_cache = source_graph_cache
 
     def _reset_source_flag_state(self) -> None:
         self.source_link_flags.clear()
@@ -11175,10 +17123,76 @@ class Compiler:
 
     def _load_source_graph(self, path: Path) -> Tuple[str, List[FileSpan]]:
         resolved = path.resolve()
+        if self.source_graph_cache is not None:
+            cached = self.source_graph_cache.load(
+                resolved,
+                defines=self.defines,
+                include_paths=self.include_paths,
+            )
+            if cached is not None:
+                cached_source = cached.get("source")
+                span_rows = cached.get("spans")
+                if isinstance(cached_source, str) and isinstance(span_rows, list):
+                    cached_spans: List[FileSpan] = []
+                    for row in span_rows:
+                        if (
+                            isinstance(row, (list, tuple))
+                            and len(row) == 4
+                            and isinstance(row[0], str)
+                            and isinstance(row[1], int)
+                            and isinstance(row[2], int)
+                            and isinstance(row[3], int)
+                        ):
+                            cached_spans.append(FileSpan(Path(row[0]), row[1], row[2], row[3]))
+
+                    loaded_files: Set[Path] = set()
+                    raw_files = cached.get("files", [])
+                    if isinstance(raw_files, list):
+                        for raw in raw_files:
+                            if isinstance(raw, str):
+                                loaded_files.add(Path(raw))
+                    if not loaded_files:
+                        loaded_files.add(resolved)
+
+                    link_flags = cached.get("source_link_flags", [])
+                    self.source_link_flags = [str(f) for f in link_flags if isinstance(f, str) and f]
+
+                    include_flags = cached.get("source_include_paths", [])
+                    cached_include_paths: List[Path] = []
+                    if isinstance(include_flags, list):
+                        for raw in include_flags:
+                            if isinstance(raw, str) and raw:
+                                inc = Path(raw)
+                                cached_include_paths.append(inc)
+                                if inc not in self.include_paths:
+                                    self.include_paths.append(inc)
+                    self.source_include_paths = cached_include_paths
+
+                    cli_flags = cached.get("source_cli_flags", [])
+                    self.source_cli_flags = [str(f) for f in cli_flags if isinstance(f, str) and f]
+
+                    self._loaded_files = loaded_files
+                    self._last_loaded_path = resolved
+                    self._last_loaded_source = cached_source
+                    self._last_loaded_spans = cached_spans
+                    return cached_source, cached_spans
+
         source, spans = self._load_with_imports(resolved)
         self._last_loaded_path = resolved
         self._last_loaded_source = source
         self._last_loaded_spans = spans
+        if self.source_graph_cache is not None:
+            self.source_graph_cache.save(
+                resolved,
+                defines=self.defines,
+                include_paths=self.include_paths,
+                loaded_files=self._loaded_files,
+                source_text=source,
+                spans=spans,
+                source_link_flags=self.source_link_flags,
+                source_include_paths=self.source_include_paths,
+                source_cli_flags=self.source_cli_flags,
+            )
         return source, spans
 
     def _record_source_link_flag(self, flag: str) -> None:
@@ -11775,6 +17789,7 @@ class Compiler:
                 header_target, remainder = parsed_cimport
                 # cimport "header.h" — extract extern declarations from a C header
                 header_path = self._resolve_import_target(path, header_target)
+                seen.add(header_path)
                 try:
                     header_text = header_path.read_text()
                 except FileNotFoundError as exc:
@@ -11829,8 +17844,164 @@ class Compiler:
             raise ParseError(f"unterminated ifdef/ifndef ({len(_ifdef_stack)} level(s) deep) in {path}")
 
 
+class SourceGraphCache:
+    """Caches fully preprocessed source graphs keyed by source/import state."""
+
+    _VERSION = 1
+
+    def __init__(self, cache_dir: Path) -> None:
+        self.cache_dir = cache_dir
+
+    @staticmethod
+    def _hash_bytes(data: bytes) -> str:
+        import hashlib
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _hash_str(s: str) -> str:
+        import hashlib
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _compiler_fingerprint() -> str:
+        try:
+            st = Path(__file__).stat()
+            return f"{int(st.st_mtime_ns)}:{int(st.st_size)}"
+        except OSError:
+            return "0:0"
+
+    def _manifest_path(
+        self,
+        source: Path,
+        *,
+        defines: Set[str],
+        include_paths: Sequence[Path],
+    ) -> Path:
+        define_key = "\x1f".join(sorted(str(item) for item in defines))
+        include_key = "\x1f".join(str(Path(item).expanduser().resolve()) for item in include_paths)
+        key = self._hash_str(
+            f"v={self._VERSION}|source={source.resolve()}|"
+            f"defines={define_key}|includes={include_key}|"
+            f"compiler={self._compiler_fingerprint()}"
+        )
+        return self.cache_dir / f"graph_{key}.json"
+
+    def _file_info(self, path: Path) -> dict:
+        st = path.stat()
+        return {
+            "mtime_ns": int(st.st_mtime_ns),
+            "size": int(st.st_size),
+            "hash": self._hash_bytes(path.read_bytes()),
+        }
+
+    def _deps_fresh(self, file_info: Dict[str, Any]) -> bool:
+        for path_str, info in file_info.items():
+            if not isinstance(path_str, str) or not isinstance(info, dict):
+                return False
+            p = Path(path_str)
+            if not p.exists():
+                return False
+            try:
+                st = p.stat()
+            except OSError:
+                return False
+
+            cached_mtime_ns = info.get("mtime_ns")
+            cached_size = info.get("size")
+            if isinstance(cached_mtime_ns, int) and isinstance(cached_size, int):
+                if int(st.st_mtime_ns) == cached_mtime_ns and int(st.st_size) == cached_size:
+                    continue
+
+            actual_hash = self._hash_bytes(p.read_bytes())
+            if actual_hash != info.get("hash"):
+                return False
+        return True
+
+    def load(
+        self,
+        source: Path,
+        *,
+        defines: Set[str],
+        include_paths: Sequence[Path],
+    ) -> Optional[dict]:
+        manifest_path = self._manifest_path(source, defines=defines, include_paths=include_paths)
+        if not manifest_path.exists():
+            return None
+        try:
+            import json
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != self._VERSION:
+            return None
+        file_info = payload.get("file_info")
+        if not isinstance(file_info, dict):
+            return None
+        if not self._deps_fresh(file_info):
+            return None
+        return payload
+
+    def save(
+        self,
+        source: Path,
+        *,
+        defines: Set[str],
+        include_paths: Sequence[Path],
+        loaded_files: Set[Path],
+        source_text: str,
+        spans: Sequence[FileSpan],
+        source_link_flags: Sequence[str],
+        source_include_paths: Sequence[Path],
+        source_cli_flags: Sequence[str],
+    ) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        file_info: Dict[str, dict] = {}
+        for p in sorted(loaded_files, key=lambda item: str(item)):
+            try:
+                file_info[str(p)] = self._file_info(p)
+            except OSError:
+                continue
+
+        span_rows: List[Tuple[str, int, int, int]] = []
+        for span in spans:
+            span_rows.append(
+                (
+                    span.path.as_posix(),
+                    int(span.start_line),
+                    int(span.end_line),
+                    int(span.local_start_line),
+                )
+            )
+
+        payload = {
+            "version": self._VERSION,
+            "source": source_text,
+            "spans": span_rows,
+            "files": [str(p) for p in sorted(loaded_files, key=lambda item: str(item))],
+            "file_info": file_info,
+            "source_link_flags": [str(f) for f in source_link_flags if str(f)],
+            "source_include_paths": [str(Path(p).expanduser().resolve()) for p in source_include_paths],
+            "source_cli_flags": [str(f) for f in source_cli_flags if str(f)],
+            "defines": sorted(str(item) for item in defines),
+            "include_paths": [str(Path(p).expanduser().resolve()) for p in include_paths],
+        }
+
+        manifest_path = self._manifest_path(source, defines=defines, include_paths=include_paths)
+        try:
+            import json
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            return
+
+
 class BuildCache:
     """Caches compilation artifacts keyed by source content and compiler flags."""
+
+    _FORMAT_VERSION = 2
 
     def __init__(self, cache_dir: Path) -> None:
         self.cache_dir = cache_dir
@@ -11887,9 +18058,14 @@ class BuildCache:
             return None
         try:
             import json
-            return json.loads(mp.read_text())
+            payload = json.loads(mp.read_text())
         except (ValueError, OSError):
             return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("format_version") != self._FORMAT_VERSION:
+            return None
+        return payload
 
     def check_fresh(self, manifest: dict, fhash: str) -> bool:
         """Return True if all source files are unchanged and flags match."""
@@ -11941,6 +18117,7 @@ class BuildCache:
         asm_path = self.cache_dir / f"{asm_hash}.asm"
         asm_path.write_text(asm_text)
         manifest = {
+            "format_version": self._FORMAT_VERSION,
             "source": str(source.resolve()),
             "flags_hash": fhash,
             "files": files,
@@ -11960,12 +18137,25 @@ _nasm_path: str = ""
 _linker_path: str = ""
 _linker_is_lld: bool = False
 
+
+def _which_exec(name: str) -> Optional[str]:
+    """Lightweight executable lookup without importing shutil."""
+    if not name:
+        return None
+    if os.path.sep in name:
+        return name if (os.path.isfile(name) and os.access(name, os.X_OK)) else None
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        base = part or "."
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
 def _find_nasm() -> str:
     global _nasm_path
     if _nasm_path:
         return _nasm_path
-    import shutil
-    p = shutil.which("nasm")
+    p = _which_exec("nasm")
     if not p:
         raise RuntimeError("nasm not found")
     _nasm_path = p
@@ -11975,13 +18165,12 @@ def _find_linker() -> tuple:
     global _linker_path, _linker_is_lld
     if _linker_path:
         return _linker_path, _linker_is_lld
-    import shutil
-    lld = shutil.which("ld.lld")
+    lld = _which_exec("ld.lld")
     if lld:
         _linker_path = lld
         _linker_is_lld = True
         return lld, True
-    ld = shutil.which("ld")
+    ld = _which_exec("ld")
     if ld:
         _linker_path = ld
         _linker_is_lld = False
@@ -12662,3548 +18851,88 @@ def _repl_build_source(
     return "\n".join(lines) + "\n"
 
 
-class DocEntry:
-    __slots__ = ('name', 'stack_effect', 'description', 'kind', 'path', 'line')
+# ---- Docs explorer integration (delegated to docs.py) ----
 
-    def __init__(self, name: str, stack_effect: str, description: str, kind: str, path: Path, line: int) -> None:
-        self.name = name
-        self.stack_effect = stack_effect
-        self.description = description
-        self.kind = kind
-        self.path = path
-        self.line = line
+_DOCS_HELPERS_MODULE: Any = None
+_DOCS_HELPERS_LOADED = False
+_DOCS_HELPERS_WARNED = False
+_DOCS_HELPERS_ERROR = ""
 
 
-_DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
-_DOC_WORD_RE = re.compile(r"^\s*(?:inline\s+)?word\s+([^\s]+)\b")
-_DOC_ASM_RE = re.compile(r"^\s*:asm\s+([^\s{]+)")
-_DOC_PY_RE = re.compile(r"^\s*:py\s+([^\s{]+)")
-_DOC_MACRO_RE = re.compile(r"^\s*macro\s+([^\s]+)(?:\s+(\d+))?")
+def _load_docs_helpers(*, warn: bool = False) -> Optional[Any]:
+    global _DOCS_HELPERS_MODULE
+    global _DOCS_HELPERS_LOADED
+    global _DOCS_HELPERS_WARNED
+    global _DOCS_HELPERS_ERROR
 
-
-def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
-    match = _DOC_STACK_RE.match(text)
-    if match is None:
-        return None
-    name = match.group(1).strip()
-    tail = match.group(2).strip()
-    if not name:
-        return None
-    if "->" not in tail:
-        return None
-    return name, tail
-
-
-def _extract_definition_name(text: str, *, include_macros: bool = False) -> Optional[Tuple[str, str, int]]:
-    for kind, regex in (("word", _DOC_WORD_RE), ("asm", _DOC_ASM_RE), ("py", _DOC_PY_RE)):
-        match = regex.match(text)
-        if match is not None:
-            return kind, match.group(1), -1
-    if include_macros:
-        match = _DOC_MACRO_RE.match(text)
-        if match is not None:
-            arg_count = int(match.group(2)) if match.group(2) is not None else 0
-            return "macro", match.group(1), arg_count
-    return None
-
-
-def _is_doc_symbol_name(name: str, *, include_private: bool = False) -> bool:
-    if not name:
-        return False
-    if not include_private and name.startswith("__"):
-        return False
-    return True
-
-
-def _collect_leading_doc_comments(lines: Sequence[str], def_index: int, name: str) -> Tuple[str, str]:
-    comments: List[str] = []
-    stack_effect = ""
-
-    idx = def_index - 1
-    while idx >= 0:
-        raw = lines[idx]
-        stripped = raw.strip()
-        if not stripped:
-            break
-        if not stripped.startswith("#"):
-            break
-
-        parsed = _extract_stack_comment(raw)
-        if parsed is not None:
-            comment_name, effect = parsed
-            if comment_name == name and not stack_effect:
-                stack_effect = effect
-            idx -= 1
-            continue
-
-        text = stripped[1:].strip()
-        if text:
-            comments.append(text)
-        idx -= 1
-
-    comments.reverse()
-    return stack_effect, " ".join(comments)
-
-
-def _scan_doc_file(
-    path: Path,
-    *,
-    include_undocumented: bool = False,
-    include_private: bool = False,
-    include_macros: bool = False,
-) -> List[DocEntry]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return []
-
-    lines = text.splitlines()
-    entries: List[DocEntry] = []
-    defined_names: Set[str] = set()
-
-    for idx, line in enumerate(lines):
-        parsed = _extract_definition_name(line, include_macros=include_macros)
-        if parsed is None:
-            continue
-        kind, name, macro_args = parsed
-        if not _is_doc_symbol_name(name, include_private=include_private):
-            continue
-        defined_names.add(name)
-        stack_effect, description = _collect_leading_doc_comments(lines, idx, name)
-        # Auto-generate stack effect for macros from arg count
-        if kind == "macro" and not stack_effect:
-            if macro_args > 0:
-                params = " ".join(f"${i}" for i in range(macro_args))
-                stack_effect = f"macro({macro_args}): {params} -> expanded"
-            else:
-                stack_effect = "macro(0): -> expanded"
-        if not include_undocumented and not stack_effect and not description:
-            continue
-        entries.append(
-            DocEntry(
-                name=name,
-                stack_effect=stack_effect,
-                description=description,
-                kind=kind,
-                path=path,
-                line=idx + 1,
-            )
-        )
-
-    return entries
-
-
-def _iter_doc_files(roots: Sequence[Path], *, include_tests: bool = False) -> List[Path]:
-    seen: Set[Path] = set()
-    files: List[Path] = []
-    skip_parts = {"build", ".git", ".venv", "raylib-5.5_linux_amd64"}
-    if not include_tests:
-        skip_parts.update({"tests", "extra_tests"})
-
-    def _should_skip(candidate: Path) -> bool:
-        parts = set(candidate.parts)
-        return any(part in parts for part in skip_parts)
-
-    for root in roots:
-        resolved = root.expanduser().resolve()
-        if not resolved.exists():
-            continue
-        if resolved.is_file() and resolved.suffix == ".sl":
-            if _should_skip(resolved):
-                continue
-            if resolved not in seen:
-                seen.add(resolved)
-                files.append(resolved)
-            continue
-        if not resolved.is_dir():
-            continue
-        for path in resolved.rglob("*.sl"):
-            if _should_skip(path):
-                continue
-            candidate = path.resolve()
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            files.append(candidate)
-    files.sort()
-    return files
-
-
-def collect_docs(
-    roots: Sequence[Path],
-    *,
-    include_undocumented: bool = False,
-    include_private: bool = False,
-    include_macros: bool = False,
-    include_tests: bool = False,
-) -> List[DocEntry]:
-    entries: List[DocEntry] = []
-    for doc_file in _iter_doc_files(roots, include_tests=include_tests):
-        entries.extend(
-            _scan_doc_file(
-                doc_file,
-                include_undocumented=include_undocumented,
-                include_private=include_private,
-                include_macros=include_macros,
-            )
-        )
-    # Deduplicate by symbol name; keep first (roots/files are stable-sorted)
-    dedup: Dict[str, DocEntry] = {}
-    for entry in entries:
-        dedup.setdefault(entry.name, entry)
-    entries = list(dedup.values())
-    entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
-    return entries
-
-
-def _filter_docs(entries: Sequence[DocEntry], query: str) -> List[DocEntry]:
-    q = query.strip().lower()
-    if not q:
-        return list(entries)
-
-    try:
-        import shlex
-        raw_terms = [term.lower() for term in shlex.split(q) if term]
-    except Exception:
-        raw_terms = [term.lower() for term in q.split() if term]
-    terms = raw_terms
-    if not terms:
-        return list(entries)
-
-    positive_terms: List[str] = []
-    negative_terms: List[str] = []
-    field_terms: Dict[str, List[str]] = {"name": [], "effect": [], "desc": [], "path": [], "kind": []}
-    for term in terms:
-        if term.startswith("-") and len(term) > 1:
-            negative_terms.append(term[1:])
-            continue
-        if ":" in term:
-            prefix, value = term.split(":", 1)
-            if prefix in field_terms and value:
-                field_terms[prefix].append(value)
-                continue
-        positive_terms.append(term)
-
-    ranked: List[Tuple[int, DocEntry]] = []
-    for entry in entries:
-        name = entry.name.lower()
-        effect = entry.stack_effect.lower()
-        desc = entry.description.lower()
-        path_text = entry.path.as_posix().lower()
-        kind = entry.kind.lower()
-        all_text = " ".join([name, effect, desc, path_text, kind])
-
-        if any(term in all_text for term in negative_terms):
-            continue
-
-        if any(term not in name for term in field_terms["name"]):
-            continue
-        if any(term not in effect for term in field_terms["effect"]):
-            continue
-        if any(term not in desc for term in field_terms["desc"]):
-            continue
-        if any(term not in path_text for term in field_terms["path"]):
-            continue
-        if any(term not in kind for term in field_terms["kind"]):
-            continue
-
-        score = 0
-        matches_all = True
-        for term in positive_terms:
-            term_score = 0
-            if name == term:
-                term_score = 400
-            elif name.startswith(term):
-                term_score = 220
-            elif term in name:
-                term_score = 140
-            elif term in effect:
-                term_score = 100
-            elif term in desc:
-                term_score = 70
-            elif term in path_text:
-                term_score = 40
-            if term_score == 0:
-                matches_all = False
-                break
-            score += term_score
-
-        if not matches_all:
-            continue
-        if len(positive_terms) == 1 and positive_terms[0] in effect and positive_terms[0] not in name:
-            score -= 5
-        if field_terms["name"]:
-            score += 60
-        if field_terms["kind"]:
-            score += 20
-        ranked.append((score, entry))
-
-    ranked.sort(key=lambda item: (-item[0], item[1].name.lower(), str(item[1].path), item[1].line))
-    return [entry for _, entry in ranked]
-
-
-def _run_docs_tui(
-    entries: Sequence[DocEntry],
-    initial_query: str = "",
-    *,
-    reload_fn: Optional[Callable[..., List[DocEntry]]] = None,
-) -> int:
-    if not entries:
-        print("[info] no documentation entries found")
-        return 0
-
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        filtered = _filter_docs(entries, initial_query)
-        print(f"[info] docs entries: {len(filtered)}/{len(entries)}")
-        for entry in filtered[:200]:
-            effect = entry.stack_effect if entry.stack_effect else "(no stack effect)"
-            print(f"{entry.name:24} {effect}  [{entry.path}:{entry.line}]")
-        if len(filtered) > 200:
-            print(f"[info] ... {len(filtered) - 200} more entries")
-        return 0
-
-    import curses
-
-    _MODE_BROWSE = 0
-    _MODE_SEARCH = 1
-    _MODE_DETAIL = 2
-    _MODE_FILTER = 3
-    _MODE_LANG_REF = 4
-    _MODE_LANG_DETAIL = 5
-    _MODE_LICENSE = 6
-    _MODE_PHILOSOPHY = 7
-    _MODE_CT_REF = 8
-    _MODE_QA = 9
-    _MODE_HOW = 10
-    _MODE_CT_REF_SEARCH = 11
-    _MODE_CT_REF_FILTER = 12
-
-    _TAB_LIBRARY = 0
-    _TAB_LANG_REF = 1
-    _TAB_CT_REF = 2
-    _TAB_NAMES = ["Library Docs", "Language Reference", "Compile-Time Reference"]
-
-    _FILTER_KINDS = ["all", "word", "asm", "py", "macro"]
-
-    _L2_MACRO_CANONICAL_TEXT = (
-        "Macro definitions support three styles:\n"
-        "  1. Legacy positional:  macro <name> <count> <tokens...> ;\n"
-        "  2. Named signature:    macro <name> (<params...>) <tokens...> ;\n"
-        "  3. Pattern clauses:    macro <name> ... => ... ; ... ;\n\n"
-        "Compatibility shorthand for generated nested macros:\n"
-        "  macro <name> <value> ;\n"
-        "When emitted by macro expansion, this defines a 0-arg macro whose\n"
-        "body is <value>.\n\n"
-        "Placeholders:\n"
-        "  $0, $1, ...  legacy positional arguments\n"
-        "  $name        named argument\n"
-        "  $*name       splice variadic capture\n"
-        "A bare '$' token is preserved unchanged (for asm-heavy macros).\n\n"
-        "Call styles:\n"
-        "  prefix:  m a b\n"
-        "  call:    m(a, b, expr)\n"
-        "Prefix style consumes fixed args first; variadic tails consume\n"
-        "remaining arguments from the same source line.\n\n"
-        "Pattern macros are enabled when the body contains => clauses and\n"
-        "the definition closes with trailing ';'. Clauses are matched\n"
-        "top-to-bottom and compile into grammar-stage rewrite rules.\n"
-        "Capture forms:\n"
-        "  $x       single-token capture\n"
-        "  $*xs     variadic capture\n"
-        "  $x:int   constrained capture\n"
-        "Repeated capture names enforce equality.\n\n"
-        "Use --macro-preview to trace macro and rewrite expansions."
-    )
-    _L2_MACRO_LANG_DETAIL = (
-        _L2_MACRO_CANONICAL_TEXT
-        + "\n\n"
-        + "Example:\n"
-        + "  macro max2 (lhs rhs) $lhs $rhs > if $lhs else $rhs end ;\n"
-        + "  max2(5, 3)   # leaves 5 on stack\n\n"
-        + "Pattern example:\n"
-        + "  macro simplify\n"
-        + "    $x:int + 0 => $x ;\n"
-        + "    0 + $x:int => $x ;\n"
-        + "  ;"
-    )
-    _L2_MACRO_CT_BLOCK = textwrap.indent(_L2_MACRO_CANONICAL_TEXT, "  ") + "\n\n"
-    _L2_MACRO_QA_BLOCK = textwrap.indent(_L2_MACRO_CANONICAL_TEXT, "    ") + "\n\n"
-
-    # ── Language Reference Entries ──────────────────────────────────
-    _LANG_REF_ENTRIES: List[Dict[str, str]] = [
-        {
-            "name": "word ... end",
-            "category": "Definitions",
-            "syntax": "word <name> <body...> end",
-            "summary": "Define a new word (function).",
-            "detail": (
-                "Defines a named word that can be called by other words. "
-                "The body consists of stack operations, literals, and calls to other words. "
-                "Redefinitions overwrite the previous entry with a warning.\n\n"
-                "Example:\n"
-                "  word square dup * end\n"
-                "  word greet \"hello world\" puts end"
-            ),
-        },
-        {
-            "name": "inline word ... end",
-            "category": "Definitions",
-            "syntax": "inline word <name> <body...> end",
-            "summary": "Define an inlined word (body is expanded at call sites).",
-            "detail": (
-                "Marks the definition for inline expansion. "
-                "Every call site gets a copy of the body rather than a function call. "
-                "Recursive inline calls are rejected at compile time.\n\n"
-                "Example:\n"
-                "  inline word inc 1 + end"
-            ),
-        },
-        {
-            "name": ":asm ... ;",
-            "category": "Definitions",
-            "syntax": ":asm <name> { <nasm body> } ;",
-            "summary": "Define a word in raw NASM x86-64 assembly.",
-            "detail": (
-                "The body is copied verbatim into the output assembly. "
-                "r12 = data stack pointer, r13 = return stack pointer. "
-                "Values are 64-bit qwords. An implicit `ret` is appended.\n\n"
-                "Example:\n"
-                "  :asm double {\n"
-                "      mov rax, [r12]\n"
-                "      shl rax, 1\n"
-                "      mov [r12], rax\n"
-                "  } ;"
-            ),
-        },
-        {
-            "name": ":py ... ;",
-            "category": "Definitions",
-            "syntax": ":py <name> { <python body> } ;",
-            "summary": "Define a compile-time Python macro or intrinsic.",
-            "detail": (
-                "The body executes once during parsing. It may define:\n"
-                "  - macro(ctx: MacroContext): manipulate tokens, emit literals\n"
-                "  - intrinsic(builder: FunctionEmitter): emit assembly directly\n\n"
-                "Used by syntax extensions like libs/fn.sl to reshape the language."
-            ),
-        },
-        {
-            "name": "extern",
-            "category": "Definitions",
-            "syntax": "extern <name> <n_args> <n_rets>\nextern <ret_type> <name>(<arg_types>)",
-            "summary": "Declare a foreign (C) function.",
-            "detail": (
-                "Two forms:\n"
-                "  Raw:    extern foo 2 1     (2 args, 1 return)\n"
-                "  C-like: extern double atan2(double y, double x)\n\n"
-                "The emitter marshals arguments into System V registers "
-                "(rdi, rsi, rdx, rcx, r8, r9 for ints; xmm0-xmm7 for floats), "
-                "aligns rsp, and pushes the result from rax or xmm0."
-            ),
-        },
-        {
-            "name": "macro ... ;",
-            "category": "Definitions",
-            "syntax": (
-                "macro <name> <param_count> <tokens...> ;\n"
-                "macro <name> (<params...>) <tokens...> ;\n"
-                "macro <name>\n  <pattern...> => <replacement...> ;\n  ...\n;"
-            ),
-            "summary": "Define substitution macros and pattern-matching macros.",
-            "detail": _L2_MACRO_LANG_DETAIL,
-        },
-        {
-            "name": "struct ... end",
-            "category": "Definitions",
-            "syntax": "struct <Name>\n  field <field> <size>\n  ...\nend",
-            "summary": "Define a packed struct with auto-generated accessors.",
-            "detail": (
-                "Emits helper words:\n"
-                "  <Name>.size         — total byte size\n"
-                "  <Name>.<field>.size   — field byte size\n"
-                "  <Name>.<field>.offset — field byte offset\n"
-                "  <Name>.<field>@     — read field from struct pointer\n"
-                "  <Name>.<field>!     — write field to struct pointer\n\n"
-                "Layout is tightly packed with no implicit padding.\n\n"
-                "Example:\n"
-                "  struct Point\n"
-                "    field x 8\n"
-                "    field y 8\n"
-                "  end\n"
-                "  # Now Point.x@, Point.x!, Point.y@, Point.y! exist"
-            ),
-        },
-        {
-            "name": "cstruct ... end",
-            "category": "Definitions",
-            "syntax": "cstruct <Name>\n  cfield <field> <c_type>\n  ...\nend",
-            "summary": "Define a C-compatible struct with ABI-aligned layout.",
-            "detail": (
-                "Computes offsets, alignment, and final struct size using C ABI rules. "
-                "Generates <Name>.size, <Name>.align, <Name>.<field>.size, and "
-                "<Name>.<field>.offset for every field. Accessors @/! are generated "
-                "for 8-byte fields.\n\n"
-                "Example:\n"
-                "  cstruct Pair\n"
-                "    cfield left long\n"
-                "    cfield right long\n"
-                "  end"
-            ),
-        },
-        {
-            "name": "if ... end",
-            "category": "Control Flow",
-            "syntax": "<cond> if <body> end\n<cond> if <then> else <otherwise> end",
-            "summary": "Conditional execution — pops a flag from the stack.",
-            "detail": (
-                "Pops the top of stack. If non-zero, executes the `then` branch; "
-                "otherwise executes the `else` branch (if present).\n\n"
-                "For else-if chains, place `if` on the same line as `else` "
-                "(backward-compatible style):\n"
-                "  <cond1> if\n"
-                "    ... branch 1 ...\n"
-                "  else <cond2> if\n"
-                "    ... branch 2 ...\n"
-                "  else\n"
-                "    ... fallback ...\n"
-                "  end\n\n"
-                "The parser also accepts flexible shorthand where chained if/else "
-                "blocks may close with fewer explicit `end` tokens; omitted trailing "
-                "if/else closes are resolved automatically.\n\n"
-                "Example:\n"
-                "  dup 0 > if \"positive\" puts else \"non-positive\" puts end"
-            ),
-        },
-        {
-            "name": "while ... do ... end",
-            "category": "Control Flow",
-            "syntax": "while <condition> do <body> end",
-            "summary": "Loop while condition is true.",
-            "detail": (
-                "The condition block runs before each iteration. It must leave "
-                "a flag on the stack. If non-zero, the body executes and the loop "
-                "repeats. If zero, execution continues after `end`.\n\n"
-                "Example:\n"
-                "  10\n"
-                "  while dup 0 > do\n"
-                "    dup puti cr\n"
-                "    1 -\n"
-                "  end\n"
-                "  drop"
-            ),
-        },
-        {
-            "name": "for ... end",
-            "category": "Control Flow",
-            "syntax": "<count> for <body> end",
-            "summary": "Counted loop — pops count, loops that many times.",
-            "detail": (
-                "Pops the loop count from the stack, stores it on the return stack, "
-                "and decrements it each pass. Use `r@` (return "
-                "stack peek) to read the current counter value.\n\n"
-                "Example:\n"
-                "  10 for\n"
-                "    \"hello\" puts\n"
-                "  end\n\n"
-                "  # prints \"hello\" 10 times"
-            ),
-        },
-        {
-            "name": "begin ... again",
-            "category": "Control Flow",
-            "syntax": "begin <body> again",
-            "summary": "Infinite loop (use `exit` or `goto` to break out).",
-            "detail": (
-                "Creates an unconditional loop. The body repeats forever.\n"
-                "Available only at compile time.\n\n"
-                "Example:\n"
-                "  begin\n"
-                "    read_stdin\n"
-                "    dup 0 == if drop exit end\n"
-                "    process\n"
-                "  again"
-            ),
-        },
-        {
-            "name": "continue",
-            "category": "Control Flow",
-            "syntax": "continue",
-            "summary": "Jump to the next iteration of a begin/again loop.",
-            "detail": (
-                "Valid only inside `begin ... again`. Emits a jump to the loop head. "
-                "Using it outside a begin/again loop is a parse error."
-            ),
-        },
-        {
-            "name": "label / goto",
-            "category": "Control Flow",
-            "syntax": "label <name>\ngoto <name>",
-            "summary": "Local jumps within a definition.",
-            "detail": (
-                "Defines a local label and jumps to it. "
-                "Labels are scoped to the enclosing word definition.\n\n"
-                "Example:\n"
-                "  word example\n"
-                "    label start\n"
-                "    dup 0 == if drop exit end\n"
-                "    1 - goto start\n"
-                "  end"
-            ),
-        },
-        {
-            "name": "&name",
-            "category": "Control Flow",
-            "syntax": "&<word_name>",
-            "summary": "Push pointer to a word's code label.",
-            "detail": (
-                "Pushes the callable address of the named word onto the stack. "
-                "Combine with `jmp` for indirect/tail calls.\n\n"
-                "Example:\n"
-                "  &my_handler jmp   # tail-call my_handler"
-            ),
-        },
-        {
-            "name": "with ... in ... end",
-            "category": "Control Flow",
-            "syntax": "with <a> <b> in <body> end",
-            "summary": "Local variable scope using hidden globals.",
-            "detail": (
-                "Pops the named values from the stack and stores them in hidden "
-                "global cells (__with_a, etc.). Inside the body, reading `a` "
-                "compiles to `@`, writing compiles to `!`. The cells persist "
-                "across calls and are NOT re-entrant.\n\n"
-                "Example:\n"
-                "  10 20 with x y in\n"
-                "    x y + puti cr   # prints 30\n"
-                "  end"
-            ),
-        },
-        {
-            "name": "import",
-            "category": "Modules",
-            "syntax": "import <path>",
-            "summary": "Textually include another .sl file.",
-            "detail": (
-                "Inserts the referenced file. Resolution order:\n"
-                "  1. Absolute path\n"
-                "  2. Relative to the importing file\n"
-                "  3. Each include path (defaults: project root, ./stdlib)\n\n"
-                "Each file is included at most once per compilation unit."
-            ),
-        },
-        {
-            "name": "flags",
-            "category": "Modules",
-            "syntax": "flags <token...> | flags \"<token...>\"",
-            "summary": "Provide linker/include flags from source.",
-            "detail": (
-                "Processed during source loading before tokenization. "
-                "Supports shell-like token splitting. "
-                "`-I`/`--include` update import search paths (relative to the "
-                "current file when not absolute). Other tokens are forwarded "
-                "as linker/runtime library flags.\n\n"
-                "Examples:\n"
-                "  flags -lc -lm -L. -I.\n"
-                "  flags \"-lc -lm -L. -I.\""
-            ),
-        },
-        {
-            "name": "cimport",
-            "category": "Modules",
-            "syntax": "cimport \"header.h\"",
-            "summary": "Import C declarations and auto-generate extern/cstruct forms.",
-            "detail": (
-                "Reads a C header, preprocesses it, then injects generated `extern` "
-                "declarations and `cstruct` definitions into the token stream. "
-                "Resolution follows normal import search rules."
-            ),
-        },
-        {
-            "name": "ifdef / ifndef / elsedef / endif",
-            "category": "Modules",
-            "syntax": "ifdef <NAME> ... elsedef ... endif\nifndef <NAME> ... elsedef ... endif",
-            "summary": "Conditional source inclusion based on -D symbols.",
-            "detail": (
-                "Source preprocessing evaluates these directives before tokenization. "
-                "Symbols may be defined via CLI `-D NAME` and source-level "
-                "`define NAME`. `elsedef` flips the current branch. "
-                "Nested conditionals are supported."
-            ),
-        },
-        {
-            "name": "[ ... ]",
-            "category": "Data",
-            "syntax": "[ <values...> ]",
-            "summary": "Heap list literal — captures stack segment into mmap'd buffer.",
-            "detail": (
-                "Captures the intervening stack values into a freshly allocated "
-                "buffer. Format: [len, item0, item1, ...] as qwords. "
-                "The buffer address is pushed. User must `munmap` when done.\n\n"
-                "Example:\n"
-                "  [ 1 2 3 4 5 ]   # pushes addr of [5, 1, 2, 3, 4, 5]"
-            ),
-        },
-        {
-            "name": "{ ... } and { ... }:N",
-            "category": "Data",
-            "syntax": "{ <int-or-char...> } | { <int-or-char...> }:<size> | {}:<size>",
-            "summary": "BSS-backed fixed-size list literal.",
-            "detail": (
-                "Allocates a fixed-size qword list in .bss and pushes its address. "
-                "Layout is [len, item0, item1, ...]. "
-                "With :N, len is forced to N and any missing trailing elements are "
-                "zero-initialized.\n\n"
-                "Examples:\n"
-                "  { 1 2 3 }      # len=3, items=1,2,3\n"
-                "  { 1 2 }:10     # len=10, items=1,2, then zeros\n"
-                "  {}:10          # len=10, all zeros"
-            ),
-        },
-        {
-            "name": "String literals",
-            "category": "Data",
-            "syntax": "\"<text>\"",
-            "summary": "Push (addr len) pair for a string.",
-            "detail": (
-                "String literals push a (addr len) pair with length on top. "
-                "Stored in .data with a trailing NULL for C compatibility. "
-                "Escape sequences: \\\", \\\\, \\n, \\r, \\t, \\0.\n\n"
-                "Example:\n"
-                "  \"hello world\" puts   # prints: hello world"
-            ),
-        },
-        {
-            "name": "Char literals",
-            "category": "Data",
-            "syntax": "'<ch>'",
-            "summary": "Push character code as integer.",
-            "detail": (
-                "Single-quoted literals push an integer character code. "
-                "Supported escapes: \\n, \\r, \\t, \\0, \\\\, \\', \", \\xNN.\n\n"
-                "Example:\n"
-                "  'A' puti cr    # prints 65"
-            ),
-        },
-        {
-            "name": "Number literals",
-            "category": "Data",
-            "syntax": "123  0xFF  0b1010  0o77",
-            "summary": "Push a signed 64-bit integer.",
-            "detail": (
-                "Numbers are signed 64-bit integers. Supports:\n"
-                "  Decimal:  123, -42\n"
-                "  Hex:      0xFF, 0x1A\n"
-                "  Binary:   0b1010, 0b11110000\n"
-                "  Octal:    0o77, 0o755\n"
-                "  Float:    3.14, 1e10 (stored as 64-bit IEEE double)"
-            ),
-        },
-        {
-            "name": "immediate",
-            "category": "Modifiers",
-            "syntax": "immediate",
-            "summary": "Mark the last-defined word to execute at parse time.",
-            "detail": (
-                "Applied to the most recently defined word. Immediate words "
-                "run during parsing rather than being compiled into the output. "
-                "Used for syntax extensions and compile-time computation."
-            ),
-        },
-        {
-            "name": "compile-only",
-            "category": "Modifiers",
-            "syntax": "compile-only",
-            "summary": "Mark the last-defined word as compile-only.",
-            "detail": (
-                "The word can only be used inside other definitions, not at "
-                "the top level. Often combined with `immediate`."
-            ),
-        },
-        {
-            "name": "priority",
-            "category": "Modifiers",
-            "syntax": "priority <int>",
-            "summary": "Set priority for the next definition (conflict resolution).",
-            "detail": (
-                "Controls redefinition conflicts. Higher priority wins; "
-                "lower-priority definitions are silently ignored. Equal priority "
-                "keeps the last definition with a warning."
-            ),
-        },
-        {
-            "name": "compile-time",
-            "category": "Modifiers",
-            "syntax": "compile-time <word>",
-            "summary": "Execute a word at compile time but still emit it.",
-            "detail": (
-                "Runs the named word immediately during compilation, "
-                "but its definition is also emitted for runtime use."
-            ),
-        },
-        {
-            "name": "here",
-            "category": "Modifiers",
-            "syntax": "here",
-            "summary": "Push current source location string.",
-            "detail": (
-                "Immediate word that pushes `file:line:column` for the current parse "
-                "location as a string literal. Useful for diagnostics and assertions."
-            ),
-        },
-        {
-            "name": "syscall",
-            "category": "System",
-            "syntax": "<argN> ... <arg0> <count> <nr> syscall",
-            "summary": "Invoke a Linux system call directly.",
-            "detail": (
-                "Expects (argN ... arg0 count nr) on the stack. Count is "
-                "clamped to [0,6]. Arguments are loaded into rdi, rsi, rdx, r10, "
-                "r8, r9. Executes `syscall` and pushes rax.\n\n"
-                "Example:\n"
-                "  # write(1, addr, len)\n"
-                "  addr len 1   # fd=stdout\n"
-                "  3 1 syscall  # 3 args, nr=1 (write)"
-            ),
-        },
-        {
-            "name": "ret",
-            "category": "Control Flow",
-            "syntax": "ret",
-            "summary": "Return from a word",
-            "detail": (
-                "Returns from a word.\n\n"
-                "Example:\n"
-                "  word a\n"
-                "    \"g\" puts\n"
-                "    ret\n"
-                "    \"g\" puts\n"
-                "  end\n\n"
-                "  word main\n"
-                "    a\n"
-                "  end\n"
-                "Output:\n"
-                "  g\n"
-            ),
-        },
-        {
-            "name": "exit",
-            "category": "System",
-            "syntax": "<code> exit",
-            "summary": "Terminate the process with given exit code.",
-            "detail": (
-                "Pops the exit code and terminates via sys_exit_group(231). "
-                "Convention: 0 = success, non-zero = failure.\n\n"
-                "Example:\n"
-                "  0 exit   # success"
-            ),
-        },
-    ]
-
-    _LANG_REF_CATEGORIES = []
-    _cat_seen: set = set()
-    for _lre in _LANG_REF_ENTRIES:
-        if _lre["category"] not in _cat_seen:
-            _cat_seen.add(_lre["category"])
-            _LANG_REF_CATEGORIES.append(_lre["category"])
-
-    _L2_LICENSE_TEXT = (
-        "═══════════════════════════════════════════════════════════════\n"
-        "          Apache License, Version 2.0\n"
-        "          January 2004\n"
-        "          http://www.apache.org/licenses/\n"
-        "═══════════════════════════════════════════════════════════════\n"
-        "\n"
-        "  TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n"
-        "\n"
-        "  1. Definitions.\n"
-        "\n"
-        "  \"License\" shall mean the terms and conditions for use,\n"
-        "  reproduction, and distribution as defined by Sections 1\n"
-        "  through 9 of this document.\n"
-        "\n"
-        "  \"Licensor\" shall mean the copyright owner or entity\n"
-        "  authorized by the copyright owner that is granting the\n"
-        "  License.\n"
-        "\n"
-        "  \"Legal Entity\" shall mean the union of the acting entity\n"
-        "  and all other entities that control, are controlled by,\n"
-        "  or are under common control with that entity. For the\n"
-        "  purposes of this definition, \"control\" means (i) the\n"
-        "  power, direct or indirect, to cause the direction or\n"
-        "  management of such entity, whether by contract or\n"
-        "  otherwise, or (ii) ownership of fifty percent (50%) or\n"
-        "  more of the outstanding shares, or (iii) beneficial\n"
-        "  ownership of such entity.\n"
-        "\n"
-        "  \"You\" (or \"Your\") shall mean an individual or Legal\n"
-        "  Entity exercising permissions granted by this License.\n"
-        "\n"
-        "  \"Source\" form shall mean the preferred form for making\n"
-        "  modifications, including but not limited to software\n"
-        "  source code, documentation source, and configuration\n"
-        "  files.\n"
-        "\n"
-        "  \"Object\" form shall mean any form resulting from\n"
-        "  mechanical transformation or translation of a Source\n"
-        "  form, including but not limited to compiled object code,\n"
-        "  generated documentation, and conversions to other media\n"
-        "  types.\n"
-        "\n"
-        "  \"Work\" shall mean the work of authorship, whether in\n"
-        "  Source or Object form, made available under the License,\n"
-        "  as indicated by a copyright notice that is included in\n"
-        "  or attached to the work.\n"
-        "\n"
-        "  \"Derivative Works\" shall mean any work, whether in\n"
-        "  Source or Object form, that is based on (or derived\n"
-        "  from) the Work and for which the editorial revisions,\n"
-        "  annotations, elaborations, or other modifications\n"
-        "  represent, as a whole, an original work of authorship.\n"
-        "\n"
-        "  \"Contribution\" shall mean any work of authorship,\n"
-        "  including the original version of the Work and any\n"
-        "  modifications or additions to that Work or Derivative\n"
-        "  Works thereof, that is intentionally submitted to the\n"
-        "  Licensor for inclusion in the Work by the copyright\n"
-        "  owner or by an individual or Legal Entity authorized to\n"
-        "  submit on behalf of the copyright owner.\n"
-        "\n"
-        "  \"Contributor\" shall mean Licensor and any individual or\n"
-        "  Legal Entity on behalf of whom a Contribution has been\n"
-        "  received by the Licensor and subsequently incorporated\n"
-        "  within the Work.\n"
-        "\n"
-        "  2. Grant of Copyright License.\n"
-        "\n"
-        "  Subject to the terms and conditions of this License,\n"
-        "  each Contributor hereby grants to You a perpetual,\n"
-        "  worldwide, non-exclusive, no-charge, royalty-free,\n"
-        "  irrevocable copyright license to reproduce, prepare\n"
-        "  Derivative Works of, publicly display, publicly perform,\n"
-        "  sublicense, and distribute the Work and such Derivative\n"
-        "  Works in Source or Object form.\n"
-        "\n"
-        "  3. Grant of Patent License.\n"
-        "\n"
-        "  Subject to the terms and conditions of this License,\n"
-        "  each Contributor hereby grants to You a perpetual,\n"
-        "  worldwide, non-exclusive, no-charge, royalty-free,\n"
-        "  irrevocable (except as stated in this section) patent\n"
-        "  license to make, have made, use, offer to sell, sell,\n"
-        "  import, and otherwise transfer the Work, where such\n"
-        "  license applies only to those patent claims licensable\n"
-        "  by such Contributor that are necessarily infringed by\n"
-        "  their Contribution(s) alone or by combination of their\n"
-        "  Contribution(s) with the Work to which such\n"
-        "  Contribution(s) was submitted.\n"
-        "\n"
-        "  If You institute patent litigation against any entity\n"
-        "  (including a cross-claim or counterclaim in a lawsuit)\n"
-        "  alleging that the Work or a Contribution incorporated\n"
-        "  within the Work constitutes direct or contributory\n"
-        "  patent infringement, then any patent licenses granted\n"
-        "  to You under this License for that Work shall terminate\n"
-        "  as of the date such litigation is filed.\n"
-        "\n"
-        "  4. Redistribution.\n"
-        "\n"
-        "  You may reproduce and distribute copies of the Work or\n"
-        "  Derivative Works thereof in any medium, with or without\n"
-        "  modifications, and in Source or Object form, provided\n"
-        "  that You meet the following conditions:\n"
-        "\n"
-        "  (a) You must give any other recipients of the Work or\n"
-        "      Derivative Works a copy of this License; and\n"
-        "\n"
-        "  (b) You must cause any modified files to carry prominent\n"
-        "      notices stating that You changed the files; and\n"
-        "\n"
-        "  (c) You must retain, in the Source form of any Derivative\n"
-        "      Works that You distribute, all copyright, patent,\n"
-        "      trademark, and attribution notices from the Source\n"
-        "      form of the Work, excluding those notices that do\n"
-        "      not pertain to any part of the Derivative Works; and\n"
-        "\n"
-        "  (d) If the Work includes a \"NOTICE\" text file as part\n"
-        "      of its distribution, then any Derivative Works that\n"
-        "      You distribute must include a readable copy of the\n"
-        "      attribution notices contained within such NOTICE\n"
-        "      file, excluding any notices that do not pertain to\n"
-        "      any part of the Derivative Works, in at least one\n"
-        "      of the following places: within a NOTICE text file\n"
-        "      distributed as part of the Derivative Works; within\n"
-        "      the Source form or documentation, if provided along\n"
-        "      with the Derivative Works; or, within a display\n"
-        "      generated by the Derivative Works, if and wherever\n"
-        "      such third-party notices normally appear.\n"
-        "\n"
-        "  5. Submission of Contributions.\n"
-        "\n"
-        "  Unless You explicitly state otherwise, any Contribution\n"
-        "  intentionally submitted for inclusion in the Work by You\n"
-        "  to the Licensor shall be under the terms and conditions\n"
-        "  of this License, without any additional terms or\n"
-        "  conditions. Notwithstanding the above, nothing herein\n"
-        "  shall supersede or modify the terms of any separate\n"
-        "  license agreement you may have executed with Licensor\n"
-        "  regarding such Contributions.\n"
-        "\n"
-        "  6. Trademarks.\n"
-        "\n"
-        "  This License does not grant permission to use the trade\n"
-        "  names, trademarks, service marks, or product names of\n"
-        "  the Licensor, except as required for reasonable and\n"
-        "  customary use in describing the origin of the Work and\n"
-        "  reproducing the content of the NOTICE file.\n"
-        "\n"
-        "  7. Disclaimer of Warranty.\n"
-        "\n"
-        "  Unless required by applicable law or agreed to in\n"
-        "  writing, Licensor provides the Work (and each\n"
-        "  Contributor provides its Contributions) on an \"AS IS\"\n"
-        "  BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,\n"
-        "  either express or implied, including, without limitation,\n"
-        "  any warranties or conditions of TITLE, NON-INFRINGEMENT,\n"
-        "  MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE.\n"
-        "  You are solely responsible for determining the\n"
-        "  appropriateness of using or redistributing the Work and\n"
-        "  assume any risks associated with Your exercise of\n"
-        "  permissions under this License.\n"
-        "\n"
-        "  8. Limitation of Liability.\n"
-        "\n"
-        "  In no event and under no legal theory, whether in tort\n"
-        "  (including negligence), contract, or otherwise, unless\n"
-        "  required by applicable law (such as deliberate and\n"
-        "  grossly negligent acts) or agreed to in writing, shall\n"
-        "  any Contributor be liable to You for damages, including\n"
-        "  any direct, indirect, special, incidental, or\n"
-        "  consequential damages of any character arising as a\n"
-        "  result of this License or out of the use or inability\n"
-        "  to use the Work (including but not limited to damages\n"
-        "  for loss of goodwill, work stoppage, computer failure\n"
-        "  or malfunction, or any and all other commercial damages\n"
-        "  or losses), even if such Contributor has been advised\n"
-        "  of the possibility of such damages.\n"
-        "\n"
-        "  9. Accepting Warranty or Additional Liability.\n"
-        "\n"
-        "  While redistributing the Work or Derivative Works\n"
-        "  thereof, You may choose to offer, and charge a fee for,\n"
-        "  acceptance of support, warranty, indemnity, or other\n"
-        "  liability obligations and/or rights consistent with\n"
-        "  this License. However, in accepting such obligations,\n"
-        "  You may act only on Your own behalf and on Your sole\n"
-        "  responsibility, not on behalf of any other Contributor,\n"
-        "  and only if You agree to indemnify, defend, and hold\n"
-        "  each Contributor harmless for any liability incurred\n"
-        "  by, or claims asserted against, such Contributor by\n"
-        "  reason of your accepting any such warranty or\n"
-        "  additional liability.\n"
-        "\n"
-        "  END OF TERMS AND CONDITIONS\n"
-        "\n"
-        "═══════════════════════════════════════════════════════════════\n"
-        "\n"
-        "  Copyright 2024-2026 Igor Cielniak\n"
-        "\n"
-        "  Licensed under the Apache License, Version 2.0 (the\n"
-        "  \"License\"); you may not use this file except in\n"
-        "  compliance with the License. You may obtain a copy at\n"
-        "\n"
-        "    http://www.apache.org/licenses/LICENSE-2.0\n"
-        "\n"
-        "  Unless required by applicable law or agreed to in\n"
-        "  writing, software distributed under the License is\n"
-        "  distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES\n"
-        "  OR CONDITIONS OF ANY KIND, either express or implied.\n"
-        "  See the License for the specific language governing\n"
-        "  permissions and limitations under the License.\n"
-        "\n"
-        "═══════════════════════════════════════════════════════════════\n"
-    )
-
-    _L2_PHILOSOPHY_TEXT = (
-        "═══════════════════════════════════════════════════════════\n"
-        "          T H E   P H I L O S O P H Y   O F   L 2\n"
-        "═══════════════════════════════════════════════════════════\n"
-        "\n"
-        "  \"Give the programmer raw power and get out of the way.\"\n"
-        "\n"
-        "───────────────────────────────────────────────────────────\n"
-        "\n"
-        "  WHAT IS L2?\n"
-        "\n"
-        "  At its core, L2 is a programmable assembly templating\n"
-        "  engine with a Forth-style stack interface. You write\n"
-        "  small 'words' that compose into larger programs, and\n"
-        "  each word compiles to a known, inspectable sequence of\n"
-        "  x86-64 instructions. The language sits just above raw\n"
-        "  assembly — close enough to see every byte, high enough\n"
-        "  to be genuinely productive.\n"
-        "\n"
-        "  But L2 is more than a glorified macro assembler. Its\n"
-        "  compile-time virtual machine lets you run arbitrary L2\n"
-        "  code at compile time: generate words, compute lookup\n"
-        "  tables, build structs, or emit entire subsystems before\n"
-        "  a single byte of native code is produced. Text macros,\n"
-        "  :py blocks, and token hooks extend the syntax in ways\n"
-        "  that feel like language features — because they are.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────\n"
-        "\n"
-        "  WHY DOES L2 EXIST?\n"
-        "\n"
-        "  L2 was built for fun — and that's a feature, not an\n"
-        "  excuse. It exists because writing a compiler is deeply\n"
-        "  satisfying, because Forth's ideas deserve to be pushed\n"
-        "  further, and because sometimes you want to write a\n"
-        "  program that does exactly what you told it to.\n"
-        "\n"
-        "  That said, 'fun' doesn't mean 'toy'. L2 produces real\n"
-        "  native binaries, links against C libraries, and handles\n"
-        "  practical tasks like file I/O, hashmap manipulation,\n"
-        "  and async scheduling — all with a minimal runtime.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────\n"
-        "\n"
-        "  CORE TENETS\n"
-        "\n"
-        "  1. SIMPLICITY OVER CONVENIENCE\n"
-        "     No garbage collector, no hidden magic. The compiler\n"
-        "     emits a minimal runtime you can read and modify.\n"
-        "     You own every allocation and every free.\n"
-        "\n"
-        "  2. TRANSPARENCY\n"
-        "     Every word compiles to a known, inspectable\n"
-        "     sequence of x86-64 instructions. --emit-asm\n"
-        "     shows exactly what runs on the metal.\n"
-        "\n"
-        "  3. COMPOSABILITY\n"
-        "     Small words build big programs. The stack is the\n"
-        "     universal interface — no types to reconcile, no\n"
-        "     generics to instantiate. If it fits on the stack,\n"
-        "     it composes.\n"
-        "\n"
-        "  4. META-PROGRAMMABILITY\n"
-        "     The front-end is user-extensible: text macros, :py\n"
-        "     blocks, immediate words, and token hooks reshape\n"
-        "     syntax at compile time. The compile-time VM can\n"
-        "     execute full L2 programs during compilation, making\n"
-        "     the boundary between 'language' and 'metaprogram'\n"
-        "     deliberately blurry.\n"
-        "\n"
-        "  5. UNSAFE BY DESIGN\n"
-        "     Safety is the programmer's job, not the language's.\n"
-        "     L2 trusts you with raw memory, inline assembly,\n"
-        "     and direct syscalls. This is a feature, not a bug.\n"
-        "\n"
-        "  6. MINIMAL STANDARD LIBRARY\n"
-        "     The stdlib provides building blocks — not policy.\n"
-        "     It gives you alloc/free, puts/puti, arrays, and\n"
-        "     file I/O. Everything else is your choice.\n"
-        "\n"
-        "  7. FUN FIRST\n"
-        "     If using L2 feels like a chore, the design has\n"
-        "     failed. The language should reward curiosity and\n"
-        "     make you want to dig deeper into how things work.\n"
-        "     At least its fun for me to write programs in. ;)"
-        "\n"
-        "───────────────────────────────────────────────────────────\n"
-        "\n"
-        "  L2 is for programmers who want to understand every\n"
-        "  byte their program emits, and who believe that the\n"
-        "  best abstraction is the one you built yourself.\n"
-        "\n"
-        "═══════════════════════════════════════════════════════════\n"
-    )
-
-    _L2_CT_REF_TEXT = (
-        "═══════════════════════════════════════════════════════════════\n"
-        "        C O M P I L E - T I M E   R E F E R E N C E\n"
-        "═══════════════════════════════════════════════════════════════\n"
-        "\n"
-        "  L2 runs a compile-time virtual machine (the CT VM) during\n"
-        "  parsing. Code marked `compile-time`, immediate words, and\n"
-        "  :py blocks execute inside this VM. They can inspect and\n"
-        "  transform the token stream, emit definitions, manipulate\n"
-        "  lists and maps, and control the generated assembly output.\n"
-        "\n"
-        "  Unless noted otherwise, words listed below are compile-only:\n"
-        "  they exist only during compilation and produce no runtime\n"
-        "  code.\n"
-        "\n"
-        "  Stack notation:  [*, deeper, deeper | top] -> [*]\n"
-        "    *   = rest of stack (unchanged)\n"
-        "    |   = separates deeper elements from the top\n"
-        "    ->  = before / after\n"
-        "    ||  = separates alternative stack effects\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 1  COMPILE-TIME HOOKS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  compile-time                             [immediate]\n"
-        "    Marks a word definition so that its body\n"
-        "    runs in the CT VM. The word's definition\n"
-        "    is interpreted by the VM when the\n"
-        "    word is referenced during compilation.\n"
-        "\n"
-        "      word double-ct dup + end\n"
-        "      compile-time double-ct\n"
-        "\n"
-        "  immediate                                [immediate]\n"
-        "    Mark the preceding word as immediate: it runs at parse\n"
-        "    time whenever the compiler encounters it. Immediate words\n"
-        "    receive a MacroContext and can consume tokens, emit ops,\n"
-        "    or inject tokens into the stream.\n"
-        "\n"
-        "  compile-only                             [immediate]\n"
-        "    Mark the preceding word as compile-only. It can only be\n"
-        "    called during compilation, its asm is not emitted.\n"
-        "\n"
-        "  runtime                                  [immediate]\n"
-        "  runtime-only                             [immediate]\n"
-        "    Mark the preceding word as runtime-only. The word may\n"
-        "    be emitted and called at runtime, but any compile-time\n"
-        "    attempt to execute it is rejected.\n"
-        "\n"
-        "  inline                                   [immediate]\n"
-        "    Mark a word for inline expansion: its body\n"
-        "    is expanded at each call site instead of emitting a call.\n"
-        "\n"
-        "  CT                                       [runtime + compile-time]\n"
-        "    Pushes 1 when running in compile-time execution and 0 in\n"
-        "    emitted runtime code, so words can branch on execution\n"
-        "    mode explicitly.\n"
-        "\n"
-        "  use-l2-ct                           [immediate, compile-only]\n"
-        "    Replace the built-in CT intrinsic of a word with its L2\n"
-        "    definition body. With a name on the stack, targets that\n"
-        "    word; with an empty stack, targets the most recently\n"
-        "    defined word.\n"
-        "\n"
-        "      word 3dup dup dup dup end  use-l2-ct\n"
-        "\n"
-        "  set-token-hook                           [compile-only]\n"
-        "    [* | name] -> [*]\n"
-        "    Register a word as the token hook. Every token the parser\n"
-        "    encounters is pushed onto the CT stack, the hook word is\n"
-        "    invoked, and the result (0 = not handled, 1 = handled)\n"
-        "    tells the parser whether to skip normal processing.\n"
-        "\n"
-        "  clear-token-hook                         [compile-only]\n"
-        "    [*] -> [*]\n"
-        "    Remove the currently active token hook.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 2  LIST OPERATIONS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  Lists are dynamic arrays that live in the CT VM. They hold\n"
-        "  integers, strings, tokens, other lists, maps, or nil.\n"
-        "\n"
-        "  list-new          [*] -> [* | list]\n"
-        "    Create a new empty list.\n"
-        "\n"
-        "  list-clone         [* | list] -> [* | copy]\n"
-        "    Shallow-copy a list.\n"
-        "\n"
-        "  list-append        [*, list | value] -> [* | list]\n"
-        "    Append value to the end of list (mutates in place).\n"
-        "\n"
-        "  list-pop            [* | list] -> [*, list | value]\n"
-        "    Remove and return the last element.\n"
-        "\n"
-        "  list-pop-front      [* | list] -> [*, list | value]\n"
-        "    Remove and return the first element.\n"
-        "\n"
-        "  list-peek-front     [* | list] -> [*, list | value]\n"
-        "    Return the first element without removing it.\n"
-        "\n"
-        "  list-push-front     [*, list | value] -> [* | list]\n"
-        "    Insert value at the beginning of list.\n"
-        "\n"
-        "  list-reverse        [* | list] -> [* | list]\n"
-        "    Reverse the list in place.\n"
-        "\n"
-        "  list-length         [* | list] -> [* | n]\n"
-        "    Push the number of elements.\n"
-        "\n"
-        "  list-empty?         [* | list] -> [* | flag]\n"
-        "    Push 1 if the list is empty, 0 otherwise.\n"
-        "\n"
-        "  list-get            [*, list | index] -> [* | value]\n"
-        "    Get element at index (0-based). Errors on out-of-range.\n"
-        "\n"
-        "  list-set            [*, list, index | value] -> [* | list]\n"
-        "    Set element at index. Errors on out-of-range.\n"
-        "\n"
-        "  list-clear          [* | list] -> [* | list]\n"
-        "    Remove all elements from the list.\n"
-        "\n"
-        "  list-extend         [*, target | source] -> [* | target]\n"
-        "    Append all elements of source to target.\n"
-        "\n"
-        "  list-last           [* | list] -> [* | value]\n"
-        "    Push the last element without removing it.\n"
-        "\n"
-        "  list-insert         [*, list, index | value] -> [* | list]\n"
-        "    Insert value at index, shifting following elements right.\n"
-        "\n"
-        "  list-remove         [*, list | index] -> [*, list | value]\n"
-        "    Remove and return element at index.\n"
-        "\n"
-        "  list-slice          [*, list, start | end] -> [* | sublist]\n"
-        "    Push a new list with list[start:end].\n"
-        "\n"
-        "  list-find           [*, list | value] -> [*, index | found]\n"
-        "    Search list for value. Returns (index, 1) or (-1, 0).\n"
-        "\n"
-        "  list-contains?      [*, list | value] -> [* | flag]\n"
-        "    Push 1 if value exists in list, 0 otherwise.\n"
-        "\n"
-        "  list-join           [*, list | separator] -> [* | str]\n"
-        "    Join list elements (string-compatible) with separator.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 3  MAP OPERATIONS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  Maps are string-keyed dictionaries in the CT VM.\n"
-        "\n"
-        "  map-new             [*] -> [* | map]\n"
-        "    Create a new empty map.\n"
-        "\n"
-        "  map-set             [*, map, key | value] -> [* | map]\n"
-        "    Set key to value in the map (mutates in place).\n"
-        "\n"
-        "  map-get             [*, map | key] -> [*, map, value | flag]\n"
-        "    Look up key. Pushes the map back, then the value\n"
-        "    (or nil if absent), then 1 if found or 0 if not.\n"
-        "\n"
-        "  map-has?            [*, map | key] -> [*, map | flag]\n"
-        "    Push 1 if the key exists in the map, 0 otherwise.\n"
-        "\n"
-        "  map-delete          [*, map | key] -> [*, map | flag]\n"
-        "    Delete key if present. Returns 1 when deleted, else 0.\n"
-        "\n"
-        "  map-clear           [* | map] -> [* | map]\n"
-        "    Remove all entries from the map.\n"
-        "\n"
-        "  map-length          [* | map] -> [* | n]\n"
-        "    Push number of entries in map.\n"
-        "\n"
-        "  map-empty?          [* | map] -> [* | flag]\n"
-        "    Push 1 if map has no entries, 0 otherwise.\n"
-        "\n"
-        "  map-keys            [* | map] -> [* | list]\n"
-        "    Push a list of map keys.\n"
-        "\n"
-        "  map-values          [* | map] -> [* | list]\n"
-        "    Push a list of map values.\n"
-        "\n"
-        "  map-clone           [* | map] -> [* | copy]\n"
-        "    Shallow-copy a map.\n"
-        "\n"
-        "  map-update          [*, target | source] -> [* | target]\n"
-        "    Merge source entries into target (mutates target).\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 4  NIL\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  nil                 [*] -> [* | nil]\n"
-        "    Push the nil sentinel value.\n"
-        "\n"
-        "  nil?                [* | value] -> [* | flag]\n"
-        "    Push 1 if the value is nil, 0 otherwise.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 5  STRING OPERATIONS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  Strings in the CT VM are immutable sequences of characters.\n"
-        "\n"
-        "  string=             [*, a | b] -> [* | flag]\n"
-        "    Push 1 if strings a and b are equal, 0 otherwise.\n"
-        "\n"
-        "  string-length       [* | str] -> [* | n]\n"
-        "    Push the length of the string.\n"
-        "\n"
-        "  string-append       [*, left | right] -> [* | result]\n"
-        "    Concatenate two strings.\n"
-        "\n"
-        "  string>number       [* | str] -> [*, value | flag]\n"
-        "    Parse an integer from the string (supports 0x, 0b, 0o\n"
-        "    prefixes). Pushes (value, 1) on success or (0, 0) on\n"
-        "    failure.\n"
-        "\n"
-        "  int>string          [* | n] -> [* | str]\n"
-        "    Convert an integer to its decimal string representation.\n"
-        "\n"
-        "  identifier?         [* | value] -> [* | flag]\n"
-        "    Push 1 if the value is a valid L2 identifier string,\n"
-        "    0 otherwise. Also accepts token objects.\n"
-        "\n"
-        "  string-contains?    [*, haystack | needle] -> [* | flag]\n"
-        "    Push 1 if needle occurs inside haystack, else 0.\n"
-        "\n"
-        "  string-starts-with? [*, text | prefix] -> [* | flag]\n"
-        "    Push 1 if text starts with prefix, else 0.\n"
-        "\n"
-        "  string-ends-with?   [*, text | suffix] -> [* | flag]\n"
-        "    Push 1 if text ends with suffix, else 0.\n"
-        "\n"
-        "  string-split        [*, text | sep] -> [* | list]\n"
-        "    Split text by non-empty separator and return list of parts.\n"
-        "\n"
-        "  string-join         [*, list | sep] -> [* | str]\n"
-        "    Join string-compatible list items with separator.\n"
-        "\n"
-        "  string-strip        [* | text] -> [* | stripped]\n"
-        "    Trim leading/trailing whitespace.\n"
-        "\n"
-        "  string-replace      [*, text, old | new] -> [* | replaced]\n"
-        "    Replace all old substrings with new.\n"
-        "\n"
-        "  string-upper        [* | text] -> [* | upper]\n"
-        "    Uppercase conversion.\n"
-        "\n"
-        "  string-lower        [* | text] -> [* | lower]\n"
-        "    Lowercase conversion.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 6  TOKEN STREAM MANIPULATION\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  These words give compile-time code direct control over\n"
-        "  the token stream the parser reads from.\n"
-        "\n"
-        "  next-token          [*] -> [* | token]\n"
-        "    Consume and push the next token from the parser.\n"
-        "\n"
-        "  peek-token          [*] -> [* | token]\n"
-        "    Push the next token without consuming it.\n"
-        "\n"
-        "  token-lexeme        [* | token] -> [* | str]\n"
-        "    Extract the lexeme (text) from a token or string.\n"
-        "\n"
-        "  token-from-lexeme   [*, lexeme | template] -> [* | token]\n"
-        "    Create a new token with the given lexeme, using source\n"
-        "    location from the template token.\n"
-        "\n"
-        "  token-line          [* | token] -> [* | line]\n"
-        "    Return token source line number.\n"
-        "\n"
-        "  token-column        [* | token] -> [* | column]\n"
-        "    Return token source column number.\n"
-        "\n"
-        "  inject-tokens       [* | list-of-tokens] -> [*]\n"
-        "    Insert a list of token objects at the current parser\n"
-        "    position. The parser will read them before continuing\n"
-        "    with the original stream.\n"
-        "\n"
-        "  add-token           [* | str] -> [*]\n"
-        "    Register a single-character string as a token separator\n"
-        "    recognized by the reader.\n"
-        "\n"
-        "  add-token-chars     [* | str] -> [*]\n"
-        "    Register each character of the string as a token\n"
-        "    separator character.\n"
-        "\n"
-        "  ct-add-reader-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
-        "    Install a reader-stage rewrite rule. Pattern/replacement\n"
-        "    are token-lexeme lists. Supports captures:\n"
-        "      $x / $0        single-token capture\n"
-        "      $*xs           variadic capture\n"
-        "      $x:int         constrained capture\n"
-        "    Repeated capture names enforce equality across matches.\n"
-        "\n"
-        "  ct-add-grammar-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
-        "    Install a grammar-stage rewrite rule (runs after token hook\n"
-        "    and before normal token handling).\n"
-        "    Reader rewrites are tokenization-adjacent; grammar rewrites\n"
-        "    are syntax-shaping and usually safer for language extensions.\n"
-        "\n"
-        "  ct-add-reader-rewrite-named  [*, name, pattern | replacement] -> [* | name]\n"
-        "  ct-add-grammar-rewrite-named [*, name, pattern | replacement] -> [* | name]\n"
-        "    Named variants that replace any existing rule with the same\n"
-        "    name (idempotent upsert behavior).\n"
-        "\n"
-        "    Example (grammar alias):\n"
-        "      # rewrite: kw -> 42\n"
-        "      list-new \"kw\" list-append\n"
-        "      list-new \"42\" list-append\n"
-        "      ct-add-grammar-rewrite drop\n"
-        "\n"
-        "  ct-remove-reader-rewrite   [* | name] -> [* | flag]\n"
-        "  ct-remove-grammar-rewrite  [* | name] -> [* | flag]\n"
-        "  ct-clear-reader-rewrites   [*] -> [* | count]\n"
-        "  ct-clear-grammar-rewrites  [*] -> [* | count]\n"
-        "  ct-list-reader-rewrites    [*] -> [* | list]\n"
-        "  ct-list-grammar-rewrites   [*] -> [* | list]\n"
-        "    Manage rewrite rules at compile time. Remove returns 1 when\n"
-        "    a named rule existed, else 0. Clear returns removed count.\n"
-        "\n"
-        "  ct-add-reader-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
-        "  ct-add-grammar-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
-        "    Install rewrite rules with explicit priority. Higher priority\n"
-        "    rules are tried first. Ties preserve insertion order.\n"
-        "\n"
-        "  ct-set-reader-rewrite-enabled  [*, name | flag] -> [* | ok]\n"
-        "  ct-set-grammar-rewrite-enabled [*, name | flag] -> [* | ok]\n"
-        "  ct-get-reader-rewrite-enabled  [* | name] -> [*, flag | found]\n"
-        "  ct-get-grammar-rewrite-enabled [* | name] -> [*, flag | found]\n"
-        "    Enable/disable rules and query rule status. get-* returns\n"
-        "    [flag found] so missing names are distinguishable from false.\n"
-        "\n"
-        "  ct-set-reader-rewrite-priority  [*, name | priority] -> [* | ok]\n"
-        "  ct-set-grammar-rewrite-priority [*, name | priority] -> [* | ok]\n"
-        "  ct-get-reader-rewrite-priority  [* | name] -> [*, priority | found]\n"
-        "  ct-get-grammar-rewrite-priority [* | name] -> [*, priority | found]\n"
-        "    Adjust/query rewrite priority after registration.\n"
-        "\n"
-        "  ct-current-token      [*] -> [* | token]\n"
-        "  ct-parser-pos         [*] -> [* | n]\n"
-        "  ct-parser-remaining   [*] -> [* | n]\n"
-        "    Parser introspection helpers for advanced metaprogramming.\n"
-        "\n"
-        "  ct-set-macro-expansion-limit [* | n] -> [*]\n"
-        "  ct-get-macro-expansion-limit [*] -> [* | n]\n"
-        "    Configure/query parser macro+rewrite expansion guard limit.\n"
-        "\n"
-        "  ct-set-macro-preview   [* | flag] -> [*]\n"
-        "  ct-get-macro-preview   [*] -> [* | flag]\n"
-        "    Enable/query preview tracing for macro+rewrite expansions.\n"
-        "    Preview output includes the expanded token stream and a\n"
-        "    source-context window around the expansion site.\n"
-        "\n"
-        "  ct-register-text-macro [*, name, params | expansion-list] -> [*]\n"
-        "    Programmatically register a text macro from compile-time code.\n"
-        "\n"
-        "  ct-register-text-macro-signature [*, name, param-spec | expansion-list] -> [*]\n"
-        "    Register a text macro with explicit parameter names.\n"
-        "    `param-spec` is a list of identifiers. Prefix one with\n"
-        "    `*` or `...` to mark it variadic (must be last).\n"
-        "\n"
-        "  ct-list-words        [*] -> [* | list]\n"
-        "  ct-unregister-word    [* | name] -> [* | flag]\n"
-        "  ct-word-exists?       [* | name] -> [* | flag]\n"
-        "  ct-get-word-body      [* | name] -> [* | body-or-nil]\n"
-        "  ct-get-word-asm       [* | name] -> [* | asm-or-nil]\n"
-        "    Remove words from the dictionary or query presence.\n"
-        "    `ct-get-word-body` returns macro expansion lists for text\n"
-        "    macros, or a list of op-maps ({op,data}) for high-level\n"
-        "    words. Returns nil when unavailable.\n"
-        "\n"
-        "  emit-definition     [*, name | body-list] -> [*]\n"
-        "    Emit a word definition dynamically. `name` is a token or\n"
-        "    string; `body-list` is a list of tokens/strings that form\n"
-        "    the word body. Injects the equivalent of\n"
-        "      word <name> <body...> end\n"
-        "    into the parser's token stream.\n"
-        "\n"
-        "  ── Control-frame helpers (for custom control structures)\n"
-        "\n"
-        "  ct-control-frame-new [* | type] -> [* | frame]\n"
-        "    Create a control frame map with a `type` field.\n"
-        "\n"
-        "  ct-control-get       [*, frame | key] -> [* | value]\n"
-        "    Read key from a control frame map.\n"
-        "\n"
-        "  ct-control-set       [*, frame, key | value] -> [* | frame]\n"
-        "    Write key/value into a control frame map.\n"
-        "\n"
-        "  ct-control-push      [* | frame] -> [*]\n"
-        "    Push a frame onto the parser control stack.\n"
-        "\n"
-        "  ct-control-pop       [*] -> [* | frame]\n"
-        "    Pop and return the top parser control frame.\n"
-        "\n"
-        "  ct-control-peek      [*] -> [* | frame] || [* | nil]\n"
-        "    Return the top parser control frame without popping.\n"
-        "\n"
-        "  ct-control-depth     [*] -> [* | n]\n"
-        "    Return parser control-stack depth.\n"
-        "\n"
-        "  ct-control-add-close-op [*, frame, op | data] -> [* | frame]\n"
-        "    Append a close operation descriptor to frame.close_ops.\n"
-        "\n"
-        "  ct-new-label         [* | prefix] -> [* | label]\n"
-        "    Allocate a fresh internal label with the given prefix.\n"
-        "\n"
-        "  ct-emit-op           [*, op | data] -> [*]\n"
-        "    Emit an internal op node directly into the current body.\n"
-        "\n"
-        "  ct-last-token-line   [*] -> [* | line]\n"
-        "    Return line number of the last parser token (or 0).\n"
-        "\n"
-        "  ct-register-block-opener [* | name] -> [*]\n"
-        "    Mark a word name as a block opener for `with` nesting.\n"
-        "\n"
-        "  ct-unregister-block-opener [* | name] -> [*]\n"
-        "    Remove a word name from block opener registration.\n"
-        "\n"
-        "  ct-register-control-override [* | name] -> [*]\n"
-        "    Register a control word override so parser can delegate\n"
-        "    built-in control handling to custom compile-time words.\n"
-        "\n"
-        "  ct-unregister-control-override [* | name] -> [*]\n"
-        "    Remove a control word override registration.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 7  LEXER OBJECTS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  Lexer objects provide structured token parsing with custom\n"
-        "  separator characters. They wrap the main parser and let\n"
-        "  macros build mini-DSLs that tokenize differently.\n"
-        "\n"
-        "  lexer-new           [* | separators] -> [* | lexer]\n"
-        "    Create a lexer object with the given separator characters\n"
-        "    (e.g. \",;\" to split on commas and semicolons).\n"
-        "\n"
-        "  lexer-pop           [* | lexer] -> [*, lexer | token]\n"
-        "    Consume and return the next token from the lexer.\n"
-        "\n"
-        "  lexer-peek          [* | lexer] -> [*, lexer | token]\n"
-        "    Return the next token without consuming it.\n"
-        "\n"
-        "  lexer-expect        [*, lexer | str] -> [*, lexer | token]\n"
-        "    Consume the next token and assert its lexeme matches str.\n"
-        "    Raises a parse error on mismatch.\n"
-        "\n"
-        "  lexer-collect-brace [* | lexer] -> [*, lexer | list]\n"
-        "    Collect all tokens between matching { } braces into a\n"
-        "    list. The opening { must be the next token.\n"
-        "\n"
-        "  lexer-push-back     [* | lexer] -> [* | lexer]\n"
-        "    Push the most recently consumed token back onto the\n"
-        "    lexer's stream.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 8  ASSEMBLY OUTPUT CONTROL\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  These words let compile-time code modify the generated\n"
-        "  assembly: the prelude (code inside _start) and the\n"
-        "  BSS section (uninitialized data).\n"
-        "\n"
-        "  prelude-clear       [*] -> [*]\n"
-        "    Discard the entire custom prelude.\n"
-        "\n"
-        "  prelude-append      [* | line] -> [*]\n"
-        "    Append a line of assembly to the custom prelude.\n"
-        "\n"
-        "  prelude-set         [* | list-of-strings] -> [*]\n"
-        "    Replace the custom prelude with the given list of\n"
-        "    assembly lines.\n"
-        "\n"
-        "  bss-clear           [*] -> [*]\n"
-        "    Discard all custom BSS declarations.\n"
-        "\n"
-        "  bss-append          [* | line] -> [*]\n"
-        "    Append a line to the custom BSS section.\n"
-        "\n"
-        "  bss-set             [* | list-of-strings] -> [*]\n"
-        "    Replace the custom BSS with the given list of lines.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 9  EXPRESSION HELPER\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  shunt               [* | token-list] -> [* | postfix-list]\n"
-        "    Shunting-yard algorithm. Takes a list of infix token\n"
-        "    strings (numbers, identifiers, +, -, *, /, %, parentheses)\n"
-        "    and returns the equivalent postfix (RPN) token list.\n"
-        "    Useful for building expression-based DSLs.\n"
-        "\n"
-        "      [\"3\" \"+\" \"4\" \"*\" \"2\"] shunt\n"
-        "      # => [\"3\" \"4\" \"2\" \"*\" \"+\"]\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 10  LOOP INDEX\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  i                   [*] -> [* | index]\n"
-        "    Push the current iteration index (0-based) of the\n"
-        "    innermost compile-time for loop.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 11  ASSERTIONS & ERRORS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  static_assert       [* | condition] -> [*]\n"
-        "    If condition is zero or false, abort compilation with a\n"
-        "    static assertion failure (includes source location).\n"
-        "\n"
-        "  parse-error         [* | message] -> (aborts)\n"
-        "    Abort compilation with the given error message.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 12  EVAL\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  eval                [* | source-string] -> [*]\n"
-        "    Parse and execute a string of L2 code in the CT VM.\n"
-        "    The string is tokenized, parsed as if it were part of\n"
-        "    a definition body, and the resulting ops are executed\n"
-        "    immediately.\n"
-        "\n"
-        "      \"3 4 +\" eval   # pushes 7 onto the CT stack\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 13  MACRO & TEXT MACRO DEFINITION\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        + _L2_MACRO_CT_BLOCK
-        + "  :py { ... }\n"
-        "    Embed a Python code block that runs at compile time.\n"
-        "    The block receives a `ctx` (MacroContext) variable and\n"
-        "    can call ctx.emit(), ctx.next_token(), etc.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 14  STRUCT & CSTRUCT\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  struct <name> field <name> <size> ... end\n"
-        "    Define a simple struct with manually-sized fields.\n"
-        "    Generates accessor words:\n"
-        "      <struct>.size           — total byte size\n"
-        "      <struct>.<field>.offset — byte offset\n"
-        "      <struct>.<field>.size   — field byte size\n"
-        "      <struct>.<field>@       — read field (qword)\n"
-        "      <struct>.<field>!       — write field (qword)\n"
-        "\n"
-        "  cstruct <name> cfield <name> <type> ... end\n"
-        "    Define a C-compatible struct with automatic alignment\n"
-        "    and padding. Field types use C names (int, long, char*,\n"
-        "    struct <name>*, etc.). Generates the same accessors as\n"
-        "    struct plus <struct>.align.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 15  FLOW CONTROL LABELS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  label <name>                             [immediate]\n"
-        "    Emit a named label at the current position in the word\n"
-        "    body. Can be targeted by `goto`.\n"
-        "\n"
-        "  goto <name>                              [immediate]\n"
-        "    Emit an unconditional jump to the named label.\n"
-        "\n"
-        "  here                                     [immediate]\n"
-        "    Push a \"file:line:col\" string literal for the current\n"
-        "    source location. Useful for error messages and debugging.\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 16  WITH (SCOPED VARIABLES)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  with <names...> in <body> end\n"
-        "    Pop values from the stack into named local variables.\n"
-        "    Inside the body, referencing a name reads the variable;\n"
-        "    `name !` writes to it. Variables are backed by hidden\n"
-        "    globals and are NOT re-entrant.\n"
-        "\n"
-        "      10 20 with x y in\n"
-        "        x y +   # reads x (10) and y (20), adds -> 30\n"
-        "      end\n"
-        "\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 17  SUMMARY TABLE\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  Word                  Category        Stack Effect\n"
-        "  ────────────────────  ──────────────  ──────────────────────────\n"
-        "  nil                   Nil             [*] -> [* | nil]\n"
-        "  nil?                  Nil             [* | v] -> [* | flag]\n"
-        "  list-new              List            [*] -> [* | list]\n"
-        "  list-clone            List            [* | list] -> [* | copy]\n"
-        "  list-append           List            [*, list | v] -> [* | list]\n"
-        "  list-pop              List            [* | list] -> [*, list | v]\n"
-        "  list-pop-front        List            [* | list] -> [*, list | v]\n"
-        "  list-peek-front       List            [* | list] -> [*, list | v]\n"
-        "  list-push-front       List            [*, list | v] -> [* | list]\n"
-        "  list-reverse          List            [* | list] -> [* | list]\n"
-        "  list-length           List            [* | list] -> [* | n]\n"
-        "  list-empty?           List            [* | list] -> [* | flag]\n"
-        "  list-get              List            [*, list | i] -> [* | v]\n"
-        "  list-set              List            [*, list, i | v] -> [* | list]\n"
-        "  list-clear            List            [* | list] -> [* | list]\n"
-        "  list-extend           List            [*, tgt | src] -> [* | tgt]\n"
-        "  list-last             List            [* | list] -> [* | v]\n"
-        "  list-insert           List            [*, list, i | v] -> [* | list]\n"
-        "  list-remove           List            [*, list | i] -> [*, list | v]\n"
-        "  list-slice            List            [*, list, s | e] -> [* | list]\n"
-        "  list-find             List            [*, list | v] -> [*, i | f]\n"
-        "  list-contains?        List            [*, list | v] -> [* | f]\n"
-        "  list-join             List            [*, list | sep] -> [* | s]\n"
-        "  map-new               Map             [*] -> [* | map]\n"
-        "  map-set               Map             [*, map, k | v] -> [* | map]\n"
-        "  map-get               Map             [*, map | k] -> [*, map, v | f]\n"
-        "  map-has?              Map             [*, map | k] -> [*, map | f]\n"
-        "  map-delete            Map             [*, map | k] -> [*, map | f]\n"
-        "  map-clear             Map             [* | map] -> [* | map]\n"
-        "  map-length            Map             [* | map] -> [* | n]\n"
-        "  map-empty?            Map             [* | map] -> [* | f]\n"
-        "  map-keys              Map             [* | map] -> [* | list]\n"
-        "  map-values            Map             [* | map] -> [* | list]\n"
-        "  map-clone             Map             [* | map] -> [* | map]\n"
-        "  map-update            Map             [*, tgt | src] -> [* | tgt]\n"
-        "  string=               String          [*, a | b] -> [* | flag]\n"
-        "  string-length         String          [* | s] -> [* | n]\n"
-        "  string-append         String          [*, l | r] -> [* | lr]\n"
-        "  string>number         String          [* | s] -> [*, v | flag]\n"
-        "  string-contains?      String          [*, h | n] -> [* | f]\n"
-        "  string-starts-with?   String          [*, s | p] -> [* | f]\n"
-        "  string-ends-with?     String          [*, s | p] -> [* | f]\n"
-        "  string-split          String          [*, s | sep] -> [* | list]\n"
-        "  string-join           String          [*, list | sep] -> [* | s]\n"
-        "  string-strip          String          [* | s] -> [* | s]\n"
-        "  string-replace        String          [*, s, old | new] -> [* | s]\n"
-        "  string-upper          String          [* | s] -> [* | s]\n"
-        "  string-lower          String          [* | s] -> [* | s]\n"
-        "  int>string            String          [* | n] -> [* | s]\n"
-        "  identifier?           String          [* | v] -> [* | flag]\n"
-        "  next-token            Token           [*] -> [* | tok]\n"
-        "  peek-token            Token           [*] -> [* | tok]\n"
-        "  token-lexeme          Token           [* | tok] -> [* | s]\n"
-        "  token-from-lexeme     Token           [*, s | tmpl] -> [* | tok]\n"
-        "  token-line            Token           [* | tok] -> [* | n]\n"
-        "  token-column          Token           [* | tok] -> [* | n]\n"
-        "  inject-tokens         Token           [* | list] -> [*]\n"
-        "  add-token             Token           [* | s] -> [*]\n"
-        "  add-token-chars       Token           [* | s] -> [*]\n"
-        "  emit-definition       Token           [*, name | body] -> [*]\n"
-        "  ct-list-words         Meta            [*] -> [* | list]\n"
-        "  ct-word-exists?       Meta            [* | name] -> [* | flag]\n"
-        "  ct-get-word-body      Meta            [* | name] -> [* | body]\n"
-        "  ct-get-word-asm       Meta            [* | name] -> [* | asm]\n"
-        "  ct-control-frame-new  Control         [* | type] -> [* | frame]\n"
-        "  ct-control-get        Control         [*, frame | key] -> [* | value]\n"
-        "  ct-control-set        Control         [*, frame, key | value] -> [* | frame]\n"
-        "  ct-control-push       Control         [* | frame] -> [*]\n"
-        "  ct-control-pop        Control         [*] -> [* | frame]\n"
-        "  ct-control-peek       Control         [*] -> [* | frame]\n"
-        "  ct-control-depth      Control         [*] -> [* | n]\n"
-        "  ct-control-add-close-op Control       [*, frame, op | data] -> [* | frame]\n"
-        "  ct-new-label          Control         [* | prefix] -> [* | label]\n"
-        "  ct-emit-op            Control         [*, op | data] -> [*]\n"
-        "  ct-last-token-line    Control         [*] -> [* | line]\n"
-        "  ct-register-block-opener Control      [* | name] -> [*]\n"
-        "  ct-unregister-block-opener Control    [* | name] -> [*]\n"
-        "  ct-register-control-override Control  [* | name] -> [*]\n"
-        "  ct-unregister-control-override Control [* | name] -> [*]\n"
-        "  set-token-hook        Hook            [* | name] -> [*]\n"
-        "  clear-token-hook      Hook            [*] -> [*]\n"
-        "  prelude-clear         Assembly        [*] -> [*]\n"
-        "  prelude-append        Assembly        [* | line] -> [*]\n"
-        "  prelude-set           Assembly        [* | list] -> [*]\n"
-        "  bss-clear             Assembly        [*] -> [*]\n"
-        "  bss-append            Assembly        [* | line] -> [*]\n"
-        "  bss-set               Assembly        [* | list] -> [*]\n"
-        "  shunt                 Expression      [* | list] -> [* | list]\n"
-        "  i                     Loop            [*] -> [* | idx]\n"
-        "  static_assert         Assert          [* | cond] -> [*]\n"
-        "  parse-error           Assert          [* | msg] -> (aborts)\n"
-        "  eval                  Eval            [* | str] -> [*]\n"
-        "  lexer-new             Lexer           [* | seps] -> [* | lex]\n"
-        "  lexer-pop             Lexer           [* | lex] -> [*, lex | tok]\n"
-        "  lexer-peek            Lexer           [* | lex] -> [*, lex | tok]\n"
-        "  lexer-expect          Lexer           [*, lex | s] -> [*, lex | tok]\n"
-        "  lexer-collect-brace   Lexer           [* | lex] -> [*, lex | list]\n"
-        "  lexer-push-back       Lexer           [* | lex] -> [* | lex]\n"
-        "  runtime               Hook            [immediate]\n"
-        "  runtime-only          Hook            [immediate]\n"
-        "  CT                    Hook            [*] -> [* | flag]\n"
-        "  use-l2-ct             Hook            [* | name?] -> [*]\n"
-        "\n"
-        "═══════════════════════════════════════════════════════════════\n"
-    )
-
-    _L2_QA_TEXT = (
-        "═══════════════════════════════════════════════════════════\n"
-        "              Q & A   /   T I P S   &   T R I C K S\n"
-        "═══════════════════════════════════════════════════════════\n"
-        "\n"
-        "  HOW DO I DEBUG AN L2 PROGRAM?\n"
-        "\n"
-        "    Compile with --debug to embed DWARF debug info, then\n"
-        "    launch with --dbg to drop straight into GDB:\n"
-        "\n"
-        "      python3 main.py my_program.sl --debug --dbg\n"
-        "\n"
-        "    Inside GDB you can:\n"
-        "      - Set breakpoints on word labels  (b word_main)\n"
-        "      - Inspect the data stack via r12  (x/8gx $r12)\n"
-        "      - Step through asm instructions   (si / ni)\n"
-        "      - View registers                  (info registers)\n"
-        "      - Disassemble a word              (disas word_foo)\n"
-        "\n"
-        "    Tip: r12 is the stack pointer. [r12] = TOS,\n"
-        "    [r12+8] = second element, etc.\n"
-        "\n"
-        "  HOW DO I VIEW THE GENERATED ASSEMBLY?\n"
-        "\n"
-        "    Use --emit-asm to stop after generating assembly:\n"
-        "\n"
-        "      python3 main.py my_program.sl --emit-asm\n"
-        "\n"
-        "    The .asm file is written to build/<name>.asm.\n"
-        "    You can also use -v1 or higher for timing info,\n"
-        "    -v2 for per-function details, and -v3 or -v4 for\n"
-        "    full optimization tracing.\n"
-        "\n"
-        "  HOW DO I CALL C FUNCTIONS?\n"
-        "\n"
-        "    Declare them with the C-style extern syntax:\n"
-        "\n"
-        "      extern int printf(const char* fmt, ...)\n"
-        "      extern void* malloc(size_t size)\n"
-        "\n"
-        "    Or use the legacy style:\n"
-        "\n"
-        "      extern printf 2 1\n"
-        "\n"
-        "    Link the library with -l:\n"
-        "\n"
-        "      python3 main.py my_program.sl -l c\n"
-        "\n"
-        "    You can also use cimport to auto-extract externs:\n"
-        "\n"
-        "      cimport \"my_header.h\"\n"
-        "\n"
-        "  HOW DO MACROS WORK?\n"
-        "\n"
-        + _L2_MACRO_QA_BLOCK
-        + "  WHAT IS THE L2 DATA MODEL FOR ARRAYS/STRINGS?\n"
-        "\n"
-        "    - [ ... ] creates a heap list at runtime. Layout is:\n"
-        "      [len, elem0, elem1, ...]. Free it with arr_free.\n"
-        "    - { ... } creates a fixed-size BSS-backed list.\n"
-        "    - { ... }:N creates BSS storage of N elements, copying\n"
-        "      initializers then zero-filling the rest.\n"
-        "    - String literals are emitted to static data and\n"
-        "      deduplicated by default (--no-string-dedup disables).\n"
-        "    - stdlib/dyn_arr.sl provides growable dynamic arrays\n"
-        "      with [len, cap, data_ptr] style metadata.\n"
-        "\n"
-        "  HOW DO I RUN CODE AT COMPILE TIME?\n"
-        "\n"
-        "    Use --ct-run-main or --script to execute 'main' at\n"
-        "    compile time. The CT VM supports most stack ops, I/O,\n"
-        "    lists, hashmaps, and string manipulation.\n"
-        "\n"
-        "    You can also mark words as compile-time:\n"
-        "\n"
-        "      word generate-table\n"
-        "        # ... runs during compilation\n"
-        "      end\n"
-        "      compile-time generate-table\n"
-        "\n"
-        "  WHAT IS THE --SCRIPT FLAG?\n"
-        "\n"
-        "    Shorthand for --no-artifact --ct-run-main. It parses\n"
-        "    and runs 'main' in the compile-time VM without\n"
-        "    producing a binary — useful for scripts as the name suggests.\n"
-        "\n"
-        "  HOW DO I USE THE BUILD CACHE?\n"
-        "\n"
-        "    The cache is automatic. It stores assembly output\n"
-        "    and skips recompilation when source files haven't\n"
-        "    changed. Disable with --no-cache if needed.\n"
-        "\n"
-        "  HOW DO I DO A CHECK-ONLY BUILD?\n"
-        "\n"
-        "    Use --check to parse/compile/validate without emitting\n"
-        "    final artifacts. This is equivalent to enabling\n"
-        "    --no-artifact after successful compilation.\n"
-        "\n"
-        "      python3 main.py prog.sl --check\n"
-        "\n"
-        "  HOW DO CONDITIONAL DIRECTIVES WORK?\n"
-        "\n"
-        "    Use ifdef/ifndef/elsedef/endif in source and pass\n"
-        "    -D NAME (repeatable) on the CLI, or add `define NAME`\n"
-        "    in source. Directives are\n"
-        "    resolved during preprocessing before tokenization.\n"
-        "\n"
-        "      ifdef DEBUG\n"
-        "        \"debug path\" puts\n"
-        "      elsedef\n"
-        "        \"release path\" puts\n"
-        "      endif\n"
-        "\n"
-        "  HOW DO I CONTROL WARNINGS?\n"
-        "\n"
-        "    Enable categories with -W (repeatable), and promote\n"
-        "    warnings to errors with --Werror.\n"
-        "\n"
-        "      python3 main.py prog.sl -W redefine -W stack-depth\n"
-        "      python3 main.py prog.sl -W all --Werror\n"
-        "\n"
-        "  HOW DO I DUMP THE CONTROL-FLOW GRAPH?\n"
-        "\n"
-        "    Use --dump-cfg to produce a Graphviz DOT file:\n"
-        "\n"
-        "      python3 main.py prog.sl --dump-cfg\n"
-        "      dot -Tpng build/prog.cfg.dot -o cfg.png\n"
-        "\n"
-        "  WHAT OPTIMIZATIONS DOES L2 PERFORM?\n"
-        "\n"
-        "    - Constant folding (--no-folding to disable)\n"
-        "    - Peephole optimization (--no-peephole)\n"
-        "    - Loop unrolling (--no-loop-unroll)\n"
-        "    - Auto-inlining of small asm bodies (--no-auto-inline)\n"
-        "    - String literal deduplication (--no-string-dedup to disable)\n"
-        "    - Dead code elimination (automatic)\n"
-        "    - -O0 disables all optimizations\n"
-        "    - -O2 disables all optimizations AND checks\n"
-        "\n"
-        "══════════════════════════════════════════════════════════\n"
-    )
-
-    _L2_HOW_TEXT = (
-        "═══════════════════════════════════════════════════════════════\n"
-        "          H O W   L 2   W O R K S   (I N T E R N A L S)\n"
-        "═══════════════════════════════════════════════════════════════\n"
-        "\n"
-        "  ARCHITECTURE OVERVIEW\n"
-        "\n"
-        "    The L2 compiler is a single-pass, single-file Python\n"
-        "    program (~13K lines) with these major stages:\n"
-        "\n"
-        "    1. READER/TOKENIZER\n"
-        "       Splits source into whitespace-delimited tokens.\n"
-        "       Tracks line, column, and byte offsets per token.\n"
-        "       Line comments (starting with #) are discarded by the\n"
-        "       tokenizer and do not become runtime operations.\n"
-        "\n"
-        "    2. IMPORT RESOLUTION\n"
-        "       'import' and 'cimport' directives are resolved\n"
-        "       recursively. Each file is loaded once. Imports are\n"
-        "       concatenated into a single token stream with\n"
-        "       FileSpan markers for error reporting.\n"
-        "\n"
-        "    3. PARSER\n"
-        "       Walks the token stream and builds an IR Module of\n"
-        "       Op lists (one per word definition). Key features:\n"
-        "       - Word/asm/py/extern definitions -> dictionary\n"
-        "       - Control flow (if/else/end, while/do/end, for)\n"
-        "         compiled to label-based jumps\n"
-        "       - Macro expansion (text macros with $N params)\n"
-        "       - Token hooks for user-extensible syntax\n"
-        "       - Compile-time VM execution of immediate words\n"
-        "\n"
-        "    4. ASSEMBLER / CODE GENERATOR\n"
-        "       Converts the Op IR into NASM x86-64 assembly.\n"
-        "       Handles calling conventions, extern C FFI with\n"
-        "       full System V ABI support (register classification,\n"
-        "       struct passing, SSE arguments).\n"
-        "\n"
-        "    5. NASM + LINKER\n"
-        "       The assembly is assembled by NASM into an object\n"
-        "       file, then linked (via ld or ld.lld) into the final\n"
-        "       binary.\n"
-        "\n"
-        "  CONFORMANCE NOTES\n"
-        "\n"
-        "    - A program is considered conforming when accepted by\n"
-        "      the reference parser/preprocessor in this repository.\n"
-        "    - Runtime behavior is defined by emitted x86-64 code\n"
-        "      plus imported stdlib words.\n"
-        "    - If docs and implementation diverge, implementation\n"
-        "      behavior is authoritative until docs are updated.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────────\n"
-        "\n"
-        "  THE STACKS\n"
-        "\n"
-        "    L2 uses register r12 as the stack pointer for its data\n"
-        "    stack. The stack grows downward:\n"
-        "\n"
-        "      push:  sub r12, 8; mov [r12], rax\n"
-        "      pop:   mov rax, [r12]; add r12, 8\n"
-        "\n"
-        "    The return stack lives in a separate buffer with r13 as\n"
-        "    its stack pointer (also grows downward). The native x86\n"
-        "    call/ret stack (rsp) is used only for word call/return\n"
-        "    linkage and C interop.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────────\n"
-        "\n"
-        "  THE COMPILE-TIME VM\n"
-        "\n"
-        "    The CT VM is a stack-based interpreter that runs during\n"
-        "    parsing. It maintains:\n"
-        "\n"
-        "      - A value stack\n"
-        "      - A dictionary of CT-callable words\n"
-        "      - A return stack for nested calls\n"
-        "\n"
-        "    CT words can:\n"
-        "      - Emit token sequences into the compiler's stream\n"
-        "      - Inspect/modify the parser state\n"
-        "      - Call other CT words or builtins\n"
-        "      - Perform I/O, string ops, list/hashmap manipulation\n"
-        "\n"
-        "    When --ct-run-main is used, the CT VM can also JIT-compile\n"
-        "    and execute native x86-64 code via the Keystone assembler\n"
-        "    engine (for words that need near native performance).\n"
-        "\n"
-        "───────────────────────────────────────────────────────────────\n"
-        "\n"
-        "  OPTIMIZATION PASSES\n"
-        "\n"
-        "    CONSTANT FOLDING\n"
-        "      Evaluates pure arithmetic sequences (e.g., 3 4 +\n"
-        "      becomes push 7). Works across word boundaries for\n"
-        "      inlined words.\n"
-        "\n"
-        "    PEEPHOLE OPTIMIZATION\n"
-        "      Pattern-matches instruction sequences and\n"
-        "      replaces them with shorter equivalents. Examples:\n"
-        "        swap drop -> nip\n"
-        "        swap nip  -> drop\n"
-        "\n"
-        "    LOOP UNROLLING\n"
-        "      Small deterministic loops (e.g., '4 for ... end')\n"
-        "      are unrolled into straight-line code when the\n"
-        "      iteration count is known at compile time.\n"
-        "\n"
-        "    AUTO-INLINING\n"
-        "      Small asm-body words (below a size threshold) are\n"
-        "      automatically inlined at call sites, eliminating\n"
-        "      call/ret overhead.\n"
-        "\n"
-        "    LIST LITERAL LOWERING\n"
-        "      [ ... ] literals are always heap-backed and\n"
-        "      allocated at runtime.\n"
-        "      { ... } literals are fixed-size BSS-backed\n"
-        "      arrays; with { ... }:N, trailing elements are\n"
-        "      zero-initialized up to N.\n"
-        "\n"
-        "    DATA LAYOUTS\n"
-        "      Heap list layout: [len, elem0, elem1, ...]\n"
-        "      BSS list layout:  [len, elem0, elem1, ...]\n"
-        "      Dynamic array layout (stdlib/dyn_arr.sl):\n"
-        "        [len, cap, data_ptr, inline_elems...]\n"
-        "      String literals point at static data bytes\n"
-        "      (deduplicated unless --no-string-dedup).\n"
-        "\n"
-        "    DEAD CODE ELIMINATION\n"
-        "      Words that are never called (and not 'main') are\n"
-        "      excluded from the final assembly output.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────────\n"
-        "\n"
-        "  EXTERN C FFI\n"
-        "\n"
-        "    L2's extern system supports the full System V AMD64 ABI:\n"
-        "\n"
-        "    - Integer args -> rdi, rsi, rdx, rcx, r8, r9, then stack\n"
-        "    - Float/double args -> xmm0..xmm7, then stack\n"
-        "    - Struct args classified per ABI eightbyte rules\n"
-        "    - Return values in rax (int), xmm0 (float), or via\n"
-        "      hidden sret pointer for large structs\n"
-        "    - RSP is aligned to 16 bytes before each call\n"
-        "\n"
-        "    The compiler auto-classifies argument types from the\n"
-        "    C-style declaration and generates the correct register\n"
-        "    shuffle and stack layout.\n"
-        "\n"
-        "───────────────────────────────────────────────────────────────\n"
-        "\n"
-        "  QUIRKS & GOTCHAS\n"
-        "\n"
-        "    - No type system: everything is a 64-bit integer on\n"
-        "      the stack. Pointers, booleans, characters — all\n"
-        "      just numbers. Type safety is your responsibility.\n"
-        "\n"
-        "    - Macro expansion depth: macros can expand macros,\n"
-        "      but there's a limit (default 256, configurable via\n"
-        "      --macro-expansion-limit).\n"
-        "      Use --macro-preview to trace each expansion.\n"
-        "\n"
-        "    - :py blocks: Python code embedded in :py { ... }\n"
-        "      runs in the compiler's Python process. It has full\n"
-        "      access to the parser and dictionary — powerful but\n"
-        "      dangerous.\n"
-        "\n"
-        "    - The CT VM and native codegen share a dictionary\n"
-        "      but have separate stacks. A word defined at CT\n"
-        "      exists at CT only unless also compiled normally.\n"
-        "\n"
-        "    - The build cache tracks file mtimes and a hash of\n"
-        "      compiler flags. CT side effects invalidate the\n"
-        "      cache for that file.\n"
-        "\n"
-        "    - Unsafe and implementation-defined behavior is\n"
-        "      intentional: raw memory access, inline asm, syscalls,\n"
-        "      external calls, exact label layout, and optimization\n"
-        "      interactions are programmer-visible and may vary with\n"
-        "      flags and code shape.\n"
-        "\n"
-        "═══════════════════════════════════════════════════════════════\n"
-    )
-
-    def _parse_sig_counts(effect: str) -> Tuple[int, int]:
-        """Parse stack effect to (n_args, n_returns).
-
-        Counts all named items (excluding ``*``) on each side of ``->``.
-        Items before ``|`` are deeper stack elements; items after are top.
-        Both count as args/returns.
-
-        Handles dual-return with ``||``:
-          ``[* | x] -> [* | y] || [*, x | z]``
-        Takes the first branch for counting.
-        Returns (-1, -1) for unparseable effects.
-        """
-        if not effect or "->" not in effect:
-            return (-1, -1)
-        # Split off dual-return: take first branch
-        main = effect.split("||")[0].strip()
-        parts = main.split("->", 1)
-        if len(parts) != 2:
-            return (-1, -1)
-        lhs, rhs = parts[0].strip(), parts[1].strip()
-
-        def _count_items(side: str) -> int:
-            s = side.strip()
-            if s.startswith("["):
-                s = s[1:]
-            if s.endswith("]"):
-                s = s[:-1]
-            s = s.strip()
-            if not s:
-                return 0
-            # Flatten both sides of pipe and count all non-* items
-            all_items = s.replace("|", ",")
-            return len([x.strip() for x in all_items.split(",")
-                        if x.strip() and x.strip() != "*"])
-
-        return (_count_items(lhs), _count_items(rhs))
-
-    def _safe_addnstr(scr: Any, y: int, x: int, text: str, maxlen: int, attr: int = 0) -> None:
-        h, w = scr.getmaxyx()
-        if y < 0 or y >= h or x >= w:
-            return
-        maxlen = min(maxlen, w - x)
-        if maxlen <= 0:
-            return
-        try:
-            scr.addnstr(y, x, text, maxlen, attr)
-        except curses.error:
-            pass
-
-    def _build_detail_lines(entry: DocEntry, width: int) -> List[str]:
-        lines: List[str] = []
-        lines.append(f"{'Name:':<14} {entry.name}")
-        lines.append(f"{'Kind:':<14} {entry.kind}")
-        if entry.stack_effect:
-            lines.append(f"{'Stack effect:':<14} {entry.stack_effect}")
+    if not _DOCS_HELPERS_LOADED:
+        _DOCS_HELPERS_LOADED = True
+        docs_path = Path(__file__).with_name("docs.py")
+        if docs_path.exists():
+            spec = None
+            try:
+                spec = importlib.util.spec_from_file_location("l2_docs_helpers", docs_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("unable to create module spec")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                if hasattr(module, "configure_runtime"):
+                    module.configure_runtime(ct_word_metadata_provider=_collect_ct_word_metadata)
+                _DOCS_HELPERS_MODULE = module
+                _DOCS_HELPERS_ERROR = ""
+            except Exception as exc:
+                if spec is not None and getattr(spec, "name", None):
+                    sys.modules.pop(spec.name, None)
+                _DOCS_HELPERS_MODULE = None
+                _DOCS_HELPERS_ERROR = f"failed to import docs.py: {exc}"
         else:
-            lines.append(f"{'Stack effect:':<14} (none)")
-        lines.append(f"{'File:':<14} {entry.path}:{entry.line}")
-        lines.append("")
-        if entry.description:
-            lines.append("Description:")
-            # Word-wrap description
-            words = entry.description.split()
-            current: List[str] = []
-            col = 2  # indent
-            for w in words:
-                if current and col + 1 + len(w) > width - 2:
-                    lines.append("  " + " ".join(current))
-                    current = [w]
-                    col = 2 + len(w)
-                else:
-                    current.append(w)
-                    col += 1 + len(w) if current else len(w)
-            if current:
-                lines.append("  " + " ".join(current))
+            _DOCS_HELPERS_MODULE = None
+            _DOCS_HELPERS_ERROR = "docs.py not found"
+
+    if warn and _DOCS_HELPERS_MODULE is None and not _DOCS_HELPERS_WARNED:
+        _DOCS_HELPERS_WARNED = True
+        if _DOCS_HELPERS_ERROR:
+            sys.stderr.write(f"[warn] docs helpers unavailable ({_DOCS_HELPERS_ERROR})\n")
         else:
-            lines.append("(no description)")
-        lines.append("")
-        # Show source context
-        lines.append("Source context:")
-        try:
-            src_lines = entry.path.read_text(encoding="utf-8", errors="ignore").splitlines()
-            start = max(0, entry.line - 1)
-            if entry.kind == "word":
-                # Depth-tracking: word/if/while/for/begin/with open blocks closed by 'end'
-                _block_openers = {"word", "if", "while", "for", "begin", "with"}
-                depth = 0
-                end = min(len(src_lines), start + 200)
-                for i in range(start, end):
-                    stripped = src_lines[i].strip()
-                    # Strip comments (# to end of line, but not inside strings)
-                    code = stripped.split("#", 1)[0].strip() if "#" in stripped else stripped
-                    # Count all block openers and 'end' tokens on the line
-                    for tok in code.split():
-                        if tok in _block_openers:
-                            depth += 1
-                        elif tok == "end":
-                            depth -= 1
-                    prefix = f"  {i + 1:4d}| "
-                    lines.append(prefix + src_lines[i])
-                    if depth <= 0 and i > start:
-                        break
-            elif entry.kind in ("asm", "py"):
-                # Show until closing brace + a few extra lines of context
-                end = min(len(src_lines), start + 200)
-                found_close = False
-                extra_after = 0
-                for i in range(start, end):
-                    prefix = f"  {i + 1:4d}| "
-                    lines.append(prefix + src_lines[i])
-                    stripped = src_lines[i].strip()
-                    if not found_close and stripped in ("}", "};") and i > start:
-                        found_close = True
-                        extra_after = 0
-                        continue
-                    if found_close:
-                        extra_after += 1
-                        if extra_after >= 3 or not stripped:
-                            break
-            elif entry.kind == "macro":
-                # Show macro body until closing ';'
-                end = min(len(src_lines), start + 200)
-                for i in range(start, end):
-                    prefix = f"  {i + 1:4d}| "
-                    lines.append(prefix + src_lines[i])
-                    stripped = src_lines[i].strip()
-                    if stripped.endswith(";") and i >= start:
-                        break
-            else:
-                end = min(len(src_lines), start + 30)
-                for i in range(start, end):
-                    prefix = f"  {i + 1:4d}| "
-                    lines.append(prefix + src_lines[i])
-        except Exception:
-            lines.append("  (unable to read source)")
-        return lines
+            sys.stderr.write("[warn] docs helpers unavailable\n")
 
-    def _app(stdscr: Any) -> int:
-        try:
-            curses.curs_set(0)
-        except Exception:
-            pass
-        stdscr.keypad(True)
+    return _DOCS_HELPERS_MODULE
 
-        # Initialize color pairs for kind tags
-        _has_colors = False
-        try:
-            if curses.has_colors():
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_CYAN, -1)     # word
-                curses.init_pair(2, curses.COLOR_GREEN, -1)    # asm
-                curses.init_pair(3, curses.COLOR_YELLOW, -1)   # py
-                curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # macro
-                _has_colors = True
-        except Exception:
-            pass
 
-        _KIND_COLORS = {
-            "word": curses.color_pair(1) if _has_colors else 0,
-            "asm": curses.color_pair(2) if _has_colors else 0,
-            "py": curses.color_pair(3) if _has_colors else 0,
-            "macro": curses.color_pair(4) if _has_colors else 0,
-        }
-
-        nonlocal entries
-        query = initial_query
-        selected = 0
-        scroll = 0
-        mode = _MODE_BROWSE
-        active_tab = _TAB_LIBRARY
-
-        # Search mode state
-        search_buf = query
-
-        # Detail mode state
-        detail_scroll = 0
-        detail_lines: List[str] = []
-
-        # Language reference state
-        lang_selected = 0
-        lang_scroll = 0
-        lang_cat_filter = 0  # 0 = all
-        lang_detail_scroll = 0
-        lang_detail_lines: List[str] = []
-
-        # License/philosophy scroll state
-        info_scroll = 0
-        info_lines: List[str] = []
-
-        # Compile-time reference search state
-        ct_ref_all_lines: List[str] = _L2_CT_REF_TEXT.splitlines()
-        ct_ref_query = ""
-        ct_ref_search_buf = ""
-        _CT_REF_SECTION_RE = re.compile(r"^\s*§\s*\d+\s+(.+?)\s*$")
-        _CT_REF_WORD_RE = re.compile(r"^\s{2,}[A-Za-z0-9_?.:+\-*/<>=!&]+(?:\s{2,}|\s+\[)")
-        ct_ref_sections: List[str] = ["all", "intro"]
-        ct_ref_line_sections: List[str] = []
-        _ct_section_cur = "intro"
-        for _ct_line in ct_ref_all_lines:
-            _ct_match = _CT_REF_SECTION_RE.match(_ct_line)
-            if _ct_match is not None:
-                _ct_section_cur = _ct_match.group(1).strip()
-                if _ct_section_cur not in ct_ref_sections:
-                    ct_ref_sections.append(_ct_section_cur)
-            ct_ref_line_sections.append(_ct_section_cur)
-        ct_ref_section_idx = 0
-        ct_ref_scope_options = [
-            "all",
-            "immediate",
-            "compile-only",
-            "runtime+compile-time",
-            "runtime-only",
-        ]
-        ct_ref_scope_idx = 0
-        ct_ref_words_only = False
-        ct_ref_filter_field = 0
-
-        # Filter mode state
-        filter_kind_idx = 0  # index into _FILTER_KINDS
-        filter_field = 0  # 0=kind, 1=args, 2=returns, 3=show_private, 4=show_macros, 5=extra_path, 6=files
-        filter_file_scroll = 0
-        filter_file_cursor = 0
-        filter_args = -1      # -1 = any
-        filter_returns = -1   # -1 = any
-        filter_extra_path = ""  # text input for adding paths
-        filter_extra_roots: List[str] = []  # accumulated extra paths
-        filter_show_private = False
-        filter_show_macros = False
-
-        # Build unique file list; all enabled by default
-        all_file_paths: List[str] = sorted(set(e.path.as_posix() for e in entries))
-        filter_files_enabled: Dict[str, bool] = {p: True for p in all_file_paths}
-
-        def _rebuild_file_list() -> None:
-            nonlocal all_file_paths, filter_files_enabled
-            new_paths = sorted(set(e.path.as_posix() for e in entries))
-            old = filter_files_enabled
-            filter_files_enabled = {p: old.get(p, True) for p in new_paths}
-            all_file_paths = new_paths
-
-        def _filter_lang_ref() -> List[Dict[str, str]]:
-            if lang_cat_filter == 0:
-                return list(_LANG_REF_ENTRIES)
-            cat = _LANG_REF_CATEGORIES[lang_cat_filter - 1]
-            return [e for e in _LANG_REF_ENTRIES if e["category"] == cat]
-
-        def _build_lang_detail_lines(entry: Dict[str, str], width: int) -> List[str]:
-            lines: List[str] = []
-            lines.append(f"{'Name:':<14} {entry['name']}")
-            lines.append(f"{'Category:':<14} {entry['category']}")
-            lines.append("")
-            lines.append("Syntax:")
-            for sl in entry["syntax"].split("\n"):
-                lines.append(f"  {sl}")
-            lines.append("")
-            lines.append(f"{'Summary:':<14} {entry['summary']}")
-            lines.append("")
-            lines.append("Description:")
-            for dl in entry["detail"].split("\n"):
-                if len(dl) <= width - 4:
-                    lines.append(f"  {dl}")
-                else:
-                    words = dl.split()
-                    current: List[str] = []
-                    col = 2
-                    for w in words:
-                        if current and col + 1 + len(w) > width - 2:
-                            lines.append("  " + " ".join(current))
-                            current = [w]
-                            col = 2 + len(w)
-                        else:
-                            current.append(w)
-                            col += 1 + len(w) if current else len(w)
-                    if current:
-                        lines.append("  " + " ".join(current))
-            return lines
-
-        def _render_tab_bar(scr: Any, y: int, width: int) -> None:
-            x = 1
-            for i, name in enumerate(_TAB_NAMES):
-                label = f" {name} "
-                attr = curses.A_REVERSE | curses.A_BOLD if i == active_tab else curses.A_DIM
-                _safe_addnstr(scr, y, x, label, width - x - 1, attr)
-                x += len(label) + 1
-            # Right-aligned shortcuts
-            shortcuts = " ? Q&A  H how  P philosophy  L license "
-            if x + len(shortcuts) < width:
-                _safe_addnstr(scr, y, width - len(shortcuts) - 1, shortcuts, len(shortcuts), curses.A_DIM)
-
-        def _apply_filters(items: List[DocEntry]) -> List[DocEntry]:
-            result = items
-            kind = _FILTER_KINDS[filter_kind_idx]
-            if kind != "all":
-                result = [e for e in result if e.kind == kind]
-            # File toggle filter
-            if not all(filter_files_enabled.get(p, True) for p in all_file_paths):
-                result = [e for e in result if filter_files_enabled.get(e.path.as_posix(), True)]
-            # Signature filters
-            if filter_args >= 0 or filter_returns >= 0:
-                filtered = []
-                for e in result:
-                    n_args, n_rets = _parse_sig_counts(e.stack_effect)
-                    if filter_args >= 0 and n_args != filter_args:
-                        continue
-                    if filter_returns >= 0 and n_rets != filter_returns:
-                        continue
-                    filtered.append(e)
-                result = filtered
-            return result
-
-        def _ct_ref_line_is_word(line: str) -> bool:
-            if not line.strip():
-                return False
-            if line.lstrip().startswith("§"):
-                return False
-            if "━━━━━━━━" in line:
-                return False
-            return _CT_REF_WORD_RE.match(line) is not None
-
-        def _ct_ref_scope_matches(line: str, scope: str) -> bool:
-            if scope == "all":
-                return True
-            low = line.lower()
-            if scope == "immediate":
-                return "[immediate" in low
-            if scope == "compile-only":
-                return "compile-only" in low
-            if scope == "runtime+compile-time":
-                return "runtime + compile-time" in low or "runtime+compile-time" in low
-            if scope == "runtime-only":
-                return "runtime-only" in low
-            return True
-
-        def _ct_ref_normalize_scope(raw_scope: str) -> Optional[str]:
-            scope = raw_scope.strip().lower().replace("_", "-")
-            aliases = {
-                "rt+ct": "runtime+compile-time",
-                "runtime-compile-time": "runtime+compile-time",
-                "runtime+ct": "runtime+compile-time",
-                "rt-only": "runtime-only",
+def _collect_ct_word_metadata() -> List[Dict[str, Any]]:
+    dictionary = bootstrap_dictionary()
+    out: List[Dict[str, Any]] = []
+    for name, word in dictionary.words.items():
+        if word.compile_time_intrinsic is None or name.startswith("__"):
+            continue
+        out.append(
+            {
+                "name": name,
+                "compile_only": bool(word.compile_only),
+                "immediate": bool(word.immediate),
+                "runtime_only": bool(word.runtime_only),
+                "has_runtime_intrinsic": bool(word.runtime_intrinsic is not None),
             }
-            scope = aliases.get(scope, scope)
-            if scope in ct_ref_scope_options:
-                return scope
-            return None
+        )
+    out.sort(key=lambda item: str(item["name"]).lower())
+    return out
 
-        def _ct_ref_filter_summary() -> str:
-            parts: List[str] = []
-            if ct_ref_section_idx > 0:
-                parts.append(f"section={ct_ref_sections[ct_ref_section_idx]}")
-            if ct_ref_scope_idx > 0:
-                parts.append(f"scope={ct_ref_scope_options[ct_ref_scope_idx]}")
-            if ct_ref_words_only:
-                parts.append("words-only")
-            return ", ".join(parts)
 
-        def _filter_ct_ref_lines(raw_query: str) -> List[str]:
-            query_text = raw_query.strip()
-            query_terms: List[str] = []
-            query_section: Optional[str] = None
-            query_scope: Optional[str] = None
-            for part in query_text.split():
-                lower = part.lower()
-                if lower.startswith("section:") and len(part) > len("section:"):
-                    query_section = part.split(":", 1)[1].replace("_", " ").strip().lower()
-                    continue
-                if lower.startswith("scope:") and len(part) > len("scope:"):
-                    query_scope = _ct_ref_normalize_scope(part.split(":", 1)[1])
-                    continue
-                query_terms.append(lower)
+def _build_ct_ref_complete_summary_table(base_doc_text: str) -> str:
+    docs_helpers = _load_docs_helpers(warn=False)
+    if docs_helpers is None or not hasattr(docs_helpers, "build_ct_reference_bundle"):
+        return ""
+    bundle = docs_helpers.build_ct_reference_bundle(base_doc_text, _collect_ct_word_metadata())
+    return str(bundle.get("summary_text", ""))
 
-            section_filter = ct_ref_sections[ct_ref_section_idx].lower()
-            if query_section:
-                section_filter = query_section
 
-            scope_filter = ct_ref_scope_options[ct_ref_scope_idx]
-            if query_scope is not None:
-                scope_filter = query_scope
-
-            candidates: List[Tuple[int, str, str]] = []
-            for idx, line in enumerate(ct_ref_all_lines):
-                section = ct_ref_line_sections[idx]
-                if section_filter != "all" and section_filter not in section.lower():
-                    continue
-                line_is_word = _ct_ref_line_is_word(line)
-                if ct_ref_words_only and not line_is_word:
-                    continue
-                if scope_filter != "all":
-                    if not line_is_word:
-                        continue
-                    if not _ct_ref_scope_matches(line, scope_filter):
-                        continue
-                candidates.append((idx + 1, line, section))
-
-            if not query_terms:
-                if section_filter == "all" and scope_filter == "all" and not ct_ref_words_only:
-                    return list(ct_ref_all_lines)
-                if not candidates:
-                    return ["(no compile-time reference lines match current filters)"]
-                out: List[str] = [
-                    f"[filter] {len(candidates)} line(s)"
-                    + (f" section={section_filter}" if section_filter != "all" else "")
-                    + (f" scope={scope_filter}" if scope_filter != "all" else "")
-                    + (" words-only" if ct_ref_words_only else ""),
-                    "",
-                ]
-                out.extend(f"{line_no:5d}: {line}" for line_no, line, _ in candidates)
-                return out
-
-            scored_matches: List[Tuple[int, int, str, str]] = []
-            for line_no, line, section in candidates:
-                line_low = line.lower()
-                section_low = section.lower()
-                score = 0
-                for term in query_terms:
-                    if line_low == term:
-                        score += 300
-                    elif re.search(rf"\\b{re.escape(term)}\\b", line_low):
-                        score += 180
-                    elif line_low.startswith(term):
-                        score += 120
-                    elif term in line_low:
-                        score += 80
-                    elif term in section_low:
-                        score += 45
-                    else:
-                        score = -1
-                        break
-                if score < 0:
-                    continue
-                if _ct_ref_line_is_word(line):
-                    score += 10
-                scored_matches.append((score, line_no, line, section))
-
-            if not scored_matches:
-                return [f"(no compile-time reference matches for '{query_text}')"]
-
-            scored_matches.sort(key=lambda item: (-item[0], item[1]))
-            out = [
-                f"[search] {len(scored_matches)} match(es) for '{query_text}'",
-                "",
-            ]
-            out.extend(f"{line_no:5d} [{section}] {line}" for _, line_no, line, section in scored_matches)
-            return out
-
-        def _refresh_ct_ref_lines() -> None:
-            nonlocal info_lines, info_scroll
-            info_lines = _filter_ct_ref_lines(ct_ref_query)
-            info_scroll = 0
-
-        while True:
-            filtered = _apply_filters(_filter_docs(entries, query))
-            if selected >= len(filtered):
-                selected = max(0, len(filtered) - 1)
-
-            height, width = stdscr.getmaxyx()
-            if height < 3 or width < 10:
-                stdscr.erase()
-                _safe_addnstr(stdscr, 0, 0, "terminal too small", width - 1)
-                stdscr.refresh()
-                stdscr.getch()
-                continue
-
-            # -- DETAIL MODE --
-            if mode == _MODE_DETAIL:
-                stdscr.erase()
-                _safe_addnstr(
-                    stdscr, 0, 0,
-                    f" {detail_lines[0] if detail_lines else ''} ",
-                    width - 1, curses.A_BOLD,
-                )
-                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k/Up/Down: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
-                body_height = max(1, height - 3)
-                max_dscroll = max(0, len(detail_lines) - body_height)
-                if detail_scroll > max_dscroll:
-                    detail_scroll = max_dscroll
-                for row in range(body_height):
-                    li = detail_scroll + row
-                    if li >= len(detail_lines):
-                        break
-                    _safe_addnstr(stdscr, 2 + row, 0, detail_lines[li], width - 1)
-                pos_text = f" {detail_scroll + 1}-{min(detail_scroll + body_height, len(detail_lines))}/{len(detail_lines)} "
-                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
-                    mode = _MODE_BROWSE
-                    continue
-                if key in (curses.KEY_DOWN, ord("j")):
-                    if detail_scroll < max_dscroll:
-                        detail_scroll += 1
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    if detail_scroll > 0:
-                        detail_scroll -= 1
-                    continue
-                if key == curses.KEY_NPAGE:
-                    detail_scroll = min(max_dscroll, detail_scroll + body_height)
-                    continue
-                if key == curses.KEY_PPAGE:
-                    detail_scroll = max(0, detail_scroll - body_height)
-                    continue
-                if key == ord("g"):
-                    detail_scroll = 0
-                    continue
-                if key == ord("G"):
-                    detail_scroll = max_dscroll
-                    continue
-                continue
-
-            # -- FILTER MODE --
-            if mode == _MODE_FILTER:
-                stdscr.erase()
-                _safe_addnstr(stdscr, 0, 0, " Filters ", width - 1, curses.A_BOLD)
-                _safe_addnstr(stdscr, 1, 0, " Tab: next field  Space/Left/Right: change  a: all files  n: none  Enter/Esc: close ", width - 1, curses.A_DIM)
-
-                _N_FILTER_FIELDS = 7  # kind, args, returns, show_private, show_macros, extra_path, files
-                row_y = 3
-
-                # Kind row
-                kind_label = f"  Kind: < {_FILTER_KINDS[filter_kind_idx]:6} >"
-                kind_attr = curses.A_REVERSE if filter_field == 0 else 0
-                _safe_addnstr(stdscr, row_y, 0, kind_label, width - 1, kind_attr)
-                row_y += 1
-
-                # Args row
-                args_val = "any" if filter_args < 0 else str(filter_args)
-                args_label = f"  Args: < {args_val:6} >"
-                args_attr = curses.A_REVERSE if filter_field == 1 else 0
-                _safe_addnstr(stdscr, row_y, 0, args_label, width - 1, args_attr)
-                row_y += 1
-
-                # Returns row
-                rets_val = "any" if filter_returns < 0 else str(filter_returns)
-                rets_label = f"  Rets: < {rets_val:6} >"
-                rets_attr = curses.A_REVERSE if filter_field == 2 else 0
-                _safe_addnstr(stdscr, row_y, 0, rets_label, width - 1, rets_attr)
-                row_y += 1
-
-                # Show private row
-                priv_val = "yes" if filter_show_private else "no"
-                priv_label = f"  Private: < {priv_val:6} >"
-                priv_attr = curses.A_REVERSE if filter_field == 3 else 0
-                _safe_addnstr(stdscr, row_y, 0, priv_label, width - 1, priv_attr)
-                row_y += 1
-
-                # Show macros row
-                macro_val = "yes" if filter_show_macros else "no"
-                macro_label = f"  Macros: < {macro_val:6} >"
-                macro_attr = curses.A_REVERSE if filter_field == 4 else 0
-                _safe_addnstr(stdscr, row_y, 0, macro_label, width - 1, macro_attr)
-                row_y += 1
-
-                # Extra path row
-                if filter_field == 5:
-                    ep_label = f"  Path: {filter_extra_path}_"
-                    ep_attr = curses.A_REVERSE
-                else:
-                    ep_label = f"  Path: {filter_extra_path or '(type path, Enter to add)'}"
-                    ep_attr = 0
-                _safe_addnstr(stdscr, row_y, 0, ep_label, width - 1, ep_attr)
-                row_y += 1
-                for er in filter_extra_roots:
-                    _safe_addnstr(stdscr, row_y, 0, f"    + {er}", width - 1, curses.A_DIM)
-                    row_y += 1
-                row_y += 1
-
-                # Files section
-                files_header = "  Files:"
-                files_header_attr = curses.A_BOLD if filter_field == 6 else curses.A_DIM
-                _safe_addnstr(stdscr, row_y, 0, files_header, width - 1, files_header_attr)
-                row_y += 1
-
-                file_area_top = row_y
-                file_area_height = max(1, height - file_area_top - 2)
-                n_files = len(all_file_paths)
-
-                if filter_field == 6:
-                    # Clamp cursor and scroll
-                    if filter_file_cursor >= n_files:
-                        filter_file_cursor = max(0, n_files - 1)
-                    if filter_file_cursor < filter_file_scroll:
-                        filter_file_scroll = filter_file_cursor
-                    if filter_file_cursor >= filter_file_scroll + file_area_height:
-                        filter_file_scroll = filter_file_cursor - file_area_height + 1
-                    max_fscroll = max(0, n_files - file_area_height)
-                    if filter_file_scroll > max_fscroll:
-                        filter_file_scroll = max_fscroll
-
-                for row in range(file_area_height):
-                    fi = filter_file_scroll + row
-                    if fi >= n_files:
-                        break
-                    fp = all_file_paths[fi]
-                    mark = "[x]" if filter_files_enabled.get(fp, True) else "[ ]"
-                    label = f"    {mark} {fp}"
-                    attr = curses.A_REVERSE if (filter_field == 6 and fi == filter_file_cursor) else 0
-                    _safe_addnstr(stdscr, file_area_top + row, 0, label, width - 1, attr)
-
-                enabled_count = sum(1 for v in filter_files_enabled.values() if v)
-                preview = _apply_filters(_filter_docs(entries, query))
-                status = f" {enabled_count}/{n_files} files  kind={_FILTER_KINDS[filter_kind_idx]}  args={args_val}  rets={rets_val}  {len(preview)} matches "
-                _safe_addnstr(stdscr, height - 1, 0, status, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key == 27:
-                    mode = _MODE_BROWSE
-                    selected = 0
-                    scroll = 0
-                    continue
-                if key in (10, 13, curses.KEY_ENTER) and filter_field != 5:
-                    mode = _MODE_BROWSE
-                    selected = 0
-                    scroll = 0
-                    continue
-                if key == 9:  # Tab
-                    filter_field = (filter_field + 1) % _N_FILTER_FIELDS
-                    continue
-                if filter_field not in (5, 6):
-                    if key in (curses.KEY_DOWN, ord("j")):
-                        filter_field = (filter_field + 1) % _N_FILTER_FIELDS
-                        continue
-                    if key in (curses.KEY_UP, ord("k")):
-                        filter_field = (filter_field - 1) % _N_FILTER_FIELDS
-                        continue
-                if filter_field == 0:
-                    # Kind field
-                    if key in (curses.KEY_LEFT, ord("h")):
-                        filter_kind_idx = (filter_kind_idx - 1) % len(_FILTER_KINDS)
-                        continue
-                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
-                        filter_kind_idx = (filter_kind_idx + 1) % len(_FILTER_KINDS)
-                        continue
-                elif filter_field == 1:
-                    # Args field: Left/Right to adjust, -1 = any
-                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
-                        filter_args += 1
-                        if filter_args > 10:
-                            filter_args = -1
-                        continue
-                    if key in (curses.KEY_LEFT, ord("h")):
-                        filter_args -= 1
-                        if filter_args < -1:
-                            filter_args = 10
-                        continue
-                elif filter_field == 2:
-                    # Returns field: Left/Right to adjust
-                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
-                        filter_returns += 1
-                        if filter_returns > 10:
-                            filter_returns = -1
-                        continue
-                    if key in (curses.KEY_LEFT, ord("h")):
-                        filter_returns -= 1
-                        if filter_returns < -1:
-                            filter_returns = 10
-                        continue
-                elif filter_field == 3:
-                    # Show private toggle
-                    if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord(" ")):
-                        filter_show_private = not filter_show_private
-                        if reload_fn is not None:
-                            entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
-                            _rebuild_file_list()
-                        continue
-                elif filter_field == 4:
-                    # Show macros toggle
-                    if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord(" ")):
-                        filter_show_macros = not filter_show_macros
-                        if reload_fn is not None:
-                            entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
-                            _rebuild_file_list()
-                        continue
-                elif filter_field == 5:
-                    # Extra path: text input, Enter adds to roots
-                    if key in (10, 13, curses.KEY_ENTER):
-                        if filter_extra_path.strip():
-                            filter_extra_roots.append(filter_extra_path.strip())
-                            filter_extra_path = ""
-                            if reload_fn is not None:
-                                entries = reload_fn(
-                                    include_private=filter_show_private,
-                                    include_macros=filter_show_macros,
-                                    extra_roots=filter_extra_roots,
-                                )
-                                _rebuild_file_list()
-                        continue
-                    if key in (curses.KEY_BACKSPACE, 127, 8):
-                        filter_extra_path = filter_extra_path[:-1]
-                        continue
-                    if 32 <= key <= 126:
-                        filter_extra_path += chr(key)
-                        continue
-                elif filter_field == 6:
-                    # Files field
-                    if key in (curses.KEY_UP, ord("k")):
-                        if filter_file_cursor > 0:
-                            filter_file_cursor -= 1
-                        continue
-                    if key in (curses.KEY_DOWN, ord("j")):
-                        if filter_file_cursor + 1 < n_files:
-                            filter_file_cursor += 1
-                        continue
-                    if key == ord(" "):
-                        if 0 <= filter_file_cursor < n_files:
-                            fp = all_file_paths[filter_file_cursor]
-                            filter_files_enabled[fp] = not filter_files_enabled.get(fp, True)
-                        continue
-                    if key == ord("a"):
-                        for fp in all_file_paths:
-                            filter_files_enabled[fp] = True
-                        continue
-                    if key == ord("n"):
-                        for fp in all_file_paths:
-                            filter_files_enabled[fp] = False
-                        continue
-                    if key == curses.KEY_PPAGE:
-                        filter_file_cursor = max(0, filter_file_cursor - file_area_height)
-                        continue
-                    if key == curses.KEY_NPAGE:
-                        filter_file_cursor = min(max(0, n_files - 1), filter_file_cursor + file_area_height)
-                        continue
-                continue
-
-            # -- SEARCH MODE --
-            if mode == _MODE_SEARCH:
-                stdscr.erase()
-                prompt = f"/{search_buf}"
-                _safe_addnstr(stdscr, 0, 0, prompt, width - 1, curses.A_BOLD)
-                preview = _apply_filters(_filter_docs(entries, search_buf))
-                _safe_addnstr(stdscr, 1, 0, f" {len(preview)} matches   (Enter: apply  Esc: cancel)", width - 1, curses.A_DIM)
-                preview_height = max(1, height - 3)
-                for row in range(min(preview_height, len(preview))):
-                    e = preview[row]
-                    effect = e.stack_effect if e.stack_effect else "(no stack effect)"
-                    line = f"  {e.name:24} {effect}"
-                    _safe_addnstr(stdscr, 2 + row, 0, line, width - 1)
-                stdscr.refresh()
-                try:
-                    curses.curs_set(1)
-                except Exception:
-                    pass
-                key = stdscr.getch()
-                if key == 27:
-                    # Cancel search, revert
-                    search_buf = query
-                    mode = _MODE_BROWSE
-                    try:
-                        curses.curs_set(0)
-                    except Exception:
-                        pass
-                    continue
-                if key in (10, 13, curses.KEY_ENTER):
-                    query = search_buf
-                    selected = 0
-                    scroll = 0
-                    mode = _MODE_BROWSE
-                    try:
-                        curses.curs_set(0)
-                    except Exception:
-                        pass
-                    continue
-                if key in (curses.KEY_BACKSPACE, 127, 8):
-                    search_buf = search_buf[:-1]
-                    continue
-                if 32 <= key <= 126:
-                    search_buf += chr(key)
-                    continue
-                continue
-
-            # -- LANGUAGE REFERENCE BROWSE --
-            if mode == _MODE_LANG_REF:
-                lang_entries = _filter_lang_ref()
-                if lang_selected >= len(lang_entries):
-                    lang_selected = max(0, len(lang_entries) - 1)
-
-                list_height = max(1, height - 5)
-                if lang_selected < lang_scroll:
-                    lang_scroll = lang_selected
-                if lang_selected >= lang_scroll + list_height:
-                    lang_scroll = lang_selected - list_height + 1
-                max_ls = max(0, len(lang_entries) - list_height)
-                if lang_scroll > max_ls:
-                    lang_scroll = max_ls
-
-                stdscr.erase()
-                _render_tab_bar(stdscr, 0, width)
-                cat_names = ["all"] + _LANG_REF_CATEGORIES
-                cat_label = cat_names[lang_cat_filter]
-                header = f" Language Reference  {len(lang_entries)} entries  category: {cat_label}"
-                _safe_addnstr(stdscr, 1, 0, header, width - 1, curses.A_BOLD)
-                hint = " c category  Enter detail  j/k nav  Tab switch  C ct-ref  ? Q&A  H how  P philosophy  q quit"
-                _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
-
-                for row in range(list_height):
-                    idx = lang_scroll + row
-                    if idx >= len(lang_entries):
-                        break
-                    le = lang_entries[idx]
-                    cat_tag = f"[{le['category']}]"
-                    line = f"  {le['name']:<28} {le['summary']:<36} {cat_tag}"
-                    attr = curses.A_REVERSE if idx == lang_selected else 0
-                    _safe_addnstr(stdscr, 3 + row, 0, line, width - 1, attr)
-
-                if lang_entries:
-                    cur = lang_entries[lang_selected]
-                    _safe_addnstr(stdscr, height - 1, 0, f" {cur['syntax'].split(chr(10))[0]}", width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-
-                if key in (27, ord("q")):
-                    return 0
-                if key == 9:  # Tab
-                    active_tab = _TAB_CT_REF
-                    _refresh_ct_ref_lines()
-                    mode = _MODE_CT_REF
-                    continue
-                if key == ord("c"):
-                    lang_cat_filter = (lang_cat_filter + 1) % (len(_LANG_REF_CATEGORIES) + 1)
-                    lang_selected = 0
-                    lang_scroll = 0
-                    continue
-                if key in (10, 13, curses.KEY_ENTER):
-                    if lang_entries:
-                        lang_detail_lines = _build_lang_detail_lines(lang_entries[lang_selected], width)
-                        lang_detail_scroll = 0
-                        mode = _MODE_LANG_DETAIL
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    if lang_selected > 0:
-                        lang_selected -= 1
-                    continue
-                if key in (curses.KEY_DOWN, ord("j")):
-                    if lang_selected + 1 < len(lang_entries):
-                        lang_selected += 1
-                    continue
-                if key == curses.KEY_PPAGE:
-                    lang_selected = max(0, lang_selected - list_height)
-                    continue
-                if key == curses.KEY_NPAGE:
-                    lang_selected = min(max(0, len(lang_entries) - 1), lang_selected + list_height)
-                    continue
-                if key == ord("g"):
-                    lang_selected = 0
-                    lang_scroll = 0
-                    continue
-                if key == ord("G"):
-                    lang_selected = max(0, len(lang_entries) - 1)
-                    continue
-                if key == ord("L"):
-                    info_lines = _L2_LICENSE_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_LICENSE
-                    continue
-                if key == ord("P"):
-                    info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_PHILOSOPHY
-                    continue
-                if key == ord("?"):
-                    info_lines = _L2_QA_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_QA
-                    continue
-                if key == ord("H"):
-                    info_lines = _L2_HOW_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_HOW
-                    continue
-                if key == ord("C"):
-                    active_tab = _TAB_CT_REF
-                    _refresh_ct_ref_lines()
-                    mode = _MODE_CT_REF
-                    continue
-
-            # -- LANGUAGE DETAIL MODE --
-            if mode == _MODE_LANG_DETAIL:
-                stdscr.erase()
-                _safe_addnstr(
-                    stdscr, 0, 0,
-                    f" {lang_detail_lines[0] if lang_detail_lines else ''} ",
-                    width - 1, curses.A_BOLD,
-                )
-                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k/Up/Down: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
-                body_height = max(1, height - 3)
-                max_ldscroll = max(0, len(lang_detail_lines) - body_height)
-                if lang_detail_scroll > max_ldscroll:
-                    lang_detail_scroll = max_ldscroll
-                for row in range(body_height):
-                    li = lang_detail_scroll + row
-                    if li >= len(lang_detail_lines):
-                        break
-                    _safe_addnstr(stdscr, 2 + row, 0, lang_detail_lines[li], width - 1)
-                pos_text = f" {lang_detail_scroll + 1}-{min(lang_detail_scroll + body_height, len(lang_detail_lines))}/{len(lang_detail_lines)} "
-                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
-                    mode = _MODE_LANG_REF
-                    continue
-                if key in (curses.KEY_DOWN, ord("j")):
-                    if lang_detail_scroll < max_ldscroll:
-                        lang_detail_scroll += 1
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    if lang_detail_scroll > 0:
-                        lang_detail_scroll -= 1
-                    continue
-                if key == curses.KEY_NPAGE:
-                    lang_detail_scroll = min(max_ldscroll, lang_detail_scroll + body_height)
-                    continue
-                if key == curses.KEY_PPAGE:
-                    lang_detail_scroll = max(0, lang_detail_scroll - body_height)
-                    continue
-                if key == ord("g"):
-                    lang_detail_scroll = 0
-                    continue
-                if key == ord("G"):
-                    lang_detail_scroll = max_ldscroll
-                    continue
-                continue
-
-            # -- LICENSE / PHILOSOPHY / Q&A / HOW-IT-WORKS MODE --
-            if mode in (_MODE_LICENSE, _MODE_PHILOSOPHY, _MODE_QA, _MODE_HOW):
-                _info_titles = {
-                    _MODE_LICENSE: "License",
-                    _MODE_PHILOSOPHY: "Philosophy of L2",
-                    _MODE_QA: "Q&A / Tips & Tricks",
-                    _MODE_HOW: "How L2 Works (Internals)",
-                }
-                title = _info_titles.get(mode, "")
-                stdscr.erase()
-                _safe_addnstr(stdscr, 0, 0, f" {title} ", width - 1, curses.A_BOLD)
-                _safe_addnstr(stdscr, 1, 0, " q/Esc: back  j/k: scroll  PgUp/PgDn ", width - 1, curses.A_DIM)
-                body_height = max(1, height - 3)
-                max_iscroll = max(0, len(info_lines) - body_height)
-                if info_scroll > max_iscroll:
-                    info_scroll = max_iscroll
-                for row in range(body_height):
-                    li = info_scroll + row
-                    if li >= len(info_lines):
-                        break
-                    _safe_addnstr(stdscr, 2 + row, 0, f"  {info_lines[li]}", width - 1)
-                pos_text = f" {info_scroll + 1}-{min(info_scroll + body_height, len(info_lines))}/{len(info_lines)} "
-                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-                prev_mode = _MODE_LANG_REF if active_tab == _TAB_LANG_REF else (_MODE_CT_REF if active_tab == _TAB_CT_REF else _MODE_BROWSE)
-                if key in (27, ord("q"), ord("h"), curses.KEY_LEFT):
-                    mode = prev_mode
-                    # Restore info_lines when returning to CT ref
-                    if prev_mode == _MODE_CT_REF:
-                        _refresh_ct_ref_lines()
-                    continue
-                if key in (curses.KEY_DOWN, ord("j")):
-                    if info_scroll < max_iscroll:
-                        info_scroll += 1
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    if info_scroll > 0:
-                        info_scroll -= 1
-                    continue
-                if key == curses.KEY_NPAGE:
-                    info_scroll = min(max_iscroll, info_scroll + body_height)
-                    continue
-                if key == curses.KEY_PPAGE:
-                    info_scroll = max(0, info_scroll - body_height)
-                    continue
-                if key == ord("g"):
-                    info_scroll = 0
-                    continue
-                if key == ord("G"):
-                    info_scroll = max_iscroll
-                    continue
-                continue
-
-            # -- COMPILE-TIME REFERENCE SEARCH MODE --
-            if mode == _MODE_CT_REF_SEARCH:
-                stdscr.erase()
-                prompt = f"/ct {ct_ref_search_buf}"
-                _safe_addnstr(stdscr, 0, 0, prompt, width - 1, curses.A_BOLD)
-                preview_lines = _filter_ct_ref_lines(ct_ref_search_buf)
-                _safe_addnstr(
-                    stdscr,
-                    1,
-                    0,
-                    f" {len(preview_lines)} lines  (Enter: apply  Esc: cancel)  query fields: section:<name> scope:<mode>",
-                    width - 1,
-                    curses.A_DIM,
-                )
-                preview_height = max(1, height - 3)
-                for row in range(min(preview_height, len(preview_lines))):
-                    _safe_addnstr(stdscr, 2 + row, 0, f"  {preview_lines[row]}", width - 1)
-                stdscr.refresh()
-                try:
-                    curses.curs_set(1)
-                except Exception:
-                    pass
-                key = stdscr.getch()
-                if key == 27:
-                    mode = _MODE_CT_REF
-                    try:
-                        curses.curs_set(0)
-                    except Exception:
-                        pass
-                    continue
-                if key in (10, 13, curses.KEY_ENTER):
-                    ct_ref_query = ct_ref_search_buf
-                    _refresh_ct_ref_lines()
-                    mode = _MODE_CT_REF
-                    try:
-                        curses.curs_set(0)
-                    except Exception:
-                        pass
-                    continue
-                if key in (curses.KEY_BACKSPACE, 127, 8):
-                    ct_ref_search_buf = ct_ref_search_buf[:-1]
-                    continue
-                if 32 <= key <= 126:
-                    ct_ref_search_buf += chr(key)
-                    continue
-                continue
-
-            # -- COMPILE-TIME REFERENCE FILTER MODE --
-            if mode == _MODE_CT_REF_FILTER:
-                stdscr.erase()
-                _safe_addnstr(stdscr, 0, 0, " CT Reference Filters ", width - 1, curses.A_BOLD)
-                _safe_addnstr(stdscr, 1, 0, " Tab/j/k: field  Left/Right/Space: change  c: clear  Enter/Esc: close ", width - 1, curses.A_DIM)
-
-                _N_CT_FILTER_FIELDS = 3
-                row_y = 3
-
-                section_label = f"  Section: < {ct_ref_sections[ct_ref_section_idx]} >"
-                section_attr = curses.A_REVERSE if ct_ref_filter_field == 0 else 0
-                _safe_addnstr(stdscr, row_y, 0, section_label, width - 1, section_attr)
-                row_y += 1
-
-                scope_label = f"  Scope:   < {ct_ref_scope_options[ct_ref_scope_idx]} >"
-                scope_attr = curses.A_REVERSE if ct_ref_filter_field == 1 else 0
-                _safe_addnstr(stdscr, row_y, 0, scope_label, width - 1, scope_attr)
-                row_y += 1
-
-                words_label = f"  Words:   < {'yes' if ct_ref_words_only else 'no'} >"
-                words_attr = curses.A_REVERSE if ct_ref_filter_field == 2 else 0
-                _safe_addnstr(stdscr, row_y, 0, words_label, width - 1, words_attr)
-                row_y += 2
-
-                preview = _filter_ct_ref_lines(ct_ref_query)
-                summary = _ct_ref_filter_summary() or "none"
-                status = f" active filters: {summary}  query: {ct_ref_query or '(none)'}  preview lines: {len(preview)} "
-                _safe_addnstr(stdscr, height - 1, 0, status, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-
-                if key == 27 or key in (10, 13, curses.KEY_ENTER):
-                    mode = _MODE_CT_REF
-                    continue
-                if key == ord("c"):
-                    ct_ref_section_idx = 0
-                    ct_ref_scope_idx = 0
-                    ct_ref_words_only = False
-                    _refresh_ct_ref_lines()
-                    continue
-                if key == 9 or key in (curses.KEY_DOWN, ord("j")):
-                    ct_ref_filter_field = (ct_ref_filter_field + 1) % _N_CT_FILTER_FIELDS
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    ct_ref_filter_field = (ct_ref_filter_field - 1) % _N_CT_FILTER_FIELDS
-                    continue
-
-                if ct_ref_filter_field == 0:
-                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
-                        ct_ref_section_idx = (ct_ref_section_idx + 1) % len(ct_ref_sections)
-                        _refresh_ct_ref_lines()
-                        continue
-                    if key in (curses.KEY_LEFT, ord("h")):
-                        ct_ref_section_idx = (ct_ref_section_idx - 1) % len(ct_ref_sections)
-                        _refresh_ct_ref_lines()
-                        continue
-                elif ct_ref_filter_field == 1:
-                    if key in (curses.KEY_RIGHT, ord("l"), ord(" ")):
-                        ct_ref_scope_idx = (ct_ref_scope_idx + 1) % len(ct_ref_scope_options)
-                        _refresh_ct_ref_lines()
-                        continue
-                    if key in (curses.KEY_LEFT, ord("h")):
-                        ct_ref_scope_idx = (ct_ref_scope_idx - 1) % len(ct_ref_scope_options)
-                        _refresh_ct_ref_lines()
-                        continue
-                else:
-                    if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), ord(" ")):
-                        ct_ref_words_only = not ct_ref_words_only
-                        _refresh_ct_ref_lines()
-                        continue
-                continue
-
-            # -- COMPILE-TIME REFERENCE MODE --
-            if mode == _MODE_CT_REF:
-                stdscr.erase()
-                title = " Compile-Time Reference "
-                if ct_ref_query.strip():
-                    title = f" Compile-Time Reference /{ct_ref_query.strip()} "
-                ct_filter_summary = _ct_ref_filter_summary()
-                if ct_filter_summary:
-                    title = title[:-1] + f" [{ct_filter_summary}] "
-                _safe_addnstr(stdscr, 0, 0, title, width - 1, curses.A_BOLD)
-                _render_tab_bar(stdscr, 1, width)
-                _safe_addnstr(stdscr, 2, 0, " / search  f filters  c clear  j/k scroll  PgUp/PgDn  Tab switch  ? Q&A  H how  P philosophy  L license  q quit", width - 1, curses.A_DIM)
-                body_height = max(1, height - 4)
-                max_iscroll = max(0, len(info_lines) - body_height)
-                if info_scroll > max_iscroll:
-                    info_scroll = max_iscroll
-                for row in range(body_height):
-                    li = info_scroll + row
-                    if li >= len(info_lines):
-                        break
-                    _safe_addnstr(stdscr, 3 + row, 0, f"  {info_lines[li]}", width - 1)
-                pos_text = f" {info_scroll + 1}-{min(info_scroll + body_height, len(info_lines))}/{len(info_lines)} "
-                _safe_addnstr(stdscr, height - 1, 0, pos_text, width - 1, curses.A_DIM)
-                stdscr.refresh()
-                key = stdscr.getch()
-                if key in (27, ord("q")):
-                    return 0
-                if key == 9:  # Tab
-                    active_tab = _TAB_LIBRARY
-                    mode = _MODE_BROWSE
-                    continue
-                if key == ord("/"):
-                    ct_ref_search_buf = ct_ref_query
-                    mode = _MODE_CT_REF_SEARCH
-                    continue
-                if key == ord("f"):
-                    mode = _MODE_CT_REF_FILTER
-                    continue
-                if key == ord("c"):
-                    if ct_ref_query:
-                        ct_ref_query = ""
-                        _refresh_ct_ref_lines()
-                    continue
-                if key in (curses.KEY_DOWN, ord("j")):
-                    if info_scroll < max_iscroll:
-                        info_scroll += 1
-                    continue
-                if key in (curses.KEY_UP, ord("k")):
-                    if info_scroll > 0:
-                        info_scroll -= 1
-                    continue
-                if key == curses.KEY_NPAGE:
-                    info_scroll = min(max_iscroll, info_scroll + body_height)
-                    continue
-                if key == curses.KEY_PPAGE:
-                    info_scroll = max(0, info_scroll - body_height)
-                    continue
-                if key == ord("g"):
-                    info_scroll = 0
-                    continue
-                if key == ord("G"):
-                    info_scroll = max_iscroll
-                    continue
-                if key == ord("L"):
-                    info_lines = _L2_LICENSE_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_LICENSE
-                    continue
-                if key == ord("P"):
-                    info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_PHILOSOPHY
-                    continue
-                if key == ord("?"):
-                    info_lines = _L2_QA_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_QA
-                    continue
-                if key == ord("H"):
-                    info_lines = _L2_HOW_TEXT.splitlines()
-                    info_scroll = 0
-                    mode = _MODE_HOW
-                    continue
-                if key == ord("C"):
-                    active_tab = _TAB_CT_REF
-                    _refresh_ct_ref_lines()
-                    mode = _MODE_CT_REF
-                    continue
-                continue
-
-            # -- BROWSE MODE --
-            list_height = max(1, height - 5)
-            if selected < scroll:
-                scroll = selected
-            if selected >= scroll + list_height:
-                scroll = selected - list_height + 1
-            max_scroll = max(0, len(filtered) - list_height)
-            if scroll > max_scroll:
-                scroll = max_scroll
-
-            stdscr.erase()
-            kind_str = _FILTER_KINDS[filter_kind_idx]
-            enabled_count = sum(1 for v in filter_files_enabled.values() if v)
-            filter_info = ""
-            has_kind_filter = kind_str != "all"
-            has_file_filter = enabled_count < len(all_file_paths)
-            has_sig_filter = filter_args >= 0 or filter_returns >= 0
-            if has_kind_filter or has_file_filter or has_sig_filter or filter_extra_roots or filter_show_private or filter_show_macros:
-                parts = []
-                if has_kind_filter:
-                    parts.append(f"kind={kind_str}")
-                if has_file_filter:
-                    parts.append(f"files={enabled_count}/{len(all_file_paths)}")
-                if filter_args >= 0:
-                    parts.append(f"args={filter_args}")
-                if filter_returns >= 0:
-                    parts.append(f"rets={filter_returns}")
-                if filter_show_private:
-                    parts.append("private")
-                if filter_show_macros:
-                    parts.append("macros")
-                if filter_extra_roots:
-                    parts.append(f"+{len(filter_extra_roots)} paths")
-                filter_info = "  [" + ", ".join(parts) + "]"
-            header = f" L2 docs  {len(filtered)}/{len(entries)}" + (f"  search: {query}" if query else "") + filter_info
-            _safe_addnstr(stdscr, 0, 0, header, width - 1, curses.A_BOLD)
-            _render_tab_bar(stdscr, 1, width)
-            hint = " / search  f filters  r reload  Enter detail  Tab switch  C ct-ref  ? Q&A  H how  P philosophy  L license  q quit"
-            _safe_addnstr(stdscr, 2, 0, hint, width - 1, curses.A_DIM)
-
-            for row in range(list_height):
-                idx = scroll + row
-                if idx >= len(filtered):
-                    break
-                entry = filtered[idx]
-                effect = entry.stack_effect if entry.stack_effect else ""
-                kind_tag = f"[{entry.kind:5}]"
-                name_part = f" {entry.name:24} "
-                effect_part = f"{effect:30} "
-                is_sel = idx == selected
-                base_attr = curses.A_REVERSE if is_sel else 0
-                y = 3 + row
-                # Draw name
-                _safe_addnstr(stdscr, y, 0, name_part, width - 1, base_attr | curses.A_BOLD if is_sel else base_attr)
-                # Draw stack effect
-                x = len(name_part)
-                if x < width - 1:
-                    _safe_addnstr(stdscr, y, x, effect_part, width - x - 1, base_attr)
-                # Draw kind tag with color
-                x2 = x + len(effect_part)
-                if x2 < width - 1:
-                    kind_color = _KIND_COLORS.get(entry.kind, 0) if not is_sel else 0
-                    _safe_addnstr(stdscr, y, x2, kind_tag, width - x2 - 1, base_attr | kind_color)
-
-            if filtered:
-                current = filtered[selected]
-                detail = f" {current.path}:{current.line}"
-                if current.description:
-                    detail += f"  {current.description}"
-                _safe_addnstr(stdscr, height - 1, 0, detail, width - 1, curses.A_DIM)
-            else:
-                _safe_addnstr(stdscr, height - 1, 0, " No matches", width - 1, curses.A_DIM)
-
-            stdscr.refresh()
-            key = stdscr.getch()
-
-            if key in (27, ord("q")):
-                return 0
-            if key == 9:  # Tab
-                active_tab = _TAB_LANG_REF
-                mode = _MODE_LANG_REF
-                continue
-            if key == ord("L"):
-                info_lines = _L2_LICENSE_TEXT.splitlines()
-                info_scroll = 0
-                mode = _MODE_LICENSE
-                continue
-            if key == ord("P"):
-                info_lines = _L2_PHILOSOPHY_TEXT.splitlines()
-                info_scroll = 0
-                mode = _MODE_PHILOSOPHY
-                continue
-            if key == ord("?"):
-                info_lines = _L2_QA_TEXT.splitlines()
-                info_scroll = 0
-                mode = _MODE_QA
-                continue
-            if key == ord("H"):
-                info_lines = _L2_HOW_TEXT.splitlines()
-                info_scroll = 0
-                mode = _MODE_HOW
-                continue
-            if key == ord("C"):
-                active_tab = _TAB_CT_REF
-                _refresh_ct_ref_lines()
-                mode = _MODE_CT_REF
-                continue
-            if key == ord("/"):
-                search_buf = query
-                mode = _MODE_SEARCH
-                continue
-            if key == ord("f"):
-                mode = _MODE_FILTER
-                continue
-            if key == ord("r"):
-                if reload_fn is not None:
-                    entries = reload_fn(include_private=filter_show_private, include_macros=filter_show_macros, extra_roots=filter_extra_roots)
-                    _rebuild_file_list()
-                    selected = 0
-                    scroll = 0
-                continue
-            if key in (10, 13, curses.KEY_ENTER):
-                if filtered:
-                    detail_lines = _build_detail_lines(filtered[selected], width)
-                    detail_scroll = 0
-                    mode = _MODE_DETAIL
-                continue
-            if key in (curses.KEY_UP, ord("k")):
-                if selected > 0:
-                    selected -= 1
-                continue
-            if key in (curses.KEY_DOWN, ord("j")):
-                if selected + 1 < len(filtered):
-                    selected += 1
-                continue
-            if key == curses.KEY_PPAGE:
-                selected = max(0, selected - list_height)
-                continue
-            if key == curses.KEY_NPAGE:
-                selected = min(max(0, len(filtered) - 1), selected + list_height)
-                continue
-            if key == ord("g"):
-                selected = 0
-                scroll = 0
-                continue
-            if key == ord("G"):
-                selected = max(0, len(filtered) - 1)
-                continue
-
-        return 0
-
-    return int(curses.wrapper(_app))
+def _build_ct_ref_function_appendix(base_doc_text: str) -> str:
+    docs_helpers = _load_docs_helpers(warn=False)
+    if docs_helpers is None or not hasattr(docs_helpers, "build_ct_reference_bundle"):
+        return ""
+    bundle = docs_helpers.build_ct_reference_bundle(base_doc_text, _collect_ct_word_metadata())
+    return str(bundle.get("appendix_text", ""))
 
 
 def run_docs_explorer(
@@ -16216,53 +18945,27 @@ def run_docs_explorer(
     include_private: bool = False,
     include_tests: bool = False,
 ) -> int:
-    roots: List[Path] = [Path("."), Path("./stdlib"), Path("./libs")]
-    roots.extend(include_paths)
-    roots.extend(explicit_roots)
-    if source is not None:
-        roots.append(source.parent)
-        roots.append(source)
-
-    collect_opts: Dict[str, Any] = dict(
-        include_undocumented=include_undocumented,
-        include_private=include_private,
-        include_tests=include_tests,
-        include_macros=False,
-    )
-
-    def _reload(**overrides: Any) -> List[DocEntry]:
-        extra = overrides.pop("extra_roots", [])
-        opts = {**collect_opts, **overrides}
-        entries = collect_docs(roots, **opts)
-        # Scan extra roots directly, bypassing _iter_doc_files skip filters
-        # Always include undocumented entries from user-added paths
-        if extra:
-            seen_names = {e.name for e in entries}
-            scan_opts = dict(
-                include_undocumented=True,
-                include_private=True,
-                include_macros=opts.get("include_macros", False),
+    docs_helpers = _load_docs_helpers(warn=True)
+    if docs_helpers is None:
+        reason = _DOCS_HELPERS_ERROR or "failed to import docs.py"
+        raise CompileError(f"docs mode unavailable: {reason}")
+    if not hasattr(docs_helpers, "run_docs_cli"):
+        raise CompileError("docs mode unavailable: docs.py missing run_docs_cli")
+    try:
+        return int(
+            docs_helpers.run_docs_cli(
+                source=source,
+                include_paths=include_paths,
+                explicit_roots=explicit_roots,
+                initial_query=initial_query,
+                include_undocumented=include_undocumented,
+                include_private=include_private,
+                include_tests=include_tests,
+                ct_word_metadata_provider=_collect_ct_word_metadata,
             )
-            for p in extra:
-                ep = Path(p).expanduser().resolve()
-                if not ep.exists():
-                    continue
-                if ep.is_file() and ep.suffix == ".sl":
-                    for e in _scan_doc_file(ep, **scan_opts):
-                        if e.name not in seen_names:
-                            seen_names.add(e.name)
-                            entries.append(e)
-                elif ep.is_dir():
-                    for sl in sorted(ep.rglob("*.sl")):
-                        for e in _scan_doc_file(sl.resolve(), **scan_opts):
-                            if e.name not in seen_names:
-                                seen_names.add(e.name)
-                                entries.append(e)
-            entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
-        return entries
-
-    entries = _reload()
-    return _run_docs_tui(entries, initial_query=initial_query, reload_fn=_reload)
+        )
+    except Exception as exc:
+        raise CompileError(f"docs mode failed: {exc}") from exc
 
 
 def _integrity_opcode_symbols() -> Set[str]:
@@ -16291,9 +18994,13 @@ def _integrity_symbols_in_object(obj: Any) -> Set[str]:
 
 
 def _integrity_load_ct_reference_text() -> str:
-    """Load `_L2_CT_REF_TEXT` from `_run_docs_tui` assignments for integrity checks."""
+    """Load `_L2_CT_REF_TEXT` from docs.py `_run_docs_tui` assignments."""
+    docs_path = Path(__file__).with_name("docs.py")
+    if not docs_path.exists():
+        return ""
+
     try:
-        source = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+        source = docs_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
     try:
@@ -16364,21 +19071,190 @@ def _run_integrity_compile_time_docs_checks(errors: List[str]) -> None:
         errors.append("failed to load built-in compile-time reference text")
         return
 
+    docs_helpers = _load_docs_helpers(warn=False)
+    summary_text = ""
+    appendix_text = ""
+    entries: List[Dict[str, Any]] = []
+
+    try:
+        if docs_helpers is not None and hasattr(docs_helpers, "build_ct_reference_bundle"):
+            bundle = docs_helpers.build_ct_reference_bundle(
+                doc_text,
+                _collect_ct_word_metadata(),
+            )
+            summary_text = str(bundle.get("summary_text", ""))
+            appendix_text = str(bundle.get("appendix_text", ""))
+            entries = [dict(item) for item in bundle.get("entries", [])]
+        else:
+            summary_text = _build_ct_ref_complete_summary_table(doc_text)
+            appendix_text = _build_ct_ref_function_appendix(doc_text)
+    except Exception as exc:
+        errors.append(f"failed to build generated compile-time reference sections: {exc}")
+        return
+
+    full_text = doc_text + summary_text + appendix_text
+
     dictionary = bootstrap_dictionary()
     registered_ct_words = sorted(
         name
         for name, word in dictionary.words.items()
-        if word.compile_only and word.compile_time_intrinsic is not None and not name.startswith("__")
+        if word.compile_time_intrinsic is not None and not name.startswith("__")
     )
-    missing_docs = [name for name in registered_ct_words if not _integrity_doc_has_word_entry(doc_text, name)]
+    missing_docs = [name for name in registered_ct_words if not _integrity_doc_has_word_entry(full_text, name)]
     if missing_docs:
         errors.append(
             "compile-time reference missing registered compile-time words: "
             + ", ".join(missing_docs)
         )
 
+    missing_summary = [
+        name
+        for name in registered_ct_words
+        if re.search(rf"(?m)^[ \t]{{2,}}{re.escape(name)}[ \t]{{2,}}", summary_text) is None
+    ]
+    if missing_summary:
+        errors.append(
+            "compile-time summary table missing CT words: "
+            + ", ".join(missing_summary)
+        )
+
+    missing_appendix = [
+        name
+        for name in registered_ct_words
+        if re.search(rf"(?m)^[ \t]{{2,}}{re.escape(name)}(?:[ \t]{{2,}}|$)", appendix_text) is None
+    ]
+    if missing_appendix:
+        errors.append(
+            "compile-time appendix missing CT words: "
+            + ", ".join(missing_appendix)
+        )
+
+    if entries:
+        bad_names = {"word", "call:", "->", "*", "overview:", "example:", "category:"}
+        bad_present = sorted(
+            name for name in {str(item.get("name", "")).strip().lower() for item in entries}
+            if name in bad_names
+        )
+        if bad_present:
+            errors.append(
+                "compile-time entry catalog contains noisy/non-function names: "
+                + ", ".join(bad_present)
+            )
+
+        entry_names = {str(item.get("name", "")).strip() for item in entries}
+        missing_entry_records = [name for name in registered_ct_words if name not in entry_names]
+        if missing_entry_records:
+            errors.append(
+                "compile-time entry catalog missing registered words: "
+                + ", ".join(missing_entry_records)
+            )
+
+        for item in entries:
+            name = str(item.get("name", "")).strip()
+            if not name:
+                errors.append("compile-time entry catalog contains blank name")
+                continue
+            overview = str(item.get("overview", "")).strip()
+            example = str(item.get("example", "")).strip()
+            category = str(item.get("category", "")).strip()
+            if not overview:
+                errors.append(f"compile-time entry '{name}' is missing overview text")
+            if not example:
+                errors.append(f"compile-time entry '{name}' is missing example text")
+            if not category:
+                errors.append(f"compile-time entry '{name}' is missing category")
+
+            if "..." in example:
+                errors.append(f"compile-time entry '{name}' example still uses placeholder ellipsis")
+            if example == name:
+                errors.append(f"compile-time entry '{name}' example should include an explicit usage context")
+            if len(overview) < 40:
+                errors.append(f"compile-time entry '{name}' overview is too short for useful guidance")
+            if overview.lower().startswith("compile-time operation for "):
+                errors.append(f"compile-time entry '{name}' overview is still generic boilerplate")
+            if not re.search(rf"(?<![A-Za-z0-9_?.:+\-*/<>=!&]){re.escape(name)}(?![A-Za-z0-9_?.:+\-*/<>=!&])", example):
+                errors.append(f"compile-time entry '{name}' example should explicitly show the word invocation")
+
+            text_blob = " ".join(
+                [
+                    name,
+                    str(item.get("search_text", "")),
+                    overview,
+                    example,
+                ]
+            ).lower()
+            if " handler:" in text_blob or " flags:" in text_blob:
+                errors.append(f"compile-time entry '{name}' still embeds handler/flags text")
+
+    for name in registered_ct_words:
+        entry_match = re.search(
+            rf"(?m)^[ \t]{{2,}}{re.escape(name)}(?:[ \t]+[^\n]*)?\n((?:[ \t]{{4}}[^\n]*\n)+)",
+            appendix_text,
+        )
+        if entry_match is None:
+            continue
+        detail_lines = [line.strip() for line in entry_match.group(1).splitlines() if line.strip()]
+        if not detail_lines:
+            errors.append(f"compile-time appendix entry '{name}' is missing detail lines")
+            continue
+
+        if not any(line.startswith("Overview:") for line in detail_lines):
+            errors.append(f"compile-time appendix entry '{name}' is missing descriptive overview line")
+
+        if not any(line.startswith("Category:") for line in detail_lines):
+            errors.append(f"compile-time appendix entry '{name}' is missing category metadata")
+        if not any(line.startswith("Scope:") for line in detail_lines):
+            errors.append(f"compile-time appendix entry '{name}' is missing scope metadata")
+
+        example_idx = -1
+        for idx, line in enumerate(detail_lines):
+            if line.startswith("Example:"):
+                example_idx = idx
+                break
+
+        if example_idx < 0:
+            errors.append(f"compile-time appendix entry '{name}' is missing example line")
+        else:
+            example_payload = [
+                line.strip()
+                for line in detail_lines[example_idx + 1 :]
+                if line.strip() and not line.startswith(("Category:", "Scope:", "Overview:", "Example:"))
+            ]
+            if not example_payload:
+                errors.append(f"compile-time appendix entry '{name}' has an empty example")
+
+    if (
+        docs_helpers is not None
+        and hasattr(docs_helpers, "attach_ct_entry_line_numbers")
+        and hasattr(docs_helpers, "build_ct_detail_lines")
+        and entries
+    ):
+        try:
+            line_entries = [
+                dict(item)
+                for item in docs_helpers.attach_ct_entry_line_numbers(full_text, entries)
+            ]
+        except Exception as exc:
+            errors.append(f"compile-time detail helper line mapping failed: {exc}")
+            line_entries = []
+
+        for item in line_entries[:40]:
+            name = str(item.get("name", "")).strip() or "<unknown>"
+            try:
+                detail_lines = [str(line) for line in docs_helpers.build_ct_detail_lines(item, 100)]
+            except Exception as exc:
+                errors.append(f"compile-time detail helper failed for '{name}': {exc}")
+                continue
+            detail_blob = "\n".join(detail_lines).lower()
+            if "overview:" not in detail_blob:
+                errors.append(f"compile-time detail view for '{name}' is missing overview section")
+            if "example:" not in detail_blob:
+                errors.append(f"compile-time detail view for '{name}' is missing example section")
+            if "handler:" in detail_blob or "flags:" in detail_blob:
+                errors.append(f"compile-time detail view for '{name}' still shows handler/flags")
+
     for required in ("runtime", "CT"):
-        if not _integrity_doc_has_word_entry(doc_text, required):
+        if not _integrity_doc_has_word_entry(full_text, required):
             errors.append(f"compile-time reference missing '{required}' entry")
 
 
@@ -17264,10 +20140,15 @@ def _run_integrity_failure_injection_checks(errors: List[str]) -> None:
 
 
 def _run_integrity_docs_consistency_checks(errors: List[str]) -> None:
+    docs_path = Path(__file__).with_name("docs.py")
+    if not docs_path.exists():
+        errors.append("docs consistency probe requires docs.py but it is missing")
+        return
+
     try:
-        source_text = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+        source_text = docs_path.read_text(encoding="utf-8", errors="ignore")
     except Exception as exc:
-        errors.append(f"docs consistency probe failed to read compiler implementation: {exc}")
+        errors.append(f"docs consistency probe failed to read docs.py: {exc}")
         return
 
     required_fragments = [
@@ -17275,11 +20156,15 @@ def _run_integrity_docs_consistency_checks(errors: List[str]) -> None:
         "_L2_MACRO_LANG_DETAIL = (",
         "+ _L2_MACRO_CT_BLOCK",
         "+ _L2_MACRO_QA_BLOCK",
-        "Macro language reference is centralized in §13 below.",
         "source-context window around the expansion site.",
         "_MODE_CT_REF_FILTER = 12",
+        "_MODE_CT_REF_RESULTS = 13",
+        "_MODE_CT_REF_DETAIL = 14",
         "query fields: section:<name> scope:<mode>",
+        "function(s)  (Enter: open results  Esc: cancel)",
+        "Enter detail  o jump-to-full  / search",
         " / search  f filters  c clear ",
+        "def run_docs_cli(",
     ]
     for fragment in required_fragments:
         if fragment not in source_text:
@@ -17300,6 +20185,73 @@ def _run_integrity_docs_consistency_checks(errors: List[str]) -> None:
             "compile-time reference should contain exactly one canonical macro definition block "
             f"(found {canonical_count})"
         )
+
+
+def _run_integrity_docs_module_checks(errors: List[str]) -> None:
+    repo_root = Path(__file__).resolve().parent
+    docs_path = repo_root / "docs.py"
+    if not docs_path.exists():
+        errors.append("docs.py is required for docs explorer/integrity checks but was not found")
+        return
+
+    try:
+        docs_source = docs_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        errors.append(f"failed to read docs.py: {exc}")
+        return
+
+    required_fragments = [
+        "def run_docs_explorer(",
+        "def run_docs_cli(",
+        "def _run_docs_tui(",
+        "def build_ct_reference_bundle",
+        "def attach_ct_entry_line_numbers",
+        "def build_ct_detail_lines",
+        "Overview:",
+        "Example:",
+    ]
+    for fragment in required_fragments:
+        if fragment not in docs_source:
+            errors.append(f"docs.py missing expected fragment: {fragment!r}")
+
+    docs_helpers = _load_docs_helpers(warn=False)
+    if docs_helpers is None:
+        err = _DOCS_HELPERS_ERROR or "unknown import failure"
+        errors.append(f"docs.py exists but lazy import failed: {err}")
+        return
+
+    for attr in (
+        "run_docs_cli",
+        "run_docs_explorer",
+        "build_ct_reference_bundle",
+        "attach_ct_entry_line_numbers",
+        "build_ct_detail_lines",
+    ):
+        if not hasattr(docs_helpers, attr):
+            errors.append(f"docs.py helper missing callable '{attr}'")
+
+    try:
+        impl_text = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        errors.append(f"failed to read l2_main.py for docs delegation checks: {exc}")
+        return
+
+    forbidden_main_patterns = [
+        (r"(?m)^class\s+DocEntry\s*:", "class DocEntry"),
+        (r"(?m)^def\s+_scan_doc_file\s*\(", "def _scan_doc_file("),
+        (r"(?m)^def\s+_run_docs_tui\s*\(", "def _run_docs_tui("),
+    ]
+    for pattern, label in forbidden_main_patterns:
+        if re.search(pattern, impl_text) is not None:
+            errors.append(f"l2_main.py still contains migrated docs implementation fragment: {label!r}")
+
+    required_main_fragments = [
+        "def run_docs_explorer(",
+        "docs_helpers.run_docs_cli(",
+    ]
+    for fragment in required_main_fragments:
+        if fragment not in impl_text:
+            errors.append(f"l2_main.py missing docs delegation fragment: {fragment!r}")
 
 
 def _run_integrity_meta_stdlib_checks(errors: List[str]) -> None:
@@ -17408,6 +20360,8 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
     test_py_text = (repo_root / "test.py").read_text(encoding="utf-8", errors="ignore")
     main_c_text = (repo_root / "main.c").read_text(encoding="utf-8", errors="ignore")
     meta_text = (repo_root / "stdlib" / "meta.sl").read_text(encoding="utf-8", errors="ignore")
+    docs_path = repo_root / "docs.py"
+    docs_text = docs_path.read_text(encoding="utf-8", errors="ignore") if docs_path.exists() else ""
 
     checks: List[Tuple[str, bool]] = [
         (
@@ -17424,7 +20378,12 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
         ),
         (
             "--force bypasses incremental linker shortcut",
-            "need_link = args.force or need_nasm or not args.output.exists() or args.no_cache" in impl_text,
+            "need_link = args.force or need_nasm or not args.output.exists()" in impl_text,
+        ),
+        (
+            "source graph cache is wired into Compiler and CLI",
+            "class SourceGraphCache:" in impl_text
+            and "source_graph_cache=source_graph_cache" in impl_text,
         ),
         (
             "macro engine is extracted into a dedicated class",
@@ -17436,7 +20395,30 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
         ),
         (
             "compile-time reference supports filter mode",
-            "_MODE_CT_REF_FILTER = 12" in impl_text and "query fields: section:<name> scope:<mode>" in impl_text,
+            bool(docs_text)
+            and "_MODE_CT_REF_FILTER = 12" in docs_text
+            and "query fields: section:<name> scope:<mode>" in docs_text,
+        ),
+        (
+            "compile-time reference supports function search results and detail jump mode",
+            bool(docs_text)
+            and "_MODE_CT_REF_RESULTS = 13" in docs_text
+            and "_MODE_CT_REF_DETAIL = 14" in docs_text
+            and "function(s)  (Enter: open results  Esc: cancel)" in docs_text
+            and "Enter detail  o jump-to-full  / search" in docs_text,
+        ),
+        (
+            "docs.py helpers are lazy-loaded with fallback warning",
+            "def _load_docs_helpers" in impl_text
+            and "docs.py not found" in impl_text
+            and "using built-in fallback" in impl_text,
+        ),
+        (
+            "docs.py defines structured CT docs helpers",
+            bool(docs_text)
+            and "def build_ct_reference_bundle" in docs_text
+            and "def attach_ct_entry_line_numbers" in docs_text
+            and "def build_ct_detail_lines" in docs_text,
         ),
         (
             "test.py --script uses ct-run-main + no-artifact semantics",
@@ -17484,8 +20466,10 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
         ),
         (
             "multiline string support is regression-tested",
-            (repo_root / "tests" / "multiline_string.sl").exists()
-            and (repo_root / "tests" / "multiline_string.expected").exists(),
+            any(
+                path.with_suffix(".expected").exists()
+                for path in (repo_root / "tests").rglob("multiline_string.sl")
+            ),
         ),
     ]
 
@@ -17523,6 +20507,7 @@ def _run_integrity_checks() -> None:
         ("roundtrip", _run_integrity_roundtrip_checks),
         ("failure-injection", _run_integrity_failure_injection_checks),
         ("docs-consistency", _run_integrity_docs_consistency_checks),
+        ("docs-module", _run_integrity_docs_module_checks),
         ("meta-stdlib", _run_integrity_meta_stdlib_checks),
         ("feature-matrix", _run_integrity_prompt_feature_matrix_checks),
     ]
@@ -17535,21 +20520,45 @@ def _run_integrity_checks() -> None:
         raise CompileError("integrity assertions failed:\n" + details)
 
 
-def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
-    """Fast path for benchmark-style invocations.
+def _emit_macro_profile_report(parser: Parser, destination: Optional[str]) -> None:
+    if destination is None:
+        return
+    report = parser.format_macro_profile()
+    target = str(destination).strip().lower()
+    if target in ("", "stderr"):
+        print(report, file=sys.stderr)
+        return
+    if target in ("-", "stdout"):
+        print(report)
+        return
+    out_path = Path(str(destination))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report + "\n", encoding="utf-8")
+    print(f"[info] wrote macro profile to {out_path}")
+
+
+_QUICK_FORCE_ASM_OPT_CACHE_MAX = 64
+_QUICK_FORCE_ASM_OPT_CACHE: Dict[str, str] = {}
+_QUICK_FORCE_TOKEN_CACHE_MAX = 32
+_QUICK_FORCE_TOKEN_CACHE: Dict[str, Tuple[Token, ...]] = {}
+
+
+def _try_quick_compile_force(argv: Sequence[str], *, emit_status: bool = True) -> Optional[int]:
+    """Fast path for strict full-rebuild benchmark invocations.
 
     Supported shape only:
-      python main.py <source>.sl --no-cache
+      python main.py <source>.sl --force
 
-    Any other option shape falls back to the full argparse-driven CLI.
+    Semantics intentionally preserved:
+      - always recompiles source
+      - always re-runs NASM
+      - always re-runs linker
     """
     source_token: Optional[str] = None
-    saw_no_cache = False
+    saw_force = False
     for tok in argv:
         if tok == "--force":
-            return None
-        if tok == "--no-cache":
-            saw_no_cache = True
+            saw_force = True
             continue
         if tok.startswith("-"):
             return None
@@ -17558,15 +20567,20 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
             continue
         return None
 
-    if not saw_no_cache or source_token is None:
+    if not saw_force or source_token is None:
         return None
 
     source = Path(source_token)
     if source.suffix.lower() != ".sl":
         return None
 
+    temp_dir = Path("build")
+    output = Path("a.out")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    asm_path = temp_dir / (source.stem + ".asm")
+    obj_path = temp_dir / (source.stem + ".o")
     include_paths = [Path("."), Path("./stdlib")]
-    compiler = Compiler(
+    compiler: Optional[Compiler] = Compiler(
         include_paths=include_paths,
         macro_expansion_limit=DEFAULT_MACRO_EXPANSION_LIMIT,
         macro_preview=False,
@@ -17582,7 +20596,328 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
     compiler.assembler.verbosity = 0
     compiler.parser._warnings_enabled = set()
     compiler.parser._werror = False
+    compiler.parser.capture_op_locations = False
+    compiler.parser.enable_dead_macro_elimination = True
+    compiler.parser.enable_unused_rewrite_elimination = True
     compiler.parser.dictionary.warn_callback = None
+
+    libs: List[str] = []
+    asm_text = ""
+    source_resolved = source.resolve()
+
+    try:
+        cached_graph = _quick_no_cache_load_cached_graph(source_resolved)
+        if cached_graph is not None:
+            source_cli_flags = list(cached_graph.get("source_cli_flags", ()))
+            source_link_flags = list(cached_graph.get("source_link_flags", ()))
+            source_include_paths = [Path(p) for p in cached_graph.get("source_include_paths", ())]
+            cached_source = cached_graph.get("source")
+            span_rows = cached_graph.get("spans")
+            if isinstance(cached_source, str) and isinstance(span_rows, list):
+                cached_spans: List[FileSpan] = []
+                for row in span_rows:
+                    if (
+                        isinstance(row, (list, tuple))
+                        and len(row) == 4
+                        and isinstance(row[0], str)
+                        and isinstance(row[1], int)
+                        and isinstance(row[2], int)
+                        and isinstance(row[3], int)
+                    ):
+                        cached_spans.append(FileSpan(Path(row[0]), row[1], row[2], row[3]))
+                compiler._last_loaded_path = source_resolved
+                compiler._last_loaded_source = cached_source
+                compiler._last_loaded_spans = cached_spans
+                compiler.source_cli_flags = source_cli_flags
+                compiler.source_link_flags = source_link_flags
+                compiler.source_include_paths = source_include_paths
+            else:
+                cached_graph = None
+
+        if cached_graph is None:
+            compiler.collect_source_flags(source)
+            _quick_no_cache_store_cached_graph(source_resolved, compiler)
+
+        # Source-level CLI flags can alter broader behavior; delegate to full CLI.
+        if compiler.source_cli_flags:
+            return None
+
+        normalized_include_paths: List[Path] = []
+        seen_include_paths: Set[Path] = set()
+        for include_base in [Path("."), Path("./stdlib"), *compiler.source_include_paths]:
+            resolved = include_base.expanduser().resolve()
+            if resolved in seen_include_paths:
+                continue
+            seen_include_paths.add(resolved)
+            normalized_include_paths.append(resolved)
+        compiler.include_paths = normalized_include_paths
+        compiler._import_resolve_cache.clear()
+
+        for flag in compiler.source_link_flags:
+            if flag not in libs:
+                libs.append(flag)
+        for lib in _load_sidecar_meta_libs(source):
+            if lib not in libs:
+                libs.append(lib)
+
+        source_text = compiler._last_loaded_source
+        source_spans = compiler._last_loaded_spans
+        if source_text is None or source_spans is None:
+            emission = compiler.compile_file(source, debug=False, entry_mode="program")
+        else:
+            parser = compiler.parser
+            parser.file_spans = source_spans
+
+            source_hash: Optional[str] = None
+            try:
+                import hashlib
+                source_hash = hashlib.blake2b(source_text.encode("utf-8"), digest_size=16).hexdigest()
+            except Exception:
+                source_hash = None
+
+            tokens_template: Optional[Tuple[Token, ...]] = None
+            if source_hash is not None:
+                tokens_template = _QUICK_FORCE_TOKEN_CACHE.get(source_hash)
+            if tokens_template is None:
+                tokens_template = tuple(compiler.reader.tokenize(source_text))
+                if source_hash is not None:
+                    _QUICK_FORCE_TOKEN_CACHE[source_hash] = tokens_template
+                    if len(_QUICK_FORCE_TOKEN_CACHE) > _QUICK_FORCE_TOKEN_CACHE_MAX:
+                        _QUICK_FORCE_TOKEN_CACHE.clear()
+
+            module = parser.parse(list(tokens_template), source_text)
+            emission = compiler.assembler.emit(module, debug=False, entry_mode="program")
+
+        asm_text = emission.snapshot()
+        asm_digest: Optional[str] = None
+        try:
+            import hashlib
+            asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
+        except Exception:
+            asm_digest = None
+
+        optimized_cached: Optional[str] = None
+        if asm_digest is not None:
+            optimized_cached = _QUICK_FORCE_ASM_OPT_CACHE.get(asm_digest)
+
+        if optimized_cached is None:
+            optimized_asm, _asm_stats, _asm_pass_logs = optimize_emitted_asm_text(
+                asm_text,
+                collect_pass_logs=False,
+            )
+            asm_text = optimized_asm
+            if asm_digest is not None:
+                _QUICK_FORCE_ASM_OPT_CACHE[asm_digest] = optimized_asm
+                if len(_QUICK_FORCE_ASM_OPT_CACHE) > _QUICK_FORCE_ASM_OPT_CACHE_MAX:
+                    _QUICK_FORCE_ASM_OPT_CACHE.clear()
+        else:
+            asm_text = optimized_cached
+    except (ParseError, CompileError, CompileTimeError) as exc:
+        use_color = sys.stderr.isatty()
+        diags = getattr(compiler.parser, "diagnostics", [])
+        if diags:
+            for diag in diags:
+                print(diag.format(color=use_color), file=sys.stderr)
+            error_count = sum(1 for d in diags if d.level == "error")
+            warn_count = sum(1 for d in diags if d.level == "warning")
+            summary_parts: List[str] = []
+            if error_count:
+                summary_parts.append(f"{error_count} error(s)")
+            if warn_count:
+                summary_parts.append(f"{warn_count} warning(s)")
+            if summary_parts:
+                print(f"\n{' and '.join(summary_parts)} emitted", file=sys.stderr)
+        else:
+            print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"[error] unexpected failure: {exc}", file=sys.stderr)
+        return 1
+
+    # Force mode semantics: always re-run compiler, assembler, and linker.
+    # Keep NASM/link full-rebuild behavior while avoiding redundant asm rewrites.
+    write_asm = True
+    if asm_path.exists():
+        try:
+            existing_asm = asm_path.read_text(encoding="utf-8")
+        except OSError:
+            existing_asm = None
+        if existing_asm == asm_text:
+            write_asm = False
+    if write_asm:
+        asm_path.write_text(asm_text, encoding="utf-8")
+    run_nasm(asm_path, obj_path, debug=False)
+    if output.parent and not output.parent.exists():
+        output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output.unlink(missing_ok=True)
+    except OSError:
+        pass
+    run_linker(obj_path, output, debug=False, libs=libs, shared=False)
+    if emit_status:
+        print(f"[info] built {output}")
+    return 0
+
+
+_QUICK_NO_CACHE_GRAPH_CACHE_MAX = 64
+_QUICK_NO_CACHE_GRAPH_CACHE: Dict[Path, Dict[str, Any]] = {}
+
+
+def _quick_no_cache_deps_fresh(dep_entries: Sequence[Tuple[str, int, int]]) -> bool:
+    for dep_path, dep_mtime_ns, dep_size in dep_entries:
+        try:
+            st = Path(dep_path).stat()
+        except OSError:
+            return False
+        if st.st_mtime_ns != dep_mtime_ns or st.st_size != dep_size:
+            return False
+    return True
+
+
+def _quick_no_cache_capture_deps(source: Path, spans: Sequence[FileSpan]) -> List[Tuple[str, int, int]]:
+    dep_paths: Set[Path] = {source}
+    for span in spans:
+        try:
+            dep_paths.add(span.path.resolve())
+        except Exception:
+            continue
+
+    deps: List[Tuple[str, int, int]] = []
+    for dep_path in sorted(dep_paths, key=lambda p: str(p)):
+        try:
+            st = dep_path.stat()
+        except OSError:
+            return []
+        deps.append((dep_path.as_posix(), int(st.st_mtime_ns), int(st.st_size)))
+    return deps
+
+
+def _quick_no_cache_load_cached_graph(source: Path) -> Optional[Dict[str, Any]]:
+    entry = _QUICK_NO_CACHE_GRAPH_CACHE.get(source)
+    if entry is None:
+        return None
+
+    deps = entry.get("deps")
+    if not isinstance(deps, list) or not deps:
+        _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
+        return None
+
+    dep_entries: List[Tuple[str, int, int]] = []
+    for dep in deps:
+        if (
+            not isinstance(dep, (list, tuple))
+            or len(dep) != 3
+            or not isinstance(dep[0], str)
+            or not isinstance(dep[1], int)
+            or not isinstance(dep[2], int)
+        ):
+            _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
+            return None
+        dep_entries.append((dep[0], dep[1], dep[2]))
+
+    if not _quick_no_cache_deps_fresh(dep_entries):
+        _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
+        return None
+
+    return entry
+
+
+def _quick_no_cache_store_cached_graph(source: Path, compiler: Compiler) -> None:
+    cached_source = compiler._last_loaded_source
+    spans = compiler._last_loaded_spans
+    if cached_source is None or spans is None:
+        return
+
+    deps = _quick_no_cache_capture_deps(source, spans)
+    if not deps:
+        return
+
+    span_rows: List[Tuple[str, int, int, int]] = []
+    for span in spans:
+        try:
+            span_path = span.path.resolve().as_posix()
+        except Exception:
+            continue
+        span_rows.append((span_path, int(span.start_line), int(span.end_line), int(span.local_start_line)))
+
+    _QUICK_NO_CACHE_GRAPH_CACHE[source] = {
+        "deps": deps,
+        "source": cached_source,
+        "spans": span_rows,
+        "source_link_flags": tuple(compiler.source_link_flags),
+        "source_include_paths": tuple(str(p) for p in compiler.source_include_paths),
+        "source_cli_flags": tuple(compiler.source_cli_flags),
+    }
+
+    if len(_QUICK_NO_CACHE_GRAPH_CACHE) > _QUICK_NO_CACHE_GRAPH_CACHE_MAX:
+        _QUICK_NO_CACHE_GRAPH_CACHE.clear()
+
+
+def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
+    """Fast path for benchmark-style invocations.
+
+    Supported shape only:
+      python main.py <source>.sl --no-cache
+
+    Any other option shape falls back to the full argparse-driven CLI.
+    """
+    source_token: Optional[str] = None
+    saw_no_cache = False
+    saw_no_artifact = False
+    saw_check = False
+    for tok in argv:
+        if tok == "--force":
+            return None
+        if tok == "--no-cache":
+            saw_no_cache = True
+            continue
+        if tok == "--no-artifact":
+            saw_no_artifact = True
+            continue
+        if tok == "--check":
+            saw_check = True
+            continue
+        if tok.startswith("-"):
+            return None
+        if source_token is None:
+            source_token = tok
+            continue
+        return None
+
+    if not saw_no_cache or source_token is None:
+        return None
+
+    source = Path(source_token)
+    if source.suffix.lower() != ".sl":
+        return None
+    source_resolved = source.resolve()
+    no_artifact_mode = saw_no_artifact or saw_check
+
+    include_paths = [Path("."), Path("./stdlib")]
+
+    def _new_compiler() -> Compiler:
+        compiler = Compiler(
+            include_paths=include_paths,
+            macro_expansion_limit=DEFAULT_MACRO_EXPANSION_LIMIT,
+            macro_preview=False,
+            defines=[],
+        )
+        compiler.assembler.enable_constant_folding = True
+        compiler.assembler.enable_peephole_optimization = True
+        compiler.assembler.enable_loop_unroll = True
+        compiler.assembler.enable_auto_inline = True
+        compiler.assembler.enable_string_deduplication = True
+        compiler.assembler.enable_extern_type_check = True
+        compiler.assembler.enable_stack_check = True
+        compiler.assembler.verbosity = 0
+        compiler.parser._warnings_enabled = set()
+        compiler.parser._werror = False
+        compiler.parser.enable_dead_macro_elimination = True
+        compiler.parser.enable_unused_rewrite_elimination = True
+        compiler.parser.dictionary.warn_callback = None
+        return compiler
+
+    compiler: Optional[Compiler] = None
 
     temp_dir = Path("build")
     output = Path("a.out")
@@ -17592,6 +20927,7 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
     asm_path = temp_dir / (source.stem + ".asm")
     obj_path = temp_dir / (source.stem + ".o")
     source_stamp_path = temp_dir / f"{source.stem}.src_stamp"
+    source_fast_stamp_path = temp_dir / f"{source.stem}.src_stamp.fast"
 
     def _load_source_stamp() -> Optional[Dict[str, Any]]:
         try:
@@ -17631,7 +20967,11 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
                 return False
         return True
 
-    def _write_source_stamp(source_link_libs: Sequence[str]) -> None:
+    def _write_source_stamp(
+        compiler: Compiler,
+        source_link_libs: Sequence[str],
+        all_link_libs: Sequence[str],
+    ) -> None:
         dep_paths: Set[Path] = {source.resolve()}
         loaded_spans = compiler._last_loaded_spans or []
         for span in loaded_spans:
@@ -17670,16 +21010,34 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
         except OSError:
             pass
 
+        fast_lines: List[str] = [
+            "v1",
+            f"sidecar\t{1 if sidecar_meta.exists() else 0}",
+        ]
+        for dep in dep_payload:
+            fast_lines.append(
+                f"dep\t{dep['path']}\t{dep['mtime_ns']}\t{dep['size']}"
+            )
+        for lib in all_link_libs:
+            fast_lines.append(f"lib\t{str(lib)}")
+        try:
+            source_fast_stamp_path.write_text("\n".join(fast_lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
     libs: List[str] = []
     asm_text = ""
     compiled_this_run = False
 
-    stamp_payload = _load_source_stamp()
-    can_reuse_compilation = (
-        stamp_payload is not None
-        and asm_path.exists()
-        and _source_stamp_fresh(stamp_payload)
-    )
+    stamp_payload: Optional[Dict[str, Any]] = None
+    can_reuse_compilation = False
+    if not no_artifact_mode:
+        stamp_payload = _load_source_stamp()
+        can_reuse_compilation = (
+            stamp_payload is not None
+            and asm_path.exists()
+            and _source_stamp_fresh(stamp_payload)
+        )
 
     if can_reuse_compilation:
         source_link_libs = [
@@ -17696,21 +21054,62 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
 
     if not can_reuse_compilation:
         try:
-            compiler.collect_source_flags(source)
+            compiler = _new_compiler()
+            source_cli_flags: List[str] = []
+            source_link_flags: List[str] = []
+            source_include_paths: List[Path] = []
+            cached_graph = _quick_no_cache_load_cached_graph(source_resolved)
+
+            if cached_graph is not None:
+                source_cli_flags = list(cached_graph.get("source_cli_flags", ()))
+                source_link_flags = list(cached_graph.get("source_link_flags", ()))
+                source_include_paths = [Path(p) for p in cached_graph.get("source_include_paths", ())]
+                cached_source = cached_graph.get("source")
+                span_rows = cached_graph.get("spans")
+                if isinstance(cached_source, str) and isinstance(span_rows, list):
+                    cached_spans: List[FileSpan] = []
+                    for row in span_rows:
+                        if (
+                            isinstance(row, (list, tuple))
+                            and len(row) == 4
+                            and isinstance(row[0], str)
+                            and isinstance(row[1], int)
+                            and isinstance(row[2], int)
+                            and isinstance(row[3], int)
+                        ):
+                            cached_spans.append(FileSpan(Path(row[0]), row[1], row[2], row[3]))
+                    compiler._last_loaded_path = source_resolved
+                    compiler._last_loaded_source = cached_source
+                    compiler._last_loaded_spans = cached_spans
+                    compiler.source_cli_flags = source_cli_flags
+                    compiler.source_link_flags = source_link_flags
+                    compiler.source_include_paths = source_include_paths
+                else:
+                    cached_graph = None
+
+            if cached_graph is None:
+                compiler.collect_source_flags(source)
+                _quick_no_cache_store_cached_graph(source_resolved, compiler)
+                source_cli_flags = list(compiler.source_cli_flags)
+                source_link_flags = list(compiler.source_link_flags)
+                source_include_paths = list(compiler.source_include_paths)
+
             # Source-level CLI flags can imply complex option semantics; keep full CLI for those.
-            if compiler.source_cli_flags:
+            if source_cli_flags:
                 return None
 
             normalized_include_paths: List[Path] = []
-            for include_base in [Path("."), Path("./stdlib"), *compiler.source_include_paths]:
+            seen_include_paths: Set[Path] = set()
+            for include_base in [Path("."), Path("./stdlib"), *source_include_paths]:
                 resolved = include_base.expanduser().resolve()
-                if resolved not in normalized_include_paths:
+                if resolved not in seen_include_paths:
+                    seen_include_paths.add(resolved)
                     normalized_include_paths.append(resolved)
             compiler.include_paths = normalized_include_paths
             compiler._import_resolve_cache.clear()
 
             source_link_libs = []
-            for flag in compiler.source_link_flags:
+            for flag in source_link_flags:
                 if flag not in source_link_libs:
                     source_link_libs.append(flag)
                 if flag not in libs:
@@ -17719,13 +21118,14 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
                 if lib not in libs:
                     libs.append(lib)
 
-            if compiler._last_loaded_path == source.resolve() and compiler._last_loaded_source is not None:
+            if compiler._last_loaded_path == source_resolved and compiler._last_loaded_source is not None:
                 emission = compiler.compile_preloaded(debug=False, entry_mode="program")
             else:
                 emission = compiler.compile_file(source, debug=False, entry_mode="program")
             asm_text = emission.snapshot()
             compiled_this_run = True
-            _write_source_stamp(source_link_libs)
+            if not no_artifact_mode:
+                _write_source_stamp(compiler, source_link_libs, libs)
         except (ParseError, CompileError, CompileTimeError) as exc:
             use_color = sys.stderr.isatty()
             diags = getattr(compiler.parser, "diagnostics", [])
@@ -17749,12 +21149,17 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
             return 1
 
     if compiled_this_run:
+        assert compiler is not None
         use_color = sys.stderr.isatty()
         warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
         if warnings:
             for diag in warnings:
                 print(diag.format(color=use_color), file=sys.stderr)
             print(f"\n{len(warnings)} warning(s) emitted", file=sys.stderr)
+
+    if no_artifact_mode:
+        print("[info] skipped artifact generation (--no-artifact)")
+        return 0
 
     asm_changed = False
     if compiled_this_run:
@@ -17842,9 +21247,9 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
 
 
 def cli(argv: Sequence[str]) -> int:
-    quick_result = _try_quick_compile_no_cache(argv)
-    if quick_result is not None:
-        return quick_result
+    quick_force = _try_quick_compile_force(argv)
+    if quick_force is not None:
+        return quick_force
 
     import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
@@ -17885,8 +21290,16 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument("-v", "--verbose", type=int, default=0, metavar="LEVEL", help="verbosity level (1=summary+timing, 2=per-function/DCE, 3=full debug, 4=optimization detail)")
     parser.add_argument("--no-extern-type-check", action="store_true", help="disable extern function argument count checking")
     parser.add_argument("--no-stack-check", action="store_true", help="disable stack underflow checking for builtins")
-    parser.add_argument("--no-cache", action="store_true", help="disable incremental build cache")
-    parser.add_argument("--force", action="store_true", help="force full rebuild (recompile + assemble + relink), disabling all incremental shortcuts")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="disable compiler caches (source graph + asm cache) while keeping timestamp-based tool up-to-date checks",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="force full rebuild (always recompile + assemble + relink); implies --no-cache",
+    )
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
     parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
@@ -17935,6 +21348,14 @@ def cli(argv: Sequence[str]) -> int:
         "--macro-preview",
         action="store_true",
         help="print each text macro expansion to stderr during parsing",
+    )
+    parser.add_argument(
+        "--macro-profile",
+        nargs="?",
+        const="stderr",
+        default=None,
+        metavar="PATH",
+        help="dump macro expansion profile to stderr/stdout or a file path",
     )
     parser.add_argument(
         "-D",
@@ -17996,6 +21417,11 @@ def cli(argv: Sequence[str]) -> int:
 
     # Parse known and unknown args to allow -l flags anywhere
     args, unknown = parser.parse_known_args(argv)
+    for tok in unknown:
+        if tok == "--profile" or tok.startswith("--profile="):
+            parser.error("--profile is no longer supported")
+        if tok == "--compiler-profile" or tok.startswith("--compiler-profile="):
+            parser.error("--compiler-profile is no longer supported")
     for lib_tok in _consume_unknown_link_tokens(unknown, strict_long_opts=False):
         if lib_tok not in args.libs:
             args.libs.append(lib_tok)
@@ -18009,6 +21435,26 @@ def cli(argv: Sequence[str]) -> int:
 
     if args.force:
         args.no_cache = True
+
+    source_graph_cache: Optional[SourceGraphCache] = None
+    if not args.no_cache:
+        source_graph_cache = SourceGraphCache(args.temp_dir / ".l2cache" / "graphs")
+
+    parser_defaults = {
+        action.dest: action.default
+        for action in parser._actions
+        if getattr(action, "dest", None) and action.dest != "help"
+    }
+    source_flag_skip_dests = {
+        "source",
+        "clean",
+        "docs",
+        "repl",
+        "docs_root",
+        "docs_query",
+        "docs_all",
+        "docs_include_tests",
+    }
 
     if args.macro_expansion_limit < 1:
         parser.error("--macro-expansion-limit must be >= 1")
@@ -18067,15 +21513,19 @@ def cli(argv: Sequence[str]) -> int:
         return 0
 
     if args.docs:
-        return run_docs_explorer(
-            source=args.source,
-            include_paths=args.include_paths,
-            explicit_roots=args.docs_root,
-            initial_query=str(args.docs_query or ""),
-            include_undocumented=args.docs_all,
-            include_private=args.docs_all,
-            include_tests=args.docs_include_tests,
-        )
+        try:
+            return run_docs_explorer(
+                source=args.source,
+                include_paths=args.include_paths,
+                explicit_roots=args.docs_root,
+                initial_query=str(args.docs_query or ""),
+                include_undocumented=args.docs_all,
+                include_private=args.docs_all,
+                include_tests=args.docs_include_tests,
+            )
+        except CompileError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
 
     if args.source is None and args.check_integrity and not args.repl:
         if args.dump_cfg is not None:
@@ -18121,6 +21571,7 @@ def cli(argv: Sequence[str]) -> int:
         macro_expansion_limit=args.macro_expansion_limit,
         macro_preview=args.macro_preview,
         defines=args.defines,
+        source_graph_cache=source_graph_cache,
     )
     compiler.assembler.enable_constant_folding = folding_enabled
     compiler.assembler.enable_peephole_optimization = peephole_enabled
@@ -18144,6 +21595,9 @@ def cli(argv: Sequence[str]) -> int:
         warnings_set.add("all")
     compiler.parser._warnings_enabled = warnings_set
     compiler.parser._werror = werror
+    compiler.parser.set_macro_profile_enabled(args.macro_profile is not None)
+    compiler.parser.enable_dead_macro_elimination = not args.repl
+    compiler.parser.enable_unused_rewrite_elimination = not args.repl
     # Route dictionary redefine warnings through the parser's _warn system
     if warnings_set or werror:
         def _dict_warn_cb(name: str, priority: int) -> None:
@@ -18153,8 +21607,6 @@ def cli(argv: Sequence[str]) -> int:
             )
         compiler.parser.dictionary.warn_callback = _dict_warn_cb
     cache: Optional[BuildCache] = None
-    if not args.no_cache and not args.force:
-        cache = BuildCache(args.temp_dir / ".l2cache")
 
     try:
         if args.repl:
@@ -18176,24 +21628,9 @@ def cli(argv: Sequence[str]) -> int:
                 if compiler.source_cli_flags:
                     probe_tokens = [str(args.source), *compiler.source_cli_flags]
                     src_args, src_unknown = parser.parse_known_args(probe_tokens)
-                    defaults = {
-                        action.dest: action.default
-                        for action in parser._actions
-                        if getattr(action, "dest", None) and action.dest != "help"
-                    }
                     # Flags that don't make sense from source-level pragmas.
-                    skip_dests = {
-                        "source",
-                        "clean",
-                        "docs",
-                        "repl",
-                        "docs_root",
-                        "docs_query",
-                        "docs_all",
-                        "docs_include_tests",
-                    }
-                    for dest, default in defaults.items():
-                        if dest in skip_dests:
+                    for dest, default in parser_defaults.items():
+                        if dest in source_flag_skip_dests:
                             continue
                         cur_val = getattr(args, dest)
                         src_val = getattr(src_args, dest)
@@ -18234,8 +21671,21 @@ def cli(argv: Sequence[str]) -> int:
                     args.no_artifact = True
                     changed = True
 
+                if args.force and not args.no_cache:
+                    args.no_cache = True
+                    changed = True
+
                 if not changed:
                     break
+
+        cache_enabled = not args.no_cache
+        if cache_enabled:
+            if compiler.source_graph_cache is None:
+                compiler.source_graph_cache = SourceGraphCache(args.temp_dir / ".l2cache" / "graphs")
+            cache = BuildCache(args.temp_dir / ".l2cache" / "asm")
+        else:
+            compiler.source_graph_cache = None
+            cache = None
 
         if args.macro_expansion_limit < 1:
             parser.error("--macro-expansion-limit must be >= 1")
@@ -18288,15 +21738,20 @@ def cli(argv: Sequence[str]) -> int:
             args.output = default_outputs[artifact_kind]
 
         normalized_include_paths: List[Path] = []
+        seen_include_paths: Set[Path] = set()
         for include_base in [Path("."), Path("./stdlib"), *args.include_paths]:
             resolved = include_base.expanduser().resolve()
-            if resolved not in normalized_include_paths:
+            if resolved not in seen_include_paths:
+                seen_include_paths.add(resolved)
                 normalized_include_paths.append(resolved)
         compiler.include_paths = normalized_include_paths
         compiler._import_resolve_cache.clear()
         compiler.defines = set(args.defines)
         compiler.parser.macro_expansion_limit = args.macro_expansion_limit
         compiler.parser.macro_preview = args.macro_preview
+        compiler.parser.set_macro_profile_enabled(args.macro_profile is not None)
+        compiler.parser.enable_dead_macro_elimination = not args.repl
+        compiler.parser.enable_unused_rewrite_elimination = not args.repl
 
         compiler.assembler.enable_constant_folding = folding_enabled
         compiler.assembler.enable_peephole_optimization = peephole_enabled
@@ -18357,6 +21812,7 @@ def cli(argv: Sequence[str]) -> int:
         # --- assembly-level cache check ---
         asm_text: Optional[str] = None
         fhash = ""
+        cache_asm_hit = False
         if cache and not args.ct_run_main and args.dump_cfg is None:
             fhash = cache.flags_hash(
                 args.debug,
@@ -18372,6 +21828,7 @@ def cli(argv: Sequence[str]) -> int:
                 cached = cache.get_cached_asm(manifest)
                 if cached is not None:
                     asm_text = cached
+                    cache_asm_hit = True
                     if verbosity >= 1:
                         print(f"[v1] cache hit for {args.source}")
 
@@ -18392,6 +21849,66 @@ def cli(argv: Sequence[str]) -> int:
                 print(f"[v1] compilation: {_compile_dt:.1f}ms")
                 print(f"[v1] assembly size: {len(asm_text)} bytes")
 
+            has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
+
+            if asm_post_opt_enabled:
+                use_asm_opt_cache = cache_enabled
+                asm_opt_key_path = args.temp_dir / f"{args.source.stem}.asmopt.key"
+                asm_opt_cache_path = args.temp_dir / f"{args.source.stem}.asmopt.asm"
+                asm_opt_cache_version = "v1"
+
+                asm_digest: Optional[str] = None
+                try:
+                    import hashlib
+                    asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
+                except Exception:
+                    asm_digest = None
+
+                optimized_from_cache = False
+                asm_opt_stats: Dict[str, int] = {}
+                asm_opt_pass_logs: List[str] = []
+                if use_asm_opt_cache and asm_digest is not None:
+                    try:
+                        cached_key = asm_opt_key_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        cached_key = ""
+                    expected_key = f"{asm_opt_cache_version}:{asm_digest}"
+                    if cached_key == expected_key:
+                        try:
+                            asm_text = asm_opt_cache_path.read_text(encoding="utf-8")
+                            optimized_from_cache = True
+                        except OSError:
+                            optimized_from_cache = False
+
+                if not optimized_from_cache:
+                    optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
+                        asm_text,
+                        collect_pass_logs=(verbosity >= 4),
+                    )
+                    if optimized_asm != asm_text:
+                        asm_text = optimized_asm
+                    if use_asm_opt_cache and asm_digest is not None:
+                        try:
+                            asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
+                            asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
+                            asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
+                        except OSError:
+                            pass
+
+                if verbosity >= 1:
+                    if optimized_from_cache:
+                        print("[v1] asm post-opt: cache hit")
+                    else:
+                        changed = sum(asm_opt_stats.values())
+                        print(f"[v1] asm post-opt: {changed} rewrite(s)")
+                if verbosity >= 2 and not optimized_from_cache:
+                    for key in sorted(asm_opt_stats):
+                        if asm_opt_stats[key]:
+                            print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
+                if verbosity >= 4 and not optimized_from_cache:
+                    for msg in asm_opt_pass_logs:
+                        print(f"[v4] asm post-opt {msg}")
+
             if cache and not args.ct_run_main:
                 if not fhash:
                     fhash = cache.flags_hash(
@@ -18403,26 +21920,7 @@ def cli(argv: Sequence[str]) -> int:
                         string_deduplication_enabled,
                         entry_mode,
                     )
-                has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
                 cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
-
-            if asm_post_opt_enabled:
-                optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
-                    asm_text,
-                    collect_pass_logs=(verbosity >= 4),
-                )
-                if optimized_asm != asm_text:
-                    asm_text = optimized_asm
-                if verbosity >= 1:
-                    changed = sum(asm_opt_stats.values())
-                    print(f"[v1] asm post-opt: {changed} rewrite(s)")
-                if verbosity >= 2:
-                    for key in sorted(asm_opt_stats):
-                        if asm_opt_stats[key]:
-                            print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
-                if verbosity >= 4:
-                    for msg in asm_opt_pass_logs:
-                        print(f"[v4] asm post-opt {msg}")
 
         # Merge source-level `flags ...` pragmas into effective linker flags.
         if compiler.source_link_flags:
@@ -18525,6 +22023,9 @@ def cli(argv: Sequence[str]) -> int:
             print(diag.format(color=use_color), file=sys.stderr)
         print(f"\n{len(warnings)} warning(s) emitted", file=sys.stderr)
 
+    if args.macro_profile is not None:
+        _emit_macro_profile_report(compiler.parser, args.macro_profile)
+
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")
     obj_path = args.temp_dir / (args.source.stem + ".o")
@@ -18555,6 +22056,7 @@ def cli(argv: Sequence[str]) -> int:
             need_nasm = True
     if need_nasm:
         run_nasm(asm_path, obj_path, debug=args.debug)
+
     if args.output.parent and not args.output.parent.exists():
         args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -18590,7 +22092,7 @@ def cli(argv: Sequence[str]) -> int:
         )
     link_fingerprint = "\n".join(link_fingerprint_parts)
 
-    need_link = args.force or need_nasm or not args.output.exists() or args.no_cache
+    need_link = args.force or need_nasm or not args.output.exists()
     if not need_link:
         # Check that the output was linked from the same inputs/config last time.
         try:

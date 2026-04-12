@@ -66,5 +66,5 @@ jobs:
       - name: Run integrity checks
         run: |
           python3 main.py --check-integrity
-          python3 main.py tests/hello.sl --check-integrity
+          python3 main.py tests/general/hello.sl --check-integrity
         timeout-minutes: 20

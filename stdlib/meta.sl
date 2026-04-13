@@ -659,6 +659,10 @@ compile-only
 word meta-word-list ct-list-words end
 compile-only
 
+# Compatibility wrapper around ct-list-words-prefix.
+word meta-word-list-prefix ct-list-words-prefix end
+compile-only
+
 # Compatibility wrapper around ct-word-exists?.
 word meta-word-exists ct-word-exists? end
 compile-only

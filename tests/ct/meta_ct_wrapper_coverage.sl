@@ -338,6 +338,8 @@ word verify_meta_ct_wrapper_coverage
   "ct-word-exists?" meta-word-exists static_assert
   "meta-word-list" meta-word-exists static_assert
   "ct-list-words" meta-word-exists static_assert
+  "meta-word-list-prefix" meta-word-exists static_assert
+  "ct-list-words-prefix" meta-word-exists static_assert
   "meta-word-remove" meta-word-exists static_assert
   "ct-unregister-word" meta-word-exists static_assert
 end

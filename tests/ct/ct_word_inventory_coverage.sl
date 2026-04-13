@@ -136,6 +136,7 @@ word verify_ct_word_inventory_coverage
   "ct-list-reader-rewrites" meta-word-exists static_assert
   "ct-list-rewrite-active-pipelines" meta-word-exists static_assert
   "ct-list-words" meta-word-exists static_assert
+  "ct-list-words-prefix" meta-word-exists static_assert
   "ct-macro-attrs-get" meta-word-exists static_assert
   "ct-macro-attrs-set" meta-word-exists static_assert
   "ct-macro-doc-get" meta-word-exists static_assert

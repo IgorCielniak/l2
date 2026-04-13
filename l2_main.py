@@ -15792,6 +15792,12 @@ def _ct_list_words(vm: CompileTimeVM) -> None:
     vm.push(sorted(vm.dictionary.words.keys()))
 
 
+def _ct_list_words_prefix(vm: CompileTimeVM) -> None:
+    prefix = vm.pop_str()
+    names = [name for name in vm.dictionary.words.keys() if name.startswith(prefix)]
+    vm.push(sorted(names))
+
+
 def _ct_introspection_value(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -17140,6 +17146,7 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-rewrite-run-on-list", _ct_rewrite_run_on_list, compile_only=True)
     register("ct-unregister-word", _ct_unregister_word, compile_only=True)
     register("ct-list-words", _ct_list_words, compile_only=True)
+    register("ct-list-words-prefix", _ct_list_words_prefix, compile_only=True)
     register("ct-word-exists?", _ct_word_exists, compile_only=True)
     register("ct-get-word-body", _ct_get_word_body, compile_only=True)
     register("ct-get-word-asm", _ct_get_word_asm, compile_only=True)

@@ -691,6 +691,316 @@ word fn-dsl-register-macros
 	ct-register-text-macro-signature
 	"thrush" "alias of pipe/thread-first" fn-dsl-set-doc
 	"thrush" "pipeline" fn-dsl-set-attrs
+
+	"identity"
+	list-new "value" list-append
+	list-new "$value" list-append
+	ct-register-text-macro-signature
+	"identity" "return value unchanged" fn-dsl-set-doc
+	"identity" "functional" fn-dsl-set-attrs
+
+	"const"
+	list-new "value" list-append "_ignored" list-append
+	list-new "$value" list-append
+	ct-register-text-macro-signature
+	"const" "always return first argument" fn-dsl-set-doc
+	"const" "functional" fn-dsl-set-attrs
+
+	"default"
+	list-new "value" list-append "fallback" list-append
+	list-new "$value" list-append "dup" list-append "if" list-append "else" list-append "drop" list-append "$fallback" list-append "end" list-append
+	ct-register-text-macro-signature
+	"default" "return fallback only when value is falsey" fn-dsl-set-doc
+	"default" "control" fn-dsl-set-attrs
+
+	"maybe"
+	list-new "value" list-append "on_some" list-append "on_none" list-append
+	list-new "$value" list-append "dup" list-append "if" list-append "$on_some" list-append "else" list-append "drop" list-append "$on_none" list-append "end" list-append
+	ct-register-text-macro-signature
+	"maybe" "branch on value presence while preserving happy-path value" fn-dsl-set-doc
+	"maybe" "control" fn-dsl-set-attrs
+
+	"keep"
+	list-new "value" list-append "func" list-append
+	list-new "$value" list-append "dup" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"keep" "alias of tap" fn-dsl-set-doc
+	"keep" "pipeline" fn-dsl-set-attrs
+
+	"pipe-if"
+	list-new "value" list-append "cond" list-append "func" list-append
+	list-new "$cond" list-append "if" list-append "$value" list-append "$func" list-append "else" list-append "$value" list-append "end" list-append
+	ct-register-text-macro-signature
+	"pipe-if" "conditionally apply function and keep original value otherwise" fn-dsl-set-doc
+	"pipe-if" "pipeline" fn-dsl-set-attrs
+
+	"pipe-unless"
+	list-new "value" list-append "cond" list-append "func" list-append
+	list-new "$cond" list-append "if" list-append "$value" list-append "else" list-append "$value" list-append "$func" list-append "end" list-append
+	ct-register-text-macro-signature
+	"pipe-unless" "inverse conditional pipeline" fn-dsl-set-doc
+	"pipe-unless" "pipeline" fn-dsl-set-attrs
+
+	"pipe-last2"
+	list-new "value" list-append "arg" list-append "func" list-append
+	list-new "$arg" list-append "$value" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"pipe-last2" "thread-last with one fixed argument" fn-dsl-set-doc
+	"pipe-last2" "pipeline" fn-dsl-set-attrs
+
+	"pipe-last3"
+	list-new "value" list-append "arg1" list-append "arg2" list-append "func" list-append
+	list-new "$arg1" list-append "$arg2" list-append "$value" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"pipe-last3" "thread-last with two fixed arguments" fn-dsl-set-doc
+	"pipe-last3" "pipeline" fn-dsl-set-attrs
+
+	"pipe-last4"
+	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "func" list-append
+	list-new "$arg1" list-append "$arg2" list-append "$arg3" list-append "$value" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"pipe-last4" "thread-last with three fixed arguments" fn-dsl-set-doc
+	"pipe-last4" "pipeline" fn-dsl-set-attrs
+
+	"pipe6"
+	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "arg4" list-append "arg5" list-append "func" list-append
+	list-new "$value" list-append "$arg1" list-append "$arg2" list-append "$arg3" list-append "$arg4" list-append "$arg5" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"pipe6" "thread-first with five extra arguments" fn-dsl-set-doc
+	"pipe6" "pipeline" fn-dsl-set-attrs
+
+	"apply6"
+	list-new "func" list-append "a" list-append "b" list-append "c" list-append "d" list-append "e" list-append "f" list-append
+	list-new "$a" list-append "$b" list-append "$c" list-append "$d" list-append "$e" list-append "$f" list-append "$func" list-append
+	ct-register-text-macro-signature
+	"apply6" "apply 6-arity function" fn-dsl-set-doc
+	"apply6" "functional" fn-dsl-set-attrs
+
+	"compose6"
+	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "n" list-append "x" list-append
+	list-new "$x" list-append "$n" list-append "$m" list-append "$k" list-append "$h" list-append "$g" list-append "$f" list-append
+	ct-register-text-macro-signature
+	"compose6" "compose six unary functions" fn-dsl-set-doc
+	"compose6" "functional" fn-dsl-set-attrs
+
+	"juxt4"
+	list-new "f" list-append "g" list-append "h" list-append "k" list-append "x" list-append
+	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append
+	ct-register-text-macro-signature
+	"juxt4" "apply four unary functions to the same input" fn-dsl-set-doc
+	"juxt4" "functional" fn-dsl-set-attrs
+
+	"juxt5"
+	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "x" list-append
+	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append "$x" list-append "$m" list-append
+	ct-register-text-macro-signature
+	"juxt5" "apply five unary functions to the same input" fn-dsl-set-doc
+	"juxt5" "functional" fn-dsl-set-attrs
+
+	"juxt6"
+	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "n" list-append "x" list-append
+	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append "$x" list-append "$m" list-append "$x" list-append "$n" list-append
+	ct-register-text-macro-signature
+	"juxt6" "apply six unary functions to the same input" fn-dsl-set-doc
+	"juxt6" "functional" fn-dsl-set-attrs
+
+	"tap2"
+	list-new "value" list-append "f" list-append "g" list-append
+	list-new "$value" list-append "dup" list-append "$f" list-append "dup" list-append "$g" list-append
+	ct-register-text-macro-signature
+	"tap2" "tap through two side-effect functions while preserving value" fn-dsl-set-doc
+	"tap2" "pipeline" fn-dsl-set-attrs
+
+	"tap3"
+	list-new "value" list-append "f" list-append "g" list-append "h" list-append
+	list-new "$value" list-append "dup" list-append "$f" list-append "dup" list-append "$g" list-append "dup" list-append "$h" list-append
+	ct-register-text-macro-signature
+	"tap3" "tap through three side-effect functions while preserving value" fn-dsl-set-doc
+	"tap3" "pipeline" fn-dsl-set-attrs
+
+	"when-do"
+	list-new "cond" list-append "*body" list-append
+	list-new "$cond" list-append "if" list-append "$*body" list-append "end" list-append
+	ct-register-text-macro-signature
+	"when-do" "statement-oriented conditional block" fn-dsl-set-doc
+	"when-do" "control" fn-dsl-set-attrs
+
+	"unless-do"
+	list-new "cond" list-append "*body" list-append
+	list-new "$cond" list-append "if" list-append "else" list-append "$*body" list-append "end" list-append
+	ct-register-text-macro-signature
+	"unless-do" "inverse statement-oriented conditional block" fn-dsl-set-doc
+	"unless-do" "control" fn-dsl-set-attrs
+end
+compile-only
+
+word fn-dsl-pattern-append-clause   # clauses pattern replacement -- clauses'
+	>r
+	list-new
+	swap
+	list-append
+	r>
+	list-append
+	list-append
+end
+compile-only
+
+word fn-dsl-install-pattern-macros
+	"fn_simplify"
+	list-new
+
+	list-new "$x:int" list-append "+" list-append "0" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "0" list-append "+" list-append "$x:int" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "$x:int" list-append "-" list-append "0" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "$x:int" list-append "*" list-append "1" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "1" list-append "*" list-append "$x:int" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "$x:int" list-append "/" list-append "1" list-append
+	list-new "$x" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "$x:int" list-append "*" list-append "0" list-append
+	list-new "0" list-append
+	fn-dsl-pattern-append-clause
+
+	list-new "0" list-append "*" list-append "$x:int" list-append
+	list-new "0" list-append
+	fn-dsl-pattern-append-clause
+
+	ct-register-pattern-macro
+
+	"fn_simplify" "fn.dsl.optim" ct-set-pattern-macro-group static_assert
+	"fn_simplify" "fn.dsl.scope" ct-set-pattern-macro-scope static_assert
+	"fn_simplify" 20 ct-set-pattern-macro-priority static_assert
+	"fn.dsl.optim" 1 ct-set-pattern-group-active static_assert
+	"fn.dsl.scope" 1 ct-set-pattern-scope-active static_assert
+end
+compile-only
+
+word fn-dsl-pattern-enable
+	"fn_simplify" 1 ct-set-pattern-macro-enabled
+end
+compile-only
+
+word fn-dsl-pattern-disable
+	"fn_simplify" 0 ct-set-pattern-macro-enabled
+end
+compile-only
+
+word fn-dsl-pattern-enabled
+	"fn_simplify" ct-get-pattern-macro-enabled
+end
+compile-only
+
+word fn-dsl-pattern-clauses
+	"fn_simplify" ct-get-pattern-macro-clauses
+end
+compile-only
+
+word fn-dsl-pattern-conflicts
+	"fn_simplify" ct-detect-pattern-conflicts-named
+end
+compile-only
+
+word fn-dsl-ct-call-policy-open
+	"off" ct-set-ct-call-sandbox-mode
+	"raise" ct-set-ct-call-exception-policy
+	1 ct-set-ct-call-memo
+	0 ct-set-ct-call-side-effects
+	64 ct-set-ct-call-recursion-limit
+	0 ct-set-ct-call-timeout-ms
+end
+compile-only
+
+word fn-dsl-ct-call-policy-safe
+	"compile-only" ct-set-ct-call-sandbox-mode
+	list-new
+	"ct-capture-args" list-append
+	"ct-capture-get" list-append
+	"ct-capture-has?" list-append
+	"ct-capture-shape" list-append
+	"ct-capture-coerce-tokens" list-append
+	"ct-capture-coerce-string" list-append
+	"ct-capture-coerce-number" list-append
+	"ct-capture-normalize" list-append
+	"ct-capture-pretty" list-append
+	"ct-capture-clone" list-append
+	ct-set-ct-call-sandbox-allowlist drop
+	"raise" ct-set-ct-call-exception-policy
+	1 ct-set-ct-call-memo
+	1 ct-set-ct-call-side-effects
+	64 ct-set-ct-call-recursion-limit
+	250 ct-set-ct-call-timeout-ms
+	1337 ct-ctrand-seed
+end
+compile-only
+
+word fn-dsl-ct-call-status
+	map-new
+	"sandbox_mode" ct-get-ct-call-sandbox-mode map-set
+	"exception_policy" ct-get-ct-call-exception-policy map-set
+	"memo_enabled" ct-get-ct-call-memo map-set
+	"memo_size" ct-get-ct-call-memo-size map-set
+	"side_effects_enabled" ct-get-ct-call-side-effects map-set
+	"side_effect_log" ct-get-ct-call-side-effect-log map-set
+	"recursion_limit" ct-get-ct-call-recursion-limit map-set
+	"timeout_ms" ct-get-ct-call-timeout-ms map-set
+	"sandbox_allowlist" ct-get-ct-call-sandbox-allowlist map-set
+	"sandbox_allowlist_size" ct-get-ct-call-sandbox-allowlist list-length map-set
+end
+compile-only
+
+word fn-dsl-ct-call-reset
+	ct-clear-ct-call-memo drop
+	ct-clear-ct-call-side-effect-log drop
+end
+compile-only
+
+word fn-dsl-words-prefix
+	ct-list-words-prefix
+end
+compile-only
+
+word fn-dsl-ct-capabilities
+	map-new
+	"ct_total" "ct-" fn-dsl-words-prefix list-length map-set
+	"ct_capture" "ct-capture-" fn-dsl-words-prefix list-length map-set
+	"ct_parser" "ct-parser-" fn-dsl-words-prefix list-length map-set
+	"ct_rewrite" "ct-rewrite-" fn-dsl-words-prefix list-length map-set
+	"ct_reader" "ct-add-reader-" fn-dsl-words-prefix list-length map-set
+	"ct_grammar" "ct-add-grammar-" fn-dsl-words-prefix list-length map-set
+	"ct_macro" "ct-macro-" fn-dsl-words-prefix list-length map-set
+	"ct_pattern_set" "ct-set-pattern-" fn-dsl-words-prefix list-length map-set
+	"ct_pattern_get" "ct-get-pattern-" fn-dsl-words-prefix list-length map-set
+	"ct_call_get" "ct-get-ct-call-" fn-dsl-words-prefix list-length map-set
+	"ct_call_set" "ct-set-ct-call-" fn-dsl-words-prefix list-length map-set
+	"ct_word_introspection" "ct-get-word-" fn-dsl-words-prefix list-length map-set
+end
+compile-only
+
+word fn-dsl-assert-ct-surface
+	fn-dsl-ct-capabilities
+	dup "ct_total" map-get 120 >= static_assert
+	dup "ct_capture" map-get 20 >= static_assert
+	dup "ct_parser" map-get 8 >= static_assert
+	dup "ct_rewrite" map-get 8 >= static_assert
+	dup "ct_call_get" map-get 5 >= static_assert
+	dup "ct_call_set" map-get 5 >= static_assert
+	drop
 end
 compile-only
 
@@ -852,6 +1162,7 @@ word fn-dsl-enable
 	fn-dsl-register-macros
 	fn-dsl-install-rewrites
 	fn-dsl-install-operators
+	fn-dsl-install-pattern-macros
 end
 immediate
 compile-only
@@ -874,4 +1185,14 @@ macro use-fn-dsl 0
 
 macro use-fn-calls 0
 	fn-dsl-enable-calls
+;
+
+macro use-fn-superlang 0
+	fn-dsl-enable
+	fn-dsl-enable-calls
+	fn-dsl-ct-call-policy-safe
+;
+
+macro use-fn-full 0
+	use-fn-superlang
 ;

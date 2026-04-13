@@ -57,6 +57,10 @@ defn sum5(number a, number b, number c, number d, number e){
     return a + b + c + d + e;
 }
 
+defn sum6(number a, number b, number c, number d, number e, number f){
+    return a + b + c + d + e + f;
+}
+
 word fn_dsl_compile_checks
     fn-dsl-active? static_assert
 
@@ -87,6 +91,41 @@ word fn_dsl_compile_checks
 
     fn-dsl-trace-on
     fn-dsl-trace-off
+
+    "ct-list-words" fn-dsl-words-prefix "ct-list-words-prefix" list-contains? static_assert
+
+    fn-dsl-ct-capabilities
+    dup "ct_total" map-get static_assert 50 >= static_assert
+    dup "ct_capture" map-get static_assert 8 >= static_assert
+    dup "ct_parser" map-get static_assert 5 >= static_assert
+    dup "ct_rewrite" map-get static_assert 5 >= static_assert
+    drop
+
+    fn-dsl-pattern-enabled
+    swap static_assert
+    static_assert
+
+    fn-dsl-pattern-clauses
+    static_assert
+    dup list-length 8 == static_assert
+    drop
+
+    fn-dsl-pattern-conflicts
+    dup list-length 0 >= static_assert
+    drop
+
+    fn-dsl-ct-call-policy-safe
+    fn-dsl-ct-call-status
+    dup "sandbox_mode" map-get static_assert "compile-only" string= static_assert
+    dup "exception_policy" map-get static_assert "raise" string= static_assert
+    dup "memo_enabled" map-get static_assert static_assert
+    dup "side_effects_enabled" map-get static_assert static_assert
+    dup "sandbox_allowlist_size" map-get static_assert 8 >= static_assert
+    dup "recursion_limit" map-get static_assert 64 == static_assert
+    dup "timeout_ms" map-get static_assert 250 == static_assert
+    drop
+    fn-dsl-ct-call-reset
+    fn-dsl-ct-call-policy-open
 
     fn-dsl-parser-session-begin drop
     fn-dsl-parser-session-rollback static_assert
@@ -184,6 +223,27 @@ word main
     dec1(8) puti cr
     mul2(8) puti cr
     ident(8) puti cr
+
+    identity(42) puti cr
+    pipe-if(4, 1, inc1) puti cr
+    pipe-if(4, 0, inc1) puti cr
+    pipe-unless(4, 1, inc1) puti cr
+    pipe-unless(4, 0, inc1) puti cr
+    pipe-last2(3, 4, add) puti cr
+    pipe-last3(2, 3, 4, mix) puti cr
+    pipe-last4(1, 2, 3, 4, sum4) puti cr
+    apply6 sum6 1 2 3 4 5 6 puti cr
+    pipe6(1, 2, 3, 4, 5, 6, sum6) puti cr
+    compose6 inc1 inc1 inc1 inc1 inc1 inc1 0 puti cr
+    juxt4 inc1 square cube ident 2 + + + puti cr
+    juxt5 inc1 inc1 inc1 inc1 inc1 1 + + + + puti cr
+    juxt6 inc1 inc1 inc1 inc1 inc1 inc1 1 + + + + + puti cr
+    fn_simplify 9 + 0 puti cr
+    fn_simplify 0 * 99 puti cr
+    fn_simplify 7 * 1 puti cr
+
+    when-do(1, 66 puti cr)
+    unless-do(0, 67 puti cr)
 
     add(2, 5) puti cr
     mix(2, 3, 4) puti cr

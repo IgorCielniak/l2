@@ -12340,8 +12340,22 @@ class Assembler:
         self._emit_stack.append(definition.name)
         try:
             if isinstance(definition, Definition):
-                for node in definition.body:
+                idx = 0
+                body = definition.body
+                body_len = len(body)
+                while idx < body_len:
+                    node = body[idx]
+                    if node._opcode == OP_WORD:
+                        next_node = body[idx + 1] if idx + 1 < body_len else None
+                        tail_position = next_node is None or next_node._opcode == OP_RET
+                        if tail_position and self._emit_tail_wordref(str(node.data), builder):
+                            if next_node is not None and next_node._opcode == OP_RET:
+                                idx += 2
+                            else:
+                                idx += 1
+                            continue
                     self._emit_node(node, builder)
+                    idx += 1
             elif isinstance(definition, AsmDefinition):
                 self._emit_asm_body(definition, builder)
             else:  # pragma: no cover - defensive
@@ -12892,6 +12906,28 @@ class Assembler:
             self._emit_extern_wordref(name, word, builder)
         else:
             builder.emit(f"    call {sanitize_label(name)}")
+
+    def _emit_tail_wordref(self, name: str, builder: FunctionEmitter) -> bool:
+        word = self.dictionary.words.get(name)
+        if word is None:
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"unknown word '{name}'{suffix}")
+        if word.compile_only:
+            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
+            raise CompileError(f"word '{name}' is compile-time only and cannot be used at runtime{suffix}")
+
+        # Tail-jump only for regular runtime words that would otherwise emit a call.
+        if getattr(word, "inline", False):
+            return False
+        if word.intrinsic is not None:
+            return False
+        if getattr(word, "is_extern", False):
+            return False
+        if self.enable_auto_inline and isinstance(word.definition, AsmDefinition) and self._asm_auto_inline_ok(word.definition):
+            return False
+
+        builder.emit(f"    jmp {sanitize_label(name)}")
+        return True
 
     @staticmethod
     def _asm_auto_inline_ok(defn: AsmDefinition) -> bool:
@@ -19966,8 +20002,20 @@ def _run_integrity_assembler_semantic_checks(errors: List[str]) -> None:
     asm_cases: List[Dict[str, Any]] = [
         {
             "name": "word_call",
+            "nodes": [_make_word_op(probe_target), _make_literal_op(1)],
+            "required": [f"call {sanitize_label(probe_target)}", "mov qword [r12], 1"],
+        },
+        {
+            "name": "tail_call_implicit",
             "nodes": [_make_word_op(probe_target)],
-            "required": [f"call {sanitize_label(probe_target)}"],
+            "required": [f"jmp {sanitize_label(probe_target)}"],
+            "check": lambda text_blob: None if f"\n    call {sanitize_label(probe_target)}" not in text_blob else "expected tail position call to emit jmp",
+        },
+        {
+            "name": "tail_call_explicit_ret",
+            "nodes": [_make_word_op(probe_target), _make_op("ret")],
+            "required": [f"jmp {sanitize_label(probe_target)}"],
+            "check": lambda text_blob: None if f"\n    call {sanitize_label(probe_target)}" not in text_blob else "expected call+ret tail pattern to emit jmp",
         },
         {
             "name": "literal_int",

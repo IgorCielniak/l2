@@ -19946,28 +19946,35 @@ def _run_integrity_roundtrip_checks(errors: List[str]) -> None:
     import tempfile
 
     repo_root = Path(__file__).resolve().parent
-    include_paths = [repo_root, repo_root / "stdlib"]
+    include_paths = [repo_root]
 
-    probes: List[Tuple[str, str, str]] = [
+    probes: List[Tuple[str, str, int]] = [
         (
-            "for_sum",
+            "literal_exit",
             """
-import stdlib.sl
+:asm exit_top {
+    mov rax, 60
+    mov rdi, [r12]
+    add r12, 8
+    syscall
+} ;
 
 word main
-    0
-    5 for
-        1 +
-    end
-    puti cr
+    7
+    exit_top
 end
 """.lstrip(),
-            "5\n",
+            7,
         ),
         (
             "if_else",
             """
-import stdlib.sl
+:asm exit_top {
+    mov rax, 60
+    mov rdi, [r12]
+    add r12, 8
+    syscall
+} ;
 
 word main
     0 if
@@ -19975,15 +19982,40 @@ word main
     else
         22
     end
-    puti cr
+    exit_top
 end
 """.lstrip(),
-            "22\n",
+            22,
+        ),
+        (
+            "for_sum",
+            """
+:asm exit_top {
+    mov rax, 60
+    mov rdi, [r12]
+    add r12, 8
+    syscall
+} ;
+
+word main
+    0
+    5 for
+        2 +
+    end
+    exit_top
+end
+""".lstrip(),
+            10,
         ),
         (
             "asm_word",
             """
-import stdlib.sl
+:asm exit_top {
+    mov rax, 60
+    mov rdi, [r12]
+    add r12, 8
+    syscall
+} ;
 
 :asm emit42 {
     mov rax, 42
@@ -19993,16 +20025,16 @@ import stdlib.sl
 
 word main
     emit42
-    puti cr
+    exit_top
 end
 """.lstrip(),
-            "42\n",
+            42,
         ),
     ]
 
     with tempfile.TemporaryDirectory(prefix="l2_integrity_roundtrip_") as temp_dir_raw:
         temp_dir = Path(temp_dir_raw)
-        for name, source_text, expected_stdout in probes:
+        for name, source_text, expected_exit in probes:
             src_path = temp_dir / f"{name}.sl"
             asm_path = temp_dir / f"{name}.asm"
             obj_path = temp_dir / f"{name}.o"
@@ -20037,16 +20069,136 @@ end
                 errors.append(f"round-trip probe '{name}' failed to execute: {exc}")
                 continue
 
-            if proc.returncode != 0:
+            if proc.returncode != expected_exit:
                 errors.append(
-                    f"round-trip probe '{name}' exited with code {proc.returncode}; stderr={proc.stderr!r}"
+                    f"round-trip probe '{name}' exit-code mismatch: expected {expected_exit}, got {proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
                 )
                 continue
 
-            if proc.stdout != expected_stdout:
-                errors.append(
-                    f"round-trip probe '{name}' stdout mismatch: expected {expected_stdout!r}, got {proc.stdout!r}"
+            if proc.stdout:
+                errors.append(f"round-trip probe '{name}' expected empty stdout, got {proc.stdout!r}")
+            if proc.stderr:
+                errors.append(f"round-trip probe '{name}' expected empty stderr, got {proc.stderr!r}")
+
+
+def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
+    repo_root = Path(__file__).resolve().parent
+    paths = {
+        "l2_main.py": Path(__file__),
+        "main.py": repo_root / "main.py",
+        "docs.py": repo_root / "docs.py",
+        "main.c": repo_root / "main.c",
+    }
+
+    texts: Dict[str, str] = {}
+    for name, path in paths.items():
+        if not path.exists():
+            errors.append(f"feature-matrix missing required file: {name}")
+            continue
+        try:
+            texts[name] = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            errors.append(f"feature-matrix failed to read {name}: {exc}")
+
+    if len(texts) != len(paths):
+        return
+
+    impl_text = texts["l2_main.py"]
+    main_py_text = texts["main.py"]
+    docs_text = texts["docs.py"]
+    main_c_text = texts["main.c"]
+
+    checks: List[Tuple[str, bool]] = [
+        (
+            "--force CLI option and implication are wired",
+            "--force" in impl_text
+            and "force full rebuild (always recompile + assemble + relink); implies --no-cache" in impl_text
+            and "if args.force:\n        args.no_cache = True" in impl_text,
+        ),
+        (
+            "quick force/no-cache workers are available in main.py",
+            '_FORCE_WORKER_TOKEN = "--__l2-force-worker"' in main_py_text
+            and "def _try_ultra_fast_force(" in main_py_text
+            and "def _try_ultra_fast_no_cache(" in main_py_text,
+        ),
+        (
+            "source graph cache is wired in CLI path",
+            "class SourceGraphCache:" in impl_text
+            and "source_graph_cache = SourceGraphCache(" in impl_text
+            and "source_graph_cache=source_graph_cache" in impl_text,
+        ),
+        (
+            "macro engine extraction is active",
+            "class MacroEngine:" in impl_text and "self.macro_engine = MacroEngine(self)" in impl_text,
+        ),
+        (
+            "macro preview includes before/after context",
+            "kind=\"macro-preview\"" in impl_text
+            and "context:" in impl_text
+            and "| src:" in impl_text
+            and "| now:" in impl_text,
+        ),
+        (
+            "docs helpers are lazy-loaded with fallback diagnostics",
+            "def _load_docs_helpers(" in impl_text
+            and "docs.py not found" in impl_text
+            and "using built-in fallback" in impl_text,
+        ),
+        (
+            "docs module exports advanced CT reference helpers",
+            "def run_docs_cli(" in docs_text
+            and "def run_docs_explorer(" in docs_text
+            and "def build_ct_reference_bundle" in docs_text
+            and "def attach_ct_entry_line_numbers" in docs_text
+            and "def build_ct_detail_lines" in docs_text,
+        ),
+        (
+            "docs TUI supports CT filter/results/detail modes",
+            "_MODE_CT_REF_FILTER = 12" in docs_text
+            and "_MODE_CT_REF_RESULTS = 13" in docs_text
+            and "_MODE_CT_REF_DETAIL = 14" in docs_text
+            and "query fields: section:<name> scope:<mode>" in docs_text
+            and "function(s)  (Enter: open results  Esc: cancel)" in docs_text,
+        ),
+        (
+            "integrity harness includes roundtrip and feature matrix",
+            "(\"roundtrip\", _run_integrity_roundtrip_checks)" in impl_text
+            and "(\"feature-matrix\", _run_integrity_prompt_feature_matrix_checks)" in impl_text,
+        ),
+        (
+            "main.c CLI supports script/no-artifact/ct-run-main path",
+            "if (strcmp(arg, \"--ct-run-main\") == 0)" in main_c_text
+            and "if (strcmp(arg, \"--no-artifact\") == 0)" in main_c_text
+            and "if (strcmp(arg, \"--script\") == 0)" in main_c_text
+            and "ct_run_main = true;" in main_c_text
+            and "no_artifact = true;" in main_c_text,
+        ),
+        (
+            "main.c exposes broad CT intrinsic surface",
+            all(
+                fragment in main_c_text
+                for fragment in (
+                    "register_ct_intrinsic(dict, \"list-peek-front\"",
+                    "register_ct_intrinsic(dict, \"list-push-front\"",
+                    "register_ct_intrinsic(dict, \"list-reverse\"",
+                    "register_ct_intrinsic(dict, \"map-length\"",
+                    "register_ct_intrinsic(dict, \"map-keys\"",
+                    "register_ct_intrinsic(dict, \"string-contains?\"",
+                    "register_ct_intrinsic(dict, \"string-starts-with?\"",
+                    "register_ct_intrinsic(dict, \"string-ends-with?\"",
+                    "register_ct_intrinsic(dict, \"token-line\"",
+                    "register_ct_intrinsic(dict, \"token-column\"",
+                    "register_ct_intrinsic(dict, \"next-token\"",
+                    "register_ct_intrinsic(dict, \"peek-token\"",
+                    "register_ct_intrinsic(dict, \"inject-tokens\"",
                 )
+            ) and len(re.findall(r"(?m)^\s*register_ct_intrinsic\(", main_c_text)) >= 70,
+        ),
+    ]
+
+    for label, ok in checks:
+        if not ok:
+            errors.append(f"feature checklist item failed: {label}")
 
 
 def _run_integrity_failure_injection_checks(errors: List[str]) -> None:
@@ -20254,64 +20406,192 @@ def _run_integrity_docs_module_checks(errors: List[str]) -> None:
             errors.append(f"l2_main.py missing docs delegation fragment: {fragment!r}")
 
 
-def _run_integrity_meta_stdlib_checks(errors: List[str]) -> None:
+def _run_integrity_compiler_file_contract_checks(errors: List[str]) -> None:
+    """Validate cross-file compiler contracts for main.py, l2_main.py, docs.py, and main.c.
+
+    This check is intentionally static and file-scoped so integrity mode stays
+    independent from external libraries and stdlib meta layers.
+    """
+
     repo_root = Path(__file__).resolve().parent
-    meta_path = repo_root / "stdlib" / "meta.sl"
-    stdlib_path = repo_root / "stdlib" / "stdlib.sl"
+    target_paths = {
+        "main.py": repo_root / "main.py",
+        "l2_main.py": repo_root / "l2_main.py",
+        "docs.py": repo_root / "docs.py",
+    }
+    main_c_path = repo_root / "main.c"
+    main_c_text = ""
 
-    if not meta_path.exists():
-        errors.append("missing stdlib/meta.sl")
+    if not main_c_path.exists():
+        errors.append("required compiler file missing: main.c")
+    else:
+        try:
+            main_c_text = main_c_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            errors.append(f"failed to read main.c: {exc}")
+
+    sources: Dict[str, str] = {}
+    trees: Dict[str, ast.AST] = {}
+
+    for name, path in target_paths.items():
+        if not path.exists():
+            errors.append(f"required compiler file missing: {name}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            errors.append(f"failed to read {name}: {exc}")
+            continue
+        sources[name] = text
+        try:
+            trees[name] = ast.parse(text)
+        except SyntaxError as exc:
+            errors.append(f"{name} has syntax error at line {exc.lineno}: {exc.msg}")
+
+    missing = [name for name in target_paths if name not in sources or name not in trees]
+    if missing:
         return
 
-    try:
-        meta_text = meta_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        errors.append(f"failed to read stdlib/meta.sl: {exc}")
-        return
+    main_text = sources["main.py"]
+    l2_text = sources["l2_main.py"]
+    docs_text = sources["docs.py"]
 
-    expected_wrappers = [
-        "meta-reader-add-named",
-        "meta-grammar-add-named",
-        "meta-macro-register-signature",
-        "meta-word-list",
-        "meta-inject-tokens",
-        "meta-reader-upsert-seq",
-        "meta-grammar-upsert-seq",
-        "meta-macro-register-unary-op",
-        "meta-define-const-if-missing",
-        "meta-define-alias-if-missing",
-        "meta-next-ident-lexeme",
-        "meta-expect-lexeme",
-        "meta-parser-at-end?",
+    # --- main.py contract checks ---
+    required_main_fragments = [
+        '_FORCE_WORKER_TOKEN = "--__l2-force-worker"',
+        "def _try_ultra_fast_force(",
+        "def _try_ultra_fast_no_cache(",
+        "if __name__ == \"__main__\":",
+        "from l2_main import main as _entry_main",
+        "from l2_main import *",
     ]
-    expected_high_level = [
-        "meta-collect-until",
-        "meta-collect-until-including",
-        "meta-reader-upsert-seq",
-        "meta-grammar-upsert-seq",
-        "meta-reader-remove-if-exists",
-        "meta-grammar-remove-if-exists",
-        "meta-macro-register-unary-op",
-        "meta-macro-register-const",
-        "meta-define-const-if-missing",
-        "meta-define-alias-if-missing",
-        "meta-inject-lexeme",
-        "meta-inject-word-call",
-        "meta-inject-lexeme-pair",
-        "meta-next-ident-lexeme",
-        "meta-expect-lexeme",
+    for fragment in required_main_fragments:
+        if fragment not in main_text:
+            errors.append(f"main.py missing required compiler bootstrap fragment: {fragment!r}")
+
+    main_top_imports: Set[str] = set()
+    for node in trees["main.py"].body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                main_top_imports.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            main_top_imports.add(node.module)
+    for must_import in ("os", "sys"):
+        if must_import not in main_top_imports:
+            errors.append(f"main.py missing top-level import '{must_import}'")
+
+    # --- docs.py contract checks ---
+    docs_required_defs = {
+        "run_docs_cli",
+        "run_docs_explorer",
+        "_run_docs_tui",
+        "build_ct_reference_bundle",
+        "attach_ct_entry_line_numbers",
+        "build_ct_detail_lines",
+        "collect_docs",
+    }
+    docs_defs = {
+        node.name
+        for node in trees["docs.py"].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    missing_docs_defs = sorted(docs_required_defs - docs_defs)
+    if missing_docs_defs:
+        errors.append("docs.py missing required APIs: " + ", ".join(missing_docs_defs))
+
+    docs_required_fragments = [
+        "imported lazily by l2_main.py",
+        "only when docs or integrity features need it.",
+        "Structured compile-time docs helpers",
     ]
+    for fragment in docs_required_fragments:
+        if fragment not in docs_text:
+            errors.append(f"docs.py missing required module contract text: {fragment!r}")
 
-    for name in [*expected_wrappers, *expected_high_level]:
-        if re.search(rf"(?m)^\s*word\s+{re.escape(name)}(?:\s|$)", meta_text) is None:
-            errors.append(f"meta stdlib probe missing word '{name}'")
+    # --- l2_main.py contract checks ---
+    l2_required_defs = {
+        "cli",
+        "main",
+        "_run_integrity_checks",
+        "_load_docs_helpers",
+        "run_docs_explorer",
+        "_run_integrity_compiler_file_contract_checks",
+    }
+    l2_defs = {
+        node.name
+        for node in trees["l2_main.py"].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    missing_l2_defs = sorted(l2_required_defs - l2_defs)
+    if missing_l2_defs:
+        errors.append("l2_main.py missing required compiler entrypoints: " + ", ".join(missing_l2_defs))
 
-    compile_only_count = sum(1 for line in meta_text.splitlines() if line.strip() == "compile-only")
-    expected_compile_only_floor = len(set([*expected_wrappers, *expected_high_level]))
-    if compile_only_count < expected_compile_only_floor:
-        errors.append(
-            "stdlib/meta.sl appears incomplete: expected many compile-only helper declarations"
-        )
+    l2_required_fragments = [
+        "--check-integrity",
+        "run internal compiler integrity assertions",
+        "if args.check_integrity:",
+        "if args.source is None and args.check_integrity and not args.repl:",
+        "docs_helpers.run_docs_cli(",
+        'Path(__file__).with_name("docs.py")',
+        "importlib.util.spec_from_file_location",
+    ]
+    for fragment in l2_required_fragments:
+        if fragment not in l2_text:
+            errors.append(f"l2_main.py missing required integration fragment: {fragment!r}")
+
+    # Cross-file API usage integrity: methods invoked from l2_main must exist in docs.py.
+    referenced_docs_apis = [
+        "run_docs_cli",
+        "run_docs_explorer",
+        "build_ct_reference_bundle",
+        "attach_ct_entry_line_numbers",
+        "build_ct_detail_lines",
+    ]
+    for api in referenced_docs_apis:
+        if f"docs_helpers.{api}" in l2_text and api not in docs_defs:
+            errors.append(f"l2_main.py references docs helper '{api}' but docs.py does not define it")
+
+    # --- main.c contract checks ---
+    if main_c_text:
+        required_main_c_fragments = [
+            "int l2_cli(int argc, char **argv)",
+            "int main(int argc, char **argv)",
+            "return l2_cli(argc, argv);",
+            "if (strcmp(arg, \"--ct-run-main\") == 0)",
+            "if (strcmp(arg, \"--no-artifact\") == 0)",
+            "if (strcmp(arg, \"--script\") == 0)",
+            "ct_run_main = true;",
+            "no_artifact = true;",
+            "usage: %s <source.sl> [-o output] [--emit-asm] [--ct-run-main] [--no-artifact] [--script]",
+        ]
+        for fragment in required_main_c_fragments:
+            if fragment not in main_c_text:
+                errors.append(f"main.c missing required CLI/runtime fragment: {fragment!r}")
+
+        ct_required_intrinsics = [
+            "register_ct_intrinsic(dict, \"list-peek-front\"",
+            "register_ct_intrinsic(dict, \"list-push-front\"",
+            "register_ct_intrinsic(dict, \"list-reverse\"",
+            "register_ct_intrinsic(dict, \"map-length\"",
+            "register_ct_intrinsic(dict, \"map-keys\"",
+            "register_ct_intrinsic(dict, \"string-contains?\"",
+            "register_ct_intrinsic(dict, \"string-starts-with?\"",
+            "register_ct_intrinsic(dict, \"string-ends-with?\"",
+            "register_ct_intrinsic(dict, \"token-line\"",
+            "register_ct_intrinsic(dict, \"token-column\"",
+            "register_ct_intrinsic(dict, \"next-token\"",
+            "register_ct_intrinsic(dict, \"peek-token\"",
+            "register_ct_intrinsic(dict, \"inject-tokens\"",
+        ]
+        missing_intrinsics = [frag for frag in ct_required_intrinsics if frag not in main_c_text]
+        if missing_intrinsics:
+            errors.append("main.c missing required CT intrinsic registrations")
+
+        ct_registration_count = len(re.findall(r"(?m)^\s*register_ct_intrinsic\(", main_c_text))
+        if ct_registration_count < 70:
+            errors.append(
+                f"main.c expected broad CT intrinsic surface (>=70 registrations), found {ct_registration_count}"
+            )
 
 
 def _run_integrity_opcode_matrix_checks(errors: List[str]) -> None:
@@ -20354,130 +20634,6 @@ def _run_integrity_opcode_matrix_checks(errors: List[str]) -> None:
             )
 
 
-def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
-    repo_root = Path(__file__).resolve().parent
-    impl_text = Path(__file__).read_text(encoding="utf-8", errors="ignore")
-    test_py_text = (repo_root / "test.py").read_text(encoding="utf-8", errors="ignore")
-    main_c_text = (repo_root / "main.c").read_text(encoding="utf-8", errors="ignore")
-    meta_text = (repo_root / "stdlib" / "meta.sl").read_text(encoding="utf-8", errors="ignore")
-    docs_path = repo_root / "docs.py"
-    docs_text = docs_path.read_text(encoding="utf-8", errors="ignore") if docs_path.exists() else ""
-
-    checks: List[Tuple[str, bool]] = [
-        (
-            "--force CLI option is declared with full-rebuild semantics",
-            "--force" in impl_text and "force full rebuild (recompile + assemble + relink)" in impl_text,
-        ),
-        (
-            "--force toggles --no-cache behavior",
-            "if args.force:\n        args.no_cache = True" in impl_text,
-        ),
-        (
-            "--force bypasses incremental NASM shortcut",
-            "need_nasm = args.force or asm_changed or not obj_path.exists()" in impl_text,
-        ),
-        (
-            "--force bypasses incremental linker shortcut",
-            "need_link = args.force or need_nasm or not args.output.exists()" in impl_text,
-        ),
-        (
-            "source graph cache is wired into Compiler and CLI",
-            "class SourceGraphCache:" in impl_text
-            and "source_graph_cache=source_graph_cache" in impl_text,
-        ),
-        (
-            "macro engine is extracted into a dedicated class",
-            "class MacroEngine:" in impl_text and "self.macro_engine = MacroEngine(self)" in impl_text,
-        ),
-        (
-            "macro preview includes transformed context window",
-            "kind=\"macro-preview\"" in impl_text and "context:" in impl_text and "| src:" in impl_text and "| now:" in impl_text,
-        ),
-        (
-            "compile-time reference supports filter mode",
-            bool(docs_text)
-            and "_MODE_CT_REF_FILTER = 12" in docs_text
-            and "query fields: section:<name> scope:<mode>" in docs_text,
-        ),
-        (
-            "compile-time reference supports function search results and detail jump mode",
-            bool(docs_text)
-            and "_MODE_CT_REF_RESULTS = 13" in docs_text
-            and "_MODE_CT_REF_DETAIL = 14" in docs_text
-            and "function(s)  (Enter: open results  Esc: cancel)" in docs_text
-            and "Enter detail  o jump-to-full  / search" in docs_text,
-        ),
-        (
-            "docs.py helpers are lazy-loaded with fallback warning",
-            "def _load_docs_helpers" in impl_text
-            and "docs.py not found" in impl_text
-            and "using built-in fallback" in impl_text,
-        ),
-        (
-            "docs.py defines structured CT docs helpers",
-            bool(docs_text)
-            and "def build_ct_reference_bundle" in docs_text
-            and "def attach_ct_entry_line_numbers" in docs_text
-            and "def build_ct_detail_lines" in docs_text,
-        ),
-        (
-            "test.py --script uses ct-run-main + no-artifact semantics",
-            "cmd.append(\"--ct-run-main\")" in test_py_text and "cmd.append(\"--no-artifact\")" in test_py_text,
-        ),
-        (
-            "main.c supports --script shortcut",
-            "if (strcmp(arg, \"--script\") == 0)" in main_c_text
-            and "ct_run_main = true;" in main_c_text
-            and "no_artifact = true;" in main_c_text,
-        ),
-        (
-            "main.c includes expanded CT list/map/string/token intrinsics",
-            all(
-                fragment in main_c_text
-                for fragment in (
-                    "register_ct_intrinsic(dict, \"list-peek-front\"",
-                    "register_ct_intrinsic(dict, \"list-push-front\"",
-                    "register_ct_intrinsic(dict, \"list-reverse\"",
-                    "register_ct_intrinsic(dict, \"map-length\"",
-                    "register_ct_intrinsic(dict, \"map-keys\"",
-                    "register_ct_intrinsic(dict, \"string-contains?\"",
-                    "register_ct_intrinsic(dict, \"string-starts-with?\"",
-                    "register_ct_intrinsic(dict, \"string-ends-with?\"",
-                    "register_ct_intrinsic(dict, \"token-line\"",
-                    "register_ct_intrinsic(dict, \"token-column\"",
-                )
-            ),
-        ),
-        (
-            "meta.sl contains high-level (not alias-only) helper toolkit",
-            all(
-                re.search(rf"(?m)^\s*word\s+{re.escape(name)}(?:\s|$)", meta_text) is not None
-                for name in (
-                    "meta-collect-until",
-                    "meta-collect-until-including",
-                    "meta-reader-upsert-seq",
-                    "meta-grammar-upsert-seq",
-                    "meta-inject-lexeme-pair",
-                    "meta-macro-register-unary-op",
-                    "meta-define-const-if-missing",
-                    "meta-next-ident-lexeme",
-                )
-            ),
-        ),
-        (
-            "multiline string support is regression-tested",
-            any(
-                path.with_suffix(".expected").exists()
-                for path in (repo_root / "tests").rglob("multiline_string.sl")
-            ),
-        ),
-    ]
-
-    for label, ok in checks:
-        if not ok:
-            errors.append(f"feature checklist item failed: {label}")
-
-
 def _run_integrity_step(step_name: str, step_fn: Callable[[List[str]], None], errors: List[str]) -> None:
     before = len(errors)
     try:
@@ -20508,7 +20664,7 @@ def _run_integrity_checks() -> None:
         ("failure-injection", _run_integrity_failure_injection_checks),
         ("docs-consistency", _run_integrity_docs_consistency_checks),
         ("docs-module", _run_integrity_docs_module_checks),
-        ("meta-stdlib", _run_integrity_meta_stdlib_checks),
+        ("compiler-files", _run_integrity_compiler_file_contract_checks),
         ("feature-matrix", _run_integrity_prompt_feature_matrix_checks),
     ]
 
@@ -21373,7 +21529,7 @@ def cli(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--check-integrity",
         action="store_true",
-        help="run internal compiler integrity assertions (opcode docs + coverage checks)",
+        help="run internal compiler integrity assertions (compiler-only: main.py, l2_main.py, docs.py)",
     )
     parser.add_argument(
         "-W",

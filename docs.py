@@ -1500,6 +1500,15 @@ def _run_docs_tui(
         "    Create a new token with the given lexeme, using source\n"
         "    location from the template token.\n"
         "\n"
+        "  token-with-lexeme   [*, token | lexeme] -> [* | token]\n"
+        "    Clone token metadata and replace only the lexeme text.\n"
+        "\n"
+        "  token-clone         [* | token] -> [* | token]\n"
+        "    Return a shallow clone of token metadata and lexeme.\n"
+        "\n"
+        "  token-shift-column  [*, token | delta] -> [* | token]\n"
+        "    Clone token with shifted source column/start/end offsets.\n"
+        "\n"
         "  token-line          [* | token] -> [* | line]\n"
         "    Return token source line number.\n"
         "\n"
@@ -1510,6 +1519,11 @@ def _run_docs_tui(
         "    Insert a list of token objects at the current parser\n"
         "    position. The parser will read them before continuing\n"
         "    with the original stream.\n"
+        "\n"
+        "  inject-lexemes      [*, list-of-lexemes | template-token] -> [*]\n"
+        "    Build token objects from lexeme strings (or token values)\n"
+        "    using template source location, then inject them at the\n"
+        "    current parser position.\n"
         "\n"
         "  add-token           [* | str] -> [*]\n"
         "    Register a single-character string as a token separator\n"
@@ -1598,11 +1612,73 @@ def _run_docs_tui(
         "    Adjust/query rewrite priority after registration.\n"
         "\n"
         "  ct-current-token      [*] -> [* | token]\n"
+        "    Return most recently consumed token (or nil before any\n"
+        "    parser consumption in current compile-time flow).\n"
         "\n"
         "  ct-parser-pos         [*] -> [* | n]\n"
+        "    Return absolute parser cursor index within current token\n"
+        "    stream (0-based, inclusive start position).\n"
         "\n"
         "  ct-parser-remaining   [*] -> [* | n]\n"
-        "    Parser introspection helpers for advanced metaprogramming.\n"
+        "    Return remaining token count from current cursor to stream\n"
+        "    end (never negative).\n"
+        "\n"
+        "  ct-parser-eof?        [*] -> [* | flag]\n"
+        "    Push 1 when parser cursor is at/after end-of-stream,\n"
+        "    otherwise 0.\n"
+        "\n"
+        "  ct-parser-peek        [* | n] -> [* | token]\n"
+        "    Non-consuming lookahead by offset n from current cursor.\n"
+        "    n must be >= 0; out-of-range returns nil.\n"
+        "\n"
+        "  ct-parser-set-pos     [* | n] -> [* | old-n]\n"
+        "    Move cursor to absolute position n (0 <= n <= len(tokens)).\n"
+        "    Returns previous cursor; updates ct-current-token coherently.\n"
+        "\n"
+        "  ct-parser-checkpoint  [*] -> [* | checkpoint-map]\n"
+        "    Snapshot parser cursor state for speculative parsing.\n"
+        "    Map includes pos, last_token, and remaining keys.\n"
+        "\n"
+        "  ct-parser-restore     [* | checkpoint] -> [* | flag]\n"
+        "    Restore cursor from checkpoint map or raw integer position.\n"
+        "    Returns 1 on successful restore; validates bounds/types.\n"
+        "\n"
+        "  ct-parser-tail        [*] -> [* | list-of-tokens]\n"
+        "    Return copy of remaining token objects from current cursor.\n"
+        "    Useful for diagnostics and custom parser lookahead.\n"
+        "\n"
+        "  ct-parser-session-begin [*] -> [* | depth]\n"
+        "    Push full parser state snapshot (tokens, pos, last_token)\n"
+        "    onto nested session stack and return new depth.\n"
+        "\n"
+        "  ct-parser-session-commit [*] -> [* | flag]\n"
+        "    Commit top session (discard snapshot) and keep current\n"
+        "    parser state. Returns 1 when session existed, else 0.\n"
+        "\n"
+        "  ct-parser-session-rollback [*] -> [* | flag]\n"
+        "    Restore parser to top session snapshot and pop it.\n"
+        "    Returns 1 when restored, else 0 if no active session.\n"
+        "\n"
+        "  ct-parser-collect-until [* | delimiter] -> [* | tokens found]\n"
+        "    Consume tokens until delimiter lexeme is encountered.\n"
+        "    Delimiter is consumed; output excludes delimiter token.\n"
+        "\n"
+        "  ct-parser-collect-balanced [*, open | close] -> [* | tokens found]\n"
+        "    Consume balanced token region for open/close delimiters.\n"
+        "    Tracks nested open tokens; closing token at depth 0 ends read.\n"
+        "\n"
+        "  ct-parser-mark [* | name] -> [*, prev-pos | had-prev]\n"
+        "    Save current cursor under string mark name. Returns previous\n"
+        "    position and had-prev flag (0 when mark was newly created).\n"
+        "\n"
+        "  ct-parser-diff [*, start | end] -> [* | map]\n"
+        "    Compare two parser positions/marks/checkpoints and return map\n"
+        "    with start,end,delta,forward,count,lexemes fields.\n"
+        "\n"
+        "  ct-parser-expected [* | expected] -> [* | token]\n"
+        "    Validate next token lexeme against expected value(s).\n"
+        "    expected can be string/token or list of strings/tokens;\n"
+        "    raises parse-error on mismatch and returns matched token.\n"
         "\n"
         "  ct-set-macro-expansion-limit [* | n] -> [*]\n"
         "\n"
@@ -2099,6 +2175,19 @@ def _run_docs_tui(
         "\n"
         "  ct-rewrite-compatibility-matrix [* | stage] -> [* | matrix]\n"
         "    Build stage compatibility matrix for rewrite rules/constraints.\n"
+        "\n"
+        "  ct-rewrite-scope-push [*] -> [* | depth]\n"
+        "    Push current rewrite activation snapshot (pipelines, groups,\n"
+        "    scopes) onto CT scope stack.\n"
+        "\n"
+        "  ct-rewrite-scope-pop [*] -> [* | flag]\n"
+        "    Restore top rewrite activation snapshot. Returns 0 when\n"
+        "    scope stack is empty.\n"
+        "\n"
+        "  ct-rewrite-run-on-list [*, stage | tokens] -> [*, tokens | patches]\n"
+        "    Run rewrite engine on explicit token-lexeme list using current\n"
+        "    stage activation/saturation settings, without mutating parser\n"
+        "    token stream.\n"
         "\n"
         "    Template helper introspection: see ct-get-macro-template-mode,\n"
         "    ct-get-macro-template-version, and\n"
@@ -4821,7 +4910,20 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
         target = _target_phrase(word_name, "map-")
         return f"Map operation for {target}; works on string-keyed CT maps used for structured metadata."
 
-    if word_name.startswith("token-") or word_name in {"next-token", "peek-token", "inject-tokens", "add-token", "add-token-chars"}:
+    if (
+        word_name.startswith("token-")
+        or word_name.startswith("ct-parser-")
+        or word_name
+        in {
+            "next-token",
+            "peek-token",
+            "inject-tokens",
+            "inject-lexemes",
+            "add-token",
+            "add-token-chars",
+            "ct-current-token",
+        }
+    ):
         target = _name_phrase(word_name)
         return f"Token-stream helper for {target}; reads, inspects, or injects parser tokens during compile time."
 
@@ -4853,16 +4955,15 @@ def category_for_word(word_name: str) -> str:
         return "Map"
     if word_name.startswith("string-") or word_name in ("int>string", "string>number", "identifier?"):
         return "String"
-    if word_name.startswith("token-") or word_name in (
+    if word_name.startswith("token-") or word_name.startswith("ct-parser-") or word_name in (
         "next-token",
         "peek-token",
         "inject-tokens",
+        "inject-lexemes",
         "add-token",
         "add-token-chars",
         "emit-definition",
         "ct-current-token",
-        "ct-parser-pos",
-        "ct-parser-remaining",
     ):
         return "Token"
     if word_name.startswith("lexer-"):
@@ -4946,6 +5047,26 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-capture-map": "Applies a named transform over capture tokens (upper, lower, strip, int, int-normalize).",
     "ct-capture-filter": "Filters capture tokens by built-in predicates or rewrite-constraint predicate names.",
     "ct-capture-separate": "Flattens capture values into a token list and inserts separator token between variadic groups.",
+    "ct-parser-eof?": "Returns 1 when parser cursor is at or beyond end-of-stream and 0 otherwise, enabling safe loop termination in custom parser macros.",
+    "ct-parser-peek": "Performs non-consuming lookahead by offset from current parser cursor; out-of-range reads return nil instead of raising.",
+    "ct-parser-set-pos": "Repositions parser cursor to an absolute token index, returns previous position, and keeps ct-current-token state consistent.",
+    "ct-parser-checkpoint": "Captures parser cursor snapshot map (pos, last_token, remaining) for speculative parsing and branch rollback.",
+    "ct-parser-restore": "Restores parser cursor from checkpoint map or raw position with bounds/type validation and returns success flag.",
+    "ct-parser-tail": "Returns a copy of remaining token objects from current parser cursor for diagnostics, lookahead, or external analyzers.",
+    "ct-parser-session-begin": "Pushes full parser snapshot (tokens, pos, last_token) onto nested session stack and returns session depth.",
+    "ct-parser-session-commit": "Commits top parser session by discarding snapshot while preserving current parser state; returns 0 when stack is empty.",
+    "ct-parser-session-rollback": "Rolls back parser to top session snapshot and pops it, restoring tokens/cursor atomically for safe speculative parsing.",
+    "ct-parser-collect-until": "Consumes tokens until delimiter lexeme appears, returning collected token list and found flag while consuming delimiter itself.",
+    "ct-parser-collect-balanced": "Consumes nested balanced open/close regions, returning collected tokens and found flag when outer close delimiter is reached.",
+    "ct-parser-mark": "Stores current parser cursor under a named mark and returns previous mark position plus had-previous flag.",
+    "ct-parser-diff": "Builds parser position diff map (start/end/delta/count/lexemes/forward) between marks, checkpoints, or explicit indices.",
+    "ct-parser-expected": "Asserts next token lexeme is in expected set (string/token/list forms), raising detailed parse errors on mismatch.",
+    "token-clone": "Clones token object preserving lexeme and source coordinates, useful when edits require immutable-style token workflows.",
+    "token-with-lexeme": "Clones token metadata but substitutes lexeme text, preserving source anchors while retokenizing generated constructs.",
+    "token-shift-column": "Clones token and shifts column/start/end coordinates by delta, helping synthetic tokens keep stable relative source spans.",
+    "ct-rewrite-scope-push": "Pushes active rewrite pipeline/group/scope activation snapshot so temporary DSL rewrites can be scoped safely.",
+    "ct-rewrite-scope-pop": "Restores rewrite activation snapshot from scope stack, preventing temporary rewrite settings from leaking globally.",
+    "ct-rewrite-run-on-list": "Runs rewrite engine against explicit lexeme list using current stage settings and returns rewritten output plus patch trace.",
 }
 
 
@@ -5075,6 +5196,27 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "map-new": 'map-new "key" 42 map-set',
     "next-token": "next-token token-lexeme",
     "peek-token": "peek-token token-lexeme",
+    "token-with-lexeme": 'peek-token "renamed" token-with-lexeme token-lexeme',
+    "token-clone": "peek-token token-clone token-lexeme",
+    "token-shift-column": "peek-token 2 token-shift-column token-column",
+    "inject-lexemes": 'list-new "tmp_word" list-append ct-current-token inject-lexemes',
+    "ct-parser-eof?": "ct-parser-eof?",
+    "ct-parser-peek": "0 ct-parser-peek token-lexeme",
+    "ct-parser-set-pos": "ct-parser-pos ct-parser-set-pos drop",
+    "ct-parser-checkpoint": "ct-parser-checkpoint map-length",
+    "ct-parser-restore": "ct-parser-checkpoint ct-parser-restore static_assert",
+    "ct-parser-tail": "ct-parser-tail list-length",
+    "ct-parser-session-begin": "ct-parser-session-begin 0 > static_assert",
+    "ct-parser-session-commit": "ct-parser-session-begin drop ct-parser-session-commit static_assert",
+    "ct-parser-session-rollback": "ct-parser-session-begin drop ct-parser-session-rollback static_assert",
+    "ct-parser-collect-until": '"end" ct-parser-collect-until swap drop',
+    "ct-parser-collect-balanced": '"(" ")" ct-parser-collect-balanced swap drop',
+    "ct-parser-mark": '"m0" ct-parser-mark swap drop drop',
+    "ct-parser-diff": '"m0" ct-parser-mark drop drop "m0" ct-parser-pos ct-parser-diff map-length',
+    "ct-parser-expected": 'list-new "word" list-append ct-parser-expected token-lexeme',
+    "ct-rewrite-scope-push": "ct-rewrite-scope-push 0 > static_assert",
+    "ct-rewrite-scope-pop": "ct-rewrite-scope-push drop ct-rewrite-scope-pop static_assert",
+    "ct-rewrite-run-on-list": '"grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop',
 }
 
 

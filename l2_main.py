@@ -4242,6 +4242,9 @@ class Parser:
         self._ct_call_recursion_limit: int = 32
         self._ct_call_timeout_ms: int = 0
         self._ct_call_active: List[str] = []
+        self._ct_parser_sessions: List[Dict[str, Any]] = []
+        self._ct_parser_marks: Dict[str, int] = {}
+        self._ct_rewrite_scope_stack: List[Dict[str, Any]] = []
         self.diagnostics: List[Diagnostic] = []
         self._max_errors: int = 20
         self._warnings_enabled: Set[str] = set()
@@ -6174,6 +6177,9 @@ class Parser:
         self._rewrite_seen_state.clear()
         self.rewrite_loop_reports.clear()
         self._macro_hotness.clear()
+        self._ct_parser_sessions.clear()
+        self._ct_parser_marks.clear()
+        self._ct_rewrite_scope_stack.clear()
         if self._macro_profile_enabled:
             self._macro_profile.clear()
         for _stage_stats in self.rewrite_profile.values():
@@ -15825,6 +15831,175 @@ def _ct_parser_remaining(vm: CompileTimeVM) -> None:
     vm.push(max(0, len(vm.parser.tokens) - vm.parser.pos))
 
 
+def _ct_parser_eof(vm: CompileTimeVM) -> None:
+    vm.push(1 if vm.parser.pos >= len(vm.parser.tokens) else 0)
+
+
+def _ct_parser_peek(vm: CompileTimeVM) -> None:
+    offset = vm.pop_int()
+    if offset < 0:
+        raise ParseError("ct-parser-peek expects non-negative offset")
+    idx = vm.parser.pos + offset
+    if idx >= len(vm.parser.tokens):
+        vm.push(None)
+        return
+    vm.push(vm.parser.tokens[idx])
+
+
+def _ct_parser_set_pos(vm: CompileTimeVM) -> None:
+    pos = vm.pop_int()
+    if pos < 0 or pos > len(vm.parser.tokens):
+        raise ParseError("ct-parser-set-pos expects position within current token stream")
+    old_pos = vm.parser.pos
+    vm.parser.pos = pos
+    vm.parser._last_token = vm.parser.tokens[pos - 1] if pos > 0 else None
+    vm.push(old_pos)
+
+
+def _ct_parser_checkpoint(vm: CompileTimeVM) -> None:
+    vm.push(
+        {
+            "pos": vm.parser.pos,
+            "last_token": vm.parser._last_token,
+            "remaining": max(0, len(vm.parser.tokens) - vm.parser.pos),
+        }
+    )
+
+
+def _ct_parser_restore(vm: CompileTimeVM) -> None:
+    checkpoint = vm._resolve_handle(vm.pop())
+    restore_last_token = False
+    last_token: Optional[Token] = None
+
+    if isinstance(checkpoint, bool):
+        raise ParseError("ct-parser-restore expects checkpoint map or integer position")
+    if isinstance(checkpoint, int):
+        pos = checkpoint
+    elif isinstance(checkpoint, dict):
+        raw_pos = checkpoint.get("pos")
+        if isinstance(raw_pos, bool) or not isinstance(raw_pos, int):
+            raise ParseError("ct-parser-restore checkpoint map requires integer 'pos'")
+        pos = raw_pos
+        if "last_token" in checkpoint:
+            restore_last_token = True
+            raw_last_token = vm._resolve_handle(checkpoint.get("last_token"))
+            if raw_last_token is not None and not isinstance(raw_last_token, Token):
+                raise ParseError("ct-parser-restore checkpoint map 'last_token' must be token or nil")
+            last_token = raw_last_token
+    else:
+        raise ParseError("ct-parser-restore expects checkpoint map or integer position")
+
+    if pos < 0 or pos > len(vm.parser.tokens):
+        raise ParseError("ct-parser-restore position is outside current token stream")
+
+    vm.parser.pos = pos
+    if restore_last_token:
+        vm.parser._last_token = last_token
+    else:
+        vm.parser._last_token = vm.parser.tokens[pos - 1] if pos > 0 else None
+    vm.push(1)
+
+
+def _ct_parser_tail(vm: CompileTimeVM) -> None:
+    vm.push(list(vm.parser.tokens[vm.parser.pos:]))
+
+
+def _ct_parser_session_begin(vm: CompileTimeVM) -> None:
+    parser = vm.parser
+    parser._ct_parser_sessions.append(
+        {
+            "tokens": list(parser.tokens),
+            "pos": int(parser.pos),
+            "last_token": parser._last_token,
+        }
+    )
+    vm.push(len(parser._ct_parser_sessions))
+
+
+def _ct_parser_session_commit(vm: CompileTimeVM) -> None:
+    sessions = vm.parser._ct_parser_sessions
+    if not sessions:
+        vm.push(0)
+        return
+    sessions.pop()
+    vm.push(1)
+
+
+def _ct_parser_session_rollback(vm: CompileTimeVM) -> None:
+    parser = vm.parser
+    sessions = parser._ct_parser_sessions
+    if not sessions:
+        vm.push(0)
+        return
+
+    snapshot = sessions.pop()
+    raw_tokens = snapshot.get("tokens")
+    raw_pos = snapshot.get("pos")
+    raw_last_token = snapshot.get("last_token")
+
+    if not isinstance(raw_tokens, list) or not all(isinstance(item, Token) for item in raw_tokens):
+        raise ParseError("ct-parser-session-rollback encountered invalid token snapshot")
+    if isinstance(raw_pos, bool) or not isinstance(raw_pos, int):
+        raise ParseError("ct-parser-session-rollback encountered invalid parser position snapshot")
+    if raw_last_token is not None and not isinstance(raw_last_token, Token):
+        raise ParseError("ct-parser-session-rollback encountered invalid last_token snapshot")
+    if raw_pos < 0 or raw_pos > len(raw_tokens):
+        raise ParseError("ct-parser-session-rollback snapshot position is out of range")
+
+    parser.tokens = list(raw_tokens)
+    parser.pos = raw_pos
+    parser._last_token = raw_last_token
+    vm.push(1)
+
+
+def _ct_parser_collect_until(vm: CompileTimeVM) -> None:
+    delimiter = vm.pop_str()
+    parser = vm.parser
+    out: List[Token] = []
+    found = 0
+    while parser.pos < len(parser.tokens):
+        token = parser.next_token()
+        parser._last_token = token
+        if token.lexeme == delimiter:
+            found = 1
+            break
+        out.append(token)
+    vm.push(out)
+    vm.push(found)
+
+
+def _ct_parser_collect_balanced(vm: CompileTimeVM) -> None:
+    close_lexeme = vm.pop_str()
+    open_lexeme = vm.pop_str()
+    parser = vm.parser
+    out: List[Token] = []
+    depth = 0
+    found = 0
+
+    while parser.pos < len(parser.tokens):
+        token = parser.next_token()
+        parser._last_token = token
+        lexeme = token.lexeme
+
+        if lexeme == open_lexeme:
+            depth += 1
+            out.append(token)
+            continue
+
+        if lexeme == close_lexeme:
+            if depth == 0:
+                found = 1
+                break
+            depth -= 1
+            out.append(token)
+            continue
+
+        out.append(token)
+
+    vm.push(out)
+    vm.push(found)
+
+
 def _ct_current_token(vm: CompileTimeVM) -> None:
     vm.push(vm.parser._last_token)
 
@@ -15945,6 +16120,249 @@ def _ct_inject_tokens(vm: CompileTimeVM) -> None:
     if not all(isinstance(item, Token) for item in tokens):
         raise ParseError("inject-tokens expects a list of tokens")
     vm.parser.inject_token_objects(tokens)
+
+
+def _ct_inject_lexemes(vm: CompileTimeVM) -> None:
+    template_value = vm._resolve_handle(vm.pop())
+    lexeme_values = vm._resolve_handle(vm.pop())
+    lexemes = _coerce_lexeme_list(lexeme_values, field="inject-lexemes input")
+    template = _default_template(template_value)
+    column = max(1, int(template.column))
+    generated: List[Token] = []
+    for lexeme in lexemes:
+        generated.append(
+            Token(
+                lexeme=lexeme,
+                line=template.line,
+                column=column,
+                start=template.start,
+                end=template.end,
+                expansion_depth=template.expansion_depth,
+            )
+        )
+        column += max(1, len(lexeme))
+    vm.parser.inject_token_objects(generated)
+
+
+def _ct_token_clone(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    if not isinstance(value, Token):
+        raise ParseError("token-clone expects token value")
+    vm.push(
+        Token(
+            lexeme=value.lexeme,
+            line=value.line,
+            column=value.column,
+            start=value.start,
+            end=value.end,
+            expansion_depth=value.expansion_depth,
+        )
+    )
+
+
+def _ct_token_with_lexeme(vm: CompileTimeVM) -> None:
+    lexeme = vm.pop_str()
+    value = vm._resolve_handle(vm.pop())
+    if not isinstance(value, Token):
+        raise ParseError("token-with-lexeme expects token value")
+    vm.push(
+        Token(
+            lexeme=lexeme,
+            line=value.line,
+            column=value.column,
+            start=value.start,
+            end=value.end,
+            expansion_depth=value.expansion_depth,
+        )
+    )
+
+
+def _ct_token_shift_column(vm: CompileTimeVM) -> None:
+    delta = vm.pop_int()
+    value = vm._resolve_handle(vm.pop())
+    if not isinstance(value, Token):
+        raise ParseError("token-shift-column expects token value")
+
+    shifted_column = max(1, int(value.column) + int(delta))
+    shifted_start = max(0, int(value.start) + int(delta))
+    shifted_end = max(shifted_start, int(value.end) + int(delta))
+    vm.push(
+        Token(
+            lexeme=value.lexeme,
+            line=value.line,
+            column=shifted_column,
+            start=shifted_start,
+            end=shifted_end,
+            expansion_depth=value.expansion_depth,
+        )
+    )
+
+
+def _coerce_parser_position(vm: CompileTimeVM, value: Any, *, field: str) -> int:
+    parser = vm.parser
+    resolved = vm._resolve_handle(value)
+
+    if isinstance(resolved, bool):
+        raise ParseError(f"{field} expects integer position, mark name, or checkpoint map")
+    if isinstance(resolved, int):
+        pos = int(resolved)
+    elif isinstance(resolved, str):
+        if resolved not in parser._ct_parser_marks:
+            raise ParseError(f"{field} references unknown parser mark '{resolved}'")
+        pos = int(parser._ct_parser_marks[resolved])
+    elif isinstance(resolved, dict):
+        raw_pos = resolved.get("pos")
+        if isinstance(raw_pos, bool) or not isinstance(raw_pos, int):
+            raise ParseError(f"{field} checkpoint map requires integer 'pos'")
+        pos = int(raw_pos)
+    else:
+        raise ParseError(f"{field} expects integer position, mark name, or checkpoint map")
+
+    if pos < 0 or pos > len(parser.tokens):
+        raise ParseError(f"{field} resolved position is outside current token stream")
+    return pos
+
+
+def _ct_parser_mark(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    marks = vm.parser._ct_parser_marks
+    previous = marks.get(name)
+    marks[name] = int(vm.parser.pos)
+    if previous is None:
+        vm.push(-1)
+        vm.push(0)
+        return
+    vm.push(int(previous))
+    vm.push(1)
+
+
+def _ct_parser_diff(vm: CompileTimeVM) -> None:
+    end_ref = vm.pop()
+    start_ref = vm.pop()
+    start = _coerce_parser_position(vm, start_ref, field="ct-parser-diff start")
+    end = _coerce_parser_position(vm, end_ref, field="ct-parser-diff end")
+
+    lo = min(start, end)
+    hi = max(start, end)
+    segment = vm.parser.tokens[lo:hi]
+    vm.push(
+        {
+            "start": start,
+            "end": end,
+            "delta": end - start,
+            "forward": 1 if end >= start else 0,
+            "count": len(segment),
+            "lexemes": [tok.lexeme for tok in segment],
+        }
+    )
+
+
+def _ct_parser_expected(vm: CompileTimeVM) -> None:
+    expected_raw = vm._resolve_handle(vm.pop())
+    expected_lexemes: List[str] = []
+
+    if isinstance(expected_raw, Token):
+        expected_lexemes = [expected_raw.lexeme]
+    elif isinstance(expected_raw, str):
+        expected_lexemes = [expected_raw]
+    elif isinstance(expected_raw, list):
+        for item in expected_raw:
+            resolved = vm._resolve_handle(item)
+            if isinstance(resolved, Token):
+                expected_lexemes.append(resolved.lexeme)
+            elif isinstance(resolved, str):
+                expected_lexemes.append(resolved)
+            else:
+                raise ParseError("ct-parser-expected list items must be tokens or strings")
+    else:
+        raise ParseError("ct-parser-expected expects string/token or list of string/token values")
+
+    if not expected_lexemes:
+        raise ParseError("ct-parser-expected requires at least one expected lexeme")
+
+    token = vm.parser.peek_token()
+    if token is None:
+        expected_blob = ", ".join(repr(item) for item in expected_lexemes)
+        raise ParseError(f"ct-parser-expected failed: expected one of {expected_blob}, got EOF")
+    if token.lexeme not in expected_lexemes:
+        expected_blob = ", ".join(repr(item) for item in expected_lexemes)
+        raise ParseError(
+            f"ct-parser-expected failed: expected one of {expected_blob}, got {token.lexeme!r} at {token.line}:{token.column}"
+        )
+    vm.push(token)
+
+
+def _ct_rewrite_scope_push(vm: CompileTimeVM) -> None:
+    parser = vm.parser
+    parser._ct_rewrite_scope_stack.append(
+        {
+            "active_rewrite_pipelines": {
+                "reader": set(parser._active_rewrite_pipelines.get("reader", {"default"})),
+                "grammar": set(parser._active_rewrite_pipelines.get("grammar", {"default"})),
+            },
+            "active_pattern_groups": set(parser._active_pattern_groups),
+            "active_pattern_scopes": set(parser._active_pattern_scopes),
+        }
+    )
+    vm.push(len(parser._ct_rewrite_scope_stack))
+
+
+def _ct_rewrite_scope_pop(vm: CompileTimeVM) -> None:
+    parser = vm.parser
+    stack = parser._ct_rewrite_scope_stack
+    if not stack:
+        vm.push(0)
+        return
+
+    snapshot = stack.pop()
+    pipelines_raw = snapshot.get("active_rewrite_pipelines")
+    if not isinstance(pipelines_raw, dict):
+        raise ParseError("ct-rewrite-scope-pop encountered invalid pipeline snapshot")
+
+    for stage in ("reader", "grammar"):
+        raw_values = pipelines_raw.get(stage, {"default"})
+        if isinstance(raw_values, (set, list, tuple)):
+            restored_values = {str(item) for item in raw_values}
+        else:
+            restored_values = {"default"}
+        if not restored_values:
+            restored_values = {"default"}
+        parser._active_rewrite_pipelines[stage] = restored_values
+
+    groups_raw = snapshot.get("active_pattern_groups", {"default"})
+    if isinstance(groups_raw, (set, list, tuple)):
+        groups = {str(item) for item in groups_raw}
+    else:
+        groups = {"default"}
+    if not groups:
+        groups = {"default"}
+
+    scopes_raw = snapshot.get("active_pattern_scopes", {"global"})
+    if isinstance(scopes_raw, (set, list, tuple)):
+        scopes = {str(item) for item in scopes_raw}
+    else:
+        scopes = {"global"}
+    if not scopes:
+        scopes = {"global"}
+
+    parser._active_pattern_groups = groups
+    parser._active_pattern_scopes = scopes
+    vm.push(1)
+
+
+def _ct_rewrite_run_on_list(vm: CompileTimeVM) -> None:
+    lexeme_values = vm._resolve_handle(vm.pop())
+    stage = _coerce_rewrite_stage(vm.pop(), field="rewrite run stage")
+    lexemes = _coerce_lexeme_list(lexeme_values, field="rewrite run token list")
+    max_steps = max(1, int(vm.parser.rewrite_max_steps))
+    result, patches = _simulate_rewrite_dry_run(
+        vm.parser,
+        stage=stage,
+        lexemes=lexemes,
+        max_steps=max_steps,
+    )
+    vm.push(result)
+    vm.push(patches)
 
 
 def _coerce_lexeme_list(value: Any, *, field: str) -> List[str]:
@@ -16490,6 +16908,9 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
 
     register("token-lexeme", _ct_token_lexeme, compile_only=True)
     register("token-from-lexeme", _ct_token_from_lexeme, compile_only=True)
+    register("token-with-lexeme", _ct_token_with_lexeme, compile_only=True)
+    register("token-clone", _ct_token_clone, compile_only=True)
+    register("token-shift-column", _ct_token_shift_column, compile_only=True)
     register("token-line", _ct_token_line, compile_only=True)
     register("token-column", _ct_token_column, compile_only=True)
     register("next-token", _ct_next_token, compile_only=True)
@@ -16497,7 +16918,22 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-current-token", _ct_current_token, compile_only=True)
     register("ct-parser-pos", _ct_parser_pos, compile_only=True)
     register("ct-parser-remaining", _ct_parser_remaining, compile_only=True)
+    register("ct-parser-eof?", _ct_parser_eof, compile_only=True)
+    register("ct-parser-peek", _ct_parser_peek, compile_only=True)
+    register("ct-parser-set-pos", _ct_parser_set_pos, compile_only=True)
+    register("ct-parser-checkpoint", _ct_parser_checkpoint, compile_only=True)
+    register("ct-parser-restore", _ct_parser_restore, compile_only=True)
+    register("ct-parser-tail", _ct_parser_tail, compile_only=True)
+    register("ct-parser-session-begin", _ct_parser_session_begin, compile_only=True)
+    register("ct-parser-session-commit", _ct_parser_session_commit, compile_only=True)
+    register("ct-parser-session-rollback", _ct_parser_session_rollback, compile_only=True)
+    register("ct-parser-collect-until", _ct_parser_collect_until, compile_only=True)
+    register("ct-parser-collect-balanced", _ct_parser_collect_balanced, compile_only=True)
+    register("ct-parser-mark", _ct_parser_mark, compile_only=True)
+    register("ct-parser-diff", _ct_parser_diff, compile_only=True)
+    register("ct-parser-expected", _ct_parser_expected, compile_only=True)
     register("inject-tokens", _ct_inject_tokens, compile_only=True)
+    register("inject-lexemes", _ct_inject_lexemes, compile_only=True)
     register("add-token", _ct_add_token, compile_only=True)
     register("add-token-chars", _ct_add_token_chars, compile_only=True)
     register("ct-add-reader-rewrite", _ct_add_reader_rewrite, compile_only=True)
@@ -16663,6 +17099,9 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-get-rewrite-profile", _ct_get_rewrite_profile, compile_only=True)
     register("ct-clear-rewrite-profile", _ct_clear_rewrite_profile, compile_only=True)
     register("ct-rewrite-compatibility-matrix", _ct_rewrite_compatibility_matrix, compile_only=True)
+    register("ct-rewrite-scope-push", _ct_rewrite_scope_push, compile_only=True)
+    register("ct-rewrite-scope-pop", _ct_rewrite_scope_pop, compile_only=True)
+    register("ct-rewrite-run-on-list", _ct_rewrite_run_on_list, compile_only=True)
     register("ct-unregister-word", _ct_unregister_word, compile_only=True)
     register("ct-list-words", _ct_list_words, compile_only=True)
     register("ct-word-exists?", _ct_word_exists, compile_only=True)

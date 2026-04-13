@@ -31,6 +31,8 @@ DEFAULT_EXTRA_TESTS = [
     "extra_tests/fn_test.sl",
     "extra_tests/nob_test.sl",
     "extra_tests/termios_test.sl",
+    "extra_tests/ct_parser_controls_test.sl",
+    "extra_tests/fn_dsl_test.sl",
 ]
 
 COLORS = {

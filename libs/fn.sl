@@ -33,9 +33,27 @@ compile-only
 
 #extend-syntax [*] -> [*]
 word extend-syntax
-	"call-syntax-rewrite" set-token-hook
+	fn-dsl-lang-ensure
+	fn-dsl-lang-name "call-syntax-rewrite" ct-lang-set-token-hook drop
 end
 immediate
+compile-only
+
+
+word fn-dsl-lang-name
+	"fn.dsl"
+end
+compile-only
+
+word fn-dsl-lang-ensure
+	fn-dsl-lang-name ct-lang-create drop
+	fn-dsl-lang-name ct-lang-activate drop
+end
+compile-only
+
+word fn-dsl-lang-status
+	fn-dsl-lang-name ct-lang-status
+end
 compile-only
 
 
@@ -266,6 +284,664 @@ end
 compile-only
 
 
+word fn-build-param-type-map       # params -- typeMap
+	map-new                         # params typeMap
+	0                               # params typeMap idx
+	begin
+		2 pick list-length            # params typeMap idx len
+		over swap >= if               # params typeMap idx flag
+			drop                        # params typeMap
+			swap drop                   # typeMap
+			exit
+		end                          # params typeMap idx
+		2 pick over list-get          # params typeMap idx name
+		"number"                      # params typeMap idx name type
+		rot >r                        # params typeMap name type   (r: idx)
+		map-set                       # params typeMap'
+		r> 1 +                        # params typeMap' idx'
+		continue
+	again
+end
+compile-only
+
+
+word fn-map-increment-values       # map -- map
+	dup map-clone                   # map original clone
+	over map-keys                   # map original clone keys
+begin
+	dup list-empty? if
+		drop
+		swap drop
+		exit
+	end
+	dup list-pop-front              # map original clone keys keys' key
+	rot drop                        # map original clone keys' key
+	dup                             # map original clone keys' key key
+	4 pick swap map-get             # map original clone keys' key original value ok
+	rot drop                        # map original clone keys' key value ok
+	0 == if "internal fn variable map corruption" parse-error end
+	1 +                             # map original clone keys' key value+1
+	3 pick                          # map original clone keys' key value+1 clone
+	rot                             # map original clone keys' value+1 clone key
+	rot                             # map original clone keys' clone key value+1
+	map-set                         # map original clone keys' clone'
+	rot                             # map original keys' clone' clone
+	drop                            # map original keys' clone'
+	swap                            # map original clone' keys'
+	continue
+again
+end
+compile-only
+
+
+word fn-vars-push-binding          # vars name -- vars'
+	swap
+	fn-map-increment-values
+	swap
+	0 map-set
+end
+compile-only
+
+
+word fn-list-copy                  # list -- copy
+	list-new swap list-extend
+end
+compile-only
+
+
+word fn-call-close-index           # expr -- closeIdx found
+	2 0                               # expr idx depth
+begin
+	2 pick list-length               # expr idx depth len
+	2 pick over >= if                # expr idx depth len flag
+		drop
+		drop
+		drop
+		drop
+		-1 0 exit
+	end
+	drop                             # expr idx depth
+
+	>r                               # expr idx            (r: depth)
+	over over list-get               # expr idx tok
+	r>                               # expr idx tok depth
+	swap                             # expr idx depth tok
+	dup "(" string= if
+		drop
+		1 +                            # expr idx depth+1
+		swap 1 + swap                  # expr idx+1 depth+1
+		continue
+	end
+
+	dup ")" string= if
+		drop
+		dup 0 == if
+			drop
+			swap drop
+			1 exit
+		end
+		1 -                            # expr idx depth-1
+		swap 1 + swap                  # expr idx+1 depth-1
+		continue
+	end
+
+	drop
+	swap 1 + swap                    # expr idx+1 depth
+again
+end
+compile-only
+
+
+word fn-call-syntax-expr?          # expr -- flag
+	dup list-length 3 < if drop 0 exit end
+	dup 0 list-get identifier? 0 == if drop 0 exit end
+	dup 1 list-get "(" string= 0 == if drop 0 exit end
+
+	dup fn-call-close-index
+	if
+		over list-length swap 1 + ==
+		swap drop
+		exit
+	end
+
+	drop
+	drop
+	0
+end
+compile-only
+
+
+word fn-call-args-split            # inner -- args
+	list-new swap list-new swap 0 swap   # args cur depth inner
+begin
+	dup list-empty? if
+		drop
+		drop
+		dup list-empty? if
+			drop
+		else
+			over swap list-append
+			swap drop
+		end
+		exit
+	end
+
+	list-pop-front                    # args cur depth inner' tok
+	swap >r                           # args cur depth tok   (r: inner')
+
+	dup "(" string= if
+		swap >r                          # args cur tok         (r: depth inner')
+		list-append                      # args cur'
+		r> 1 +                           # args cur' depth+1
+		r>
+		continue
+	end
+
+	dup ")" string= if
+		swap                             # args cur tok depth
+		dup 0 > if
+			1 - >r                         # args cur tok         (r: depth-1 inner')
+			list-append                    # args cur'
+			r>
+			r>
+			continue
+		end
+		drop                             # args cur tok
+		list-append                      # args cur'
+		0                                # args cur' depth
+		r>
+		continue
+	end
+
+	dup "," string= if
+		swap                             # args cur tok depth
+		dup 0 == if
+			drop                            # args cur tok
+			drop                            # args cur
+			over swap list-append           # args'
+			list-new                        # args' cur'
+			0                               # args' cur' depth
+			r>
+			continue
+		end
+		>r                               # args cur tok         (r: depth inner')
+		list-append                      # args cur'
+		r>
+		r>
+		continue
+	end
+
+	swap                               # args cur tok depth
+	>r                                 # args cur tok         (r: depth inner')
+	list-append                        # args cur'
+	r>
+	r>
+	continue
+again
+end
+compile-only
+
+
+word fn-rewrite-call-expr          # expr -- expr postfix_flag
+	dup list-length 3 < if 0 exit end
+	dup 0 list-get identifier? 0 == if 0 exit end
+	dup 1 list-get "(" string= 0 == if 0 exit end
+	dup "," list-contains? if 0 exit end
+	dup "+" list-contains? if 0 exit end
+	dup "-" list-contains? if 0 exit end
+	dup "*" list-contains? if 0 exit end
+	dup "/" list-contains? if 0 exit end
+	dup "%" list-contains? if 0 exit end
+	shunt
+	list-reverse
+	1
+end
+compile-only
+
+
+word fn-list-drop-front-n          # list n -- list
+	>r                                # list      (r: n)
+begin
+	r> dup 0 > if                     # list n
+		1 - >r                          # list      (r: n-1)
+		dup list-empty? if "invalid fn statement shape" parse-error end
+		list-pop-front drop             # list'
+		continue
+	end
+	drop                              # list
+	exit
+again
+end
+compile-only
+
+
+word fn-stmt-expr-from             # stmt n -- expr
+	swap
+	fn-list-copy
+	swap
+	fn-list-drop-front-n
+end
+compile-only
+
+
+word fn-valid-type?
+	dup "int" string= if drop 1 exit end
+	dup "number" string= if drop 1 exit end
+	dup "float" string= if drop 1 exit end
+	drop 0
+end
+compile-only
+
+
+word fn-stmt-decl?
+	dup list-length 5 < if drop 0 exit end
+	dup 0 list-get "let" string= 0 == if drop 0 exit end
+	dup 1 list-get identifier? 0 == if drop 0 exit end
+	dup 2 list-get identifier? 0 == if drop 0 exit end
+	dup 3 list-get "=" string= 0 == if drop 0 exit end
+	drop 1
+end
+compile-only
+
+
+word fn-stmt-assign?
+	dup list-length 3 < if drop 0 exit end
+	dup 0 list-get identifier? 0 == if drop 0 exit end
+	dup 1 list-get "=" string= 0 == if drop 0 exit end
+	drop 1
+end
+compile-only
+
+
+word fn-expr-has-operator?         # expr -- flag
+	fn-list-copy
+	begin
+		dup list-empty? if
+			drop
+			0 exit
+		end
+		list-pop-front                # expr' tok
+		swap >r                       # tok      (r: expr')
+		fn-operator? if
+			rdrop
+			1 exit
+		end
+		r>
+		continue
+	again
+end
+compile-only
+
+
+word fn-token-type                 # typeMap tok -- type
+	dup string>number
+	if
+		drop
+		drop
+		drop
+		"int" exit
+	end
+	drop
+	map-get
+	if
+		swap drop
+		exit
+	end
+	drop
+	drop
+	"number"
+end
+compile-only
+
+
+word fn-expr-type                  # expr typeMap -- type
+	>r                                # expr          (r: typeMap)
+	dup fn-expr-has-operator? if
+		drop
+		r> drop
+		"number" exit
+	end
+	dup list-length 1 == if
+		dup 0 list-get                  # expr tok
+		r>                              # expr tok typeMap
+		swap                            # expr typeMap tok
+		fn-token-type                   # expr type
+		swap drop
+		exit
+	end
+	drop
+	r> drop
+	"number"
+end
+compile-only
+
+
+word fn-type-compatible?           # targetType exprType -- flag
+	2dup string= if
+		drop
+		drop
+		1 exit
+	end
+	swap
+	dup "number" string= if
+		drop
+		"int" string=
+		exit
+	end
+	drop
+	drop
+	0
+end
+compile-only
+
+
+word fn-parse-let-stmt             # stmt -- type name expr
+	dup fn-stmt-decl? 0 == if "invalid let statement in fn body" parse-error end
+	dup 1 list-get
+	over 2 list-get
+	rot 4 fn-stmt-expr-from
+end
+compile-only
+
+
+word fn-parse-assign-stmt          # stmt -- name expr
+	dup fn-stmt-assign? 0 == if "invalid assignment statement in fn body" parse-error end
+	dup 0 list-get
+	swap 2 fn-stmt-expr-from
+end
+compile-only
+
+
+word fn-split-statements           # bodyLexemes -- statements
+	list-new swap list-new swap      # statements cur body
+begin
+	dup list-empty? if
+		drop                          # statements cur
+		dup list-length 0 > if
+			over swap list-append
+			swap drop
+		else
+			drop
+		end
+		dup list-empty? if "empty function body" parse-error end
+		exit
+	end
+
+	list-pop-front                   # statements cur body' tok
+	swap >r                          # statements cur tok   (r: body')
+
+	dup "return" string= if
+		drop
+		r>
+		continue
+	end
+
+	dup ";" string= if
+		drop
+		dup list-length 0 == if
+			r>
+			continue
+		end
+		over swap list-append
+		swap drop
+		list-new
+		r>
+		continue
+	end
+
+	list-append                      # statements cur'
+	r>
+	continue
+again
+end
+compile-only
+
+
+word fn-out-append-repeat          # out count lexeme -- out
+	>r                                # out count   (r: lexeme)
+begin
+	dup 0 > if
+		1 -
+		swap r@ list-append swap
+		continue
+	end
+	drop
+	rdrop
+	exit
+again
+end
+compile-only
+
+
+word fn-ctx-get                    # ctx key -- value
+	map-get
+	if
+		swap drop
+		exit
+	end
+	drop
+	drop
+	"internal fn compiler context key is missing" parse-error
+end
+compile-only
+
+
+word fn-ctx-set                    # ctx key value -- ctx
+	map-set
+end
+compile-only
+
+
+word fn-ctx-set-out                # ctx out -- ctx
+	swap "out" rot fn-ctx-set
+end
+compile-only
+
+
+word fn-ctx-set-vars               # ctx vars -- ctx
+	swap "vars" rot fn-ctx-set
+end
+compile-only
+
+
+word fn-ctx-set-types              # ctx types -- ctx
+	swap "types" rot fn-ctx-set
+end
+compile-only
+
+
+word fn-ctx-set-locals             # ctx n -- ctx
+	swap "locals" rot fn-ctx-set
+end
+compile-only
+
+
+word fn-ctx-set-params-count       # ctx n -- ctx
+	swap "params_count" rot fn-ctx-set
+end
+compile-only
+
+
+word fn-ctx-set-out-vars           # ctx out vars -- ctx
+	>r                                # ctx out      (r: vars)
+	fn-ctx-set-out                    # ctx'
+	r>
+	fn-ctx-set-vars
+end
+compile-only
+
+
+word fn-ctx-inc-locals             # ctx -- ctx
+	dup "locals" fn-ctx-get
+	1 +
+	fn-ctx-set-locals
+end
+compile-only
+
+
+word fn-ctx-out-vars               # ctx -- ctx out vars
+	dup "out" fn-ctx-get
+	over "vars" fn-ctx-get
+end
+compile-only
+
+
+word fn-append-expression          # out vars expr -- out vars
+	fn-rewrite-call-expr
+	if
+	else
+		shunt
+	end
+	rot
+	swap
+	fn-translate-postfix-loop
+	swap
+end
+compile-only
+
+
+word fn-compile-expr-stmt          # ctx stmt isLast -- ctx
+	>r                                # ctx stmt    (r: isLast)
+	dup list-empty? if "empty function statement in fn body" parse-error end
+	over fn-ctx-out-vars              # ctx stmt ctx out vars
+	3 pick                            # ctx stmt ctx out vars stmt
+	fn-append-expression              # ctx stmt ctx out' vars'
+	fn-ctx-set-out-vars               # ctx stmt ctx'
+	swap drop
+	swap drop                         # ctx'
+
+	r> if
+		exit
+	end
+
+	dup "out" fn-ctx-get
+	"drop" list-append
+	fn-ctx-set-out
+end
+compile-only
+
+
+word fn-compile-let-stmt           # ctx stmt isLast -- ctx
+	if "invalid trailing function statement in fn body" parse-error end
+	fn-parse-let-stmt                 # ctx type name expr
+
+	dup list-empty? if "missing initializer expression in let statement" parse-error end
+	2 pick fn-valid-type? 0 == if "unsupported fn variable type in let statement" parse-error end
+
+	3 pick "types" fn-ctx-get
+	2 pick map-get if "duplicate variable in let statement" parse-error end
+	drop
+	drop
+
+	dup 4 pick "types" fn-ctx-get fn-expr-type   # ctx type name expr exprType
+	3 pick swap fn-type-compatible? 0 == if "fn type error: incompatible let initializer" parse-error end
+
+	swap >r swap >r                  # ctx expr      (r: type name)
+
+	over fn-ctx-out-vars              # ctx expr ctx out vars
+	3 pick                            # ctx expr ctx out vars expr
+	fn-append-expression              # ctx expr ctx out' vars'
+	fn-ctx-set-out-vars               # ctx expr ctx'
+	swap drop
+	swap drop                         # ctx'
+
+	dup "out" fn-ctx-get
+	">r" list-append
+	fn-ctx-set-out                    # ctx'
+
+	r> r>                             # ctx' type name
+
+	2 pick "vars" fn-ctx-get          # ctx' type name vars
+	1 pick fn-vars-push-binding       # ctx' type name vars'
+	swap >r                           # ctx' type vars'   (r: name)
+	swap >r                           # ctx' vars'        (r: type name)
+	fn-ctx-set-vars                   # ctx''
+	r> r>                             # ctx'' type name
+
+	2 pick "types" fn-ctx-get         # ctx'' type name types
+	swap
+	rot                               # ctx'' types name type
+	map-set                           # ctx'' types'
+	fn-ctx-set-types
+
+	fn-ctx-inc-locals
+end
+compile-only
+
+
+word fn-compile-assign-stmt        # ctx stmt isLast -- ctx
+	if "invalid trailing function statement in fn body" parse-error end
+	fn-parse-assign-stmt              # ctx name expr
+
+	dup list-empty? if "missing expression in assignment statement" parse-error end
+
+	2 pick "types" fn-ctx-get
+	2 pick map-get
+	0 == if "assignment to undeclared variable in fn body" parse-error end
+	swap drop
+
+	1 pick 4 pick "types" fn-ctx-get fn-expr-type   # ctx name expr targetType exprType
+	1 pick swap fn-type-compatible? 0 == if "fn type error: incompatible assignment expression" parse-error end
+	drop
+
+	swap >r                           # ctx expr      (r: name)
+
+	over fn-ctx-out-vars              # ctx expr ctx out vars
+	3 pick                            # ctx expr ctx out vars expr
+	fn-append-expression              # ctx expr ctx out' vars'
+	fn-ctx-set-out-vars               # ctx expr ctx'
+	swap drop
+	swap drop                         # ctx'
+
+	dup "out" fn-ctx-get
+	">r" list-append
+	fn-ctx-set-out                    # ctx'
+
+	r>                                # ctx' name
+	over "vars" fn-ctx-get
+	swap fn-vars-push-binding         # ctx' vars'
+	fn-ctx-set-vars
+
+	fn-ctx-inc-locals
+end
+compile-only
+
+
+word fn-compile-statement          # ctx stmt isLast -- ctx
+	1 pick fn-stmt-decl? if
+		fn-compile-let-stmt
+		exit
+	end
+	1 pick fn-stmt-assign? if
+		fn-compile-assign-stmt
+		exit
+	end
+	fn-compile-expr-stmt
+end
+compile-only
+
+
+word fn-compile-statements         # ctx statements -- ctx
+begin
+	dup list-empty? if
+		drop
+		exit
+	end
+	list-pop-front                    # ctx statements' stmt
+	swap >r                           # ctx stmt    (r: statements')
+	0 rpick list-empty? if
+		1
+	else
+		0
+	end
+	fn-compile-statement              # ctx'
+	r>
+	continue
+again
+end
+compile-only
+
+
 word fn-translate-token            # out map tok -- out map
 	# number?
 	dup string>number              # out map tok num ok
@@ -348,8 +1024,38 @@ word fn-translate-postfix          # postfix params -- out
 end
 compile-only
 
-word fn-build-body
-	fn-translate-postfix   # words
+word fn-build-body                # bodyLexemes params -- body
+	swap >r                         # params        (r: bodyLexemes)
+
+	list-new
+	fn-emit-prologue                # params out
+
+	over fn-build-param-map         # params out params vars
+	swap drop                       # params out vars
+	2 pick fn-build-param-type-map  # params out vars types
+	3 pick list-length              # params out vars types paramsCount
+
+	>r >r >r >r                    # params         (r: paramsCount types vars out bodyLexemes)
+
+	map-new                         # params ctx
+	r> fn-ctx-set-out               # params ctx
+	r> fn-ctx-set-vars              # params ctx
+	r> fn-ctx-set-types             # params ctx
+	0 fn-ctx-set-locals             # params ctx
+	r> fn-ctx-set-params-count      # params ctx
+
+	swap drop                       # ctx
+	r>                              # ctx bodyLexemes
+	fn-split-statements             # ctx statements
+	fn-compile-statements           # ctx
+
+	dup "params_count" fn-ctx-get
+	over "locals" fn-ctx-get
+	+                               # ctx totalDropCount
+	over "out" fn-ctx-get          # ctx totalDropCount out
+	swap                            # ctx out totalDropCount
+	"rdrop" fn-out-append-repeat    # ctx out'
+	swap drop                       # out'
 end
 compile-only
 
@@ -366,8 +1072,7 @@ word fn
 	fn-collect-body                   # params bodyTokens
 	swap >r                           # bodyTokens (r: params)
 	fn-lexemes-from-tokens            # lexemes
-	fn-body->tokens                   # tokens
-	r>                                # postfix params
+	r>                                # bodyLexemes params
 	fn-build-body                     # body
 	r> drop                           # drop name string
 	r>                                # name token
@@ -1159,6 +1864,7 @@ end
 compile-only
 
 word fn-dsl-enable
+	fn-dsl-lang-ensure
 	fn-dsl-register-macros
 	fn-dsl-install-rewrites
 	fn-dsl-install-operators
@@ -1175,6 +1881,7 @@ compile-only
 
 word fn-dsl-disable
 	"grammar" "fn.dsl" 0 ct-set-rewrite-pipeline-active
+	fn-dsl-lang-name ct-lang-deactivate drop
 end
 immediate
 compile-only

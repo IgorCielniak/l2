@@ -4989,6 +4989,8 @@ def category_for_word(word_name: str) -> str:
         or word_name.startswith("ct-ctrand-")
     ):
         return "CT-Call"
+    if word_name.startswith("ct-lang-"):
+        return "Language"
     if (
         word_name.startswith("ct-set-pattern-")
         or word_name.startswith("ct-get-pattern-")
@@ -5067,6 +5069,27 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-rewrite-scope-push": "Pushes active rewrite pipeline/group/scope activation snapshot so temporary DSL rewrites can be scoped safely.",
     "ct-rewrite-scope-pop": "Restores rewrite activation snapshot from scope stack, preventing temporary rewrite settings from leaking globally.",
     "ct-rewrite-run-on-list": "Runs rewrite engine against explicit lexeme list using current stage settings and returns rewritten output plus patch trace.",
+    "ct-lang-create": "Creates or updates a named language-extension pack record and returns whether it was newly created.",
+    "ct-lang-exists?": "Returns 1 when a named language-extension pack exists.",
+    "ct-lang-list": "Returns sorted list of registered language-extension pack names.",
+    "ct-lang-activate": "Activates a named language-extension pack.",
+    "ct-lang-deactivate": "Deactivates a named language-extension pack.",
+    "ct-lang-active?": "Returns 1 when a named language-extension pack is active.",
+    "ct-lang-active-list": "Returns sorted list of currently active language-extension pack names.",
+    "ct-lang-meta-set": "Stores metadata map for a language-extension pack; nil clears metadata.",
+    "ct-lang-meta-get": "Returns metadata map and found flag for a language-extension pack.",
+    "ct-lang-set-auto-validate": "Enables or disables automatic validator runs for a language-extension pack.",
+    "ct-lang-get-auto-validate": "Returns auto-validate flag and found flag for a language-extension pack.",
+    "ct-lang-add-validator": "Registers a validator word name on a language-extension pack and returns validator count.",
+    "ct-lang-run-validators": "Runs validators for one language-extension pack and returns executed count.",
+    "ct-lang-run-active-validators": "Runs validators across active language-extension packs and returns total executed count.",
+    "ct-lang-set-token-hook": "Sets or clears token hook ownership for a language-extension pack.",
+    "ct-lang-add-reader-rewrite-named": "Registers a named reader-stage rewrite under a language-extension pack.",
+    "ct-lang-add-grammar-rewrite-named": "Registers a named grammar-stage rewrite under a language-extension pack.",
+    "ct-lang-register-text-macro-signature": "Registers a text macro signature and tracks ownership in a language-extension pack.",
+    "ct-lang-register-pattern-macro": "Registers a pattern macro and tracks ownership in a language-extension pack.",
+    "ct-lang-status": "Returns status map for a language-extension pack (active state, resources, counts, metadata).",
+    "ct-lang-remove": "Removes a language-extension pack and cleans owned rewrites/macros/hooks.",
 }
 
 
@@ -5217,6 +5240,27 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "ct-rewrite-scope-push": "ct-rewrite-scope-push 0 > static_assert",
     "ct-rewrite-scope-pop": "ct-rewrite-scope-push drop ct-rewrite-scope-pop static_assert",
     "ct-rewrite-run-on-list": '"grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop',
+    "ct-lang-create": '"fn.dsl" ct-lang-create drop',
+    "ct-lang-exists?": '"fn.dsl" ct-lang-exists? static_assert',
+    "ct-lang-list": "ct-lang-list list-length 0 >= static_assert",
+    "ct-lang-activate": '"fn.dsl" ct-lang-activate static_assert',
+    "ct-lang-deactivate": '"fn.dsl" ct-lang-deactivate static_assert',
+    "ct-lang-active?": '"fn.dsl" ct-lang-active? static_assert',
+    "ct-lang-active-list": "ct-lang-active-list list-length 0 >= static_assert",
+    "ct-lang-meta-set": '"fn.dsl" map-new ct-lang-meta-set static_assert',
+    "ct-lang-meta-get": '"fn.dsl" ct-lang-meta-get swap drop',
+    "ct-lang-set-auto-validate": '"fn.dsl" 1 ct-lang-set-auto-validate static_assert',
+    "ct-lang-get-auto-validate": '"fn.dsl" ct-lang-get-auto-validate swap drop',
+    "ct-lang-add-validator": '"fn.dsl" "fn-dsl-assert-ct-surface" ct-lang-add-validator drop',
+    "ct-lang-run-validators": '"fn.dsl" ct-lang-run-validators drop',
+    "ct-lang-run-active-validators": "ct-lang-run-active-validators drop",
+    "ct-lang-set-token-hook": '"fn.dsl" "call-syntax-rewrite" ct-lang-set-token-hook drop',
+    "ct-lang-add-reader-rewrite-named": '"fn.dsl" "r" list-new list-new ct-lang-add-reader-rewrite-named drop',
+    "ct-lang-add-grammar-rewrite-named": '"fn.dsl" "g" list-new list-new ct-lang-add-grammar-rewrite-named drop',
+    "ct-lang-register-text-macro-signature": '"fn.dsl" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
+    "ct-lang-register-pattern-macro": '"fn.dsl" "pm" list-new ct-lang-register-pattern-macro drop',
+    "ct-lang-status": '"fn.dsl" ct-lang-status swap drop',
+    "ct-lang-remove": '"fn.dsl" ct-lang-remove drop',
 }
 
 

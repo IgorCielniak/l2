@@ -1,0 +1,2 @@
+[error] fn type error: incompatible let initializer
+compile-time stack: fn -> fn-build-body -> fn-compile-statements -> fn-compile-statement -> fn-compile-let-stmt -> parse-error

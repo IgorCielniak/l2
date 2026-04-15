@@ -4245,6 +4245,9 @@ class Parser:
         self._ct_parser_sessions: List[Dict[str, Any]] = []
         self._ct_parser_marks: Dict[str, int] = {}
         self._ct_rewrite_scope_stack: List[Dict[str, Any]] = []
+        self._ct_language_extensions: Dict[str, Dict[str, Any]] = {}
+        self._ct_language_active: Set[str] = set()
+        self._ct_language_token_hook_owner: Optional[str] = None
         self.diagnostics: List[Diagnostic] = []
         self._max_errors: int = 20
         self._warnings_enabled: Set[str] = set()
@@ -5179,6 +5182,381 @@ class Parser:
                 self._pattern_macro_scopes[str(name)] = str(scope)
 
         return added
+
+    @staticmethod
+    def _ct_lang_blank_record(name: str) -> Dict[str, Any]:
+        return {
+            "name": str(name),
+            "metadata": {},
+            "reader_rewrites": set(),
+            "grammar_rewrites": set(),
+            "text_macros": set(),
+            "pattern_macros": set(),
+            "validators": [],
+            "token_hook": None,
+            "auto_validate": False,
+        }
+
+    def _ct_lang_key(self, name: Any) -> str:
+        key = str(name or "").strip()
+        if not key:
+            raise ParseError("language extension name cannot be empty")
+        return key
+
+    def _ct_lang_record(self, name: Any, *, create: bool = False) -> Optional[Dict[str, Any]]:
+        key = self._ct_lang_key(name)
+        record = self._ct_language_extensions.get(key)
+        if record is None and create:
+            record = self._ct_lang_blank_record(key)
+            self._ct_language_extensions[key] = record
+        return record
+
+    def _ct_lang_rule_exists(self, stage: str, name: str) -> bool:
+        bucket = self._rewrite_bucket(stage)
+        return any(rule.name == name for rule in bucket)
+
+    def ct_lang_create(
+        self,
+        name: Any,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        activate: bool = False,
+    ) -> bool:
+        key = self._ct_lang_key(name)
+        created = key not in self._ct_language_extensions
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("failed to create language extension record")
+        if metadata is not None:
+            snapshot: Dict[str, Any] = {}
+            for meta_key, meta_value in metadata.items():
+                snapshot[str(meta_key)] = _capture_deep_clone(meta_value)
+            record["metadata"] = snapshot
+        if activate:
+            self._ct_language_active.add(key)
+        return created
+
+    def ct_lang_exists(self, name: Any) -> bool:
+        key = self._ct_lang_key(name)
+        return key in self._ct_language_extensions
+
+    def ct_lang_list(self) -> List[str]:
+        return sorted(self._ct_language_extensions.keys())
+
+    def ct_lang_activate(self, name: Any, enabled: bool = True) -> bool:
+        key = self._ct_lang_key(name)
+        if key not in self._ct_language_extensions:
+            return False
+        if enabled:
+            self._ct_language_active.add(key)
+        else:
+            self._ct_language_active.discard(key)
+        return True
+
+    def ct_lang_is_active(self, name: Any) -> bool:
+        key = self._ct_lang_key(name)
+        return key in self._ct_language_active
+
+    def ct_lang_active_list(self) -> List[str]:
+        return sorted(self._ct_language_active)
+
+    def ct_lang_set_metadata(self, name: Any, metadata: Optional[Dict[str, Any]]) -> bool:
+        record = self._ct_lang_record(name, create=False)
+        if record is None:
+            return False
+        if metadata is None:
+            record["metadata"] = {}
+            return True
+        snapshot: Dict[str, Any] = {}
+        for meta_key, meta_value in metadata.items():
+            snapshot[str(meta_key)] = _capture_deep_clone(meta_value)
+        record["metadata"] = snapshot
+        return True
+
+    def ct_lang_get_metadata(self, name: Any) -> Optional[Dict[str, Any]]:
+        record = self._ct_lang_record(name, create=False)
+        if record is None:
+            return None
+        metadata = record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return {}
+        return {
+            str(meta_key): _capture_deep_clone(meta_value)
+            for meta_key, meta_value in metadata.items()
+        }
+
+    def ct_lang_set_auto_validate(self, name: Any, enabled: bool) -> bool:
+        record = self._ct_lang_record(name, create=False)
+        if record is None:
+            return False
+        record["auto_validate"] = bool(enabled)
+        return True
+
+    def ct_lang_get_auto_validate(self, name: Any) -> Optional[bool]:
+        record = self._ct_lang_record(name, create=False)
+        if record is None:
+            return None
+        return bool(record.get("auto_validate", False))
+
+    def ct_lang_add_validator(self, name: Any, validator_word: str) -> int:
+        key = self._ct_lang_key(name)
+        validator_name = str(validator_word or "").strip()
+        if not validator_name:
+            raise ParseError("language extension validator word cannot be empty")
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("language extension record is unavailable")
+        validators = record.get("validators")
+        if not isinstance(validators, list):
+            validators = []
+            record["validators"] = validators
+        if validator_name not in validators:
+            validators.append(validator_name)
+        return len(validators)
+
+    def ct_lang_set_token_hook(self, name: Any, hook_name: Optional[str]) -> Optional[str]:
+        key = self._ct_lang_key(name)
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("language extension record is unavailable")
+        previous = self.token_hook
+        if hook_name is None:
+            if self._ct_language_token_hook_owner == key:
+                self.token_hook = None
+                self._ct_language_token_hook_owner = None
+            record["token_hook"] = None
+            return previous
+        hook_text = str(hook_name).strip()
+        if not hook_text:
+            if self._ct_language_token_hook_owner == key:
+                self.token_hook = None
+                self._ct_language_token_hook_owner = None
+            record["token_hook"] = None
+            return previous
+        self.token_hook = hook_text
+        self._ct_language_token_hook_owner = key
+        record["token_hook"] = hook_text
+        return previous
+
+    def ct_lang_add_rewrite_rule(
+        self,
+        name: Any,
+        stage: str,
+        pattern: Sequence[Any],
+        replacement: Sequence[Any],
+        *,
+        rule_name: Optional[str] = None,
+        priority: int = 0,
+        enabled: bool = True,
+        pipeline: str = "default",
+        guard: Optional[str] = None,
+        group: str = "default",
+        scope: str = "global",
+        metadata: Optional[Dict[str, Any]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        key = self._ct_lang_key(name)
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("language extension record is unavailable")
+        created_name = self.add_rewrite_rule(
+            stage,
+            pattern,
+            replacement,
+            name=rule_name,
+            priority=priority,
+            enabled=enabled,
+            pipeline=pipeline,
+            guard=guard,
+            group=group,
+            scope=scope,
+            metadata=metadata,
+            provenance=provenance,
+        )
+        field = "reader_rewrites" if stage == "reader" else "grammar_rewrites"
+        bucket = record.get(field)
+        if not isinstance(bucket, set):
+            bucket = set()
+            record[field] = bucket
+        bucket.add(created_name)
+        return created_name
+
+    def ct_lang_register_text_macro_signature(
+        self,
+        name: Any,
+        macro_name: str,
+        param_spec: Sequence[Any],
+        expansion: Sequence[Any],
+    ) -> None:
+        key = self._ct_lang_key(name)
+        self.register_text_macro_signature(macro_name, param_spec, expansion)
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("language extension record is unavailable")
+        text_macros = record.get("text_macros")
+        if not isinstance(text_macros, set):
+            text_macros = set()
+            record["text_macros"] = text_macros
+        text_macros.add(str(macro_name))
+
+    def ct_lang_register_pattern_macro(
+        self,
+        name: Any,
+        macro_name: str,
+        clauses: Sequence[Any],
+    ) -> None:
+        key = self._ct_lang_key(name)
+        self.register_pattern_macro(macro_name, clauses)
+        record = self._ct_lang_record(key, create=True)
+        if record is None:  # pragma: no cover - defensive
+            raise ParseError("language extension record is unavailable")
+        pattern_macros = record.get("pattern_macros")
+        if not isinstance(pattern_macros, set):
+            pattern_macros = set()
+            record["pattern_macros"] = pattern_macros
+        pattern_macros.add(str(macro_name))
+
+    def ct_lang_run_validators(self, name: Any, *, phase: str = "manual") -> int:
+        key = self._ct_lang_key(name)
+        record = self._ct_lang_record(key, create=False)
+        if record is None:
+            return 0
+        validators_raw = record.get("validators")
+        if not isinstance(validators_raw, list):
+            return 0
+        validators = [str(item) for item in validators_raw if str(item).strip()]
+        if not validators:
+            return 0
+
+        vm = self.compile_time_vm
+        metadata = self.ct_lang_get_metadata(key) or {}
+        active = 1 if key in self._ct_language_active else 0
+        executed = 0
+        for validator_name in validators:
+            validator_word = self.dictionary.lookup(validator_name)
+            if validator_word is None:
+                raise ParseError(
+                    f"language extension '{key}' validator word '{validator_name}' is not defined"
+                )
+            payload = {
+                "language": key,
+                "phase": str(phase),
+                "active": active,
+                "metadata": {
+                    str(meta_key): _capture_deep_clone(meta_value)
+                    for meta_key, meta_value in metadata.items()
+                },
+            }
+            vm.invoke_with_args(validator_word, [payload])
+            executed += 1
+        return executed
+
+    def ct_lang_run_active_validators(self, *, phase: str = "manual", auto_only: bool = False) -> int:
+        total = 0
+        for key in sorted(self._ct_language_active):
+            record = self._ct_language_extensions.get(key)
+            if record is None:
+                continue
+            if auto_only and not bool(record.get("auto_validate", False)):
+                continue
+            total += self.ct_lang_run_validators(key, phase=phase)
+        return total
+
+    def ct_lang_status(self, name: Any) -> Optional[Dict[str, Any]]:
+        key = self._ct_lang_key(name)
+        record = self._ct_lang_record(key, create=False)
+        if record is None:
+            return None
+
+        reader_rewrites = sorted(
+            rule_name
+            for rule_name in record.get("reader_rewrites", set())
+            if isinstance(rule_name, str) and self._ct_lang_rule_exists("reader", rule_name)
+        )
+        grammar_rewrites = sorted(
+            rule_name
+            for rule_name in record.get("grammar_rewrites", set())
+            if isinstance(rule_name, str) and self._ct_lang_rule_exists("grammar", rule_name)
+        )
+
+        text_macros: List[str] = []
+        for macro_name in sorted(record.get("text_macros", set())):
+            if not isinstance(macro_name, str):
+                continue
+            word = self.dictionary.lookup(macro_name)
+            if word is None or word.macro_expansion is None:
+                continue
+            text_macros.append(macro_name)
+
+        pattern_macros: List[str] = []
+        for macro_name in sorted(record.get("pattern_macros", set())):
+            if not isinstance(macro_name, str):
+                continue
+            if self._pattern_macro_rule_names(macro_name):
+                pattern_macros.append(macro_name)
+
+        validators: List[str] = []
+        validators_raw = record.get("validators")
+        if isinstance(validators_raw, list):
+            validators = [str(item) for item in validators_raw if str(item).strip()]
+
+        metadata = self.ct_lang_get_metadata(key) or {}
+        return {
+            "name": key,
+            "active": 1 if key in self._ct_language_active else 0,
+            "auto_validate": 1 if bool(record.get("auto_validate", False)) else 0,
+            "metadata": metadata,
+            "reader_rewrites": reader_rewrites,
+            "grammar_rewrites": grammar_rewrites,
+            "text_macros": text_macros,
+            "pattern_macros": pattern_macros,
+            "validators": validators,
+            "token_hook": record.get("token_hook"),
+            "token_hook_owner": self._ct_language_token_hook_owner,
+            "reader_rewrite_count": len(reader_rewrites),
+            "grammar_rewrite_count": len(grammar_rewrites),
+            "text_macro_count": len(text_macros),
+            "pattern_macro_count": len(pattern_macros),
+            "validator_count": len(validators),
+        }
+
+    def ct_lang_remove(self, name: Any, *, cleanup: bool = True) -> bool:
+        key = self._ct_lang_key(name)
+        record = self._ct_language_extensions.pop(key, None)
+        if record is None:
+            return False
+
+        self._ct_language_active.discard(key)
+        if self._ct_language_token_hook_owner == key:
+            self._ct_language_token_hook_owner = None
+            self.token_hook = None
+
+        if not cleanup:
+            return True
+
+        for rule_name in list(record.get("reader_rewrites", set())):
+            if isinstance(rule_name, str):
+                self.remove_rewrite_rule("reader", rule_name)
+        for rule_name in list(record.get("grammar_rewrites", set())):
+            if isinstance(rule_name, str):
+                self.remove_rewrite_rule("grammar", rule_name)
+
+        for macro_name in list(record.get("text_macros", set())):
+            if not isinstance(macro_name, str):
+                continue
+            word = self.dictionary.lookup(macro_name)
+            if word is None or word.macro_expansion is None:
+                continue
+            self.unregister_word(macro_name)
+
+        for macro_name in list(record.get("pattern_macros", set())):
+            if isinstance(macro_name, str):
+                self.unregister_pattern_macro(macro_name)
+
+        return True
+
+    def _ct_lang_run_auto_validators(self) -> int:
+        return self.ct_lang_run_active_validators(phase="post-parse", auto_only=True)
 
     def _rewrite_rules_compatibility(self, left: RewriteRule, right: RewriteRule) -> str:
         left_keys, left_wild = self._rewrite_pattern_index_keys(left.pattern)
@@ -6302,6 +6680,11 @@ class Parser:
             self._record_diagnostic(self._last_token, "unclosed definition at EOF")
         if self.control_stack:
             self._record_diagnostic(self._last_token, "unclosed control structure at EOF")
+
+        try:
+            self._ct_lang_run_auto_validators()
+        except (ParseError, CompileTimeError) as _validator_exc:
+            self._record_diagnostic(self._last_token, str(_validator_exc))
 
         # If any errors were accumulated, raise with all diagnostics
         error_count = sum(1 for d in self.diagnostics if d.level == "error")
@@ -16407,6 +16790,179 @@ def _ct_rewrite_run_on_list(vm: CompileTimeVM) -> None:
     vm.push(patches)
 
 
+def _ct_lang_create(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_create(name) else 0)
+
+
+def _ct_lang_exists(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_exists(name) else 0)
+
+
+def _ct_lang_list(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.ct_lang_list())
+
+
+def _ct_lang_activate(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_activate(name, True) else 0)
+
+
+def _ct_lang_deactivate(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_activate(name, False) else 0)
+
+
+def _ct_lang_active(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_is_active(name) else 0)
+
+
+def _ct_lang_active_list(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.ct_lang_active_list())
+
+
+def _ct_lang_meta_set(vm: CompileTimeVM) -> None:
+    raw_metadata = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    if raw_metadata is None:
+        vm.push(1 if vm.parser.ct_lang_set_metadata(name, None) else 0)
+        return
+    metadata = _ensure_dict(raw_metadata)
+    snapshot = {
+        str(key): _capture_deep_clone(value)
+        for key, value in metadata.items()
+    }
+    vm.push(1 if vm.parser.ct_lang_set_metadata(name, snapshot) else 0)
+
+
+def _ct_lang_meta_get(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    metadata = vm.parser.ct_lang_get_metadata(name)
+    if metadata is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(metadata)
+    vm.push(1)
+
+
+def _ct_lang_set_auto_validate(vm: CompileTimeVM) -> None:
+    enabled = _coerce_bool(vm.pop(), field="ct-lang-set-auto-validate enabled flag")
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_set_auto_validate(name, enabled) else 0)
+
+
+def _ct_lang_get_auto_validate(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    enabled = vm.parser.ct_lang_get_auto_validate(name)
+    if enabled is None:
+        vm.push(0)
+        vm.push(0)
+        return
+    vm.push(1 if enabled else 0)
+    vm.push(1)
+
+
+def _ct_lang_add_validator(vm: CompileTimeVM) -> None:
+    validator_word = vm.pop_str()
+    name = vm.pop_str()
+    vm.push(vm.parser.ct_lang_add_validator(name, validator_word))
+
+
+def _ct_lang_run_validators(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(vm.parser.ct_lang_run_validators(name, phase="manual"))
+
+
+def _ct_lang_run_active_validators(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser.ct_lang_run_active_validators(phase="manual", auto_only=False))
+
+
+def _ct_lang_set_token_hook(vm: CompileTimeVM) -> None:
+    hook_raw = vm._resolve_handle(vm.pop())
+    name = vm.pop_str()
+    if hook_raw is None:
+        hook_name = None
+    elif isinstance(hook_raw, Token):
+        hook_name = hook_raw.lexeme
+    elif isinstance(hook_raw, str):
+        hook_name = hook_raw
+    else:
+        raise ParseError("ct-lang-set-token-hook expects hook name token/string or nil")
+    previous = vm.parser.ct_lang_set_token_hook(name, hook_name)
+    vm.push(previous)
+
+
+def _ct_lang_add_reader_rewrite_named(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="language reader rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="language reader rewrite pattern")
+    rule_name = vm.pop_str()
+    language_name = vm.pop_str()
+    created = vm.parser.ct_lang_add_rewrite_rule(
+        language_name,
+        "reader",
+        pattern,
+        replacement,
+        rule_name=rule_name,
+    )
+    vm.push(created)
+
+
+def _ct_lang_add_grammar_rewrite_named(vm: CompileTimeVM) -> None:
+    replacement = _coerce_lexeme_list(vm.pop(), field="language grammar rewrite replacement")
+    pattern = _coerce_lexeme_list(vm.pop(), field="language grammar rewrite pattern")
+    rule_name = vm.pop_str()
+    language_name = vm.pop_str()
+    created = vm.parser.ct_lang_add_rewrite_rule(
+        language_name,
+        "grammar",
+        pattern,
+        replacement,
+        rule_name=rule_name,
+    )
+    vm.push(created)
+
+
+def _ct_lang_register_text_macro_signature(vm: CompileTimeVM) -> None:
+    expansion = _coerce_lexeme_list(vm.pop(), field="language macro expansion")
+    param_spec = _coerce_lexeme_list(vm.pop(), field="language macro parameter spec")
+    macro_name = vm.pop_str()
+    language_name = vm.pop_str()
+    vm.parser.ct_lang_register_text_macro_signature(
+        language_name,
+        macro_name,
+        param_spec,
+        expansion,
+    )
+    vm.push(macro_name)
+
+
+def _ct_lang_register_pattern_macro(vm: CompileTimeVM) -> None:
+    clauses = _coerce_pattern_macro_clauses(vm.pop())
+    macro_name = vm.pop_str()
+    language_name = vm.pop_str()
+    vm.parser.ct_lang_register_pattern_macro(language_name, macro_name, clauses)
+    vm.push(macro_name)
+
+
+def _ct_lang_status(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    status = vm.parser.ct_lang_status(name)
+    if status is None:
+        vm.push(None)
+        vm.push(0)
+        return
+    vm.push(status)
+    vm.push(1)
+
+
+def _ct_lang_remove(vm: CompileTimeVM) -> None:
+    name = vm.pop_str()
+    vm.push(1 if vm.parser.ct_lang_remove(name, cleanup=True) else 0)
+
+
 def _coerce_lexeme_list(value: Any, *, field: str) -> List[str]:
     items = _ensure_list(value)
     out: List[str] = []
@@ -17144,6 +17700,27 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-rewrite-scope-push", _ct_rewrite_scope_push, compile_only=True)
     register("ct-rewrite-scope-pop", _ct_rewrite_scope_pop, compile_only=True)
     register("ct-rewrite-run-on-list", _ct_rewrite_run_on_list, compile_only=True)
+    register("ct-lang-create", _ct_lang_create, compile_only=True)
+    register("ct-lang-exists?", _ct_lang_exists, compile_only=True)
+    register("ct-lang-list", _ct_lang_list, compile_only=True)
+    register("ct-lang-activate", _ct_lang_activate, compile_only=True)
+    register("ct-lang-deactivate", _ct_lang_deactivate, compile_only=True)
+    register("ct-lang-active?", _ct_lang_active, compile_only=True)
+    register("ct-lang-active-list", _ct_lang_active_list, compile_only=True)
+    register("ct-lang-meta-set", _ct_lang_meta_set, compile_only=True)
+    register("ct-lang-meta-get", _ct_lang_meta_get, compile_only=True)
+    register("ct-lang-set-auto-validate", _ct_lang_set_auto_validate, compile_only=True)
+    register("ct-lang-get-auto-validate", _ct_lang_get_auto_validate, compile_only=True)
+    register("ct-lang-add-validator", _ct_lang_add_validator, compile_only=True)
+    register("ct-lang-run-validators", _ct_lang_run_validators, compile_only=True)
+    register("ct-lang-run-active-validators", _ct_lang_run_active_validators, compile_only=True)
+    register("ct-lang-set-token-hook", _ct_lang_set_token_hook, compile_only=True)
+    register("ct-lang-add-reader-rewrite-named", _ct_lang_add_reader_rewrite_named, compile_only=True)
+    register("ct-lang-add-grammar-rewrite-named", _ct_lang_add_grammar_rewrite_named, compile_only=True)
+    register("ct-lang-register-text-macro-signature", _ct_lang_register_text_macro_signature, compile_only=True)
+    register("ct-lang-register-pattern-macro", _ct_lang_register_pattern_macro, compile_only=True)
+    register("ct-lang-status", _ct_lang_status, compile_only=True)
+    register("ct-lang-remove", _ct_lang_remove, compile_only=True)
     register("ct-unregister-word", _ct_unregister_word, compile_only=True)
     register("ct-list-words", _ct_list_words, compile_only=True)
     register("ct-list-words-prefix", _ct_list_words_prefix, compile_only=True)

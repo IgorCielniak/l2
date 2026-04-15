@@ -304,23 +304,23 @@ You can define text macros from compile-time code:
 ### CT-Call Policy Controls
 
 - Typed contracts:
-	- `ct-set-ct-call-contract`, `ct-get-ct-call-contract`
+  - `ct-set-ct-call-contract`, `ct-get-ct-call-contract`
 - Exception handling policy:
-	- `ct-set-ct-call-exception-policy`, `ct-get-ct-call-exception-policy`
+  - `ct-set-ct-call-exception-policy`, `ct-get-ct-call-exception-policy`
 - Sandbox mode + allowlist:
-	- `ct-set-ct-call-sandbox-mode`, `ct-get-ct-call-sandbox-mode`
-	- `ct-set-ct-call-sandbox-allowlist`, `ct-get-ct-call-sandbox-allowlist`
+  - `ct-set-ct-call-sandbox-mode`, `ct-get-ct-call-sandbox-mode`
+  - `ct-set-ct-call-sandbox-allowlist`, `ct-get-ct-call-sandbox-allowlist`
 - Deterministic randomness:
-	- `ct-ctrand-seed`, `ct-ctrand-int`, `ct-ctrand-range`
+  - `ct-ctrand-seed`, `ct-ctrand-int`, `ct-ctrand-range`
 - Memoization:
-	- `ct-set-ct-call-memo`, `ct-get-ct-call-memo`
-	- `ct-clear-ct-call-memo`, `ct-get-ct-call-memo-size`
+  - `ct-set-ct-call-memo`, `ct-get-ct-call-memo`
+  - `ct-clear-ct-call-memo`, `ct-get-ct-call-memo-size`
 - Side-effect log:
-	- `ct-set-ct-call-side-effects`, `ct-get-ct-call-side-effects`
-	- `ct-get-ct-call-side-effect-log`, `ct-clear-ct-call-side-effect-log`
+  - `ct-set-ct-call-side-effects`, `ct-get-ct-call-side-effects`
+  - `ct-get-ct-call-side-effect-log`, `ct-clear-ct-call-side-effect-log`
 - Recursion and timeout guards:
-	- `ct-set-ct-call-recursion-limit`, `ct-get-ct-call-recursion-limit`
-	- `ct-set-ct-call-timeout-ms`, `ct-get-ct-call-timeout-ms`
+  - `ct-set-ct-call-recursion-limit`, `ct-get-ct-call-recursion-limit`
+  - `ct-set-ct-call-timeout-ms`, `ct-get-ct-call-timeout-ms`
 
 Example:
 
@@ -350,40 +350,79 @@ Core tools include:
 
 These are best for local syntax normalization patterns and DSL sugar.
 
+### Language Extension Pack APIs (`ct-lang-*`)
+
+L2 now includes a language-extension registry in the compile-time VM so you can
+create, activate, introspect, and cleanly remove DSL packs without hard-coding
+language-specific behavior in the core parser.
+
+New compile-time words:
+
+- `ct-lang-create`
+- `ct-lang-exists?`
+- `ct-lang-list`
+- `ct-lang-activate`
+- `ct-lang-deactivate`
+- `ct-lang-active?`
+- `ct-lang-active-list`
+- `ct-lang-meta-set`
+- `ct-lang-meta-get`
+- `ct-lang-set-auto-validate`
+- `ct-lang-get-auto-validate`
+- `ct-lang-add-validator`
+- `ct-lang-run-validators`
+- `ct-lang-run-active-validators`
+- `ct-lang-set-token-hook`
+- `ct-lang-add-reader-rewrite-named`
+- `ct-lang-add-grammar-rewrite-named`
+- `ct-lang-register-text-macro-signature`
+- `ct-lang-register-pattern-macro`
+- `ct-lang-status`
+- `ct-lang-remove`
+
+Typical lifecycle flow:
+
+1. `ct-lang-create`
+2. register rewrites/macros/hooks
+3. `ct-lang-activate`
+4. optional validator configuration (`ct-lang-add-validator`, auto/manual runs)
+5. introspection via `ct-lang-status`
+6. cleanup via `ct-lang-remove`
+
 ### Advanced Pattern/Rewrite Controls
 
 L2 now includes a richer rewrite toolchain for large macro systems:
 
 - Pattern grouping/scope activation:
-	- `ct-set-pattern-macro-group`, `ct-get-pattern-macro-group`
-	- `ct-set-pattern-macro-scope`, `ct-get-pattern-macro-scope`
-	- `ct-set-pattern-group-active`, `ct-set-pattern-scope-active`
-	- `ct-list-active-pattern-groups`, `ct-list-active-pattern-scopes`
+  - `ct-set-pattern-macro-group`, `ct-get-pattern-macro-group`
+  - `ct-set-pattern-macro-scope`, `ct-get-pattern-macro-scope`
+  - `ct-set-pattern-group-active`, `ct-set-pattern-scope-active`
+  - `ct-list-active-pattern-groups`, `ct-list-active-pattern-scopes`
 - Pattern clause guards and introspection:
-	- `ct-set-pattern-macro-clause-guard`
-	- `ct-get-pattern-macro-clause-details`
+  - `ct-set-pattern-macro-clause-guard`
+  - `ct-get-pattern-macro-clause-details`
 - Pattern diagnostics and analysis:
-	- `ct-detect-pattern-conflicts`, `ct-detect-pattern-conflicts-named`
-	- `ct-get-rewrite-specificity`
-	- `ct-rewrite-compatibility-matrix`
+  - `ct-detect-pattern-conflicts`, `ct-detect-pattern-conflicts-named`
+  - `ct-get-rewrite-specificity`
+  - `ct-rewrite-compatibility-matrix`
 - Rewrite pipelines and matcher indexing:
-	- `ct-set-rewrite-pipeline`, `ct-get-rewrite-pipeline`
-	- `ct-set-rewrite-pipeline-active`, `ct-list-rewrite-active-pipelines`
-	- `ct-rebuild-rewrite-index`, `ct-get-rewrite-index-stats`
+  - `ct-set-rewrite-pipeline`, `ct-get-rewrite-pipeline`
+  - `ct-set-rewrite-pipeline-active`, `ct-list-rewrite-active-pipelines`
+  - `ct-rebuild-rewrite-index`, `ct-get-rewrite-index-stats`
 - Rewrite transactions and packs:
-	- `ct-rewrite-txn-begin`, `ct-rewrite-txn-commit`, `ct-rewrite-txn-rollback`
-	- `ct-export-rewrite-pack`, `ct-import-rewrite-pack`, `ct-import-rewrite-pack-replace`
-	- `ct-get-rewrite-provenance`
+  - `ct-rewrite-txn-begin`, `ct-rewrite-txn-commit`, `ct-rewrite-txn-rollback`
+  - `ct-export-rewrite-pack`, `ct-import-rewrite-pack`, `ct-import-rewrite-pack-replace`
+  - `ct-get-rewrite-provenance`
 - Dry-run and fixture tooling:
-	- `ct-rewrite-dry-run`
-	- `ct-rewrite-generate-fixture`
+  - `ct-rewrite-dry-run`
+  - `ct-rewrite-generate-fixture`
 - Runtime safety/observability:
-	- `ct-set-rewrite-saturation`, `ct-get-rewrite-saturation`
-	- `ct-set-rewrite-max-steps`, `ct-get-rewrite-max-steps`
-	- `ct-set-rewrite-loop-detection`, `ct-get-rewrite-loop-detection`
-	- `ct-get-rewrite-loop-reports`, `ct-clear-rewrite-loop-reports`
-	- `ct-set-rewrite-trace`, `ct-get-rewrite-trace`, `ct-get-rewrite-trace-log`, `ct-clear-rewrite-trace-log`
-	- `ct-get-rewrite-profile`, `ct-clear-rewrite-profile`
+  - `ct-set-rewrite-saturation`, `ct-get-rewrite-saturation`
+  - `ct-set-rewrite-max-steps`, `ct-get-rewrite-max-steps`
+  - `ct-set-rewrite-loop-detection`, `ct-get-rewrite-loop-detection`
+  - `ct-get-rewrite-loop-reports`, `ct-clear-rewrite-loop-reports`
+  - `ct-set-rewrite-trace`, `ct-get-rewrite-trace`, `ct-get-rewrite-trace-log`, `ct-clear-rewrite-trace-log`
+  - `ct-get-rewrite-profile`, `ct-clear-rewrite-profile`
 
 Pattern syntax now supports additional operators in rewrite patterns:
 

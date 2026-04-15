@@ -61,8 +61,31 @@ defn sum6(number a, number b, number c, number d, number e, number f){
     return a + b + c + d + e + f;
 }
 
+defn vars_math(int a, int b){
+    let number acc = a + b;
+    let number half = 0;
+    acc = acc + 1;
+    half = acc / 2;
+    return half + acc;
+}
+
+defn vars_chain(number x){
+    let number y = x + 1;
+    y = y * 2;
+    return y;
+}
+
 word fn_dsl_compile_checks
     fn-dsl-active? static_assert
+
+    fn-dsl-lang-name ct-lang-exists? static_assert
+    fn-dsl-lang-name ct-lang-active? static_assert
+    fn-dsl-lang-name ct-lang-status
+    dup static_assert
+    drop
+    dup "name" map-get static_assert "fn.dsl" string= static_assert
+    dup "active" map-get static_assert static_assert
+    drop
 
     fn-dsl-stats
     dup "stage" map-get static_assert
@@ -249,6 +272,8 @@ word main
     mix(2, 3, 4) puti cr
     triple(4) puti cr
     cube(3) puti cr
+    vars_math(4, 5) puti cr
+    vars_chain(3) puti cr
 
     add(1, 2)
     add(3, 4)

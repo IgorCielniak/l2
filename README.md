@@ -57,7 +57,19 @@ Open it with:
 python3 main.py --docs
 ```
 
-Then switch to the `Compile-Time Reference` tab.
+Or launch the browser docs UI (static, with tab links, search, and detail/source panes):
+
+```bash
+python3 main.py --docs-serve
+```
+
+Useful options:
+
+- `--docs-port 8018`
+- `--docs-host 0.0.0.0`
+- `--docs-no-browser`
+
+Then switch to the `Compile-Time Reference` tab (or open `/?tab=ct`).
 
 ### Cache Modes (`--no-cache` vs `--force`)
 

@@ -20027,6 +20027,45 @@ def run_docs_explorer(
         raise CompileError(f"docs mode failed: {exc}") from exc
 
 
+def run_docs_server(
+    *,
+    source: Optional[Path],
+    include_paths: Sequence[Path],
+    explicit_roots: Sequence[Path],
+    initial_query: str,
+    include_undocumented: bool = False,
+    include_private: bool = False,
+    include_tests: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8008,
+    open_browser: bool = True,
+) -> int:
+    docs_helpers = _load_docs_helpers(warn=True)
+    if docs_helpers is None:
+        reason = _DOCS_HELPERS_ERROR or "failed to import docs.py"
+        raise CompileError(f"docs serve mode unavailable: {reason}")
+    if not hasattr(docs_helpers, "run_docs_serve"):
+        raise CompileError("docs serve mode unavailable: docs.py missing run_docs_serve")
+    try:
+        return int(
+            docs_helpers.run_docs_serve(
+                source=source,
+                include_paths=include_paths,
+                explicit_roots=explicit_roots,
+                initial_query=initial_query,
+                include_undocumented=include_undocumented,
+                include_private=include_private,
+                include_tests=include_tests,
+                host=host,
+                port=port,
+                open_browser=open_browser,
+                ct_word_metadata_provider=_collect_ct_word_metadata,
+            )
+        )
+    except Exception as exc:
+        raise CompileError(f"docs serve mode failed: {exc}") from exc
+
+
 def _integrity_opcode_symbols() -> Set[str]:
     return {
         name
@@ -22485,7 +22524,7 @@ def cli(argv: Sequence[str]) -> int:
         type=Path,
         nargs="?",
         default=None,
-        help="input .sl file (optional with --clean, --repl, --docs, or standalone --check-integrity)",
+        help="input .sl file (optional with --clean, --repl, --docs, --docs-serve, or standalone --check-integrity)",
     )
     parser.add_argument("-o", dest="output", type=Path, default=None, help="output path (defaults vary by artifact)")
     parser.add_argument(
@@ -22541,6 +22580,27 @@ def cli(argv: Sequence[str]) -> int:
         "--docs-query",
         default="",
         help="initial filter query for --docs mode",
+    )
+    parser.add_argument(
+        "--docs-serve",
+        action="store_true",
+        help="serve docs as an interactive web app",
+    )
+    parser.add_argument(
+        "--docs-host",
+        default="127.0.0.1",
+        help="bind host for --docs-serve (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--docs-port",
+        type=int,
+        default=8008,
+        help="bind port for --docs-serve (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--docs-no-browser",
+        action="store_true",
+        help="do not auto-open browser in --docs-serve mode",
     )
     parser.add_argument(
         "--docs-all",
@@ -22679,6 +22739,10 @@ def cli(argv: Sequence[str]) -> int:
         "repl",
         "docs_root",
         "docs_query",
+        "docs_serve",
+        "docs_host",
+        "docs_port",
+        "docs_no_browser",
         "docs_all",
         "docs_include_tests",
     }
@@ -22739,6 +22803,12 @@ def cli(argv: Sequence[str]) -> int:
             return 1
         return 0
 
+    if args.docs and args.docs_serve:
+        parser.error("--docs and --docs-serve are mutually exclusive")
+
+    if args.docs_serve and not (1 <= int(args.docs_port) <= 65535):
+        parser.error("--docs-port must be in range 1..65535")
+
     if args.docs:
         try:
             return run_docs_explorer(
@@ -22749,6 +22819,24 @@ def cli(argv: Sequence[str]) -> int:
                 include_undocumented=args.docs_all,
                 include_private=args.docs_all,
                 include_tests=args.docs_include_tests,
+            )
+        except CompileError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+
+    if args.docs_serve:
+        try:
+            return run_docs_server(
+                source=args.source,
+                include_paths=args.include_paths,
+                explicit_roots=args.docs_root,
+                initial_query=str(args.docs_query or ""),
+                include_undocumented=args.docs_all,
+                include_private=args.docs_all,
+                include_tests=args.docs_include_tests,
+                host=str(args.docs_host or "127.0.0.1"),
+                port=int(args.docs_port),
+                open_browser=not args.docs_no_browser,
             )
         except CompileError as exc:
             print(f"[error] {exc}", file=sys.stderr)

@@ -6,6 +6,9 @@ only when docs or integrity features need it.
 
 from __future__ import annotations
 
+import ast
+import html
+import json
 import re
 
 _CT_REF_SECTION_RE = re.compile(r"^\s*§\s*\d+\s+(.+?)\s*$")
@@ -162,10 +165,17 @@ def _scan_doc_file(
     return entries
 
 
-def _iter_doc_files(roots: Sequence[Path], *, include_tests: bool = False) -> List[Path]:
+def _iter_doc_files(
+    roots: Sequence[Path],
+    *,
+    include_tests: bool = False,
+    include_libs: bool = False,
+) -> List[Path]:
     seen: Set[Path] = set()
     files: List[Path] = []
     skip_parts = {"build", ".git", ".venv", "raylib-5.5_linux_amd64"}
+    if not include_libs:
+        skip_parts.add("libs")
     if not include_tests:
         skip_parts.update({"tests", "extra_tests"})
 
@@ -208,9 +218,10 @@ def collect_docs(
     include_private: bool = False,
     include_macros: bool = False,
     include_tests: bool = False,
+    include_libs: bool = False,
 ) -> List[DocEntry]:
     entries: List[DocEntry] = []
-    for doc_file in _iter_doc_files(roots, include_tests=include_tests):
+    for doc_file in _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs):
         entries.extend(
             _scan_doc_file(
                 doc_file,
@@ -4695,16 +4706,11 @@ def run_docs_explorer(
     ct_word_metadata_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
 ) -> int:
     configure_runtime(ct_word_metadata_provider=ct_word_metadata_provider)
-
-    roots: List[Path] = []
-    if source is not None:
-        roots.append(source.parent)
-        roots.append(source)
-    # Prefer user-selected roots first so symbol dedup keeps explicit docs
-    # over fallback/default roots when names collide.
-    roots.extend(explicit_roots)
-    roots.extend(include_paths)
-    roots.extend([Path("."), Path("./stdlib"), Path("./libs")])
+    roots = _build_default_docs_roots(
+        source=source,
+        include_paths=include_paths,
+        explicit_roots=explicit_roots,
+    )
 
     collect_opts: Dict[str, Any] = dict(
         include_undocumented=include_undocumented,
@@ -4716,36 +4722,1095 @@ def run_docs_explorer(
     def _reload(**overrides: Any) -> List[DocEntry]:
         extra = overrides.pop("extra_roots", [])
         opts = {**collect_opts, **overrides}
-        entries = collect_docs(roots, **opts)
-        # Scan extra roots directly, bypassing _iter_doc_files skip filters
-        # Always include undocumented entries from user-added paths
-        if extra:
-            seen_names = {e.name for e in entries}
-            scan_opts = dict(
-                include_undocumented=True,
-                include_private=True,
-                include_macros=opts.get("include_macros", False),
-            )
-            for p in extra:
-                ep = Path(p).expanduser().resolve()
-                if not ep.exists():
-                    continue
-                if ep.is_file() and ep.suffix == ".sl":
-                    for e in _scan_doc_file(ep, **scan_opts):
-                        if e.name not in seen_names:
-                            seen_names.add(e.name)
-                            entries.append(e)
-                elif ep.is_dir():
-                    for sl in sorted(ep.rglob("*.sl")):
-                        for e in _scan_doc_file(sl.resolve(), **scan_opts):
-                            if e.name not in seen_names:
-                                seen_names.add(e.name)
-                                entries.append(e)
-            entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
-        return entries
+        return _collect_docs_for_runtime(roots, extra_roots=extra, **opts)
 
     entries = _reload()
     return _run_docs_tui(entries, initial_query=initial_query, reload_fn=_reload)
+
+
+def _build_default_docs_roots(
+    *,
+    source: Optional[Path],
+    include_paths: Sequence[Path],
+    explicit_roots: Sequence[Path],
+) -> List[Path]:
+    roots: List[Path] = []
+    if source is not None:
+        roots.append(source.parent)
+        roots.append(source)
+    # Prefer user-selected roots first so symbol dedup keeps explicit docs
+    # over fallback/default roots when names collide.
+    roots.extend(explicit_roots)
+    roots.extend(include_paths)
+    # Keep default docs focused on project + stdlib surface.
+    roots.extend([Path("."), Path("./stdlib")])
+    return roots
+
+
+def _collect_docs_for_runtime(
+    roots: Sequence[Path],
+    *,
+    include_undocumented: bool,
+    include_private: bool,
+    include_tests: bool,
+    include_macros: bool,
+    include_libs: bool = False,
+    extra_roots: Sequence[Path],
+) -> List[DocEntry]:
+    entries = collect_docs(
+        roots,
+        include_undocumented=include_undocumented,
+        include_private=include_private,
+        include_tests=include_tests,
+        include_macros=include_macros,
+        include_libs=include_libs,
+    )
+
+    # Scan extra roots directly, bypassing _iter_doc_files skip filters.
+    # Always include undocumented entries from user-added paths.
+    if extra_roots:
+        seen_names = {e.name for e in entries}
+        scan_opts = dict(
+            include_undocumented=True,
+            include_private=True,
+            include_macros=include_macros,
+        )
+        for p in extra_roots:
+            ep = Path(p).expanduser().resolve()
+            if not ep.exists():
+                continue
+            if ep.is_file() and ep.suffix == ".sl":
+                for entry in _scan_doc_file(ep, **scan_opts):
+                    if entry.name not in seen_names:
+                        seen_names.add(entry.name)
+                        entries.append(entry)
+            elif ep.is_dir():
+                for sl in sorted(ep.rglob("*.sl")):
+                    for entry in _scan_doc_file(sl.resolve(), **scan_opts):
+                        if entry.name not in seen_names:
+                            seen_names.add(entry.name)
+                            entries.append(entry)
+        entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
+
+    return entries
+
+
+def _docs_entry_to_payload(entry: DocEntry, workspace_root: Path) -> Dict[str, Any]:
+    abs_path = entry.path.resolve()
+    try:
+        rel_path = abs_path.relative_to(workspace_root).as_posix()
+    except ValueError:
+        rel_path = abs_path.as_posix()
+    return {
+        "name": entry.name,
+        "stack_effect": entry.stack_effect,
+        "description": entry.description,
+        "kind": entry.kind,
+        "path": rel_path,
+        "line": int(entry.line),
+    }
+
+
+def _extract_docs_tui_assets() -> Dict[str, Any]:
+        fallback = {
+                "language_entries": [],
+                "license_text": "",
+                "philosophy_text": "",
+                "qa_text": "",
+                "how_text": "",
+                "ct_base_text": "",
+        }
+        docs_path = Path(__file__)
+        try:
+                source = docs_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+                return fallback
+
+        try:
+                tree = ast.parse(source)
+        except SyntaxError:
+                return fallback
+
+        fn_node: Optional[ast.FunctionDef] = None
+        for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == "_run_docs_tui":
+                        fn_node = node
+                        break
+        if fn_node is None:
+                return fallback
+
+        env: Dict[str, Any] = {}
+
+        def _eval_expr(node: ast.AST) -> Any:
+                if isinstance(node, ast.Constant):
+                        return node.value
+
+                if isinstance(node, ast.Name):
+                        return env.get(node.id)
+
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                        left = _eval_expr(node.left)
+                        right = _eval_expr(node.right)
+                        if isinstance(left, str) and isinstance(right, str):
+                                return left + right
+                        if isinstance(left, list) and isinstance(right, list):
+                                return left + right
+                        return None
+
+                if isinstance(node, ast.List):
+                        out: List[Any] = []
+                        for elem in node.elts:
+                                value = _eval_expr(elem)
+                                if value is None and not isinstance(elem, ast.Constant):
+                                        return None
+                                out.append(value)
+                        return out
+
+                if isinstance(node, ast.Tuple):
+                        out_items: List[Any] = []
+                        for elem in node.elts:
+                                value = _eval_expr(elem)
+                                if value is None and not isinstance(elem, ast.Constant):
+                                        return None
+                                out_items.append(value)
+                        return tuple(out_items)
+
+                if isinstance(node, ast.Dict):
+                        out_dict: Dict[Any, Any] = {}
+                        for key_node, val_node in zip(node.keys, node.values):
+                                key = _eval_expr(key_node) if key_node is not None else None
+                                val = _eval_expr(val_node)
+                                if key is None or val is None:
+                                        return None
+                                out_dict[key] = val
+                        return out_dict
+
+                if isinstance(node, ast.Call):
+                        if (
+                                isinstance(node.func, ast.Attribute)
+                                and isinstance(node.func.value, ast.Name)
+                                and node.func.value.id == "textwrap"
+                                and node.func.attr == "indent"
+                                and len(node.args) >= 2
+                        ):
+                                text_value = _eval_expr(node.args[0])
+                                prefix_value = _eval_expr(node.args[1])
+                                if isinstance(text_value, str) and isinstance(prefix_value, str):
+                                        return textwrap.indent(text_value, prefix_value)
+                        return None
+
+                return None
+
+        for stmt in fn_node.body:
+                target_name: Optional[str] = None
+                value_node: Optional[ast.AST] = None
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                        target_name = stmt.targets[0].id
+                        value_node = stmt.value
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                        target_name = stmt.target.id
+                        value_node = stmt.value
+
+                if not target_name or value_node is None:
+                        continue
+
+                value = _eval_expr(value_node)
+                if value is not None:
+                        env[target_name] = value
+
+        result = dict(fallback)
+        if isinstance(env.get("_LANG_REF_ENTRIES"), list):
+                result["language_entries"] = env.get("_LANG_REF_ENTRIES", [])
+        for env_key, result_key in (
+                ("_L2_LICENSE_TEXT", "license_text"),
+                ("_L2_PHILOSOPHY_TEXT", "philosophy_text"),
+                ("_L2_QA_TEXT", "qa_text"),
+                ("_L2_HOW_TEXT", "how_text"),
+                ("_L2_CT_REF_TEXT", "ct_base_text"),
+        ):
+                value = env.get(env_key)
+                if isinstance(value, str):
+                        result[result_key] = value
+
+        return result
+
+
+def _normalize_language_example_line(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"^[-*]\s+", "", text)
+    text = re.sub(r"^\d+[.)]\s+", "", text)
+    return text.strip()
+
+
+def _is_language_example_line(raw_line: str) -> bool:
+    stripped = raw_line.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if raw_line.startswith(("  ", "\t")):
+        return True
+    if stripped.startswith(("-", "*", "#")):
+        return True
+    if re.match(r"^\d+[.)]\s+", stripped):
+        return True
+    return lowered.startswith(
+        (
+            "word ",
+            "inline ",
+            ":asm",
+            "extern ",
+            "macro ",
+            "struct ",
+            "cstruct ",
+            "with ",
+            "if ",
+            "for ",
+            "while ",
+            "begin ",
+            "else",
+            "elif ",
+            "end",
+            "import ",
+            "flags ",
+            "cimport ",
+            "ifdef ",
+            "ifndef ",
+            "elsedef ",
+            "endif",
+            "[",
+            "{",
+            '"',
+            "'",
+            "&",
+            "compile-time ",
+            "runtime ",
+            "runtime-only ",
+            "compile-only ",
+            "immediate ",
+        )
+    )
+
+
+def _split_language_detail_and_examples(detail_text: str) -> Tuple[str, List[str]]:
+    cleaned_lines: List[str] = []
+    examples: List[str] = []
+    seen: Set[str] = set()
+    if not detail_text:
+        return "", examples
+
+    lines = detail_text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("example:") or lowered.startswith("examples:"):
+            inline = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if inline:
+                normalized = _normalize_language_example_line(inline)
+                if normalized:
+                    key = normalized.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        examples.append(normalized)
+
+            idx += 1
+            while idx < len(lines):
+                candidate = lines[idx]
+                candidate_stripped = candidate.strip()
+                if not candidate_stripped:
+                    idx += 1
+                    continue
+                if _is_language_example_line(candidate):
+                    normalized = _normalize_language_example_line(candidate_stripped)
+                    if normalized:
+                        key = normalized.lower()
+                        if key not in seen:
+                            seen.add(key)
+                            examples.append(normalized)
+                    idx += 1
+                    continue
+                break
+
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+            if idx < len(lines) and cleaned_lines and lines[idx].strip():
+                cleaned_lines.append("")
+            continue
+
+        cleaned_lines.append(line.rstrip())
+        idx += 1
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+
+    return "\n".join(cleaned_lines).strip(), examples
+
+
+def _extract_language_examples_from_detail(detail_text: str) -> List[str]:
+    _, examples = _split_language_detail_and_examples(detail_text)
+    return examples
+
+
+def _normalize_language_examples(raw_examples: Any) -> List[str]:
+    examples: List[str] = []
+    seen: Set[str] = set()
+    if isinstance(raw_examples, list):
+        for value in raw_examples:
+            text = _normalize_language_example_line(value)
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append(text)
+    return examples
+
+
+def _normalize_language_entries(raw_entries: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw_entries, list):
+        return out
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+
+        raw_detail_text = str(item.get("detail", "")).strip()
+        detail_text, extracted_examples = _split_language_detail_and_examples(raw_detail_text)
+        if not detail_text and not extracted_examples:
+            detail_text = raw_detail_text
+
+        examples = _normalize_language_examples(item.get("examples"))
+        if extracted_examples:
+            seen = {example.lower() for example in examples}
+            for value in extracted_examples:
+                key = value.lower()
+                if key not in seen:
+                    seen.add(key)
+                    examples.append(value)
+
+        out.append(
+            {
+                "name": name,
+                "category": str(item.get("category", "General")).strip() or "General",
+                "syntax": str(item.get("syntax", "")).strip(),
+                "summary": str(item.get("summary", "")).strip(),
+                "detail": detail_text,
+                "examples": examples,
+            }
+        )
+    out.sort(key=lambda item: (item["category"].lower(), item["name"].lower()))
+    return out
+
+
+def _ct_entry_to_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
+        line_no = 0
+        try:
+                line_no = int(entry.get("line_no", 0))
+        except Exception:
+                line_no = 0
+
+        examples: List[str] = []
+        raw_examples = entry.get("examples")
+        if isinstance(raw_examples, list):
+                for value in raw_examples:
+                        text = str(value).strip()
+                        if text:
+                                examples.append(text)
+        if not examples:
+                try:
+                        examples = _split_example_lines(entry)
+                except Exception:
+                        examples = []
+
+        return {
+                "name": str(entry.get("name", "")),
+                "category": str(entry.get("category", "Meta")),
+                "scope": str(entry.get("scope", "all")),
+                "stack_effect": str(entry.get("stack_effect", "")),
+                "overview": str(entry.get("overview", "")),
+                "examples": [line for line in examples if line],
+                "line": line_no,
+        }
+
+
+def _format_source_excerpt_lines(
+    lines: Sequence[str],
+    focus_line: int,
+    *,
+    before: int = 4,
+    after: int = 24,
+    end_line: Optional[int] = None,
+) -> str:
+    if not lines:
+        return "(source unavailable)"
+    total = len(lines)
+    line_no = int(focus_line) if focus_line else 1
+    if line_no < 1:
+        line_no = 1
+    if line_no > total:
+        line_no = total
+    start = max(1, line_no - before)
+    if end_line is None:
+        end = min(total, line_no + after)
+    else:
+        try:
+            forced_end = int(end_line)
+        except Exception:
+            forced_end = line_no + after
+        if forced_end < line_no:
+            forced_end = line_no
+        end = min(total, forced_end)
+    width = len(str(end))
+    out: List[str] = []
+    for n in range(start, end + 1):
+        marker = ">" if n == line_no else " "
+        out.append(f"{marker}{n:>{width}} | {lines[n - 1]}")
+    return "\n".join(out)
+
+
+_L2_WORD_DEF_RE = re.compile(r"^\s*(?:inline\s+)?word\s+[^\s]+")
+
+
+def _strip_l2_comment_and_strings(line: str) -> str:
+    out: List[str] = []
+    in_string = False
+    escape = False
+    for ch in line:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            out.append(ch if ch.isspace() else " ")
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(" ")
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def _find_l2_definition_end_line(lines: Sequence[str], focus_line: int, *, max_scan: int = 800) -> int:
+    if not lines:
+        return 1
+    total = len(lines)
+    line_no = int(focus_line) if focus_line else 1
+    if line_no < 1:
+        line_no = 1
+    if line_no > total:
+        line_no = total
+
+    head = lines[line_no - 1]
+    if _L2_WORD_DEF_RE.match(head) is None:
+        return min(total, line_no + 24)
+
+    depth = 1
+    openers = {"word", "if", "while", "for", "with"}
+    scan_end = min(total, line_no + max_scan)
+    for idx in range(line_no + 1, scan_end + 1):
+        code = _strip_l2_comment_and_strings(lines[idx - 1]).lower()
+        tokens = re.findall(r"\b(?:word|if|while|for|with|end)\b", code)
+        for token in tokens:
+            if token == "end":
+                depth -= 1
+            elif token in openers:
+                depth += 1
+        if depth <= 0:
+            return idx
+
+    return min(total, line_no + 120)
+
+
+def _read_file_source_excerpt(path: Optional[Path], line_no: int) -> str:
+    if path is None:
+        return "(source file unavailable)"
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return "(unable to read source file)"
+    lines = content.splitlines()
+    end_line = _find_l2_definition_end_line(lines, line_no)
+    return _format_source_excerpt_lines(lines, line_no, end_line=end_line)
+
+
+def _build_docs_web_static_html(
+    payload: Dict[str, Any],
+    *,
+    tab: str,
+    query: str,
+    selected: str = "",
+    workspace_root: Optional[Path] = None,
+) -> str:
+    tabs: List[Tuple[str, str]] = [
+        ("library", "Library Docs"),
+        ("language", "Language Reference"),
+        ("ct", "Compile-Time Reference"),
+        ("license", "License"),
+        ("philosophy", "Philosophy of L2"),
+        ("qa", "Q&A / Tips & Tricks"),
+        ("how", "How L2 Works (Internals)"),
+    ]
+    valid_tabs = {tab_id for tab_id, _ in tabs}
+    active_tab = tab if tab in valid_tabs else "library"
+    q = str(query or "")
+    terms = [part for part in q.lower().split() if part]
+    selected_key = str(selected or "")
+
+    def _esc(value: Any) -> str:
+        return html.escape("" if value is None else str(value), quote=True)
+
+    def _match(parts: Sequence[Any]) -> bool:
+        if not terms:
+            return True
+        blob = " ".join(str(part or "") for part in parts).lower()
+        return all(term in blob for term in terms)
+
+    from urllib.parse import urlencode
+
+    def _href(tab_id: str, q_text: str, sel_text: str = "") -> str:
+        params: Dict[str, str] = {"tab": tab_id}
+        if q_text:
+            params["q"] = q_text
+        if sel_text:
+            params["sel"] = sel_text
+        return "/?" + urlencode(params)
+
+    def _safe_resolve_source(path_text: str) -> Optional[Path]:
+        if not path_text:
+            return None
+        try:
+            p = Path(path_text)
+            if not p.is_absolute():
+                base = workspace_root if workspace_root is not None else Path(".").resolve()
+                p = (base / p).resolve()
+            else:
+                p = p.resolve()
+            if not p.is_file():
+                return None
+            return p
+        except Exception:
+            return None
+
+    nav_links: List[str] = []
+    for tab_id, label in tabs:
+        href = _href(tab_id, q, "")
+        cls = "tab active" if tab_id == active_tab else "tab"
+        nav_links.append(f'<a class="{cls}" href="{_esc(href)}">{_esc(label)}</a>')
+
+    body_html = ""
+    match_count = 0
+    total_count = 0
+    selected_for_form = ""
+
+    if active_tab == "library":
+        entries = payload.get("library", {}).get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        total_count = len(entries)
+        filtered: List[Tuple[str, Dict[str, Any]]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", ""))
+            kind = str(entry.get("kind", "word"))
+            stack_effect = str(entry.get("stack_effect", "(no stack effect)"))
+            description = str(entry.get("description", ""))
+            path = str(entry.get("path", ""))
+            line = int(entry.get("line", 0) or 0)
+            if not _match([name, kind, stack_effect, description, path, line]):
+                continue
+            key = f"{name}|{path}|{line}"
+            filtered.append((key, entry))
+
+        match_count = len(filtered)
+        if filtered and selected_key not in {key for key, _ in filtered}:
+            selected_key = filtered[0][0]
+        selected_for_form = selected_key
+
+        list_items: List[str] = []
+        selected_entry: Optional[Dict[str, Any]] = None
+        for key, entry in filtered:
+            name = str(entry.get("name", ""))
+            kind = str(entry.get("kind", "word"))
+            stack_effect = str(entry.get("stack_effect", "(no stack effect)"))
+            description = str(entry.get("description", ""))
+            path = str(entry.get("path", ""))
+            line = int(entry.get("line", 0) or 0)
+            if key == selected_key:
+                selected_entry = entry
+            active_cls = " item-active" if key == selected_key else ""
+            href = _href("library", q, key)
+            list_items.append(
+                f"<li class=\"{active_cls.strip()}\">"
+                f"<a class=\"entrybox\" href=\"{_esc(href)}\">"
+                f"<div class=\"entry\">{_esc(name)}</div>"
+                f"<div class=\"meta\">{_esc(kind)} | {_esc(stack_effect)}</div>"
+                f"<div class=\"desc\">{_esc(description or (path + ':' + str(line)))}</div>"
+                "</a>"
+                "</li>"
+            )
+
+        if selected_entry is not None:
+            name = str(selected_entry.get("name", ""))
+            kind = str(selected_entry.get("kind", "word"))
+            stack_effect = str(selected_entry.get("stack_effect", "(no stack effect)"))
+            description = str(selected_entry.get("description", ""))
+            path = str(selected_entry.get("path", ""))
+            line = int(selected_entry.get("line", 0) or 0)
+            src_path = _safe_resolve_source(path)
+            source_excerpt = _read_file_source_excerpt(src_path, line)
+            detail_html = (
+                f"<h2 style=\"margin:0 0 8px;font-size:18px;\">{_esc(name)}</h2>"
+                f"<div class=\"kv\"><strong>Kind:</strong> {_esc(kind)}</div>"
+                f"<div class=\"kv\"><strong>Stack Effect:</strong> {_esc(stack_effect)}</div>"
+                f"<div class=\"kv\"><strong>Source:</strong> {_esc(path)}:{_esc(line)}</div>"
+                "<div class=\"label\">Description</div>"
+                f"<pre class=\"mini\">{_esc(description or 'No description.')}</pre>"
+                "<div class=\"label\">Source Excerpt</div>"
+                f"<pre class=\"full\">{_esc(source_excerpt)}</pre>"
+            )
+        else:
+            detail_html = "<p>Select an entry to view details.</p>"
+
+        if list_items:
+            body_html = (
+                "<div class=\"split\">"
+                "<div class=\"listcol\"><p class=\"hint\">Click a function to inspect details and source.</p><ul class=\"rows\">"
+                + "".join(list_items)
+                + "</ul></div>"
+                + f"<div class=\"detailcol\">{detail_html}</div>"
+                + "</div>"
+            )
+        else:
+            body_html = "<p>No matching entries.</p>"
+
+    elif active_tab == "language":
+        entries = payload.get("language", {}).get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        total_count = len(entries)
+        filtered: List[Tuple[str, Dict[str, Any]]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", ""))
+            category = str(entry.get("category", "General"))
+            syntax = str(entry.get("syntax", ""))
+            summary = str(entry.get("summary", ""))
+            detail = str(entry.get("detail", ""))
+            example_text = " ".join(_normalize_language_examples(entry.get("examples", [])))
+            if not _match([name, category, syntax, summary, detail, example_text]):
+                continue
+            key = f"{name}|{category}"
+            filtered.append((key, entry))
+
+        match_count = len(filtered)
+        if filtered and selected_key not in {key for key, _ in filtered}:
+            selected_key = filtered[0][0]
+        selected_for_form = selected_key
+
+        list_items: List[str] = []
+        selected_entry: Optional[Dict[str, Any]] = None
+        for key, entry in filtered:
+            name = str(entry.get("name", ""))
+            category = str(entry.get("category", "General"))
+            syntax = str(entry.get("syntax", ""))
+            summary = str(entry.get("summary", ""))
+            detail = str(entry.get("detail", ""))
+            if key == selected_key:
+                selected_entry = entry
+            active_cls = " item-active" if key == selected_key else ""
+            href = _href("language", q, key)
+            list_items.append(
+                f"<li class=\"{active_cls.strip()}\">"
+                f"<a class=\"entrybox\" href=\"{_esc(href)}\">"
+                f"<div class=\"entry\">{_esc(name)}</div>"
+                f"<div class=\"meta\">{_esc(category)}</div>"
+                f"<div class=\"desc\">{_esc(syntax or '(syntax not provided)')}</div>"
+                f"<div class=\"desc\">{_esc(summary or detail)}</div>"
+                "</a>"
+                "</li>"
+            )
+
+        if selected_entry is not None:
+            name = str(selected_entry.get("name", ""))
+            category = str(selected_entry.get("category", "General"))
+            syntax = str(selected_entry.get("syntax", ""))
+            summary = str(selected_entry.get("summary", ""))
+            detail = str(selected_entry.get("detail", ""))
+            examples = _normalize_language_examples(selected_entry.get("examples", []))
+            ex_text = "\n".join(examples) if examples else "(no examples)"
+            detail_html = (
+                f"<h2 style=\"margin:0 0 8px;font-size:18px;\">{_esc(name)}</h2>"
+                f"<div class=\"kv\"><strong>Category:</strong> {_esc(category)}</div>"
+                "<div class=\"label\">Syntax</div>"
+                f"<pre class=\"mini\">{_esc(syntax or '(syntax not provided)')}</pre>"
+                "<div class=\"label\">Summary</div>"
+                f"<pre class=\"mini\">{_esc(summary or '(no summary)')}</pre>"
+                "<div class=\"label\">Description</div>"
+                f"<pre class=\"mini\">{_esc(detail or '(no description)')}</pre>"
+                "<div class=\"label\">Examples</div>"
+                f"<pre class=\"mini\">{_esc(ex_text)}</pre>"
+            )
+        else:
+            detail_html = "<p>Select an entry to view details.</p>"
+
+        if list_items:
+            body_html = (
+                "<div class=\"split\">"
+                "<div class=\"listcol\"><p class=\"hint\">Click an entry to inspect details and examples.</p><ul class=\"rows\">"
+                + "".join(list_items)
+                + "</ul></div>"
+                + f"<div class=\"detailcol\">{detail_html}</div>"
+                + "</div>"
+            )
+        else:
+            body_html = "<p>No matching entries.</p>"
+
+    elif active_tab == "ct":
+        entries = payload.get("ct", {}).get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        total_count = len(entries)
+        filtered: List[Tuple[str, Dict[str, Any]]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", ""))
+            category = str(entry.get("category", "Meta"))
+            scope = str(entry.get("scope", "all"))
+            stack_effect = str(entry.get("stack_effect", ""))
+            overview = str(entry.get("overview", ""))
+            examples = entry.get("examples", [])
+            if not isinstance(examples, list):
+                examples = []
+            if not _match([name, category, scope, stack_effect, overview, " ".join(str(x) for x in examples)]):
+                continue
+            line = int(entry.get("line", 0) or 0)
+            key = f"{name}|{line}"
+            filtered.append((key, entry))
+
+        match_count = len(filtered)
+        if filtered and selected_key not in {key for key, _ in filtered}:
+            selected_key = filtered[0][0]
+        selected_for_form = selected_key
+
+        list_items = []
+        selected_entry = None
+        for key, entry in filtered:
+            name = str(entry.get("name", ""))
+            category = str(entry.get("category", "Meta"))
+            scope = str(entry.get("scope", "all"))
+            stack_effect = str(entry.get("stack_effect", ""))
+            overview = str(entry.get("overview", ""))
+            if key == selected_key:
+                selected_entry = entry
+            active_cls = " item-active" if key == selected_key else ""
+            href = _href("ct", q, key)
+            list_items.append(
+                f"<li class=\"{active_cls.strip()}\">"
+                f"<a class=\"entrybox\" href=\"{_esc(href)}\">"
+                f"<div class=\"entry\">{_esc(name)}</div>"
+                f"<div class=\"meta\">{_esc(category)} | {_esc(scope)} | {_esc(stack_effect or '(see docs)')}</div>"
+                f"<div class=\"desc\">{_esc(overview or 'No overview.')}</div>"
+                "</a>"
+                "</li>"
+            )
+
+        if selected_entry is not None:
+            name = str(selected_entry.get("name", ""))
+            category = str(selected_entry.get("category", "Meta"))
+            scope = str(selected_entry.get("scope", "all"))
+            stack_effect = str(selected_entry.get("stack_effect", ""))
+            overview = str(selected_entry.get("overview", ""))
+            line = int(selected_entry.get("line", 0) or 0)
+            examples = selected_entry.get("examples", [])
+            if not isinstance(examples, list):
+                examples = []
+            ex_text = "\n".join("- " + str(x) for x in examples if str(x).strip()) or "(no examples)"
+            detail_html = (
+                f"<h2 style=\"margin:0 0 8px;font-size:18px;\">{_esc(name)}</h2>"
+                f"<div class=\"kv\"><strong>Category:</strong> {_esc(category)}</div>"
+                f"<div class=\"kv\"><strong>Scope:</strong> {_esc(scope)}</div>"
+                f"<div class=\"kv\"><strong>Stack Effect:</strong> {_esc(stack_effect or '(see docs)')}</div>"
+                f"<div class=\"kv\"><strong>Source Line:</strong> {_esc(line)}</div>"
+                "<div class=\"label\">Overview</div>"
+                f"<pre class=\"mini\">{_esc(overview or 'No overview.')}</pre>"
+                "<div class=\"label\">Examples</div>"
+                f"<pre class=\"mini\">{_esc(ex_text)}</pre>"
+            )
+        else:
+            detail_html = "<p>Select an entry to view details.</p>"
+
+        if list_items:
+            body_html = (
+                "<div class=\"split\">"
+                "<div class=\"listcol\"><p class=\"hint\">Click a function to inspect details.</p><ul class=\"rows\">"
+                + "".join(list_items)
+                + "</ul></div>"
+                + f"<div class=\"detailcol\">{detail_html}</div>"
+                + "</div>"
+            )
+        else:
+            body_html = "<p>No matching entries.</p>"
+
+    else:
+        info = payload.get("info", {})
+        if not isinstance(info, dict):
+            info = {}
+        key_map = {
+            "license": "license",
+            "philosophy": "philosophy",
+            "qa": "qa",
+            "how": "how",
+        }
+        text = str(info.get(key_map.get(active_tab, ""), ""))
+        lines = text.splitlines()
+        total_count = len(lines)
+        if terms:
+            lines = [line for line in lines if all(term in line.lower() for term in terms)]
+        match_count = len(lines)
+        shown = "\n".join(lines) if lines else "No matching lines."
+        body_html = f'<pre class="full">{_esc(shown)}</pre>'
+
+    if active_tab in {"library", "language", "ct"}:
+        meta_text = f"{match_count} / {total_count} entries"
+    else:
+        meta_text = f"{match_count} / {total_count} lines"
+
+    selected_input = (
+        f"<input type=\"hidden\" name=\"sel\" value=\"{_esc(selected_for_form)}\" />"
+        if selected_for_form and active_tab in {"library", "language", "ct"}
+        else ""
+    )
+
+    active_label = next((label for tab_id, label in tabs if tab_id == active_tab), active_tab)
+    return (
+        "<!doctype html>"
+        "<html lang=\"en\"><head><meta charset=\"utf-8\" />"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>L2 Docs Explorer</title>"
+        "<style>"
+        "body{margin:0;padding:16px;font-family:Segoe UI,Arial,sans-serif;background:#f5f8fc;color:#0f2238;}"
+        ".shell{max-width:1320px;margin:0 auto;background:#fff;border:1px solid #cbd8ea;border-radius:12px;overflow:hidden;}"
+        ".head{padding:14px 16px;border-bottom:1px solid #d6e1ef;background:#f8fbff;}"
+        ".tabs{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;border-bottom:1px solid #d6e1ef;background:#fbfdff;}"
+        ".tab{display:inline-block;padding:6px 10px;border:1px solid #c2d2e6;border-radius:999px;text-decoration:none;color:#204364;background:#fff;}"
+        ".tab.active{background:#dbeaff;border-color:#1d5aa8;font-weight:600;}"
+        ".controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid #d6e1ef;background:#f8fbff;}"
+        ".field{min-width:260px;flex:1;border:1px solid #bdcde1;border-radius:8px;padding:8px 10px;}"
+        ".btn{border:1px solid #b9cde4;background:#eef5ff;color:#1f4265;border-radius:8px;padding:8px 10px;text-decoration:none;display:inline-block;}"
+        ".content{padding:12px;}"
+        ".hint{margin:0 0 8px;color:#4a6382;font-size:13px;}"
+        ".split{display:grid;grid-template-columns:minmax(340px,40%) 1fr;gap:12px;height:min(74vh,820px);min-height:520px;}"
+        ".listcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid #d7e2ef;border-radius:10px;background:#fff;padding:8px;}"
+        ".detailcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid #d7e2ef;border-radius:10px;background:#fbfdff;padding:10px;}"
+        ".rows{list-style:none;margin:0;padding:0;}"
+        ".rows li{padding:0;border-bottom:1px solid #ecf2fb;border-left:3px solid transparent;}"
+        ".rows li:last-child{border-bottom:0;}"
+        ".rows li:hover{background:#f2f8ff;}"
+        ".rows li.item-active{background:#eef6ff;border-left-color:#1d5aa8;}"
+        ".entrybox{display:block;padding:10px 10px;text-decoration:none;color:inherit;}"
+        ".entry{font-family:Consolas,monospace;font-weight:600;color:#1a3f64;text-decoration:none;}"
+        ".entrybox:hover .entry{text-decoration:underline;}"
+        ".name{font-family:Consolas,monospace;font-weight:600;}"
+        ".meta{font-size:12px;color:#345676;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".desc{font-size:13px;color:#35516f;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".kv{font-size:13px;color:#2f4c69;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".label{margin:10px 0 6px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#566f8d;}"
+        ".mini{margin:6px 0 0;padding:8px;border:1px solid #d7e2ef;border-radius:8px;background:#f7fbff;white-space:pre-wrap;word-break:break-word;}"
+        ".full{margin:0;padding:10px;border:1px solid #d7e2ef;border-radius:8px;background:#f7fbff;white-space:pre-wrap;word-break:break-word;overflow:auto;}"
+        "@media (max-width: 980px){.split{grid-template-columns:1fr;height:auto;min-height:0;}.listcol,.detailcol{overflow:visible;overscroll-behavior:auto;}}"
+        "</style></head><body>"
+        "<div class=\"shell\">"
+        "<div class=\"head\"><h1 style=\"margin:0;font-size:20px;\">L2 Docs Explorer</h1>"
+        "<div style=\"margin-top:6px;color:#486381;font-size:13px;\">"
+        f"Showing: {_esc(active_label)} | {_esc(meta_text)}"
+        "</div></div>"
+        f"<nav class=\"tabs\">{''.join(nav_links)}</nav>"
+        "<form class=\"controls\" method=\"get\" action=\"/\">"
+        f"<input type=\"hidden\" name=\"tab\" value=\"{_esc(active_tab)}\" />"
+        f"{selected_input}"
+        f"<input class=\"field\" type=\"search\" name=\"q\" value=\"{_esc(q)}\" placeholder=\"Search current tab...\" />"
+        "<button class=\"btn\" type=\"submit\">Search</button>"
+        f"<a class=\"btn\" href=\"{_esc(_href(active_tab, '', ''))}\">Clear</a>"
+        "<a class=\"btn\" href=\"/api/docs\">Raw API</a>"
+        "</form>"
+        f"<div class=\"content\">{body_html}</div>"
+        "</div></body></html>"
+    )
+
+
+def run_docs_serve(
+    *,
+    source: Optional[Path],
+    include_paths: Sequence[Path],
+    explicit_roots: Sequence[Path],
+    initial_query: str,
+    include_undocumented: bool = False,
+    include_private: bool = False,
+    include_tests: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8008,
+    open_browser: bool = True,
+    ct_word_metadata_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
+) -> int:
+    configure_runtime(ct_word_metadata_provider=ct_word_metadata_provider)
+
+    roots = _build_default_docs_roots(
+        source=source,
+        include_paths=include_paths,
+        explicit_roots=explicit_roots,
+    )
+    entries = _collect_docs_for_runtime(
+        roots,
+        include_undocumented=include_undocumented,
+        include_private=include_private,
+        include_tests=include_tests,
+        include_macros=False,
+        extra_roots=[],
+    )
+
+    workspace_root = Path(".").resolve()
+    library_entries = [_docs_entry_to_payload(entry, workspace_root) for entry in entries]
+    library_entries.sort(key=lambda item: (str(item.get("name", "")).lower(), str(item.get("path", ""))))
+
+    tui_assets = _extract_docs_tui_assets()
+    language_entries = _normalize_language_entries(tui_assets.get("language_entries", []))
+
+    ct_base_text = str(tui_assets.get("ct_base_text", ""))
+    ct_entries: List[Dict[str, Any]] = []
+    ct_full_text = ct_base_text
+    if ct_base_text:
+        try:
+            ct_bundle = build_ct_reference_bundle(ct_base_text, _collect_ct_word_metadata())
+            ct_summary_text = str(ct_bundle.get("summary_text", ""))
+            ct_appendix_text = str(ct_bundle.get("appendix_text", ""))
+            ct_full_text = ct_base_text + ct_summary_text + ct_appendix_text
+            raw_entries = ct_bundle.get("entries", [])
+            if isinstance(raw_entries, list):
+                for entry in attach_ct_entry_line_numbers(ct_full_text, raw_entries):
+                    if isinstance(entry, dict):
+                        ct_entries.append(_ct_entry_to_payload(entry))
+        except Exception:
+            ct_entries = []
+
+    ct_entries.sort(key=lambda item: str(item.get("name", "")).lower())
+
+    payload = {
+        "library": {
+            "entries": library_entries,
+            "count": len(library_entries),
+            "kinds": sorted({str(item.get("kind", "")) for item in library_entries}),
+        },
+        "language": {
+            "entries": language_entries,
+            "count": len(language_entries),
+            "categories": sorted({str(item.get("category", "General")) for item in language_entries}),
+        },
+        "ct": {
+            "entries": ct_entries,
+            "count": len(ct_entries),
+            "categories": sorted({str(item.get("category", "Meta")) for item in ct_entries}),
+            "scopes": sorted({str(item.get("scope", "all")) for item in ct_entries}),
+        },
+        "info": {
+            "license": str(tui_assets.get("license_text", "")),
+            "philosophy": str(tui_assets.get("philosophy_text", "")),
+            "qa": str(tui_assets.get("qa_text", "")),
+            "how": str(tui_assets.get("how_text", "")),
+        },
+    }
+
+    json_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    from http import HTTPStatus
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class _DocsHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            del format, args
+
+        def _send(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path in ("/", "/index.html", "/docs-static"):
+                query_map = parse_qs(parsed.query or "")
+                static_tab = str(query_map.get("tab", ["library"])[0] or "library")
+                static_query = str(query_map.get("q", [initial_query])[0] or "")
+                static_sel = str(query_map.get("sel", [""])[0] or "")
+                static_html = _build_docs_web_static_html(
+                    payload,
+                    tab=static_tab,
+                    query=static_query,
+                    selected=static_sel,
+                    workspace_root=workspace_root,
+                )
+                self._send(int(HTTPStatus.OK), static_html.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/docs":
+                self._send(int(HTTPStatus.OK), json_bytes, "application/json; charset=utf-8")
+                return
+            self._send(int(HTTPStatus.NOT_FOUND), b"not found\n", "text/plain; charset=utf-8")
+
+    try:
+        server = ThreadingHTTPServer((host, int(port)), _DocsHandler)
+    except OSError as exc:
+        raise RuntimeError(f"unable to start docs server on {host}:{port}: {exc}") from exc
+
+    display_host = host
+    if host in {"0.0.0.0", "::"}:
+        display_host = "127.0.0.1"
+    url = f"http://{display_host}:{int(port)}/"
+
+    print(f"[info] docs web ui listening on {url}")
+    print(
+        "[info] indexed tabs: "
+        f"library={len(library_entries)} "
+        f"language={len(language_entries)} "
+        f"ct={len(ct_entries)}"
+    )
+    print("[info] mode: static docs only at / (with tab/search/detail views)")
+    print("[info] press Ctrl+C to stop")
+
+    if open_browser:
+        try:
+            import webbrowser
+
+            webbrowser.open(url, new=2)
+        except Exception:
+            pass
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[info] docs web ui stopped")
+    finally:
+        server.server_close()
+
+    return 0
 
 
 def run_docs_cli(
@@ -4771,8 +5836,6 @@ def run_docs_cli(
     )
 
 
-
-# ---- Structured CT docs helpers and quality overrides ----
 def _is_plausible_word_name(name: str) -> bool:
     if not name:
         return False
@@ -5240,27 +6303,27 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "ct-rewrite-scope-push": "ct-rewrite-scope-push 0 > static_assert",
     "ct-rewrite-scope-pop": "ct-rewrite-scope-push drop ct-rewrite-scope-pop static_assert",
     "ct-rewrite-run-on-list": '"grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop',
-    "ct-lang-create": '"fn.dsl" ct-lang-create drop',
-    "ct-lang-exists?": '"fn.dsl" ct-lang-exists? static_assert',
+    "ct-lang-create": '"demo.lang" ct-lang-create drop',
+    "ct-lang-exists?": '"demo.lang" ct-lang-exists? static_assert',
     "ct-lang-list": "ct-lang-list list-length 0 >= static_assert",
-    "ct-lang-activate": '"fn.dsl" ct-lang-activate static_assert',
-    "ct-lang-deactivate": '"fn.dsl" ct-lang-deactivate static_assert',
-    "ct-lang-active?": '"fn.dsl" ct-lang-active? static_assert',
+    "ct-lang-activate": '"demo.lang" ct-lang-activate static_assert',
+    "ct-lang-deactivate": '"demo.lang" ct-lang-deactivate static_assert',
+    "ct-lang-active?": '"demo.lang" ct-lang-active? static_assert',
     "ct-lang-active-list": "ct-lang-active-list list-length 0 >= static_assert",
-    "ct-lang-meta-set": '"fn.dsl" map-new ct-lang-meta-set static_assert',
-    "ct-lang-meta-get": '"fn.dsl" ct-lang-meta-get swap drop',
-    "ct-lang-set-auto-validate": '"fn.dsl" 1 ct-lang-set-auto-validate static_assert',
-    "ct-lang-get-auto-validate": '"fn.dsl" ct-lang-get-auto-validate swap drop',
-    "ct-lang-add-validator": '"fn.dsl" "fn-dsl-assert-ct-surface" ct-lang-add-validator drop',
-    "ct-lang-run-validators": '"fn.dsl" ct-lang-run-validators drop',
+    "ct-lang-meta-set": '"demo.lang" map-new ct-lang-meta-set static_assert',
+    "ct-lang-meta-get": '"demo.lang" ct-lang-meta-get swap drop',
+    "ct-lang-set-auto-validate": '"demo.lang" 1 ct-lang-set-auto-validate static_assert',
+    "ct-lang-get-auto-validate": '"demo.lang" ct-lang-get-auto-validate swap drop',
+    "ct-lang-add-validator": '"demo.lang" "demo-validator" ct-lang-add-validator drop',
+    "ct-lang-run-validators": '"demo.lang" ct-lang-run-validators drop',
     "ct-lang-run-active-validators": "ct-lang-run-active-validators drop",
-    "ct-lang-set-token-hook": '"fn.dsl" "call-syntax-rewrite" ct-lang-set-token-hook drop',
-    "ct-lang-add-reader-rewrite-named": '"fn.dsl" "r" list-new list-new ct-lang-add-reader-rewrite-named drop',
-    "ct-lang-add-grammar-rewrite-named": '"fn.dsl" "g" list-new list-new ct-lang-add-grammar-rewrite-named drop',
-    "ct-lang-register-text-macro-signature": '"fn.dsl" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
-    "ct-lang-register-pattern-macro": '"fn.dsl" "pm" list-new ct-lang-register-pattern-macro drop',
-    "ct-lang-status": '"fn.dsl" ct-lang-status swap drop',
-    "ct-lang-remove": '"fn.dsl" ct-lang-remove drop',
+    "ct-lang-set-token-hook": '"demo.lang" "demo-hook" ct-lang-set-token-hook drop',
+    "ct-lang-add-reader-rewrite-named": '"demo.lang" "r" list-new list-new ct-lang-add-reader-rewrite-named drop',
+    "ct-lang-add-grammar-rewrite-named": '"demo.lang" "g" list-new list-new ct-lang-add-grammar-rewrite-named drop',
+    "ct-lang-register-text-macro-signature": '"demo.lang" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
+    "ct-lang-register-pattern-macro": '"demo.lang" "pm" list-new ct-lang-register-pattern-macro drop',
+    "ct-lang-status": '"demo.lang" ct-lang-status swap drop',
+    "ct-lang-remove": '"demo.lang" ct-lang-remove drop',
 }
 
 

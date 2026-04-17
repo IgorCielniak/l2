@@ -7982,8 +7982,29 @@ class CompileTimeVM:
         token = text.strip()
         if not token:
             return None
+        if token == "?":
+            return 0
         try:
             return int(token, 0)
+        except ValueError:
+            pass
+        normalized = token.replace("_", "")
+        sign = 1
+        body = normalized
+        if body.startswith(("+", "-")):
+            if body[0] == "-":
+                sign = -1
+            body = body[1:]
+        lower = body.lower()
+        try:
+            if lower.endswith("h") and re.match(r"^[0-9a-f]+h$", lower):
+                return sign * int(lower[:-1], 16)
+            if lower.endswith("b") and re.match(r"^[01]+b$", lower):
+                return sign * int(lower[:-1], 2)
+            if lower.endswith(("o", "q")) and re.match(r"^[0-7]+[oq]$", lower):
+                return sign * int(lower[:-1], 8)
+            if lower.endswith("d") and re.match(r"^[0-9]+d$", lower):
+                return sign * int(lower[:-1], 10)
         except ValueError:
             pass
         if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
@@ -7999,6 +8020,114 @@ class CompileTimeVM:
                 return int(literal[0])
         return None
 
+    @staticmethod
+    def _split_data_operands(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        quote: Optional[str] = None
+        escaped = False
+        depth = 0
+
+        for ch in text:
+            if quote is not None:
+                buf.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+
+            if ch in ('"', "'"):
+                quote = ch
+                buf.append(ch)
+                continue
+
+            if ch == "(":
+                depth += 1
+                buf.append(ch)
+                continue
+            if ch == ")":
+                if depth > 0:
+                    depth -= 1
+                buf.append(ch)
+                continue
+
+            if ch == "," and depth == 0:
+                item = "".join(buf).strip()
+                if item:
+                    items.append(item)
+                buf = []
+                continue
+
+            buf.append(ch)
+
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    @staticmethod
+    def _consume_data_labels(text: str) -> Tuple[List[str], str]:
+        labels: List[str] = []
+        rest = text.strip()
+        while rest:
+            match = re.match(r"^([A-Za-z0-9_.$@]+)\s*:\s*(.*)$", rest)
+            if match is None:
+                break
+            labels.append(match.group(1))
+            rest = match.group(2).strip()
+        return labels, rest
+
+    def _parse_data_atom_values(self, unit: int, token: str) -> List[int]:
+        item = token.strip()
+        if not item:
+            return [0]
+
+        dup_match = re.match(r"^(.*?)\bdup\s*\((.*)\)\s*$", item, re.IGNORECASE)
+        if dup_match is not None:
+            parsed_count = self._parse_data_scalar(dup_match.group(1).strip())
+            count = int(parsed_count) if parsed_count is not None else 1
+            if count <= 0:
+                return []
+            inner_values = self._parse_data_values(unit, dup_match.group(2).strip())
+            return inner_values * count
+
+        if item == "?":
+            return [0]
+
+        if len(item) >= 2 and item[0] == item[-1] and item[0] in ('"', "'"):
+            try:
+                literal = ast.literal_eval(item)
+            except Exception:
+                literal = None
+            if isinstance(literal, str):
+                if unit == 1:
+                    blob = literal.encode("utf-8", errors="ignore")
+                    return [int(b) for b in blob] if blob else [0]
+                expanded = [ord(ch) for ch in literal]
+                return expanded if expanded else [0]
+            if isinstance(literal, (bytes, bytearray)):
+                expanded = [int(b) for b in literal]
+                return expanded if expanded else [0]
+            if isinstance(literal, int):
+                return [int(literal)]
+
+        parsed_scalar = self._parse_data_scalar(item)
+        if parsed_scalar is not None:
+            return [int(parsed_scalar)]
+        return [0]
+
+    def _parse_data_values(self, unit: int, operands: str) -> List[int]:
+        parts = self._split_data_operands(operands)
+        if not parts:
+            return [0]
+        values: List[int] = []
+        for part in parts:
+            values.extend(self._parse_data_atom_values(unit, part))
+        return values if values else [0]
+
     def _materialize_custom_data_symbols(self) -> None:
         """Populate runtime symbol map from parser.custom_data declarations."""
         if self.memory is None:
@@ -8012,49 +8141,95 @@ class CompileTimeVM:
             "dw": 2,
             "dd": 4,
             "dq": 8,
+            "dt": 10,
+            "do": 16,
+            "dy": 32,
+            "dz": 64,
             "resb": 1,
             "resw": 2,
             "resd": 4,
             "resq": 8,
+            "rest": 10,
+            "reso": 16,
+            "resy": 32,
+            "resz": 64,
         }
+        pending_labels: List[str] = []
 
         for raw_line in data_lines:
             line = raw_line.split(";", 1)[0].strip()
             if not line:
                 continue
-            match = _RE_DATA_DECL_PAT.match(line)
-            if match is None:
+
+            labels, remainder = self._consume_data_labels(line)
+            for label_name in labels:
+                if label_name not in pending_labels:
+                    pending_labels.append(label_name)
+            if not remainder:
                 continue
 
-            label = match.group(1)
-            directive = match.group(2).lower()
-            operands = match.group(3).strip()
-
-            if label in self._bss_symbols:
+            if not pending_labels:
                 continue
+
+            parts = remainder.split(None, 1)
+            directive = parts[0].lower()
+            operands = parts[1].strip() if len(parts) > 1 else ""
+            repeat_count = 1
+
+            while directive == "times":
+                time_parts = operands.split(None, 2)
+                if len(time_parts) < 2:
+                    break
+                parsed_repeat = self._parse_data_scalar(time_parts[0])
+                step_repeat = int(parsed_repeat) if parsed_repeat is not None else 1
+                if step_repeat < 0:
+                    step_repeat = 0
+                repeat_count *= step_repeat
+                directive = time_parts[1].lower()
+                operands = time_parts[2].strip() if len(time_parts) >= 3 else ""
+
+            target_labels = [name for name in pending_labels if name not in self._bss_symbols]
+            pending_labels = []
+            if not target_labels:
+                continue
+
+            if directive == "equ":
+                equ_parts = self._split_data_operands(operands)
+                equ_token = equ_parts[0] if equ_parts else "0"
+                equ_value = self._parse_data_scalar(equ_token)
+                value = int(equ_value) if equ_value is not None else 0
+                for name in target_labels:
+                    self._bss_symbols[name] = value
+                continue
+
             unit = unit_sizes.get(directive)
             if unit is None:
+                # Unknown declaration style: still provide stable address labels
+                # so [rel label] references can be resolved by the JIT.
+                addr = self.memory.allocate(8)
+                for name in target_labels:
+                    self._bss_symbols[name] = addr
                 continue
 
             values: List[int]
             if directive.startswith("res"):
-                count_token = operands.split(",", 1)[0].strip() if operands else "1"
+                count_parts = self._split_data_operands(operands)
+                count_token = count_parts[0] if count_parts else "1"
                 parsed_count = self._parse_data_scalar(count_token)
                 count = int(parsed_count) if parsed_count is not None else 1
-                if count <= 0:
-                    count = 1
-                values = [0] * count
+                if count < 0:
+                    count = 0
+                total = count * max(0, repeat_count)
+                values = [0] * max(0, total)
             else:
-                raw_items = [part.strip() for part in operands.split(",") if part.strip()]
-                if not raw_items:
-                    raw_items = ["0"]
-                values = []
-                for item in raw_items:
-                    parsed = self._parse_data_scalar(item)
-                    values.append(0 if parsed is None else int(parsed))
+                base_values = self._parse_data_values(unit, operands)
+                rep = max(0, repeat_count)
+                values = base_values * rep if rep > 0 else []
 
-            addr = self.memory.allocate(unit * len(values))
-            self._bss_symbols[label] = addr
+            byte_count = unit * len(values)
+            addr = self.memory.allocate(byte_count if byte_count > 0 else unit)
+            for name in target_labels:
+                self._bss_symbols[name] = addr
 
             if unit == 1:
                 for idx, value in enumerate(values):
@@ -8065,9 +8240,22 @@ class CompileTimeVM:
             elif unit == 4:
                 for idx, value in enumerate(values):
                     ctypes.c_uint32.from_address(addr + idx * 4).value = int(value) & 0xFFFFFFFF
-            else:
+            elif unit == 8:
                 for idx, value in enumerate(values):
                     ctypes.c_int64.from_address(addr + idx * 8).value = _to_i64(int(value))
+            else:
+                mask = (1 << (unit * 8)) - 1
+                for idx, value in enumerate(values):
+                    raw = int(value) & mask
+                    blob = raw.to_bytes(unit, byteorder="little", signed=False)
+                    ctypes.memmove(addr + idx * unit, blob, unit)
+
+        if pending_labels:
+            unresolved = [name for name in pending_labels if name not in self._bss_symbols]
+            if unresolved:
+                addr = self.memory.allocate(1)
+                for name in unresolved:
+                    self._bss_symbols[name] = addr
 
     @staticmethod
     def _is_coroutine_asm(body: str) -> bool:

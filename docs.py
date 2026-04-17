@@ -2314,8 +2314,8 @@ def _run_docs_tui(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "  These words let compile-time code modify the generated\n"
-        "  assembly: the prelude (code inside _start) and the\n"
-        "  BSS section (uninitialized data).\n"
+        "  assembly: the prelude (code inside _start), custom\n"
+        "  .data lines, and the BSS section (uninitialized data).\n"
         "\n"
         "  prelude-clear       [*] -> [*]\n"
         "    Discard the entire custom prelude.\n"
@@ -2326,6 +2326,16 @@ def _run_docs_tui(
         "  prelude-set         [* | list-of-strings] -> [*]\n"
         "    Replace the custom prelude with the given list of\n"
         "    assembly lines.\n"
+        "\n"
+        "  data-clear          [*] -> [*]\n"
+        "    Discard all custom .data section additions.\n"
+        "\n"
+        "  data-append         [* | line] -> [*]\n"
+        "    Append a line to the custom .data section additions.\n"
+        "\n"
+        "  data-set            [* | list-of-strings] -> [*]\n"
+        "    Replace custom .data additions with the given list\n"
+        "    of lines.\n"
         "\n"
         "  bss-clear           [*] -> [*]\n"
         "    Discard all custom BSS declarations.\n"
@@ -5903,7 +5913,7 @@ def extract_ct_ref_entry_details(
 
 def _name_phrase(word_name: str) -> str:
     phrase = word_name
-    for prefix in ("ct-", "list-", "map-", "string-", "token-", "lexer-", "prelude-", "bss-"):
+    for prefix in ("ct-", "list-", "map-", "string-", "token-", "lexer-", "prelude-", "data-", "bss-"):
         if phrase.startswith(prefix):
             phrase = phrase[len(prefix):]
             break
@@ -5994,9 +6004,9 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
         target = _target_phrase(word_name, "lexer-")
         return f"Lexer-object helper for {target}; supports mini-DSL parsing with custom separators and lookahead."
 
-    if word_name.startswith("prelude-") or word_name.startswith("bss-"):
+    if word_name.startswith("prelude-") or word_name.startswith("data-") or word_name.startswith("bss-"):
         target = _name_phrase(word_name)
-        return f"Assembly emission helper for {target}; updates generated prelude/BSS sections before final code emission."
+        return f"Assembly emission helper for {target}; updates generated prelude/data/BSS sections before final code emission."
 
     if word_name in {"nil", "nil?"}:
         return "Nil sentinel helper used for optional values and missing-key semantics in CT list/map workflows."
@@ -6041,7 +6051,7 @@ def category_for_word(word_name: str) -> str:
         "ct-unregister-control-override",
     ):
         return "Control"
-    if word_name.startswith("prelude-") or word_name.startswith("bss-"):
+    if word_name.startswith("prelude-") or word_name.startswith("data-") or word_name.startswith("bss-"):
         return "Assembly"
     if word_name.startswith("ct-capture-") or word_name == "ct-gensym":
         return "Capture"
@@ -6730,6 +6740,13 @@ def _example_for_word(word_name: str, stack_effect: str, category: str) -> str:
             return '"mov rax, 60" prelude-append'
         if word_name == "prelude-set":
             return 'list-new "mov rax, 60" list-append prelude-set'
+    if word_name.startswith("data-"):
+        if word_name == "data-clear":
+            return 'data-clear "scratch_dq: dq 42" data-append'
+        if word_name == "data-append":
+            return '"scratch_dq: dq 42" data-append'
+        if word_name == "data-set":
+            return 'list-new "scratch_dq: dq 42" list-append data-set'
     if word_name.startswith("bss-"):
         if word_name == "bss-clear":
             return 'bss-clear "scratch: resb 64" bss-append'

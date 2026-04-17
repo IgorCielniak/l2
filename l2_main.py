@@ -681,14 +681,17 @@ class AsmDefinition:
 
 
 class Module:
-    __slots__ = ('forms', 'variables', 'prelude', 'bss', 'cstruct_layouts')
+    __slots__ = ('forms', 'variables', 'prelude', 'data', 'bss', 'cstruct_layouts')
 
     def __init__(self, forms: List[Any], variables: Dict[str, str] = None,
-                 prelude: Optional[List[str]] = None, bss: Optional[List[str]] = None,
+                 prelude: Optional[List[str]] = None,
+                 data: Optional[List[str]] = None,
+                 bss: Optional[List[str]] = None,
                  cstruct_layouts: Dict[str, CStructLayout] = None) -> None:
         self.forms = forms
         self.variables = variables if variables is not None else {}
         self.prelude = prelude
+        self.data = data
         self.bss = bss
         self.cstruct_layouts = cstruct_layouts if cstruct_layouts is not None else {}
 
@@ -4217,6 +4220,7 @@ class Parser:
         self._span_cache_idx: int = -1
         self.compile_time_vm = CompileTimeVM(self)
         self.custom_prelude: Optional[List[str]] = None
+        self.custom_data: Optional[List[str]] = None
         self.custom_bss: Optional[List[str]] = None
         self.cstruct_layouts: Dict[str, CStructLayout] = {}
         self._pending_inline_definition: bool = False
@@ -6548,6 +6552,7 @@ class Parser:
         self.token_hook = None
         self._last_token = None
         self.custom_prelude = None
+        self.custom_data = None
         self.custom_bss = None
         self._pending_inline_definition = False
         self._pending_priority = None
@@ -6698,6 +6703,7 @@ class Parser:
             raise ParseError("internal parser state corrupt")
         module.variables = dict(self.variable_labels)
         module.prelude = self.custom_prelude
+        module.data = self.custom_data
         module.bss = self.custom_bss
         module.cstruct_layouts = dict(self.cstruct_layouts)
         return module
@@ -12598,11 +12604,13 @@ class Assembler:
                     "    syscall",
                 ])
 
+            if module.data is not None and self._data_section is not None:
+                self._data_section.extend(module.data)
+
             self._emit_variables(module.variables)
 
             if self._data_section is not None:
-                if not self._data_section:
-                    self._data_section.append("data_start:")
+                self._ensure_data_start()
                 if not self._data_section or self._data_section[-1] != "data_end:":
                     self._data_section.append("data_end:")
             bss_lines = module.bss if module.bss is not None else self._bss_layout()
@@ -12657,6 +12665,9 @@ class Assembler:
             raise CompileError("data section is not initialized")
         if not self._data_section:
             self._data_section.append("data_start:")
+            return
+        if not any(line.strip().startswith("data_start:") for line in self._data_section):
+            self._data_section.insert(0, "data_start:")
 
     def _intern_string_literal(self, value: str) -> Tuple[str, int]:
         if self._data_section is None:
@@ -14061,6 +14072,24 @@ def _ct_prelude_set(vm: CompileTimeVM) -> None:
     if not all(isinstance(item, str) for item in lines):
         raise ParseError("prelude-set expects list of strings")
     vm.parser.custom_prelude = list(lines)
+
+
+def _ct_data_clear(vm: CompileTimeVM) -> None:
+    vm.parser.custom_data = []
+
+
+def _ct_data_append(vm: CompileTimeVM) -> None:
+    line = vm.pop_str()
+    if vm.parser.custom_data is None:
+        vm.parser.custom_data = []
+    vm.parser.custom_data.append(line)
+
+
+def _ct_data_set(vm: CompileTimeVM) -> None:
+    lines = _ensure_list(vm.pop())
+    if not all(isinstance(item, str) for item in lines):
+        raise ParseError("data-set expects list of strings")
+    vm.parser.custom_data = list(lines)
 
 
 def _ct_bss_clear(vm: CompileTimeVM) -> None:
@@ -17470,6 +17499,9 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("prelude-clear", _ct_prelude_clear, compile_only=True)
     register("prelude-append", _ct_prelude_append, compile_only=True)
     register("prelude-set", _ct_prelude_set, compile_only=True)
+    register("data-clear", _ct_data_clear, compile_only=True)
+    register("data-append", _ct_data_append, compile_only=True)
+    register("data-set", _ct_data_set, compile_only=True)
     register("bss-clear", _ct_bss_clear, compile_only=True)
     register("bss-append", _ct_bss_append, compile_only=True)
     register("bss-set", _ct_bss_set, compile_only=True)

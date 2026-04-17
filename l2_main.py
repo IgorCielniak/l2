@@ -47,9 +47,11 @@ def _ensure_keystone() -> bool:
     return True
 
 # Pre-compiled regex patterns used by JIT and BSS code
-_RE_REL_PAT = re.compile(r'\[rel\s+(\w+)\]')
+_RE_REL_PAT = re.compile(r'\[\s*rel\s+([A-Za-z0-9_.$@]+)\s*\]', re.IGNORECASE)
+_RE_REL_TO_RIP_PAT = re.compile(r'\[\s*rel\s+([^\]]+?)\s*\]', re.IGNORECASE)
 _RE_LABEL_PAT = re.compile(r'^(\.\w+|\w+):')
 _RE_BSS_PERSISTENT = re.compile(r'persistent:\s*resb\s+(\d+)')
+_RE_DATA_DECL_PAT = re.compile(r'^\s*([A-Za-z0-9_.$@]+)\s*:\s*([A-Za-z]+)\b(.*)$')
 _RE_NEWLINE = re.compile('\n')
 _CT_FAST_CT_INTRINSIC_DISPATCH = {}
 # Blanking asm bodies before tokenization: the tokenizer doesn't need asm
@@ -59,6 +61,15 @@ _RE_ASM_BODY = re.compile(r'(:asm\b[^{]*\{)([^}]*)(})')
 _ASM_BLANK_TBL = str.maketrans({chr(i): ' ' for i in range(128) if i != 10})
 def _blank_asm_bodies(source: str) -> str:
     return _RE_ASM_BODY.sub(lambda m: m.group(1) + m.group(2).translate(_ASM_BLANK_TBL) + m.group(3), source)
+
+
+def _normalize_rel_to_rip(line: str) -> str:
+    """Normalize NASM-style [rel ...] operands to explicit [rip + ...]."""
+    if "rel" not in line.lower():
+        return line
+    return _RE_REL_TO_RIP_PAT.sub(r"[rip + \1]", line)
+
+
 DEFAULT_MACRO_EXPANSION_LIMIT = 256
 _SOURCE_PATH = Path("<source>")
 
@@ -4258,6 +4269,9 @@ class Parser:
         self._werror: bool = False
         # When false, parser skips per-op source location attachment for speed.
         self.capture_op_locations: bool = True
+        # Enabled by CLI --preview to capture CT/immediate execution trace events.
+        self.preview_trace_enabled: bool = False
+        self.preview_trace_events: List[Dict[str, Any]] = []
 
     def _rebuild_span_index(self) -> None:
         """Rebuild bisect index after file_spans changes."""
@@ -4306,6 +4320,72 @@ class Parser:
             return
         level = "error" if self._werror else "warning"
         self._record_diagnostic(token, message, level=level, hint=hint, suggestion=suggestion)
+
+    def _preview_value_repr(self, value: Any, *, max_len: int = 120) -> str:
+        try:
+            if isinstance(value, Token):
+                text = f"Token({value.lexeme}@{value.line}:{value.column})"
+            elif isinstance(value, str):
+                escaped = value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+                text = f'"{escaped}"'
+            elif isinstance(value, list):
+                text = f"list(len={len(value)})"
+            elif isinstance(value, dict):
+                text = f"map(len={len(value)})"
+            else:
+                text = repr(value)
+        except Exception:
+            text = "<unprintable>"
+        if len(text) > max_len:
+            return text[: max_len - 3] + "..."
+        return text
+
+    def _preview_stack_snapshot(self, *, max_items: int = 8) -> List[str]:
+        stack = self.compile_time_vm.stack
+        if not stack:
+            return []
+        tail = stack[-max_items:]
+        out = [self._preview_value_repr(item) for item in tail]
+        if len(stack) > max_items:
+            out.insert(0, f"... ({len(stack) - max_items} more)")
+        return out
+
+    def _record_preview_execution_event(
+        self,
+        *,
+        kind: str,
+        word_name: str,
+        token: Optional[Token],
+        consumed_tokens: Sequence[str],
+        stack_before: Sequence[str],
+        stack_after: Sequence[str],
+        emitted_ops: Sequence[Op],
+    ) -> None:
+        if not self.preview_trace_enabled:
+            return
+
+        emitted: List[str] = []
+        for op in emitted_ops[:12]:
+            if op.data is None:
+                emitted.append(op.op)
+            else:
+                emitted.append(f"{op.op} {self._preview_value_repr(op.data, max_len=80)}")
+        if len(emitted_ops) > 12:
+            emitted.append(f"... ({len(emitted_ops) - 12} more)")
+
+        self.preview_trace_events.append(
+            {
+                "kind": kind,
+                "word": word_name,
+                "path": str(self.location_for_token(token).path) if token is not None else "",
+                "line": int(self.location_for_token(token).line) if token is not None else 0,
+                "column": int(self.location_for_token(token).column) if token is not None else 0,
+                "consumed": [str(piece) for piece in consumed_tokens],
+                "stack_before": [str(piece) for piece in stack_before],
+                "stack_after": [str(piece) for piece in stack_after],
+                "emitted": emitted,
+            }
+        )
 
     def _skip_to_recovery_point(self) -> None:
         """Skip tokens until we reach a safe recovery point (end, ;, or top-level definition keyword)."""
@@ -6560,6 +6640,7 @@ class Parser:
         self._rewrite_seen_state.clear()
         self.rewrite_loop_reports.clear()
         self._macro_hotness.clear()
+        self.preview_trace_events.clear()
         self._ct_parser_sessions.clear()
         self._ct_parser_marks.clear()
         self._ct_rewrite_scope_stack.clear()
@@ -7143,6 +7224,25 @@ class Parser:
         return False
 
     def _execute_immediate_word(self, word: Word) -> None:
+        consumed_tokens: List[str] = []
+        stack_before: List[str] = []
+        stack_after: List[str] = []
+        emitted_ops: List[Op] = []
+        token = self._last_token
+        target_ops: Optional[List[Op]] = None
+        target_len_before = 0
+        pos_before = self.pos
+
+        if self.preview_trace_enabled:
+            stack_before = self._preview_stack_snapshot()
+            target = self.context_stack[-1] if self.context_stack else None
+            if isinstance(target, Definition):
+                target_ops = target.body
+                target_len_before = len(target_ops)
+            elif isinstance(target, Module):
+                target_ops = target.forms  # type: ignore[assignment]
+                target_len_before = len(target_ops)
+
         try:
             self.compile_time_vm.invoke(word)
         except CompileTimeError:
@@ -7151,6 +7251,22 @@ class Parser:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             raise CompileTimeError(f"compile-time word '{word.name}' failed: {exc}") from None
+
+        if self.preview_trace_enabled:
+            pos_after = self.pos
+            consumed_tokens = [tok.lexeme for tok in self.tokens[pos_before:pos_after]]
+            stack_after = self._preview_stack_snapshot()
+            if target_ops is not None and len(target_ops) > target_len_before:
+                emitted_ops = [node for node in target_ops[target_len_before:] if isinstance(node, Op)]
+            self._record_preview_execution_event(
+                kind="immediate",
+                word_name=word.name,
+                token=token,
+                consumed_tokens=consumed_tokens,
+                stack_before=stack_before,
+                stack_after=stack_after,
+                emitted_ops=emitted_ops,
+            )
 
     def _handle_macro_recording(self, token: Token) -> bool:
         if self.macro_recording is None:
@@ -7427,7 +7543,10 @@ class Parser:
         if block_end is None:
             raise ParseError("missing '}' to terminate asm body")
         asm_body = self.source[block_start:block_end]
-        if any(tok.expansion_depth > 0 for tok in body_tokens):
+        reconstruct_from_tokens = any(tok.expansion_depth > 0 for tok in body_tokens)
+        if body_tokens and block_end <= block_start:
+            reconstruct_from_tokens = True
+        if reconstruct_from_tokens:
             asm_body = _reconstruct_asm_from_tokens(body_tokens)
         priority = self._consume_pending_priority()
         definition = AsmDefinition(name=name_token.lexeme, body=asm_body, inline=inline_def)
@@ -7859,6 +7978,98 @@ class CompileTimeVM:
             self._jit_save_buf_addr = ctypes.addressof(self._jit_save_buf)
 
     @staticmethod
+    def _parse_data_scalar(text: str) -> Optional[int]:
+        token = text.strip()
+        if not token:
+            return None
+        try:
+            return int(token, 0)
+        except ValueError:
+            pass
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+            try:
+                literal = ast.literal_eval(token)
+            except Exception:
+                return None
+            if isinstance(literal, int):
+                return int(literal)
+            if isinstance(literal, str) and len(literal) == 1:
+                return ord(literal)
+            if isinstance(literal, (bytes, bytearray)) and len(literal) == 1:
+                return int(literal[0])
+        return None
+
+    def _materialize_custom_data_symbols(self) -> None:
+        """Populate runtime symbol map from parser.custom_data declarations."""
+        if self.memory is None:
+            return
+        data_lines = self.parser.custom_data
+        if not data_lines:
+            return
+
+        unit_sizes = {
+            "db": 1,
+            "dw": 2,
+            "dd": 4,
+            "dq": 8,
+            "resb": 1,
+            "resw": 2,
+            "resd": 4,
+            "resq": 8,
+        }
+
+        for raw_line in data_lines:
+            line = raw_line.split(";", 1)[0].strip()
+            if not line:
+                continue
+            match = _RE_DATA_DECL_PAT.match(line)
+            if match is None:
+                continue
+
+            label = match.group(1)
+            directive = match.group(2).lower()
+            operands = match.group(3).strip()
+
+            if label in self._bss_symbols:
+                continue
+            unit = unit_sizes.get(directive)
+            if unit is None:
+                continue
+
+            values: List[int]
+            if directive.startswith("res"):
+                count_token = operands.split(",", 1)[0].strip() if operands else "1"
+                parsed_count = self._parse_data_scalar(count_token)
+                count = int(parsed_count) if parsed_count is not None else 1
+                if count <= 0:
+                    count = 1
+                values = [0] * count
+            else:
+                raw_items = [part.strip() for part in operands.split(",") if part.strip()]
+                if not raw_items:
+                    raw_items = ["0"]
+                values = []
+                for item in raw_items:
+                    parsed = self._parse_data_scalar(item)
+                    values.append(0 if parsed is None else int(parsed))
+
+            addr = self.memory.allocate(unit * len(values))
+            self._bss_symbols[label] = addr
+
+            if unit == 1:
+                for idx, value in enumerate(values):
+                    ctypes.c_uint8.from_address(addr + idx).value = int(value) & 0xFF
+            elif unit == 2:
+                for idx, value in enumerate(values):
+                    ctypes.c_uint16.from_address(addr + idx * 2).value = int(value) & 0xFFFF
+            elif unit == 4:
+                for idx, value in enumerate(values):
+                    ctypes.c_uint32.from_address(addr + idx * 4).value = int(value) & 0xFFFFFFFF
+            else:
+                for idx, value in enumerate(values):
+                    ctypes.c_int64.from_address(addr + idx * 8).value = _to_i64(int(value))
+
+    @staticmethod
     def _is_coroutine_asm(body: str) -> bool:
         """Detect asm words that manipulate the x86 return stack (coroutine patterns).
 
@@ -7929,6 +8140,7 @@ class CompileTimeVM:
                 "sys_argc": self.memory.sys_argc_addr,
                 "sys_argv": self.memory.sys_argv_addr,
             }
+            self._materialize_custom_data_symbols()
 
             # JIT cache is per-invocation (addresses change)
             self._jit_cache = {}
@@ -8011,6 +8223,7 @@ class CompileTimeVM:
                 "sys_argc": self.memory.sys_argc_addr,
                 "sys_argv": self.memory.sys_argv_addr,
             }
+            self._materialize_custom_data_symbols()
             self._jit_cache = {}
             self._jit_code_pages = []
             self._dl_handles = []
@@ -8035,6 +8248,8 @@ class CompileTimeVM:
                     if lib not in self._repl_libs:
                         self._dlopen(lib)
                         self._repl_libs.append(lib)
+
+        self._materialize_custom_data_symbols()
 
         # Clear transient state but keep stacks and memory
         self.call_stack.clear()
@@ -8570,8 +8785,7 @@ class CompileTimeVM:
                     lines.append("    pop rax")
                     continue
             # Convert NASM 'rel' to explicit rip-relative for Keystone
-            if '[rel ' in line:
-                line = line.replace('[rel ', '[rip + ')
+            line = _normalize_rel_to_rip(line)
             lines.append(f"    {line}")
 
         # Save/epilogue
@@ -8694,8 +8908,7 @@ class CompileTimeVM:
                         lines.append(f"    {new_line}")
                         lines.append("    pop rax")
                         continue
-                if '[rel ' in line:
-                    line = line.replace('[rel ', '[rip + ')
+                line = _normalize_rel_to_rip(line)
                 lines.append(f"    {line}")
             lines.append("    ret")
         elif isinstance(definition, Definition):
@@ -8847,8 +9060,7 @@ class CompileTimeVM:
                                     lines.append(f"    {new_ln}")
                                     lines.append("    pop rax")
                                     continue
-                            if '[rel ' in ln:
-                                ln = ln.replace('[rel ', '[')
+                            ln = _normalize_rel_to_rip(ln)
                             lines.append(f"    {ln}")
                         if end_lbl is not None:
                             lines.append(f"{end_lbl}:")
@@ -9100,8 +9312,7 @@ class CompileTimeVM:
                         result.append("    pop rax")
                         continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
-                if '[rel ' in line:
-                    line = line.replace('[rel ', '[rip + ')
+                line = _normalize_rel_to_rip(line)
                 result.append(f"    {line}")
             if end_label is not None:
                 result.append(f"{end_label}:")
@@ -9377,8 +9588,7 @@ class CompileTimeVM:
                         patched_body.append(f"pop rax")
                         continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
-                if '[rel ' in line:
-                    line = line.replace('[rel ', '[rip + ')
+                line = _normalize_rel_to_rip(line)
                 patched_body.append(line)
             wrapper_lines.extend(patched_body)
         wrapper_lines.extend([
@@ -9631,8 +9841,7 @@ class CompileTimeVM:
                         lines.append("    pop rax")
                         continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
-                if '[rel ' in line:
-                    line = line.replace('[rel ', '[rip + ')
+                line = _normalize_rel_to_rip(line)
                 lines.append(f"    {line}")
 
         # Save epilog
@@ -13530,10 +13739,40 @@ def macro_compile_time(ctx: MacroContext) -> Optional[List[Op]]:
         raise ParseError(f"word '{name}' is runtime-only")
     if word.compile_only:
         raise ParseError(f"word '{name}' is compile-time only")
+
+    stack_before: List[str] = []
+    stack_after: List[str] = []
+    emitted_ops: List[Op] = []
+    target_ops: Optional[List[Any]] = None
+    target_len_before = 0
+    if parser.preview_trace_enabled:
+        stack_before = parser._preview_stack_snapshot()
+        target = parser.context_stack[-1] if parser.context_stack else None
+        if isinstance(target, Definition):
+            target_ops = target.body
+            target_len_before = len(target_ops)
+        elif isinstance(target, Module):
+            target_ops = target.forms
+            target_len_before = len(target_ops)
+
     parser.compile_time_vm.invoke(word)
     parser.compile_time_vm._ct_executed.add(name)
     if isinstance(parser.context_stack[-1], Definition):
         parser.emit_node(_make_op("word", name))
+
+    if parser.preview_trace_enabled:
+        stack_after = parser._preview_stack_snapshot()
+        if target_ops is not None and len(target_ops) > target_len_before:
+            emitted_ops = [node for node in target_ops[target_len_before:] if isinstance(node, Op)]
+        parser._record_preview_execution_event(
+            kind="compile-time",
+            word_name=name,
+            token=tok,
+            consumed_tokens=[name],
+            stack_before=stack_before,
+            stack_after=stack_after,
+            emitted_ops=emitted_ops,
+        )
     return None
 
 
@@ -18206,14 +18445,53 @@ class Compiler:
         self.source_include_paths: List[Path] = []
         self.source_cli_flags: List[str] = []
         self.source_graph_cache = source_graph_cache
+        self.last_transformed_source: str = ""
+        self._preview_focus_names: Optional[Set[str]] = None
 
     def _reset_source_flag_state(self) -> None:
         self.source_link_flags.clear()
         self.source_include_paths.clear()
         self.source_cli_flags.clear()
 
+    def _collect_preview_focus_names(self, path: Path) -> Optional[Set[str]]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+
+        names: Set[str] = set()
+        try:
+            tokens = self.reader.tokenize(text)
+        except Exception:
+            return None
+
+        i = 0
+        n = len(tokens)
+        while i < n:
+            lex = tokens[i].lexeme
+            if lex in {"word", ":asm", ":py", "macro", "struct", "cstruct"}:
+                if i + 1 < n:
+                    cand = tokens[i + 1].lexeme
+                    if _is_identifier(cand):
+                        names.add(cand)
+                i += 2
+                continue
+
+            if lex == "extern":
+                if i + 1 < n and _is_identifier(tokens[i + 1].lexeme):
+                    names.add(tokens[i + 1].lexeme)
+                elif i + 2 < n and _is_identifier(tokens[i + 2].lexeme):
+                    names.add(tokens[i + 2].lexeme)
+                i += 1
+                continue
+
+            i += 1
+
+        return names or None
+
     def _load_source_graph(self, path: Path) -> Tuple[str, List[FileSpan]]:
         resolved = path.resolve()
+        self._preview_focus_names = self._collect_preview_focus_names(resolved)
         if self.source_graph_cache is not None:
             cached = self.source_graph_cache.load(
                 resolved,
@@ -18358,18 +18636,28 @@ class Compiler:
         debug: bool = False,
         entry_mode: str = "program",
     ) -> Emission:
+        self.last_transformed_source = ""
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
+        self.last_transformed_source = _render_transformed_module_preview(
+            module,
+            focus_names=self._preview_focus_names,
+        )
         return self.assembler.emit(module, debug=debug, entry_mode=entry_mode)
 
     def parse_file(self, path: Path) -> None:
         """Parse a source file to populate the dictionary without emitting assembly."""
         self._reset_source_flag_state()
         source, spans = self._load_source_graph(path)
+        self.last_transformed_source = ""
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
-        self.parser.parse(tokens, source)
+        module = self.parser.parse(tokens, source)
+        self.last_transformed_source = _render_transformed_module_preview(
+            module,
+            focus_names=self._preview_focus_names,
+        )
 
     def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
         self._reset_source_flag_state()
@@ -19940,6 +20228,165 @@ def _repl_build_source(
                 lines.append("")
         lines.append("end")
     return "\n".join(lines) + "\n"
+
+
+def _preview_literal_text(value: Any) -> str:
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        return f'"{escaped}"'
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if value is None:
+        return "nil"
+    return str(value)
+
+
+def _preview_format_op(node: Op) -> str:
+    kind = node.op
+    data = node.data
+    if kind == "literal":
+        return _preview_literal_text(data)
+    if kind == "word":
+        return str(data)
+    if kind == "word_ptr":
+        return f"&{data}"
+    if kind == "ret":
+        return "ret"
+    if kind == "label":
+        return f"label {data}"
+    if kind == "list_begin":
+        return "["
+    if kind == "list_end":
+        return "]"
+    if kind == "list_literal" and isinstance(data, list):
+        inner = " ".join(_preview_literal_text(item) for item in data)
+        return f"[ {inner} ]"
+    if kind == "bss_list_literal" and isinstance(data, dict):
+        values = data.get("values", [])
+        size = int(data.get("size", len(values)))
+        inner = " ".join(_preview_literal_text(item) for item in values)
+        if size != len(values):
+            return f"{{ {inner} }} :{size}"
+        return f"{{ {inner} }}"
+    if data is None:
+        return kind
+    if isinstance(data, str):
+        return f"{kind} {data}"
+    return f"{kind} {data!r}"
+
+
+def _render_transformed_module_preview(module: Module, *, focus_names: Optional[Set[str]] = None) -> str:
+    lines: List[str] = []
+
+    if module.prelude:
+        lines.append("# prelude lines")
+        for line in module.prelude:
+            lines.append(f"#   {line}")
+        lines.append("")
+
+    if module.data:
+        lines.append("# data lines")
+        for line in module.data:
+            lines.append(f"#   {line}")
+        lines.append("")
+
+    if module.bss:
+        lines.append("# bss lines")
+        for line in module.bss:
+            lines.append(f"#   {line}")
+        lines.append("")
+
+    for form in module.forms:
+        if isinstance(form, Definition):
+            if focus_names and form.name not in focus_names:
+                continue
+            lines.append(f"word {form.name}")
+            for op in form.body:
+                lines.append(f"    {_preview_format_op(op)}")
+            lines.append("end")
+            flags: List[str] = []
+            if form.immediate:
+                flags.append("immediate")
+            if form.compile_only:
+                flags.append("compile-only")
+            if form.runtime_only:
+                flags.append("runtime-only")
+            if form.inline:
+                flags.append("inline")
+            if flags:
+                lines.append(f"# flags: {' '.join(flags)}")
+            lines.append("")
+            continue
+
+        if isinstance(form, AsmDefinition):
+            if focus_names and form.name not in focus_names:
+                continue
+            lines.append(f":asm {form.name} {{")
+            body_lines = form.body.splitlines() or [""]
+            for body_line in body_lines:
+                lines.append(f"    {body_line}")
+            lines.append("}")
+            lines.append(";")
+            flags: List[str] = []
+            if form.immediate:
+                flags.append("immediate")
+            if form.compile_only:
+                flags.append("compile-only")
+            if form.runtime_only:
+                flags.append("runtime-only")
+            if form.inline:
+                flags.append("inline")
+            if flags:
+                lines.append(f"# flags: {' '.join(flags)}")
+            lines.append("")
+            continue
+
+        if isinstance(form, Op):
+            lines.append(_preview_format_op(form))
+            continue
+
+        lines.append(f"# unsupported form: {type(form).__name__}")
+
+    if not lines:
+        return "# (no transformed forms)\n"
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_preview_trace_events(events: Sequence[Dict[str, Any]]) -> str:
+    if not events:
+        return "# (no compile-time execution events)\n"
+
+    lines: List[str] = []
+    for idx, event in enumerate(events, start=1):
+        kind = str(event.get("kind", "ct"))
+        word = str(event.get("word", "<unknown>"))
+        path = str(event.get("path", "")).strip()
+        line_no = int(event.get("line", 0) or 0)
+        col_no = int(event.get("column", 0) or 0)
+        if path and line_no > 0:
+            at = f" @{path}:{line_no}:{col_no}"
+        elif line_no > 0:
+            at = f" @{line_no}:{col_no}"
+        else:
+            at = ""
+        lines.append(f"{idx}. {kind} {word}{at}")
+
+        consumed = [str(item) for item in event.get("consumed", [])]
+        if consumed:
+            lines.append(f"   consumed: {' '.join(consumed)}")
+
+        before = [str(item) for item in event.get("stack_before", [])]
+        after = [str(item) for item in event.get("stack_after", [])]
+        lines.append("   stack-before: " + (" | ".join(before) if before else "(empty)"))
+        lines.append("   stack-after:  " + (" | ".join(after) if after else "(empty)"))
+
+        emitted = [str(item) for item in event.get("emitted", [])]
+        if emitted:
+            lines.append("   emitted:")
+            for item in emitted:
+                lines.append(f"     - {item}")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ---- Docs explorer integration (delegated to docs.py) ----
@@ -22669,6 +23116,11 @@ def cli(argv: Sequence[str]) -> int:
         help="print each text macro expansion to stderr during parsing",
     )
     parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="print transformed source after macro expansion and compile-time execution",
+    )
+    parser.add_argument(
         "--macro-profile",
         nargs="?",
         const="stderr",
@@ -22777,6 +23229,7 @@ def cli(argv: Sequence[str]) -> int:
         "docs_no_browser",
         "docs_all",
         "docs_include_tests",
+        "preview",
     }
 
     if args.macro_expansion_limit < 1:
@@ -22942,6 +23395,7 @@ def cli(argv: Sequence[str]) -> int:
         warnings_set.add("all")
     compiler.parser._warnings_enabled = warnings_set
     compiler.parser._werror = werror
+    compiler.parser.preview_trace_enabled = args.preview
     compiler.parser.set_macro_profile_enabled(args.macro_profile is not None)
     compiler.parser.enable_dead_macro_elimination = not args.repl
     compiler.parser.enable_unused_rewrite_elimination = not args.repl
@@ -23096,6 +23550,7 @@ def cli(argv: Sequence[str]) -> int:
         compiler.defines = set(args.defines)
         compiler.parser.macro_expansion_limit = args.macro_expansion_limit
         compiler.parser.macro_preview = args.macro_preview
+        compiler.parser.preview_trace_enabled = args.preview
         compiler.parser.set_macro_profile_enabled(args.macro_profile is not None)
         compiler.parser.enable_dead_macro_elimination = not args.repl
         compiler.parser.enable_unused_rewrite_elimination = not args.repl
@@ -23160,7 +23615,7 @@ def cli(argv: Sequence[str]) -> int:
         asm_text: Optional[str] = None
         fhash = ""
         cache_asm_hit = False
-        if cache and not args.ct_run_main and args.dump_cfg is None:
+        if cache and not args.ct_run_main and args.dump_cfg is None and not args.preview:
             fhash = cache.flags_hash(
                 args.debug,
                 folding_enabled,
@@ -23191,6 +23646,20 @@ def cli(argv: Sequence[str]) -> int:
             # Snapshot assembly text *before* ct-run-main JIT execution, which may
             # corrupt Python heap objects depending on memory layout.
             asm_text = emission.snapshot()
+            if args.preview:
+                print("[preview] compile-time execution trace:")
+                trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
+                if trace_text:
+                    print(trace_text)
+                else:
+                    print("# (no compile-time execution events)")
+                print("[preview] transformed source (post-macro + post-compile-time):")
+                preview_text = compiler.last_transformed_source.rstrip()
+                if preview_text:
+                    print(preview_text)
+                else:
+                    print("# (no transformed forms)")
+                print("[preview] end")
             if verbosity >= 1:
                 _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
                 print(f"[v1] compilation: {_compile_dt:.1f}ms")

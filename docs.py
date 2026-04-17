@@ -397,7 +397,8 @@ def _run_docs_tui(
         "  $*xs     variadic capture\n"
         "  $x:int   constrained capture\n"
         "Repeated capture names enforce equality.\n\n"
-        "Use --macro-preview to trace macro and rewrite expansions."
+        "Use --macro-preview to trace macro/rewrite steps and --preview to\n"
+        "inspect the final transformed source after macro + CT execution."
     )
     _L2_MACRO_LANG_DETAIL = (
         _L2_MACRO_CANONICAL_TEXT
@@ -1242,6 +1243,105 @@ def _run_docs_tui(
         "    - Text macros: token substitution (fast syntax shaping).\n"
         "    - Pattern macros: grammar rewrite clauses with captures/guards.\n"
         "    - ct-call: bridge from macro templates to CT words with context.\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 0  MACRO TEMPLATE DIRECTIVES\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  These directives run during macro-template expansion (parse time).\n"
+        "  They are not runtime words, but they are part of the compile-time\n"
+        "  authoring surface and are indexed here for discoverability.\n"
+        "\n"
+        "  ct-call            [template, ctx | word] -> [template | tokens]\n"
+        "    Invoke compile-time word `word` from a template and splice\n"
+        "    its return value as emitted tokens.\n"
+        "\n"
+        "  ct-if              [template | condition] -> [template]\n"
+        "    Conditional template branch with optional `else`.\n"
+        "\n"
+        "  ct-when            [template | condition] -> [template]\n"
+        "    Single-branch shorthand for `ct-if ... then ... end`.\n"
+        "\n"
+        "  ct-unless          [template | condition] -> [template]\n"
+        "    Negated single-branch conditional template gate.\n"
+        "\n"
+        "  ct-for             [template, capture | name] -> [template]\n"
+        "    Iterate capture values with optional separator clauses.\n"
+        "\n"
+        "  ct-each            [template, capture | name] -> [template]\n"
+        "    Iterate capture values (supports index+value mode).\n"
+        "\n"
+        "  ct-let             [template, expr | name] -> [template]\n"
+        "    Bind local template symbol for the nested template block.\n"
+        "\n"
+        "  ct-fn              [template | name] -> [template]\n"
+        "    Define a template-local helper callable with `ct-call`.\n"
+        "\n"
+        "  ct-switch          [template | expr] -> [template]\n"
+        "    Multi-branch selector over token-sequence expressions.\n"
+        "\n"
+        "  ct-case            [template | expr] -> [template]\n"
+        "    Case clause inside `ct-switch` or `ct-match`.\n"
+        "\n"
+        "  ct-default         [template] -> [template]\n"
+        "    Fallback clause used by selector directives.\n"
+        "\n"
+        "  ct-match           [template | expr] -> [template]\n"
+        "    Expression-style compact selector with `ct-case` arms.\n"
+        "\n"
+        "  ct-fold            [template, capture | acc] -> [template]\n"
+        "    Accumulator-based template reduction over capture groups.\n"
+        "\n"
+        "  ct-break           [template] -> [template]\n"
+        "    Exit current template loop (`ct-for`/`ct-each`/`ct-fold`).\n"
+        "\n"
+        "  ct-continue        [template] -> [template]\n"
+        "    Skip to next iteration of current template loop.\n"
+        "\n"
+        "  ct-include         [template | path] -> [template]\n"
+        "    Splice template nodes loaded from another source file.\n"
+        "\n"
+        "  ct-import          [template | path] -> [template]\n"
+        "    Import template helpers once per expansion scope.\n"
+        "\n"
+        "  ct-comment         [template] -> [template]\n"
+        "    Start nested template comment block; ends at ct-endcomment.\n"
+        "\n"
+        "  ct-endcomment      [template] -> [template]\n"
+        "    Close `ct-comment` block comment region.\n"
+        "\n"
+        "  ct-strict          [template] -> [template]\n"
+        "    Treat unknown template symbols as hard errors.\n"
+        "\n"
+        "  ct-permissive      [template] -> [template]\n"
+        "    Treat unknown template symbols as empty with warning.\n"
+        "\n"
+        "  ct-version         [template | tag] -> [template]\n"
+        "    Attach version marker metadata to the template program.\n"
+        "\n"
+        "  ct-error           [template | message] -> [template]\n"
+        "    Emit template expansion error diagnostic.\n"
+        "\n"
+        "  ct-warning         [template | message] -> [template]\n"
+        "    Emit template expansion warning diagnostic.\n"
+        "\n"
+        "  ct-note            [template | message] -> [template]\n"
+        "    Emit template expansion note diagnostic.\n"
+        "\n"
+        "  emit-list          [template | capture] -> [template | tokens]\n"
+        "    Splice capture/list value as emitted token sequence.\n"
+        "\n"
+        "  ct-emit-list       [template | capture] -> [template | tokens]\n"
+        "    Alias of emit-list for explicit compile-time naming.\n"
+        "\n"
+        "  emit-block         [template | block] -> [template | tokens]\n"
+        "    Emit inline nested template block as token output.\n"
+        "\n"
+        "  ct-emit-block      [template | block] -> [template | tokens]\n"
+        "    Alias of emit-block for explicit compile-time naming.\n"
+        "\n"
+        "  Comment aliases: `ct-#`, `ct-#(`, `ct-#)` are also supported for\n"
+        "  template comments, matching legacy shorthand forms.\n"
         "\n"
         "  Suggested reading order:\n"
         "    - Start with § 1 (execution mode and hooks).\n"
@@ -2801,7 +2901,8 @@ def _run_docs_tui(
         "    - Macro expansion depth: macros can expand macros,\n"
         "      but there's a limit (default 256, configurable via\n"
         "      --macro-expansion-limit).\n"
-        "      Use --macro-preview to trace each expansion.\n"
+        "      Use --macro-preview to trace each expansion and --preview\n"
+        "      to print the final transformed source.\n"
         "\n"
         "    - :py blocks: Python code embedded in :py { ... }\n"
         "      runs in the compiler's Python process. It has full\n"
@@ -6020,6 +6121,8 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
 
 
 def category_for_word(word_name: str) -> str:
+    if word_name in _CT_TEMPLATE_DIRECTIVE_NAMES:
+        return "Template"
     if word_name in ("nil", "nil?"):
         return "Nil"
     if word_name.startswith("list-"):
@@ -6099,6 +6202,43 @@ def category_for_word(word_name: str) -> str:
     if word_name == "i":
         return "Loop"
     return "Meta"
+
+
+_CT_TEMPLATE_DIRECTIVE_METADATA: Tuple[Dict[str, Any], ...] = (
+    {"name": "ct-call", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-if", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-when", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-unless", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-for", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-each", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-let", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-fn", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-switch", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-case", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-default", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-match", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-fold", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-break", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-continue", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-include", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-import", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-comment", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-endcomment", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-strict", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-permissive", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-version", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-error", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-warning", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-note", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "emit-list", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-emit-list", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "emit-block", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+    {"name": "ct-emit-block", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
+)
+
+_CT_TEMPLATE_DIRECTIVE_NAMES = frozenset(
+    str(item.get("name", "")).strip() for item in _CT_TEMPLATE_DIRECTIVE_METADATA
+)
 
 
 def _scope_for_word(meta: Dict[str, Any]) -> str:
@@ -6221,6 +6361,36 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "clear-token-hook": '"trace_hook" set-token-hook clear-token-hook',
     "add-token": '"@" add-token',
     "add-token-chars": '",;" add-token-chars',
+
+    "ct-call": "macro bridge 1 ct-call emit-from-capture ;",
+    "ct-if": "macro maybe (x) ct-if has x then $x else 0 end ;",
+    "ct-when": "macro only_when (x) ct-when has x $x end ;",
+    "ct-unless": "macro only_unless (x) ct-unless has x 0 end ;",
+    "ct-for": "macro sum_tail (head *tail) $head ct-for item in tail do $item + end ;",
+    "ct-each": "macro emit_each (*xs) ct-each x in xs do $x end ;",
+    "ct-let": "macro bind_tmp 1 ct-let t $0 do $t $t + end ;",
+    "ct-fn": "macro local_helper 0 ct-fn twice do $0 $0 end ct-call twice ;",
+    "ct-switch": "macro choose (x) ct-switch $x do ct-case 0 do 0 end ct-default do 1 end end ;",
+    "ct-case": "macro classify (x) ct-switch $x do ct-case 1 do 11 end ct-default do 0 end end ;",
+    "ct-default": "macro classify_default (x) ct-switch $x do ct-default do 99 end end ;",
+    "ct-match": "macro map_bool (x) ct-match $x do ct-case 0 then 0 ct-default then 1 end ;",
+    "ct-fold": "macro fold_plus (*xs) ct-fold acc item in xs with 0 do $acc $item + end ;",
+    "ct-break": "macro first_only (*xs) ct-for x in xs do $x ct-break end ;",
+    "ct-continue": "macro skip_zero (*xs) ct-for x in xs do ct-if $x 0 == then ct-continue end $x end ;",
+    "ct-include": 'macro use_shared 0 ct-include "shared_template.sl" ;',
+    "ct-import": 'macro use_pack 0 ct-import "macro_pack.sl" ;',
+    "ct-comment": "macro clean 0 ct-comment ignored tokens ct-endcomment 1 ;",
+    "ct-endcomment": "macro clean_end 0 ct-comment nested ct-endcomment 1 ;",
+    "ct-strict": "macro strict_mode 0 ct-strict 1 ;",
+    "ct-permissive": "macro permissive_mode 0 ct-permissive 1 ;",
+    "ct-version": 'macro ver 0 ct-version "1.0" 1 ;',
+    "ct-error": 'macro fail_now 0 ct-error "bad expansion" ;',
+    "ct-warning": 'macro warn_now 0 ct-warning "check this" ;',
+    "ct-note": 'macro note_now 0 ct-note "info" ;',
+    "emit-list": "macro emit_tail (*xs) emit-list xs ;",
+    "ct-emit-list": "macro emit_tail_ct (*xs) ct-emit-list xs ;",
+    "emit-block": "macro block_out 0 emit-block do 1 2 + end ;",
+    "ct-emit-block": "macro block_out_ct 0 ct-emit-block do 1 2 + end ;",
 
     "ct-control-frame-new": '"if" ct-control-frame-new ct-control-push',
     "ct-control-add-close-op": '"if" ct-control-frame-new dup "false" "if_false" ct-new-label ct-control-set dup "false" ct-control-get "label" swap ct-control-add-close-op',
@@ -6880,16 +7050,49 @@ def _format_example_display_line(line: str) -> str:
     return f"- {normalized}"
 
 
+def _merge_ct_reference_metadata(ct_words: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    def _normalize_meta(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        name = str(item.get("name", "")).strip()
+        if not _is_plausible_word_name(name):
+            return None
+        return {
+            "name": name,
+            "compile_only": bool(item.get("compile_only")),
+            "immediate": bool(item.get("immediate")),
+            "runtime_only": bool(item.get("runtime_only")),
+            "has_runtime_intrinsic": bool(item.get("has_runtime_intrinsic")),
+        }
+
+    for item in ct_words:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_meta(item)
+        if normalized is None:
+            continue
+        merged[normalized["name"]] = normalized
+
+    for item in _CT_TEMPLATE_DIRECTIVE_METADATA:
+        normalized = _normalize_meta(item)
+        if normalized is None:
+            continue
+        merged.setdefault(normalized["name"], normalized)
+
+    return sorted(merged.values(), key=lambda item: str(item.get("name", "")).lower())
+
+
 def build_ct_reference_entries(base_doc_text: str, ct_words: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    all_meta = _merge_ct_reference_metadata(ct_words)
     allowed_names = {
         str(meta.get("name", "")).strip()
-        for meta in ct_words
+        for meta in all_meta
         if _is_plausible_word_name(str(meta.get("name", "")).strip())
     }
     details = extract_ct_ref_entry_details(base_doc_text, allowed_names=allowed_names)
-    # Build entries for all ct_words (from metadata)
+    # Build entries for all known CT words + template directives.
     out: List[Dict[str, Any]] = []
-    for meta in sorted(ct_words, key=lambda item: str(item.get("name", "")).lower()):
+    for meta in all_meta:
         name = str(meta.get("name", "")).strip()
         if not _is_plausible_word_name(name):
             continue
@@ -7071,15 +7274,32 @@ def configure_runtime(*, ct_word_metadata_provider: Optional[Callable[[], List[D
 
 def _collect_ct_word_metadata() -> List[Dict[str, Any]]:
     if _CT_WORD_METADATA_PROVIDER is None:
-        return []
-    try:
-        data = _CT_WORD_METADATA_PROVIDER()
-    except Exception:
-        return []
+        data = []
+    else:
+        try:
+            data = _CT_WORD_METADATA_PROVIDER()
+        except Exception:
+            data = []
+
     out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
     for item in data:
-        if isinstance(item, dict):
-            out.append(dict(item))
+        if not isinstance(item, dict):
+            continue
+        normalized = dict(item)
+        name = str(normalized.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        out.append(normalized)
+        seen.add(name)
+
+    for item in _CT_TEMPLATE_DIRECTIVE_METADATA:
+        name = str(item.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        out.append(dict(item))
+        seen.add(name)
+
     out.sort(key=lambda item: str(item.get("name", "")).lower())
     return out
 

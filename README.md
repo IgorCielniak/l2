@@ -45,11 +45,21 @@ Optional output targets:
 - `--macro-profile -`: print to stdout.
 - `--macro-profile build/macro_profile.txt`: write a report file.
 
+For transformed-source inspection, use `--preview`:
+
+```bash
+python3 main.py tests/macro_ct_superlang.sl --no-artifact --preview
+```
+
+`--preview` prints the post-parse transformed source after macro expansion and compile-time execution.
+
 ### Complete CT Function Reference
 
 The built-in Compile-Time Reference now includes an auto-generated
 `§ 18 COMPLETE CT FUNCTION INDEX` section with one explicit entry for every
-compile-time callable word (including handler name and execution flags).
+compile-time callable word (including handler name and execution flags), plus
+template directives such as `ct-call`, `ct-if`, `ct-for`, `emit-list`, and
+their aliases.
 
 Open it with:
 
@@ -447,6 +457,8 @@ Pattern syntax now supports additional operators in rewrite patterns:
 
 - `ct-set-macro-expansion-limit` / `ct-get-macro-expansion-limit`
 - `ct-set-macro-preview` / `ct-get-macro-preview`
+- `--macro-preview` (trace each macro/rewrite step)
+- `--preview` (print final transformed source after macro + CT execution)
 
 Use preview when developing complex expansions; keep limits sensible to avoid accidental recursive explosion.
 

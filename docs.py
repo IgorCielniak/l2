@@ -5362,6 +5362,7 @@ def _build_docs_web_static_html(
     tab: str,
     query: str,
     selected: str = "",
+    theme: str = "auto",
     workspace_root: Optional[Path] = None,
 ) -> str:
     tabs: List[Tuple[str, str]] = [
@@ -5375,6 +5376,9 @@ def _build_docs_web_static_html(
     ]
     valid_tabs = {tab_id for tab_id, _ in tabs}
     active_tab = tab if tab in valid_tabs else "library"
+    active_theme = str(theme or "auto").strip().lower()
+    if active_theme not in {"auto", "light", "dark"}:
+        active_theme = "auto"
     q = str(query or "")
     terms = [part for part in q.lower().split() if part]
     selected_key = str(selected or "")
@@ -5390,13 +5394,18 @@ def _build_docs_web_static_html(
 
     from urllib.parse import urlencode
 
-    def _href(tab_id: str, q_text: str, sel_text: str = "") -> str:
+    def _href_with_theme(theme_id: str, tab_id: str, q_text: str, sel_text: str = "") -> str:
         params: Dict[str, str] = {"tab": tab_id}
+        if theme_id in {"light", "dark"}:
+            params["theme"] = theme_id
         if q_text:
             params["q"] = q_text
         if sel_text:
             params["sel"] = sel_text
         return "/?" + urlencode(params)
+
+    def _href(tab_id: str, q_text: str, sel_text: str = "") -> str:
+        return _href_with_theme(active_theme, tab_id, q_text, sel_text)
 
     def _safe_resolve_source(path_text: str) -> Optional[Path]:
         if not path_text:
@@ -5706,58 +5715,81 @@ def _build_docs_web_static_html(
         if selected_for_form and active_tab in {"library", "language", "ct"}
         else ""
     )
+    theme_input = (
+        f"<input type=\"hidden\" name=\"theme\" value=\"{_esc(active_theme)}\" />"
+        if active_theme != "auto"
+        else ""
+    )
+    sel_for_theme = (
+        selected_for_form if selected_for_form and active_tab in {"library", "language", "ct"} else ""
+    )
+    theme_links = [
+        f"<a class=\"btn theme-btn{' active' if active_theme == 'auto' else ''}\" href=\"{_esc(_href_with_theme('auto', active_tab, q, sel_for_theme))}\">Auto</a>",
+        f"<a class=\"btn theme-btn{' active' if active_theme == 'light' else ''}\" href=\"{_esc(_href_with_theme('light', active_tab, q, sel_for_theme))}\">Light</a>",
+        f"<a class=\"btn theme-btn{' active' if active_theme == 'dark' else ''}\" href=\"{_esc(_href_with_theme('dark', active_tab, q, sel_for_theme))}\">Dark</a>",
+    ]
 
     active_label = next((label for tab_id, label in tabs if tab_id == active_tab), active_tab)
     return (
         "<!doctype html>"
-        "<html lang=\"en\"><head><meta charset=\"utf-8\" />"
+        f"<html lang=\"en\" data-theme=\"{_esc(active_theme)}\"><head><meta charset=\"utf-8\" />"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
         "<title>L2 Docs Explorer</title>"
         "<style>"
-        "body{margin:0;padding:16px;font-family:Segoe UI,Arial,sans-serif;background:#f5f8fc;color:#0f2238;}"
-        ".shell{max-width:1320px;margin:0 auto;background:#fff;border:1px solid #cbd8ea;border-radius:12px;overflow:hidden;}"
-        ".head{padding:14px 16px;border-bottom:1px solid #d6e1ef;background:#f8fbff;}"
-        ".tabs{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;border-bottom:1px solid #d6e1ef;background:#fbfdff;}"
-        ".tab{display:inline-block;padding:6px 10px;border:1px solid #c2d2e6;border-radius:999px;text-decoration:none;color:#204364;background:#fff;}"
-        ".tab.active{background:#dbeaff;border-color:#1d5aa8;font-weight:600;}"
-        ".controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid #d6e1ef;background:#f8fbff;}"
-        ".field{min-width:260px;flex:1;border:1px solid #bdcde1;border-radius:8px;padding:8px 10px;}"
-        ".btn{border:1px solid #b9cde4;background:#eef5ff;color:#1f4265;border-radius:8px;padding:8px 10px;text-decoration:none;display:inline-block;}"
+        ":root{color-scheme:light dark;--bg:#f5f8fc;--fg:#0f2238;--panel:#ffffff;--panel-alt:#f8fbff;--panel-soft:#fbfdff;--border:#d6e1ef;--border-strong:#cbd8ea;--tab-border:#c2d2e6;--tab-fg:#204364;--tab-active-bg:#dbeaff;--tab-active-border:#1d5aa8;--btn-bg:#eef5ff;--btn-border:#b9cde4;--btn-fg:#1f4265;--field-bg:#ffffff;--field-border:#bdcde1;--field-fg:#0f2238;--hint:#4a6382;--subinfo:#486381;--entry:#1a3f64;--meta:#345676;--desc:#35516f;--kv:#2f4c69;--label:#566f8d;--row-border:#ecf2fb;--row-hover:#f2f8ff;--row-active:#eef6ff;--active-accent:#1d5aa8;--code-bg:#f7fbff;}"
+        "@media (prefers-color-scheme: dark){html[data-theme='auto']{color-scheme:dark;--bg:#0f1724;--fg:#e6eef9;--panel:#131d2b;--panel-alt:#162233;--panel-soft:#1a2738;--border:#2a3a52;--border-strong:#324764;--tab-border:#3a5477;--tab-fg:#c5d8f2;--tab-active-bg:#1f3553;--tab-active-border:#6ca3ff;--btn-bg:#1e314b;--btn-border:#446186;--btn-fg:#d8e8ff;--field-bg:#101a28;--field-border:#3d5474;--field-fg:#e6eef9;--hint:#9fb6d8;--subinfo:#9ab3d6;--entry:#d7e8ff;--meta:#9eb6d8;--desc:#a8c0e2;--kv:#abc3e6;--label:#89a7cf;--row-border:#24364f;--row-hover:#1d2d44;--row-active:#223955;--active-accent:#78adff;--code-bg:#122033;}}"
+        "html[data-theme='light']{color-scheme:light;--bg:#f5f8fc;--fg:#0f2238;--panel:#ffffff;--panel-alt:#f8fbff;--panel-soft:#fbfdff;--border:#d6e1ef;--border-strong:#cbd8ea;--tab-border:#c2d2e6;--tab-fg:#204364;--tab-active-bg:#dbeaff;--tab-active-border:#1d5aa8;--btn-bg:#eef5ff;--btn-border:#b9cde4;--btn-fg:#1f4265;--field-bg:#ffffff;--field-border:#bdcde1;--field-fg:#0f2238;--hint:#4a6382;--subinfo:#486381;--entry:#1a3f64;--meta:#345676;--desc:#35516f;--kv:#2f4c69;--label:#566f8d;--row-border:#ecf2fb;--row-hover:#f2f8ff;--row-active:#eef6ff;--active-accent:#1d5aa8;--code-bg:#f7fbff;}"
+        "html[data-theme='dark']{color-scheme:dark;--bg:#0f1724;--fg:#e6eef9;--panel:#131d2b;--panel-alt:#162233;--panel-soft:#1a2738;--border:#2a3a52;--border-strong:#324764;--tab-border:#3a5477;--tab-fg:#c5d8f2;--tab-active-bg:#1f3553;--tab-active-border:#6ca3ff;--btn-bg:#1e314b;--btn-border:#446186;--btn-fg:#d8e8ff;--field-bg:#101a28;--field-border:#3d5474;--field-fg:#e6eef9;--hint:#9fb6d8;--subinfo:#9ab3d6;--entry:#d7e8ff;--meta:#9eb6d8;--desc:#a8c0e2;--kv:#abc3e6;--label:#89a7cf;--row-border:#24364f;--row-hover:#1d2d44;--row-active:#223955;--active-accent:#78adff;--code-bg:#122033;}"
+        "body{margin:0;padding:16px;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--fg);}"
+        ".shell{max-width:1320px;margin:0 auto;background:var(--panel);border:1px solid var(--border-strong);border-radius:12px;overflow:hidden;}"
+        ".head{padding:14px 16px;border-bottom:1px solid var(--border);background:var(--panel-alt);}"
+        ".subinfo{margin-top:6px;color:var(--subinfo);font-size:13px;}"
+        ".tabs{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--panel-soft);}"
+        ".tab{display:inline-block;padding:6px 10px;border:1px solid var(--tab-border);border-radius:999px;text-decoration:none;color:var(--tab-fg);background:var(--panel);}"
+        ".tab.active{background:var(--tab-active-bg);border-color:var(--tab-active-border);font-weight:600;}"
+        ".controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--panel-alt);}"
+        ".field{min-width:260px;flex:1;border:1px solid var(--field-border);border-radius:8px;padding:8px 10px;background:var(--field-bg);color:var(--field-fg);}"
+        ".btn{border:1px solid var(--btn-border);background:var(--btn-bg);color:var(--btn-fg);border-radius:8px;padding:8px 10px;text-decoration:none;display:inline-block;}"
+        ".theme-group{margin-left:auto;display:flex;gap:6px;align-items:center;}"
+        ".theme-btn{min-width:56px;text-align:center;}"
+        ".theme-btn.active{border-color:var(--tab-active-border);box-shadow:inset 0 0 0 1px var(--tab-active-border);font-weight:600;}"
         ".content{padding:12px;}"
-        ".hint{margin:0 0 8px;color:#4a6382;font-size:13px;}"
+        ".hint{margin:0 0 8px;color:var(--hint);font-size:13px;}"
         ".split{display:grid;grid-template-columns:minmax(340px,40%) 1fr;gap:12px;height:min(74vh,820px);min-height:520px;}"
-        ".listcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid #d7e2ef;border-radius:10px;background:#fff;padding:8px;}"
-        ".detailcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid #d7e2ef;border-radius:10px;background:#fbfdff;padding:10px;}"
+        ".listcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border);border-radius:10px;background:var(--panel);padding:8px;}"
+        ".detailcol{min-width:0;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border);border-radius:10px;background:var(--panel-soft);padding:10px;}"
         ".rows{list-style:none;margin:0;padding:0;}"
-        ".rows li{padding:0;border-bottom:1px solid #ecf2fb;border-left:3px solid transparent;}"
+        ".rows li{padding:0;border-bottom:1px solid var(--row-border);border-left:3px solid transparent;}"
         ".rows li:last-child{border-bottom:0;}"
-        ".rows li:hover{background:#f2f8ff;}"
-        ".rows li.item-active{background:#eef6ff;border-left-color:#1d5aa8;}"
+        ".rows li:hover{background:var(--row-hover);}"
+        ".rows li.item-active{background:var(--row-active);border-left-color:var(--active-accent);}"
         ".entrybox{display:block;padding:10px 10px;text-decoration:none;color:inherit;}"
-        ".entry{font-family:Consolas,monospace;font-weight:600;color:#1a3f64;text-decoration:none;}"
+        ".entry{font-family:Consolas,monospace;font-weight:600;color:var(--entry);text-decoration:none;}"
         ".entrybox:hover .entry{text-decoration:underline;}"
         ".name{font-family:Consolas,monospace;font-weight:600;}"
-        ".meta{font-size:12px;color:#345676;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
-        ".desc{font-size:13px;color:#35516f;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
-        ".kv{font-size:13px;color:#2f4c69;margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
-        ".label{margin:10px 0 6px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#566f8d;}"
-        ".mini{margin:6px 0 0;padding:8px;border:1px solid #d7e2ef;border-radius:8px;background:#f7fbff;white-space:pre-wrap;word-break:break-word;}"
-        ".full{margin:0;padding:10px;border:1px solid #d7e2ef;border-radius:8px;background:#f7fbff;white-space:pre-wrap;word-break:break-word;overflow:auto;}"
-        "@media (max-width: 980px){.split{grid-template-columns:1fr;height:auto;min-height:0;}.listcol,.detailcol{overflow:visible;overscroll-behavior:auto;}}"
+        ".meta{font-size:12px;color:var(--meta);margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".desc{font-size:13px;color:var(--desc);margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".kv{font-size:13px;color:var(--kv);margin-top:4px;white-space:pre-wrap;word-break:break-word;}"
+        ".label{margin:10px 0 6px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--label);}"
+        ".mini{margin:6px 0 0;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--code-bg);white-space:pre-wrap;word-break:break-word;}"
+        ".full{margin:0;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--code-bg);white-space:pre-wrap;word-break:break-word;overflow:auto;}"
+        "@media (max-width: 980px){.split{grid-template-columns:1fr;height:auto;min-height:0;}.listcol,.detailcol{overflow:visible;overscroll-behavior:auto;}.theme-group{margin-left:0;}}"
         "</style></head><body>"
         "<div class=\"shell\">"
         "<div class=\"head\"><h1 style=\"margin:0;font-size:20px;\">L2 Docs Explorer</h1>"
-        "<div style=\"margin-top:6px;color:#486381;font-size:13px;\">"
+        "<div class=\"subinfo\">"
         f"Showing: {_esc(active_label)} | {_esc(meta_text)}"
         "</div></div>"
         f"<nav class=\"tabs\">{''.join(nav_links)}</nav>"
         "<form class=\"controls\" method=\"get\" action=\"/\">"
         f"<input type=\"hidden\" name=\"tab\" value=\"{_esc(active_tab)}\" />"
         f"{selected_input}"
+        f"{theme_input}"
         f"<input class=\"field\" type=\"search\" name=\"q\" value=\"{_esc(q)}\" placeholder=\"Search current tab...\" />"
         "<button class=\"btn\" type=\"submit\">Search</button>"
         f"<a class=\"btn\" href=\"{_esc(_href(active_tab, '', ''))}\">Clear</a>"
         "<a class=\"btn\" href=\"/api/docs\">Raw API</a>"
+        f"<div class=\"theme-group\">{''.join(theme_links)}</div>"
         "</form>"
         f"<div class=\"content\">{body_html}</div>"
         "</div></body></html>"
@@ -5872,11 +5904,13 @@ def run_docs_serve(
                 static_tab = str(query_map.get("tab", ["library"])[0] or "library")
                 static_query = str(query_map.get("q", [initial_query])[0] or "")
                 static_sel = str(query_map.get("sel", [""])[0] or "")
+                static_theme = str(query_map.get("theme", ["auto"])[0] or "auto")
                 static_html = _build_docs_web_static_html(
                     payload,
                     tab=static_tab,
                     query=static_query,
                     selected=static_sel,
+                    theme=static_theme,
                     workspace_root=workspace_root,
                 )
                 self._send(int(HTTPStatus.OK), static_html.encode("utf-8"), "text/html; charset=utf-8")

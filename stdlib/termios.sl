@@ -11,14 +11,8 @@ word isatty
     60 alloc                     # push addr
     r@ TCGETS over 3 16 syscall  # addr result
 
-    # Duplicate result and save it
-    dup >r                       # push result to return stack
-
     # Free buffer
-    60 swap free                 # free(addr, size)
-
-    # Restore result
-    r>                           # result back to data stack
+    swap 60 free                 # free(addr, size)
 
     # Check result
     dup ENOTTY neg == if                # -ENOTTY (not a tty)

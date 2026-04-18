@@ -2671,6 +2671,8 @@ def _run_docs_tui(
         "    Use --ct-run-main or --script to execute 'main' at\n"
         "    compile time. The CT VM supports most stack ops, I/O,\n"
         "    lists, hashmaps, and string manipulation.\n"
+        "    Use --leak-check to run in CTVM with mmap/munmap\n"
+        "    interception and leak reporting (non-zero exit on leaks).\n"
         "\n"
         "    You can also mark words as compile-time:\n"
         "\n"

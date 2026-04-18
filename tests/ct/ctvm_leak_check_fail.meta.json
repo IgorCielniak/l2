@@ -1,0 +1,7 @@
+{
+  "description": "ctvm leak checker fails on unpaired mmap allocations",
+  "expect_compile_error": true,
+  "compile_args": [
+    "--leak-check"
+  ]
+}

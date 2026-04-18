@@ -677,6 +677,25 @@ class TestRunner:
     def _ct_run_main_for_case(self, case: TestCase) -> bool:
         return self.args.ct_run_main and not self._is_example_source(case.source)
 
+    def _leak_check_mode_for_case(self, case: TestCase) -> bool:
+        """Run case via compiler --leak-check when compile-time execution is compatible."""
+        if not self.args.leak_check:
+            return False
+        if self._is_example_source(case.source):
+            return False
+        if case.config.expect_compile_error:
+            return False
+        if case.config.expected_exit != 0:
+            return False
+        if case.runtime_args():
+            return False
+        source_text = case.source.read_text(encoding="utf-8", errors="ignore")
+        if SCRIPT_RUNTIME_SENSITIVE_RE.search(source_text):
+            return False
+        if re.search(r"(?m)^\s*compile-time\s+main\b", source_text):
+            return False
+        return True
+
     def run(self) -> int:
         if not self.tests_dir.exists():
             print("tests directory not found", file=sys.stderr)
@@ -736,7 +755,8 @@ class TestRunner:
             return CaseResult(case, "failed", "compile", f"compiler exited {compile_proc.returncode}", details, duration)
         updated_notes: List[str] = []
         script_mode = self._script_mode_for_case(case)
-        if not script_mode:
+        leak_check_mode = self._leak_check_mode_for_case(case)
+        if not script_mode and not leak_check_mode:
             compile_status, compile_note, compile_details = self._check_compile_output(case, compile_proc)
             if compile_status == "failed":
                 duration = time.perf_counter() - start
@@ -752,7 +772,7 @@ class TestRunner:
             if updated_notes:
                 return CaseResult(case, "updated", "compile", "; ".join(updated_notes), details=None, duration=duration)
             return CaseResult(case, "passed", "compile", "compile-only", details=None, duration=duration)
-        if script_mode:
+        if script_mode or leak_check_mode:
             run_proc = subprocess.CompletedProcess(
                 args=compile_proc.args,
                 returncode=0,
@@ -824,6 +844,9 @@ class TestRunner:
         source_override: Optional[Path] = None,
     ) -> subprocess.CompletedProcess[str]:
         source_path = source_override or case.source
+        script_mode = self._script_mode_for_case(case)
+        leak_check_mode = self._leak_check_mode_for_case(case)
+        ct_run_main_mode = self._ct_run_main_for_case(case)
         cmd = [
             sys.executable,
             str(self.main_py),
@@ -837,10 +860,12 @@ class TestRunner:
         for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
         cmd.extend(case.config.compile_args)
-        if self._script_mode_for_case(case):
+        if leak_check_mode:
+            cmd.append("--leak-check")
+        elif script_mode:
             cmd.append("--ct-run-main")
             cmd.append("--no-artifact")
-        elif self._ct_run_main_for_case(case):
+        elif ct_run_main_mode:
             cmd.append("--ct-run-main")
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
@@ -848,7 +873,7 @@ class TestRunner:
         # so it may need stdin data that would normally go to the binary.
         compile_input = None
         stdin_data = case.stdin_data()
-        if (self._ct_run_main_for_case(case) or self._script_mode_for_case(case)) and stdin_data is not None:
+        if (ct_run_main_mode or script_mode or leak_check_mode) and stdin_data is not None:
             compile_input = stdin_data
         return subprocess.run(
             cmd,
@@ -1028,13 +1053,16 @@ class TestRunner:
 
     @staticmethod
     def _script_runtime_stdout(stdout_text: str) -> str:
-        """Map compiler stdout to script-mode runtime stdout.
+        """Map compiler stdout to compile-time runtime stdout.
 
-        --script semantics execute `main` at compile-time and skip artifact creation.
+        --script / --leak-check semantics execute `main` at compile-time and skip artifact creation.
         Keep program output while stripping compiler bookkeeping lines.
         """
         marker = "[info] skipped artifact generation (--no-artifact)"
-        if marker not in stdout_text:
+        leak_re = re.compile(
+            r"\[ctvm\] mmap leak check (?:passed|failed):[^\n]*(?:\n|$)"
+        )
+        if marker not in stdout_text and not leak_re.search(stdout_text):
             return stdout_text
         lines = stdout_text.splitlines(keepends=True)
         cleaned: List[str] = []
@@ -1042,7 +1070,7 @@ class TestRunner:
             if line.strip() == marker:
                 continue
             cleaned.append(line.replace(marker, ""))
-        return "".join(cleaned)
+        return leak_re.sub("", "".join(cleaned))
 
     @staticmethod
     def _script_runtime_stderr(stderr_text: str) -> str:
@@ -1142,7 +1170,7 @@ class TestRunner:
             return "passed", "", None
         if (
             label == "compile"
-            and (self._ct_run_main_for_case(case) or self._script_mode_for_case(case))
+            and (self._ct_run_main_for_case(case) or self._script_mode_for_case(case) or self._leak_check_mode_for_case(case))
             and expected_clean
             and actual_clean.endswith(expected_clean)
         ):
@@ -1337,6 +1365,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--update", action="store_true", help="update expectation files with actual output")
     parser.add_argument("--stop-on-fail", action="store_true", help="stop after the first failure")
     parser.add_argument("--ct-run-main", action="store_true", help="execute each test's 'main' via the compile-time VM during compilation")
+    parser.add_argument(
+        "--leak-check",
+        action="store_true",
+        help="run eligible non-example runtime tests via compiler --leak-check",
+    )
     parser.add_argument(
         "--script",
         action="store_true",

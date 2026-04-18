@@ -18,6 +18,7 @@
 #   [sched + 16]  tasks_ptr    (qword)  pointer to array of task pointers
 #   [sched + 24]  main_sp      (qword)  saved main data stack pointer
 #   [sched + 32]  main_ret     (qword)  saved main return address
+#   [sched + 40]  max_tasks    (qword)
 #
 # Usage:
 #   16 sched_new                     # create scheduler with capacity 16
@@ -89,6 +90,9 @@ word sched_main_sp 24 + @ end
 #sched_main_ret [* | sched] -> [* | ret]
 word sched_main_ret 32 + @ end
 
+#sched_max_tasks [* | sched] -> [* | max_tasks]
+word sched_max_tasks 40 + @ end
+
 # ── Global scheduler pointer (one active at a time) ──────────
 
 # We store the current scheduler pointer in a global cell
@@ -150,8 +154,8 @@ end
 #sched_new [* | max_tasks] -> [* | sched]
 # Create a new scheduler with room for max_tasks.
 word sched_new
-    # Allocate scheduler struct (40 bytes)
-    40 alloc         # stack: [*, max_tasks | sched]
+    # Allocate scheduler struct (48 bytes)
+    48 alloc         # stack: [*, max_tasks | sched]
 
     # task_count = 0
     dup 0 !
@@ -169,6 +173,9 @@ word sched_new
     # main_ret = 0
     dup 32 + 0 !
 
+    # max_tasks
+    over over 40 + swap !
+
     nip
 end
 
@@ -185,7 +192,8 @@ word sched_free
     end
     2drop
 
-    40 free
+    dup sched_tasks_ptr over sched_max_tasks 8 * free
+    48 free
 end
 
 # ── Spawning tasks ────────────────────────────────────────────

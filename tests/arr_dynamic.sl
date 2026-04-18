@@ -54,8 +54,12 @@ word main
     dup 2 dyn_arr_get puti cr
     dyn_arr_free
 
-    # free list allocation: bytes = (len + 1) * 8
-    dup @ 1 + 8 * free
+    # List literals may be static in compile-time execution; free only heap-backed ones.
+    dup is_mmap_addr if
+        arr_free
+    else
+        drop
+    end
 
     # dyn_arr_sorted (copy) should not mutate source
     5 arr_new

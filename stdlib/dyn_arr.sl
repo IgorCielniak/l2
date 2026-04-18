@@ -13,7 +13,7 @@ import arr.sl
 
 #arr_to_dyn [* | std_arr] -> [* | dyn_arr]
 word arr_to_dyn
-    dup @ dup dup 2 * 3 + alloc dup rot !
+    dup @ dup dup 2 * 3 + 8 * alloc dup rot !
     dup rot 2 * swap 8 + swap ! dup 16 +
     dup 8 + dup -rot ! 0 swap 3 pick dup @
     8 * swap 8 + swap memcpy 2drop drop nip

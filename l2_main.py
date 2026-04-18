@@ -82,6 +82,20 @@ def _get_struct():
     return _struct_mod
 
 
+_ct_libc_syscall = None
+def _ct_linux_syscall(nr: int, a0: int = 0, a1: int = 0, a2: int = 0, a3: int = 0, a4: int = 0, a5: int = 0) -> int:
+    """Call Linux syscall(2) via libc with up to 6 arguments."""
+    global _ct_libc_syscall
+    if _ct_libc_syscall is None:
+        import ctypes as _ctypes
+        globals().setdefault('ctypes', _ctypes)
+        _libc = _ctypes.CDLL(None, use_errno=True)
+        _libc.syscall.restype = _ctypes.c_long
+        _libc.syscall.argtypes = [_ctypes.c_long] * 7
+        _ct_libc_syscall = _libc.syscall
+    return int(_ct_libc_syscall(int(nr), int(a0), int(a1), int(a2), int(a3), int(a4), int(a5)))
+
+
 class Diagnostic:
     """Structured error/warning with optional source context and suggestions."""
     __slots__ = ('level', 'message', 'path', 'line', 'column', 'length', 'hint', 'suggestion')
@@ -7941,6 +7955,12 @@ class CompileTimeVM:
         self._jit_out2_addr: int = 0
         self._jit_out4: Optional[Any] = None
         self._jit_out4_addr: int = 0
+        # Runtime mmap/munmap leak tracker state (used by --leak-check)
+        self._mmap_leak_check_enabled: bool = False
+        self._mmap_live_regions: Dict[int, int] = {}
+        self._mmap_anomaly_count: int = 0
+        self._mmap_call_count: int = 0
+        self._munmap_call_count: int = 0
         # BSS symbol table for JIT patching
         self._bss_symbols: Dict[str, int] = {}
         # dlopen handles for C extern support
@@ -7969,13 +7989,81 @@ class CompileTimeVM:
             globals().setdefault('ctypes', _ctypes)
             self._jit_out2 = (_ctypes.c_int64 * 2)()
             self._jit_out2_addr = _ctypes.addressof(self._jit_out2)
-            self._jit_out4 = (_ctypes.c_int64 * 4)()
+            # Syscall path currently writes up to 8 qwords.
+            self._jit_out4 = (_ctypes.c_int64 * 8)()
             self._jit_out4_addr = _ctypes.addressof(self._jit_out4)
 
     def _ensure_jit_save_buf(self) -> None:
         if self._jit_save_buf is None:
             self._jit_save_buf = (ctypes.c_int64 * 8)()
             self._jit_save_buf_addr = ctypes.addressof(self._jit_save_buf)
+
+    @staticmethod
+    def _u64(value: int) -> int:
+        return int(value) & 0xFFFFFFFFFFFFFFFF
+
+    def _reset_mmap_leak_tracker(self, enabled: bool) -> None:
+        self._mmap_leak_check_enabled = bool(enabled)
+        self._mmap_live_regions = {}
+        self._mmap_anomaly_count = 0
+        self._mmap_call_count = 0
+        self._munmap_call_count = 0
+
+    def _track_syscall_mmap(self, addr: int, length: int, result: int) -> None:
+        if not self._mmap_leak_check_enabled:
+            return
+        self._mmap_call_count += 1
+        # Linux syscall ABI returns negative errno on failure.
+        if int(result) < 0:
+            return
+        size = int(length)
+        if size <= 0:
+            return
+        key = self._u64(addr)
+        if key in self._mmap_live_regions:
+            self._mmap_anomaly_count += 1
+        self._mmap_live_regions[key] = size
+
+    def _track_syscall_munmap(self, addr: int, length: int, result: int) -> None:
+        if not self._mmap_leak_check_enabled:
+            return
+        self._munmap_call_count += 1
+        # Only successful munmap operations should release accounting entries.
+        if int(result) != 0:
+            return
+        size = int(length)
+        if size <= 0:
+            return
+        key = self._u64(addr)
+        existing = self._mmap_live_regions.get(key)
+        if existing is None:
+            self._mmap_anomaly_count += 1
+            return
+        if size == existing:
+            del self._mmap_live_regions[key]
+            return
+        if 0 < size < existing:
+            # Partial unmap from the mapping start: keep the remaining suffix.
+            del self._mmap_live_regions[key]
+            self._mmap_live_regions[self._u64(key + size)] = existing - size
+            return
+        # munmap size larger than mapping is suspicious; drop the entry and flag it.
+        del self._mmap_live_regions[key]
+        self._mmap_anomaly_count += 1
+
+    def mmap_leak_check_report(self) -> Tuple[bool, str]:
+        leaked_regions = len(self._mmap_live_regions)
+        leaked_bytes = sum(max(0, int(size)) for size in self._mmap_live_regions.values())
+        anomalies = int(self._mmap_anomaly_count)
+        has_issues = leaked_regions > 0 or anomalies > 0
+        status = "failed" if has_issues else "passed"
+        summary = (
+            f"[ctvm] mmap leak check {status}: "
+            f"leaked_regions={leaked_regions} leaked_bytes={leaked_bytes} "
+            f"mmap_calls={int(self._mmap_call_count)} munmap_calls={int(self._munmap_call_count)} "
+            f"anomalies={anomalies}"
+        )
+        return has_issues, summary
 
     @staticmethod
     def _parse_data_scalar(text: str) -> Optional[int]:
@@ -8288,12 +8376,20 @@ class CompileTimeVM:
         self.current_location = None
         self._repl_initialized = False
 
-    def invoke(self, word: Word, *, runtime_mode: bool = False, libs: Optional[List[str]] = None) -> None:
+    def invoke(
+        self,
+        word: Word,
+        *,
+        runtime_mode: bool = False,
+        libs: Optional[List[str]] = None,
+        mmap_leak_check: bool = False,
+    ) -> None:
         self.reset()
         self._ensure_jit_out()
         prev_mode = self.runtime_mode
         self.runtime_mode = runtime_mode
         if runtime_mode:
+            self._reset_mmap_leak_tracker(mmap_leak_check)
             # Determine persistent size from BSS overrides if available.
             persistent_size = 0
             if self.parser.custom_bss:
@@ -8349,6 +8445,8 @@ class CompileTimeVM:
             old_limit = sys.getrecursionlimit()
             if old_limit < 10000:
                 sys.setrecursionlimit(10000)
+        else:
+            self._reset_mmap_leak_tracker(False)
         try:
             self._call_word(word)
         except _CTVMExit:
@@ -17679,6 +17777,49 @@ def _rt_jmp(vm: CompileTimeVM) -> None:
     raise _CTVMJump(resolved)
 
 
+def _rt_mmap(vm: CompileTimeVM) -> None:
+    """Runtime intrinsic for mmap wrapper word used by stdlib alloc paths.
+
+    Mirrors the asm `mmap` word stack protocol exactly:
+    [*, addr, len, prot, flags, fd | offset] -> [*, addr | result]
+    """
+    offset = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    fd = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    flags = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    prot = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    length = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    addr_hint = CTMemory.read_qword(vm.r12)
+
+    result = _ct_linux_syscall(9, addr_hint, length, prot, flags, fd, offset)
+
+    vm.r12 -= 8
+    CTMemory.write_qword(vm.r12, result)
+    vm._track_syscall_mmap(addr=result, length=length, result=result)
+
+
+def _rt_munmap(vm: CompileTimeVM) -> None:
+    """Runtime intrinsic for munmap wrapper word used by stdlib free paths.
+
+    Mirrors the asm `munmap` word stack protocol exactly:
+    [*, addr | len] -> [* | res]
+    """
+    length = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+    addr = CTMemory.read_qword(vm.r12)
+    vm.r12 += 8
+
+    result = _ct_linux_syscall(11, addr, length)
+
+    vm.r12 -= 8
+    CTMemory.write_qword(vm.r12, result)
+    vm._track_syscall_munmap(addr=addr, length=length, result=result)
+
+
 def _rt_syscall(vm: CompileTimeVM) -> None:
     """Execute a real Linux syscall via a JIT stub, intercepting exit/exit_group."""
     # Lazily compile the syscall JIT stub
@@ -17687,11 +17828,18 @@ def _rt_syscall(vm: CompileTimeVM) -> None:
         stub = _compile_syscall_stub(vm)
         vm._jit_cache["__syscall_stub"] = stub
 
-    # out[0] = final r12, out[1] = final r13, out[2] = flag (0=normal, 1=exit, code in out[3])
+    # out layout:
+    #   [0] final r12, [1] final r13,
+    #   [2] exit flag (0=normal, 1=exit), [3] exit code,
+    #   [4] syscall nr, [5] arg0, [6] arg1, [7] result (rax)
     out = vm._jit_out4
     stub(vm.r12, vm.r13, vm._jit_out4_addr)
     vm.r12 = out[0]
     vm.r13 = out[1]
+    if out[4] == 9:
+        vm._track_syscall_mmap(addr=out[7], length=out[6], result=out[7])
+    elif out[4] == 11:
+        vm._track_syscall_munmap(addr=out[5], length=out[6], result=out[7])
     if out[2] == 1:
         raise _CTVMExit(out[3])
 
@@ -17703,7 +17851,8 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
 
     # The stub uses the same wrapper convention as _compile_jit:
     #   rdi = r12 (data stack ptr), rsi = r13 (return stack ptr), rdx = output ptr
-    # Output struct: [r12, r13, exit_flag, exit_code]
+    # Output struct:
+    #   [r12, r13, exit_flag, exit_code, syscall_nr, arg0, arg1, result]
     #
     # Stack protocol (matching _emit_syscall_intrinsic):
     #   TOS:   syscall number -> rax
@@ -17724,6 +17873,7 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         # Pop syscall number
         "    mov rax, [r12]",
         "    add r12, 8",
+        "    mov r14, rax",          # keep syscall nr for reporting
         # Pop arg count
         "    mov rcx, [r12]",
         "    add r12, 8",
@@ -17780,6 +17930,7 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    add r12, 8",
         "_skip_rdi:",
         "    syscall",
+        "    mov rbx, rax",          # preserve result before writing output
         # Push result
         "    sub r12, 8",
         "    mov [r12], rax",
@@ -17789,6 +17940,10 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    mov qword [rax+8], r13",
         "    mov qword [rax+16], 0", # exit_flag = 0
         "    mov qword [rax+24], 0", # exit_code = 0
+        "    mov qword [rax+32], r14", # syscall_nr
+        "    mov qword [rax+40], rdi", # arg0
+        "    mov qword [rax+48], rsi", # arg1
+        "    mov qword [rax+56], rbx", # result
         "    jmp _stub_epilogue",
         # Exit path: don't actually call syscall, just report it
         "_do_exit:",
@@ -17803,6 +17958,10 @@ def _compile_syscall_stub(vm: CompileTimeVM) -> Any:
         "    mov qword [rax+8], r13",
         "    mov qword [rax+16], 1", # exit_flag = 1
         "    mov [rax+24], rbx",     # exit_code
+        "    mov qword [rax+32], r14", # syscall_nr
+        "    mov qword [rax+40], rbx", # arg0 (exit code)
+        "    mov qword [rax+48], 0",   # arg1
+        "    mov qword [rax+56], 0",   # result
         "_stub_epilogue:",
         "    add rsp, 24",
         "    pop r14",
@@ -17856,6 +18015,8 @@ def _register_runtime_intrinsics(dictionary: Dictionary) -> None:
     memory stacks.  Only a handful need Python-level interception:
       - exit    : must not actually call sys_exit (would kill the compiler)
       - jmp     : needs interpreter-level IP manipulation
+      - mmap    : tracked in CTVM for leak-check mode
+      - munmap  : tracked in CTVM for leak-check mode
       - syscall : the ``syscall`` word is compiler-generated (no asm body);
                   intercept to block sys_exit and handle safely
     Note: get_addr is handled inline in _execute_nodes before _call_word.
@@ -17863,6 +18024,8 @@ def _register_runtime_intrinsics(dictionary: Dictionary) -> None:
     _RT_MAP: Dict[str, Callable[[CompileTimeVM], None]] = {
         "exit": _rt_exit,
         "jmp": _rt_jmp,
+        "mmap": _rt_mmap,
+        "munmap": _rt_munmap,
         "syscall": _rt_syscall,
     }
     for name, func in _RT_MAP.items():
@@ -18867,14 +19030,25 @@ class Compiler:
             entry_mode=entry_mode,
         )
 
-    def run_compile_time_word(self, name: str, *, libs: Optional[List[str]] = None) -> None:
+    def run_compile_time_word(
+        self,
+        name: str,
+        *,
+        libs: Optional[List[str]] = None,
+        mmap_leak_check: bool = False,
+    ) -> None:
         word = self.dictionary.lookup(name)
         if word is None:
             raise CompileTimeError(f"word '{name}' not defined; cannot run at compile time")
         # Skip if already executed via a ``compile-time <name>`` directive.
-        if name in self.parser.compile_time_vm._ct_executed:
+        if name in self.parser.compile_time_vm._ct_executed and not mmap_leak_check:
             return
-        self.parser.compile_time_vm.invoke(word, runtime_mode=True, libs=libs)
+        self.parser.compile_time_vm.invoke(
+            word,
+            runtime_mode=True,
+            libs=libs,
+            mmap_leak_check=mmap_leak_check,
+        )
 
     def run_compile_time_word_repl(self, name: str, *, libs: Optional[List[str]] = None) -> None:
         """Like run_compile_time_word but uses invoke_repl for persistent state."""
@@ -23234,6 +23408,11 @@ def cli(argv: Sequence[str]) -> int:
         help="force full rebuild (always recompile + assemble + relink); implies --no-cache",
     )
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
+    parser.add_argument(
+        "--leak-check",
+        action="store_true",
+        help="run 'main' in CTVM, intercept mmap/munmap syscalls, and fail on leaked mappings",
+    )
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
     parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
     parser.add_argument(
@@ -23386,6 +23565,10 @@ def cli(argv: Sequence[str]) -> int:
             args.libs.append(lib_tok)
 
     if args.script:
+        args.no_artifact = True
+        args.ct_run_main = True
+
+    if args.leak_check:
         args.no_artifact = True
         args.ct_run_main = True
 
@@ -23651,6 +23834,12 @@ def cli(argv: Sequence[str]) -> int:
                         changed = True
 
                 if args.script:
+                    if not args.no_artifact or not args.ct_run_main:
+                        changed = True
+                    args.no_artifact = True
+                    args.ct_run_main = True
+
+                if args.leak_check:
                     if not args.no_artifact or not args.ct_run_main:
                         changed = True
                     args.no_artifact = True
@@ -23992,10 +24181,20 @@ def cli(argv: Sequence[str]) -> int:
 
         if args.ct_run_main:
             try:
-                compiler.run_compile_time_word("main", libs=ct_run_libs)
+                compiler.run_compile_time_word(
+                    "main",
+                    libs=ct_run_libs,
+                    mmap_leak_check=args.leak_check,
+                )
             except CompileTimeError as exc:
                 print(f"[error] compile-time execution of 'main' failed: {exc}")
                 return 1
+            if args.leak_check:
+                has_issues, summary = compiler.parser.compile_time_vm.mmap_leak_check_report()
+                if has_issues:
+                    print(summary, file=sys.stderr)
+                    return 1
+                print(summary)
     except (ParseError, CompileError, CompileTimeError) as exc:
         # Print all collected diagnostics in Rust-style format
         use_color = sys.stderr.isatty()

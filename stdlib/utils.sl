@@ -88,12 +88,16 @@ end
 #count_digits [* | int] -> [* | int]
 # returns the amount of digits of an int
 word count_digits
-    0
-    swap
-    while dup 0 > do
-        10 / swap 1 + swap
+    dup 0 == if
+        drop 1
+    else
+        0
+        swap
+        while dup 0 > do
+            10 / swap 1 + swap
+        end
+        drop
     end
-    drop
 end
 
 #tostr [* | int] -> [*, addr | len]
@@ -101,7 +105,7 @@ end
 word tostr
     dup
     count_digits
-    2dup >r alloc
+    dup >r alloc r@ swap
     swap rot swap
     for
         dup 10 % swap 10 /

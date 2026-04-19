@@ -1,0 +1,12 @@
+error[E1007]: control stack underflow
+  --> control_underflow_diagnostic.sl:2:4
+    |
+  2 |     do
+    |    ^^
+    | = note: a control keyword appeared without a matching opener
+    | = note: while parsing definition 'main'
+    |
+    = help: ensure `else` follows an `if`, and `do` follows `while`
+    = help: check that every control block starts before it is closed
+
+1 error(s) emitted

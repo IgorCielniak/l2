@@ -1,2 +1,8 @@
-[error] fn type error: incompatible let initializer
-compile-time stack: fn -> fn-build-body -> fn-compile-statements -> fn-compile-statement -> fn-compile-let-stmt -> parse-error
+error: fn type error: incompatible let initializer
+  --> libs/fn.sl:837:87
+      |
+  837 | 	3 pick swap fn-type-compatible? 0 == if "fn type error: incompatible let initializer" parse-error end
+      |                                                                                       ^
+      | = note: compile-time stack: fn -> fn-build-body -> fn-compile-statements -> fn-compile-statement -> fn-compile-let-stmt -> parse-error
+
+1 error(s) emitted

@@ -1,0 +1,10 @@
+error[E1103]: unclosed definition at EOF
+  --> if_missing_definition_end.sl:4:4
+    |
+  4 |     end
+    |    ^^^
+    | = note: a definition was opened but not closed before end-of-file
+    |
+    = help: add a matching `end` for the current definition
+
+1 error(s) emitted

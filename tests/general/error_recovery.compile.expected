@@ -1,12 +1,20 @@
-error: unexpected 'end' at 6:8
+error[E1003]: unexpected 'end' at 6:8
   --> error_recovery.sl:6:8
     |
   6 |     end end
     |        ^^^
-error: unexpected 'end' at 10:8
+    | = note: `end` must close an active definition or control block
+    |
+    = help: remove this `end` or add its matching opener earlier
+    = help: check nesting around `if`/`else`/`for`/`while`/`begin`/`word`
+error[E1003]: unexpected 'end' at 10:8
   --> error_recovery.sl:10:8
      |
   10 |     end end
      |        ^^^
+     | = note: `end` must close an active definition or control block
+     |
+     = help: remove this `end` or add its matching opener earlier
+     = help: check nesting around `if`/`else`/`for`/`while`/`begin`/`word`
 
 2 error(s) emitted

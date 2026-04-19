@@ -658,6 +658,8 @@ class TestRunner:
             return False
         if self._is_example_source(case.source):
             return False
+        if case.config.expect_compile_error:
+            return False
         if case.config.expected_exit != 0:
             return False
         if case.config.args is not None or case.config.stdin is not None:
@@ -1278,6 +1280,9 @@ class TestRunner:
             source_dir = str(case.source.parent.resolve())
             if source_dir:
                 text = text.replace(source_dir + "/", "")
+            root_dir = str(self.root.resolve())
+            if root_dir:
+                text = text.replace(root_dir + "/", "")
         return text
 
     def _sort_lines(self, text: str) -> str:

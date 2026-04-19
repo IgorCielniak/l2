@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "single end must not close both if and enclosing definition"
+}

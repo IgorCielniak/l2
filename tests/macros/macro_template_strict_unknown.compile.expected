@@ -3,5 +3,6 @@ error: macro 'strict_unknown' references argument 'missing_symbol', but the argu
      |
   13 |   strict_unknown puti cr
      |  ^^^^^^^^^^^^^^
+     | = note: while parsing definition 'main'
 
 1 error(s) emitted

@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "orphan do emits structured control-stack underflow diagnostics"
+}

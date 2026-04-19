@@ -131,13 +131,16 @@ def _request_force_worker_line(line):
     return chunks.decode("utf-8", errors="replace").split("\n", 1)[0]
 
 
-def _ping_force_worker():
+def _ping_force_worker(*, require_v2=False):
+    if require_v2:
+        return _request_force_worker_line("PING2") == "PONG2"
     return _request_force_worker_line("PING") == "PONG"
 
 
 def _run_force_worker_request(source_token):
-    response = _request_force_worker_line(f"RUN\t{source_token}")
-    if not response.startswith("RC\t"):
+    color_flag = "1" if sys.stderr.isatty() else "0"
+    response = _request_force_worker_line(f"RUN\t{color_flag}\t{source_token}")
+    if not (response.startswith("RC\t") or response.startswith("RC2\t")):
         raise RuntimeError("invalid force-worker response")
     parts = response.split("\t", 2)
     code = int(parts[1])
@@ -146,8 +149,9 @@ def _run_force_worker_request(source_token):
 
 
 def _run_no_cache_worker_request(source_token):
-    response = _request_force_worker_line(f"RUN_NC\t{source_token}")
-    if not response.startswith("RC\t"):
+    color_flag = "1" if sys.stderr.isatty() else "0"
+    response = _request_force_worker_line(f"RUN_NC\t{color_flag}\t{source_token}")
+    if not (response.startswith("RC\t") or response.startswith("RC2\t")):
         raise RuntimeError("invalid no-cache worker response")
     parts = response.split("\t", 2)
     code = int(parts[1])
@@ -161,7 +165,7 @@ def _start_force_worker():
     import time
 
     try:
-        if _ping_force_worker():
+        if _ping_force_worker(require_v2=True):
             return True
     except (OSError, RuntimeError, ValueError) as exc:
         _force_worker_log(f"pre-spawn ping failed: {exc}")
@@ -198,7 +202,7 @@ def _start_force_worker():
     while time.monotonic() < deadline:
         if os.path.exists(_FORCE_WORKER_SOCKET):
             try:
-                if _ping_force_worker():
+                if _ping_force_worker(require_v2=True):
                     return True
             except (OSError, RuntimeError, ValueError):
                 continue
@@ -275,6 +279,19 @@ def _run_force_worker():
     from l2_main import cli as _worker_cli
     from l2_main import _try_quick_compile_force as _worker_quick_force
 
+    def _parse_worker_run_payload(payload: str):
+        # Backward-compatible protocol parsing:
+        # legacy payload: "<source>"
+        # current payload: "<0|1>\t<source>"
+        wants_color = False
+        source_token = payload
+        if "\t" in payload:
+            maybe_color, rest = payload.split("\t", 1)
+            if maybe_color in ("0", "1"):
+                wants_color = maybe_color == "1"
+                source_token = rest
+        return source_token, wants_color
+
     os.makedirs("build", exist_ok=True)
     _remove_force_worker_file(_FORCE_WORKER_SOCKET)
     _write_force_worker_pid(os.getpid())
@@ -309,27 +326,39 @@ def _run_force_worker():
                 if line == "PING":
                     conn.sendall(b"PONG\n")
                     continue
+                if line == "PING2":
+                    conn.sendall(b"PONG2\n")
+                    continue
 
                 rc = 1
                 detail = ""
                 try:
                     mode = "force"
+                    wants_color = False
                     if line.startswith("RUN\t"):
-                        source_token = line.split("\t", 1)[1]
+                        source_token, wants_color = _parse_worker_run_payload(line.split("\t", 1)[1])
                     elif line.startswith("RUN_NC\t"):
                         mode = "no-cache"
-                        source_token = line.split("\t", 1)[1]
+                        source_token, wants_color = _parse_worker_run_payload(line.split("\t", 1)[1])
                     else:
                         raise RuntimeError("invalid force-worker request")
                     out_buf = io.StringIO()
                     err_buf = io.StringIO()
-                    with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                        if mode == "force":
-                            result = _worker_quick_force([source_token, "--force"], emit_status=False)
-                            if result is None:
-                                result = _worker_cli([source_token, "--force"])
+                    prev_force_color = os.environ.get("L2_FORCE_COLOR")
+                    os.environ["L2_FORCE_COLOR"] = "1" if wants_color else "0"
+                    try:
+                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                            if mode == "force":
+                                result = _worker_quick_force([source_token, "--force"], emit_status=False)
+                                if result is None:
+                                    result = _worker_cli([source_token, "--force"])
+                            else:
+                                result = _worker_cli([source_token, "--no-cache"])
+                    finally:
+                        if prev_force_color is None:
+                            os.environ.pop("L2_FORCE_COLOR", None)
                         else:
-                            result = _worker_cli([source_token, "--no-cache"])
+                            os.environ["L2_FORCE_COLOR"] = prev_force_color
                     rc = int(result) if result is not None else 0
                     if rc != 0:
                         detail = err_buf.getvalue().strip() or out_buf.getvalue().strip()
@@ -344,7 +373,7 @@ def _run_force_worker():
                 except Exception as exc:
                     rc = 1
                     detail = f"force worker exception: {exc}"
-                payload = f"RC\t{int(rc)}"
+                payload = f"RC2\t{int(rc)}"
                 if detail:
                     payload += f"\t{_encode_worker_message(detail)}"
                 conn.sendall((payload + "\n").encode("utf-8"))

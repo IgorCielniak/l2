@@ -1,0 +1,3 @@
+word main
+    do
+end

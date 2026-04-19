@@ -73,6 +73,32 @@ def _normalize_rel_to_rip(line: str) -> str:
 DEFAULT_MACRO_EXPANSION_LIMIT = 256
 _SOURCE_PATH = Path("<source>")
 
+
+def _env_flag(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"", "0", "false", "no", "off", "never"}:
+        return False
+    return True
+
+
+def _diagnostic_color_enabled() -> bool:
+    forced = _env_flag("L2_FORCE_COLOR")
+    if forced is not None:
+        return forced
+    if _env_flag("CLICOLOR_FORCE"):
+        return True
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if _env_flag("CLICOLOR") is False:
+        return False
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
+
 _struct_mod = None
 def _get_struct():
     global _struct_mod
@@ -98,7 +124,19 @@ def _ct_linux_syscall(nr: int, a0: int = 0, a1: int = 0, a2: int = 0, a3: int = 
 
 class Diagnostic:
     """Structured error/warning with optional source context and suggestions."""
-    __slots__ = ('level', 'message', 'path', 'line', 'column', 'length', 'hint', 'suggestion')
+    __slots__ = (
+        'level',
+        'message',
+        'path',
+        'line',
+        'column',
+        'length',
+        'hint',
+        'suggestion',
+        'code',
+        'notes',
+        'helps',
+    )
 
     def __init__(
         self,
@@ -110,6 +148,9 @@ class Diagnostic:
         length: int = 0,
         hint: str = "",
         suggestion: str = "",
+        code: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
     ) -> None:
         self.level = level       # "error", "warning", "note"
         self.message = message
@@ -119,6 +160,18 @@ class Diagnostic:
         self.length = length
         self.hint = hint
         self.suggestion = suggestion
+        self.code = code
+        self.notes = tuple(str(item).strip() for item in (notes or ()) if str(item).strip())
+        self.helps = tuple(str(item).strip() for item in (helps or ()) if str(item).strip())
+
+    @staticmethod
+    def _split_nonempty_lines(text: str) -> List[str]:
+        out: List[str] = []
+        for raw in str(text).splitlines():
+            line = raw.strip()
+            if line:
+                out.append(line)
+        return out
 
     def format(self, *, color: bool = True) -> str:
         """Format the diagnostic in Rust-style with source context."""
@@ -132,7 +185,18 @@ class Diagnostic:
 
         level_color = _RED if self.level == "error" else (_YELLOW if self.level == "warning" else _BLUE)
         parts: List[str] = []
-        parts.append(f"{level_color}{self.level}{_RST}{_BOLD}: {self.message}{_RST}")
+        code_suffix = f"{_DIM}[{self.code}]{_RST}" if self.code else ""
+        parts.append(f"{level_color}{self.level}{code_suffix}{_RST}{_BOLD}: {self.message}{_RST}")
+
+        note_lines: List[str] = []
+        if self.hint:
+            note_lines.extend(self._split_nonempty_lines(self.hint))
+        note_lines.extend(self.notes)
+
+        help_lines: List[str] = []
+        if self.suggestion:
+            help_lines.extend(self._split_nonempty_lines(self.suggestion))
+        help_lines.extend(self.helps)
 
         if self.path and self.line > 0:
             loc = f"{self.path}:{self.line}"
@@ -153,16 +217,20 @@ class Diagnostic:
                         caret_len = max(1, self.length) if self.length else 1
                         arrow = " " * (self.column - 1) + level_color + "^" * caret_len + _RST
                         parts.append(f"  {_BLUE}{pad} |{_RST} {arrow}")
-                    if self.hint:
-                        parts.append(f"  {_BLUE}{pad} |{_RST} {_CYAN}= note: {self.hint}{_RST}")
-                    if self.suggestion:
+                    for note in note_lines:
+                        parts.append(f"  {_BLUE}{pad} |{_RST} {_CYAN}= note: {note}{_RST}")
+                    if help_lines:
                         parts.append(f"  {_BLUE}{pad} |{_RST}")
-                        parts.append(f"  {_BLUE}{pad} = {_CYAN}help{_RST}: {self.suggestion}")
+                        for help_line in help_lines:
+                            parts.append(f"  {_BLUE}{pad} = {_CYAN}help{_RST}: {help_line}")
             except Exception:
                 pass
 
-        elif self.hint:
-            parts.append(f"  {_CYAN}= note: {self.hint}{_RST}")
+        else:
+            for note in note_lines:
+                parts.append(f"  {_CYAN}= note: {note}{_RST}")
+            for help_line in help_lines:
+                parts.append(f"  {_CYAN}help{_RST}: {help_line}")
 
         return "\n".join(parts)
 
@@ -174,14 +242,90 @@ class Diagnostic:
 
 class ParseError(Exception):
     """Raised when the source stream cannot be parsed."""
-    def __init__(self, message: str = "", *, diagnostic: Optional[Diagnostic] = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        diagnostic: Optional[Diagnostic] = None,
+        code: str = "",
+        path: Optional[Path] = None,
+        line: int = 0,
+        column: int = 0,
+        length: int = 0,
+        hint: str = "",
+        suggestion: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
+    ) -> None:
+        if diagnostic is None and (
+            path is not None
+            or line > 0
+            or column > 0
+            or length > 0
+            or hint
+            or suggestion
+            or code
+            or notes
+            or helps
+        ):
+            diagnostic = Diagnostic(
+                level="error",
+                message=message,
+                path=path,
+                line=line,
+                column=column,
+                length=length,
+                hint=hint,
+                suggestion=suggestion,
+                code=code,
+                notes=notes,
+                helps=helps,
+            )
         self.diagnostic = diagnostic
         super().__init__(message)
 
 
 class CompileError(Exception):
     """Raised when IR cannot be turned into assembly."""
-    def __init__(self, message: str = "", *, diagnostic: Optional[Diagnostic] = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        diagnostic: Optional[Diagnostic] = None,
+        code: str = "",
+        path: Optional[Path] = None,
+        line: int = 0,
+        column: int = 0,
+        length: int = 0,
+        hint: str = "",
+        suggestion: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
+    ) -> None:
+        if diagnostic is None and (
+            path is not None
+            or line > 0
+            or column > 0
+            or length > 0
+            or hint
+            or suggestion
+            or code
+            or notes
+            or helps
+        ):
+            diagnostic = Diagnostic(
+                level="error",
+                message=message,
+                path=path,
+                line=line,
+                column=column,
+                length=length,
+                hint=hint,
+                suggestion=suggestion,
+                code=code,
+                notes=notes,
+                helps=helps,
+            )
         self.diagnostic = diagnostic
         super().__init__(message)
 
@@ -295,8 +439,6 @@ class Reader:
             self._multi_char_tokens = [t for t in self._token_order if len(t) > 1]
             self._multi_first_chars = {t[0] for t in self._multi_char_tokens}
             self._token_re = None  # invalidate cached regex
-            self._multi_char_tokens = [t for t in self._token_order if len(t) > 1]
-            self._multi_first_chars = {t[0] for t in self._multi_char_tokens}
 
     def add_token_chars(self, chars: str) -> None:
         self.add_tokens(chars)
@@ -339,8 +481,11 @@ class Reader:
         # Pre-compute line start offsets for O(1) amortized line/column lookup
         _line_starts = [0]
         _line_starts_append = _line_starts.append
-        for _m in _RE_NEWLINE.finditer(source):
-            _line_starts_append(_m.end())
+        _find = source.find
+        _nl_pos = _find('\n')
+        while _nl_pos != -1:
+            _line_starts_append(_nl_pos + 1)
+            _nl_pos = _find('\n', _nl_pos + 1)
         _n_lines = len(_line_starts)
         result: List[Token] = []
         _append = result.append
@@ -4315,25 +4460,211 @@ class Parser:
                 return _make_loc(span.path, span.local_start_line + (tl - span.start_line), token.column)
         return _make_loc(_SOURCE_PATH, tl, token.column)
 
-    def _record_diagnostic(self, token: Optional[Token], message: str, *, level: str = "error", hint: str = "", suggestion: str = "") -> None:
+    def _record_diagnostic_obj(self, diag: Diagnostic) -> None:
+        """Record a prebuilt diagnostic and enforce max-error limit."""
+        self.diagnostics.append(diag)
+        if diag.level == "error" and sum(1 for d in self.diagnostics if d.level == "error") >= self._max_errors:
+            raise ParseError(f"too many errors ({self._max_errors}), aborting", diagnostic=diag)
+
+    def _record_diagnostic(
+        self,
+        token: Optional[Token],
+        message: str,
+        *,
+        level: str = "error",
+        hint: str = "",
+        suggestion: str = "",
+        code: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
+    ) -> None:
         """Record a diagnostic and raise ParseError if too many errors."""
         loc = self.location_for_token(token) if token else _make_loc(_SOURCE_PATH, 0, 0)
         diag = Diagnostic(
-            level=level, message=message,
-            path=loc.path, line=loc.line, column=loc.column,
+            level=level,
+            message=message,
+            path=loc.path,
+            line=loc.line,
+            column=loc.column,
             length=len(token.lexeme) if token else 0,
-            hint=hint, suggestion=suggestion,
+            hint=hint,
+            suggestion=suggestion,
+            code=code,
+            notes=notes,
+            helps=helps,
         )
-        self.diagnostics.append(diag)
-        if level == "error" and sum(1 for d in self.diagnostics if d.level == "error") >= self._max_errors:
-            raise ParseError(f"too many errors ({self._max_errors}), aborting", diagnostic=diag)
+        self._record_diagnostic_obj(diag)
 
-    def _warn(self, token: Optional[Token], category: str, message: str, *, hint: str = "", suggestion: str = "") -> None:
+    def _parse_context_notes(self, token: Optional[Token]) -> List[str]:
+        notes: List[str] = []
+        if self.context_stack:
+            ctx = self.context_stack[-1]
+            if isinstance(ctx, Definition):
+                notes.append(f"while parsing definition '{ctx.name}'")
+        if self.macro_recording is not None:
+            notes.append(f"while recording macro '{self.macro_recording.name}'")
+        if self.control_stack:
+            top = self.control_stack[-1]
+            ctype = top.get("type")
+            if ctype:
+                if "line" in top and "column" in top:
+                    notes.append(f"inside '{ctype}' block opened at {top['line']}:{top['column']}")
+                else:
+                    notes.append(f"inside '{ctype}' block")
+        if token is not None and int(getattr(token, "expansion_depth", 0)) > 0:
+            notes.append(f"during macro expansion depth {int(token.expansion_depth)}")
+        return notes
+
+    def _parse_error_heuristics(self, message: str) -> Tuple[str, str, str, List[str], List[str]]:
+        text = str(message or "").strip()
+        lower = text.lower()
+        code = ""
+        hint = ""
+        suggestion = ""
+        notes: List[str] = []
+        helps: List[str] = []
+
+        if "unexpected eof" in lower:
+            code = "E1001"
+            hint = "the parser reached end-of-file before closing the current construct"
+            helps.append("add the missing closing token such as `end`, `;`, `}`, `)`, or `]`")
+            return code, hint, suggestion, notes, helps
+
+        if "unterminated string literal" in lower:
+            code = "E1002"
+            hint = "string literal started but was never closed"
+            helps.append('add a closing double quote (")')
+            helps.append("escape embedded quotes inside strings")
+            return code, hint, suggestion, notes, helps
+
+        if "unexpected 'end'" in lower:
+            code = "E1003"
+            hint = "`end` must close an active definition or control block"
+            helps.append("remove this `end` or add its matching opener earlier")
+            helps.append("check nesting around `if`/`else`/`for`/`while`/`begin`/`word`")
+            return code, hint, suggestion, notes, helps
+
+        if "control stack underflow" in lower:
+            code = "E1007"
+            hint = "a control keyword appeared without a matching opener"
+            helps.append("ensure `else` follows an `if`, and `do` follows `while`")
+            helps.append("check that every control block starts before it is closed")
+            return code, hint, suggestion, notes, helps
+
+        if "mismatched control word" in lower:
+            code = "E1008"
+            hint = "a control keyword tried to close a different control frame"
+            helps.append("verify proper control flow order: `while ... do ... end`, `if ... else ... end`, `for ... end`")
+            helps.append("check source location notes for where the block was opened")
+            return code, hint, suggestion, notes, helps
+
+        if "missing ';'" in lower or "expected ';'" in lower:
+            code = "E1004"
+            hint = "`;` terminates macro, asm, and py declarations"
+            helps.append("insert `;` immediately after the declaration body")
+            return code, hint, suggestion, notes, helps
+
+        if "missing '}'" in lower or "unterminated grouped argument" in lower:
+            code = "E1005"
+            hint = "a grouped construct was opened but not closed"
+            helps.append("add the missing closing brace or delimiter")
+            return code, hint, suggestion, notes, helps
+
+        if "token hook" in lower and "not defined" in lower:
+            code = "E1006"
+            hint = "token hook must reference an existing word"
+            helps.append("define the hook word before setting it")
+            helps.append("or clear the hook with `clear-token-hook`")
+            return code, hint, suggestion, notes, helps
+
+        return code, hint, suggestion, notes, helps
+
+    def _diagnostic_from_parse_error(self, exc: ParseError, *, fallback_token: Optional[Token]) -> Diagnostic:
+        existing = getattr(exc, "diagnostic", None)
+
+        loc = _make_loc(_SOURCE_PATH, 0, 0)
+        message = str(exc) or "parse error"
+        length = 0
+        hint = ""
+        suggestion = ""
+        code = ""
+        notes: List[str] = []
+        helps: List[str] = []
+
+        if existing is not None:
+            message = existing.message or message
+            if existing.path is not None and int(existing.line) > 0:
+                loc = _make_loc(existing.path, int(existing.line), int(existing.column))
+            elif fallback_token is not None:
+                loc = self.location_for_token(fallback_token)
+            length = int(existing.length)
+            hint = existing.hint
+            suggestion = existing.suggestion
+            code = existing.code
+            notes.extend(existing.notes)
+            helps.extend(existing.helps)
+        elif fallback_token is not None:
+            loc = self.location_for_token(fallback_token)
+            length = len(fallback_token.lexeme)
+
+        h_code, h_hint, h_suggestion, h_notes, h_helps = self._parse_error_heuristics(message)
+        if not code and h_code:
+            code = h_code
+        if not hint and h_hint:
+            hint = h_hint
+        if not suggestion and h_suggestion:
+            suggestion = h_suggestion
+
+        for note in h_notes:
+            if note not in notes:
+                notes.append(note)
+        for note in self._parse_context_notes(fallback_token):
+            if note not in notes:
+                notes.append(note)
+        for help_line in h_helps:
+            if help_line not in helps:
+                helps.append(help_line)
+
+        return Diagnostic(
+            level="error",
+            message=message,
+            path=loc.path,
+            line=loc.line,
+            column=loc.column,
+            length=length,
+            hint=hint,
+            suggestion=suggestion,
+            code=code,
+            notes=notes,
+            helps=helps,
+        )
+
+    def _warn(
+        self,
+        token: Optional[Token],
+        category: str,
+        message: str,
+        *,
+        hint: str = "",
+        suggestion: str = "",
+        code: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
+    ) -> None:
         """Record a warning if the category is enabled. Promotes to error under --Werror."""
         if "all" not in self._warnings_enabled and category not in self._warnings_enabled:
             return
         level = "error" if self._werror else "warning"
-        self._record_diagnostic(token, message, level=level, hint=hint, suggestion=suggestion)
+        self._record_diagnostic(
+            token,
+            message,
+            level=level,
+            hint=hint,
+            suggestion=suggestion,
+            code=code,
+            notes=notes,
+            helps=helps,
+        )
 
     def _preview_value_repr(self, value: Any, *, max_len: int = 120) -> str:
         try:
@@ -6608,6 +6939,11 @@ class Parser:
         if not self.control_stack:
             raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
 
+        # Common case: one open control frame, so this `end` must close it.
+        if len(self.control_stack) == 1:
+            self._handle_end_control()
+            return
+
         current_end_index = self.pos - 1
         remaining_ends = self._count_remaining_end_tokens(current_end_index)
         reserved_definition_end = 0
@@ -6618,7 +6954,15 @@ class Parser:
         open_controls = len(self.control_stack)
         if remaining_ends < open_controls:
             needed_implicit = open_controls - remaining_ends
+            # The current `end` must still close one active control frame.
+            # Never consume all open controls via implicit closure.
+            max_implicit = max(0, open_controls - 1)
+            if needed_implicit > max_implicit:
+                needed_implicit = max_implicit
             self._auto_close_if_else_frames(needed_implicit)
+
+        if not self.control_stack:
+            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}")
 
         self._handle_end_control()
 
@@ -6755,7 +7099,12 @@ class Parser:
               except CompileTimeError:
                 raise
               except ParseError as _recov_exc:
-                self._record_diagnostic(self._last_token, str(_recov_exc))
+                self._record_diagnostic_obj(
+                    self._diagnostic_from_parse_error(
+                        _recov_exc,
+                        fallback_token=self._last_token,
+                    )
+                )
                 self._skip_to_recovery_point()
                 _tokens = self.tokens
                 continue
@@ -6766,25 +7115,71 @@ class Parser:
         except Exception as exc:
             tok = self._last_token
             if tok is None:
-                raise ParseError(f"unexpected error during parse: {exc}") from None
+                raise ParseError(
+                    f"unexpected error during parse: {exc}",
+                    code="E1998",
+                    hint="the parser raised an unexpected internal exception",
+                    suggestion="re-run with a reduced source snippet and report this as a compiler bug",
+                ) from None
+            loc = self.location_for_token(tok)
             raise ParseError(
-                f"unexpected error near '{tok.lexeme}' at {tok.line}:{tok.column}: {exc}"
+                f"unexpected error near '{tok.lexeme}' at {tok.line}:{tok.column}: {exc}",
+                path=loc.path,
+                line=loc.line,
+                column=loc.column,
+                length=len(tok.lexeme),
+                code="E1999",
+                hint="the parser raised an unexpected internal exception",
+                notes=[f"near token '{tok.lexeme}'"],
+                helps=["re-run with a minimal reproduction and report this as a compiler bug"],
             ) from None
 
         if self.macro_recording is not None:
-            self._record_diagnostic(self._last_token, "unterminated macro definition (missing ';')")
+            self._record_diagnostic(
+                self._last_token,
+                "unterminated macro definition (missing ';')",
+                code="E1101",
+                hint="macro declarations must end with ';'",
+                suggestion="add ';' at the end of the macro body",
+            )
         if self._pending_priority is not None:
-            self._record_diagnostic(self._last_token, f"dangling priority {self._pending_priority} without following definition")
+            self._record_diagnostic(
+                self._last_token,
+                f"dangling priority {self._pending_priority} without following definition",
+                code="E1102",
+                hint="priority directives must be immediately followed by a definition",
+                suggestion="place `word`, `:asm`, `:py`, or `extern` right after `priority`",
+            )
 
         if len(self.context_stack) != 1:
-            self._record_diagnostic(self._last_token, "unclosed definition at EOF")
+            self._record_diagnostic(
+                self._last_token,
+                "unclosed definition at EOF",
+                code="E1103",
+                hint="a definition was opened but not closed before end-of-file",
+                suggestion="add a matching `end` for the current definition",
+            )
         if self.control_stack:
-            self._record_diagnostic(self._last_token, "unclosed control structure at EOF")
+            self._record_diagnostic(
+                self._last_token,
+                "unclosed control structure at EOF",
+                code="E1104",
+                hint="control-flow blocks must be explicitly closed",
+                suggestion="add missing `end` tokens for open `if`/`else`/`for`/`while`/`begin` blocks",
+            )
 
         try:
             self._ct_lang_run_auto_validators()
         except (ParseError, CompileTimeError) as _validator_exc:
-            self._record_diagnostic(self._last_token, str(_validator_exc))
+            if isinstance(_validator_exc, ParseError):
+                self._record_diagnostic_obj(
+                    self._diagnostic_from_parse_error(
+                        _validator_exc,
+                        fallback_token=self._last_token,
+                    )
+                )
+            else:
+                self._record_diagnostic(self._last_token, str(_validator_exc), code="E1199")
 
         # If any errors were accumulated, raise with all diagnostics
         error_count = sum(1 for d in self.diagnostics if d.level == "error")
@@ -8955,11 +9350,81 @@ class CompileTimeVM:
         except (_CTVMJump, _CTVMExit, _CTVMReturn):
             raise
         except ParseError as exc:
-            raise CompileTimeError(f"{exc}\ncompile-time stack: {' -> '.join(self.call_stack)}") from None
+            stack_chain = " -> ".join(self.call_stack)
+            existing = getattr(exc, "diagnostic", None)
+            if isinstance(existing, Diagnostic):
+                notes = list(existing.notes)
+                if stack_chain:
+                    notes.append(f"compile-time stack: {stack_chain}")
+                diag = Diagnostic(
+                    level="error",
+                    message=existing.message or str(exc),
+                    path=existing.path,
+                    line=existing.line,
+                    column=existing.column,
+                    length=existing.length,
+                    hint=existing.hint,
+                    suggestion=existing.suggestion,
+                    code=existing.code,
+                    notes=notes,
+                    helps=existing.helps,
+                )
+            else:
+                raw_message = str(exc).strip() or "compile-time error"
+                message = raw_message.splitlines()[0]
+                lower = message.lower()
+                code = ""
+                hint = ""
+                helps: List[str] = []
+                if "'i' used outside of a for loop" in lower:
+                    code = "E3001"
+                    hint = "`i` is only valid while executing an active `for ... end` loop body"
+                    helps.append("move `i` into the body of a `for ... end` loop")
+                    helps.append("if you need a manual counter, track it in a variable")
+                elif "compile-time stack underflow" in lower:
+                    code = "E3002"
+                    hint = "a compile-time word popped more values than were available"
+                    helps.append("check the stack effect of preceding words")
+                    helps.append("add missing literals/values before this operation")
+                notes: List[str] = []
+                if stack_chain:
+                    notes.append(f"compile-time stack: {stack_chain}")
+                loc = self.current_location
+                diag = Diagnostic(
+                    level="error",
+                    message=message,
+                    path=loc.path if loc is not None else None,
+                    line=loc.line if loc is not None else 0,
+                    column=loc.column if loc is not None else 0,
+                    length=0,
+                    hint=hint,
+                    suggestion="",
+                    code=code,
+                    notes=notes,
+                    helps=helps,
+                )
+            raise CompileTimeError(diag.message, diagnostic=diag) from None
         except Exception as exc:
-            raise CompileTimeError(
-                f"compile-time failure in '{word.name}': {exc}\ncompile-time stack: {' -> '.join(self.call_stack)}"
-            ) from None
+            stack_chain = " -> ".join(self.call_stack)
+            loc = self.current_location
+            message = f"compile-time failure in '{word.name}': {exc}"
+            diag_notes: List[str] = []
+            if stack_chain:
+                diag_notes.append(f"compile-time stack: {stack_chain}")
+            diag = Diagnostic(
+                level="error",
+                message=message,
+                path=loc.path if loc is not None else None,
+                line=loc.line if loc is not None else 0,
+                column=loc.column if loc is not None else 0,
+                length=0,
+                hint="unexpected exception while executing compile-time code",
+                suggestion="re-run with a reduced repro and report this as a compiler bug",
+                code="E3999",
+                notes=diag_notes,
+                helps=(),
+            )
+            raise CompileTimeError(message, diagnostic=diag) from None
         finally:
             self.call_stack.pop()
 
@@ -9926,27 +10391,38 @@ class CompileTimeVM:
         handles = self._handles
 
         def _marshal_stack(py_stack: List[Any]) -> Tuple[int, int, int, Any]:
-            capacity = len(py_stack) + 16
+            extra_cells = 0
+            if string_mode:
+                extra_cells = sum(1 for value in py_stack if isinstance(value, str))
+            capacity = len(py_stack) + extra_cells + 16
             buffer = (ctypes.c_int64 * capacity)()
             base = ctypes.addressof(buffer)
             top = base + capacity * 8
             sp = top
-            for value in py_stack:
+
+            def _push_cell(cell_value: int) -> None:
+                nonlocal sp
                 sp -= 8
+                if sp < base:
+                    raise ParseError(
+                        f"compile-time asm '{word.name}' marshal overflow"
+                    )
+                ctypes.c_int64.from_address(sp).value = int(cell_value)
+
+            for value in py_stack:
                 if isinstance(value, int):
-                    ctypes.c_int64.from_address(sp).value = value
+                    _push_cell(value)
                 elif isinstance(value, str):
                     if string_mode:
                         offset, strlen = string_addrs.get(value, (0, 0))
                         addr = data_start + offset if data_start else handles.store(value)
                         # puts expects (len, addr) with len on top
-                        ctypes.c_int64.from_address(sp).value = addr
-                        sp -= 8
-                        ctypes.c_int64.from_address(sp).value = strlen
+                        _push_cell(addr)
+                        _push_cell(strlen)
                     else:
-                        ctypes.c_int64.from_address(sp).value = handles.store(value)
+                        _push_cell(handles.store(value))
                 else:
-                    ctypes.c_int64.from_address(sp).value = handles.store(value)
+                    _push_cell(handles.store(value))
             return sp, top, base, buffer
 
         # r12/r13 must point at the top element (or top of buffer if empty)
@@ -10427,20 +10903,28 @@ class CompileTimeVM:
                     continue
 
                 if kind == _OP_FOR_END:
+                    if not self.loop_stack:
+                        raise ParseError("'next' without matching 'for'")
+                    frame = self.loop_stack[-1]
+                    if not isinstance(frame, dict):
+                        raise ParseError("internal loop bookkeeping error")
+                    begin_ip = int(frame.get("begin_ip", -1))
+                    if begin_ip < 0:
+                        raise ParseError("internal loop bookkeeping error")
                     if _runtime_mode:
                         val = _c_int64_at(self.r13).value - 1
                         _c_int64_at(self.r13).value = val
+                        frame["remaining"] = int(val)
                         if val > 0:
-                            ip = self.loop_stack[-1] + 1
+                            ip = begin_ip + 1
                             continue
                         self.r13 += 8
                     else:
-                        if not self.loop_stack:
-                            raise ParseError("'next' without matching 'for'")
                         val = _peek_return() - 1
                         _poke_return(val)
+                        frame["remaining"] = int(val)
                         if val > 0:
-                            ip = self.loop_stack[-1] + 1
+                            ip = begin_ip + 1
                             continue
                         _pop_return()
                     self.loop_stack.pop()
@@ -10472,7 +10956,13 @@ class CompileTimeVM:
                             ip = match + 1
                             continue
                         _push_return(count)
-                    self.loop_stack.append(ip)
+                    self.loop_stack.append(
+                        {
+                            "begin_ip": int(ip),
+                            "initial": int(count),
+                            "remaining": int(count),
+                        }
+                    )
                     ip += 1
                     continue
 
@@ -11688,6 +12178,7 @@ class Assembler:
         self._export_all_defs: bool = False
         self._generated_bss: List[str] = []
         self._generated_bss_counter: int = 0
+        self._current_emit_loc: Optional[SourceLocation] = None
         self.enable_constant_folding = enable_constant_folding
         self.enable_peephole_optimization = enable_peephole_optimization
         self.enable_loop_unroll = enable_loop_unroll
@@ -11699,6 +12190,105 @@ class Assembler:
         self.verbosity = verbosity
         self._last_cfg_definitions: List[Definition] = []
         self._need_cfg: bool = False
+
+    def _compile_error_heuristics(self, message: str) -> Tuple[str, str, str, List[str], List[str]]:
+        text = str(message or "").strip()
+        lower = text.lower()
+        code = ""
+        hint = ""
+        suggestion = ""
+        notes: List[str] = []
+        helps: List[str] = []
+
+        if lower.startswith("unknown word '"):
+            code = "E2001"
+            hint = "runtime emission could not resolve the referenced word"
+            helps.append("check spelling and ensure the word is defined/imported before use")
+            helps.append("if this word is compile-time only, avoid calling it from runtime code")
+            return code, hint, suggestion, notes, helps
+
+        if "compile-time only and cannot be used at runtime" in lower:
+            code = "E2002"
+            hint = "compile-time-only words cannot be emitted into runtime code"
+            helps.append("replace with a runtime word, or run the caller at compile time")
+            helps.append("remove `compile-only` if runtime use is intended")
+            return code, hint, suggestion, notes, helps
+
+        if "variadic extern" in lower and "literal arg count" in lower:
+            code = "E2003"
+            hint = "variadic extern lowering requires an explicit literal variadic arg count"
+            helps.append("push a literal count before the variadic extern word")
+            helps.append("example: `2 printf` means two extra variadic arguments")
+            return code, hint, suggestion, notes, helps
+
+        if "extern '" in lower and " mismatch:" in lower:
+            code = "E2004"
+            hint = "extern signature metadata does not match declared stack arity"
+            helps.append("align extern type list length with declared input count")
+            return code, hint, suggestion, notes, helps
+
+        if "unsupported literal type" in lower or "unsupported op" in lower:
+            code = "E2990"
+            hint = "the emitter encountered an IR node it cannot lower"
+            helps.append("check preceding macro/rewrite output for malformed ops")
+            return code, hint, suggestion, notes, helps
+
+        return code, hint, suggestion, notes, helps
+
+    def _raise_compile_error(
+        self,
+        message: str,
+        *,
+        node: Optional[Op] = None,
+        code: str = "",
+        hint: str = "",
+        suggestion: str = "",
+        notes: Optional[Sequence[str]] = None,
+        helps: Optional[Sequence[str]] = None,
+    ) -> None:
+        loc = node.loc if node is not None else self._current_emit_loc
+        h_code, h_hint, h_suggestion, h_notes, h_helps = self._compile_error_heuristics(message)
+
+        merged_code = code or h_code
+        merged_hint = hint or h_hint
+        merged_suggestion = suggestion or h_suggestion
+
+        merged_notes: List[str] = []
+        for item in notes or ():
+            piece = str(item).strip()
+            if piece and piece not in merged_notes:
+                merged_notes.append(piece)
+        for item in h_notes:
+            if item and item not in merged_notes:
+                merged_notes.append(item)
+        if self._emit_stack:
+            ctx_note = f"while emitting '{self._emit_stack[-1]}'"
+            if ctx_note not in merged_notes:
+                merged_notes.append(ctx_note)
+
+        merged_helps: List[str] = []
+        for item in helps or ():
+            piece = str(item).strip()
+            if piece and piece not in merged_helps:
+                merged_helps.append(piece)
+        for item in h_helps:
+            if item and item not in merged_helps:
+                merged_helps.append(item)
+
+        diag = Diagnostic(
+            level="error",
+            message=message,
+            path=loc.path if loc is not None else None,
+            line=loc.line if loc is not None else 0,
+            column=loc.column if loc is not None else 0,
+            length=0,
+            hint=merged_hint,
+            suggestion=merged_suggestion,
+            code=merged_code,
+            notes=merged_notes,
+            helps=merged_helps,
+        )
+        raise CompileError(message, diagnostic=diag)
 
     def _copy_definition_for_cfg(self, definition: Definition) -> Definition:
         return Definition(
@@ -13234,6 +13824,7 @@ class Assembler:
                 body_len = len(body)
                 while idx < body_len:
                     node = body[idx]
+                    self._current_emit_loc = node.loc
                     if node._opcode == OP_WORD:
                         next_node = body[idx + 1] if idx + 1 < body_len else None
                         tail_position = next_node is None or next_node._opcode == OP_RET
@@ -13355,6 +13946,7 @@ class Assembler:
     def _emit_node(self, node: Op, builder: FunctionEmitter) -> None:
         kind = node._opcode
         data = node.data
+        self._current_emit_loc = node.loc
         builder.set_location(node.loc)
 
         if kind == OP_WORD:
@@ -13374,7 +13966,10 @@ class Assembler:
                 builder.push_label(label)
                 builder.push_literal(length)
                 return
-            raise CompileError(f"unsupported literal type {type(data)!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported literal type {type(data)!r}")
+            self._raise_compile_error(
+                f"unsupported literal type {type(data)!r}",
+                node=node,
+            )
 
         if kind == OP_WORD_PTR:
             self._emit_wordptr(data, builder)
@@ -13434,9 +14029,21 @@ class Assembler:
             count = int(payload.get("size", 0))
             values = [int(v) for v in list(payload.get("values", []) or [])]
             if count < 0:
-                raise CompileError("bss list size must be >= 0")
+                self._raise_compile_error(
+                    "bss list size must be >= 0",
+                    node=node,
+                    code="E2101",
+                    hint="bss list declarations require a non-negative size",
+                    suggestion="use `:0` for empty lists or provide a positive size",
+                )
             if len(values) > count:
-                raise CompileError("bss list has more initializer values than declared size")
+                self._raise_compile_error(
+                    "bss list has more initializer values than declared size",
+                    node=node,
+                    code="E2102",
+                    hint="initializer count cannot exceed declared bss list size",
+                    suggestion="increase declared size or remove extra initializer values",
+                )
             label = self._allocate_bss_list_storage(count)
             builder.comment("bss list literal")
             builder.emit(f"    lea rax, [rel {label}]")
@@ -13510,7 +14117,7 @@ class Assembler:
             builder.ret()
             return
 
-        raise CompileError(f"unsupported op {node!r} while emitting '{self._emit_stack[-1]}'" if self._emit_stack else f"unsupported op {node!r}")
+        self._raise_compile_error(f"unsupported op {node!r}", node=node)
 
     def _emit_mmap_alloc(self, builder: FunctionEmitter, size: int, target_reg: str = "rax") -> None:
         alloc_size = max(1, int(size))
@@ -13601,17 +14208,15 @@ class Assembler:
         if getattr(word, "extern_variadic", False):
             va_count = self._pop_preceding_literal(builder)
             if va_count is None:
-                suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-                raise CompileError(
-                    f"variadic extern '{name}' requires a literal arg count on TOS{suffix}"
+                self._raise_compile_error(
+                    f"variadic extern '{name}' requires a literal arg count on TOS"
                 )
             for _ in range(va_count):
                 arg_types.append("long")
             inputs += va_count
 
         if len(arg_types) != inputs and signature is not None:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"extern '{name}' mismatch: {inputs} inputs vs {len(arg_types)} types{suffix}")
+            self._raise_compile_error(f"extern '{name}' mismatch: {inputs} inputs vs {len(arg_types)} types")
 
         arg_infos = [self._analyze_extern_c_type(t) for t in arg_types]
         ret_info = self._analyze_extern_c_type(ret_type)
@@ -13724,7 +14329,12 @@ class Assembler:
                 self._emit_copy_bytes_from_ptr(builder, src_ptr_reg="rax", dst_expr=f"rsp + {stack_off}", size=size)
                 continue
 
-            raise CompileError(f"internal extern lowering error for '{name}': unknown arg mode {mode!r}")
+            self._raise_compile_error(
+                f"internal extern lowering error for '{name}': unknown arg mode {mode!r}",
+                code="E2991",
+                hint="extern lowering encountered an unexpected internal arg mode",
+                suggestion="this is likely a compiler bug; please report a minimal repro",
+            )
 
         if total_args:
             builder.emit(f"    add r12, {total_args * 8}")
@@ -13762,21 +14372,28 @@ class Assembler:
         elif outputs == 1:
             builder.push_from("rax")
         elif outputs > 1:
-            raise CompileError("extern only supports 0 or 1 scalar output")
+            self._raise_compile_error(
+                "extern only supports 0 or 1 scalar output",
+                code="E2103",
+                hint="extern lowering currently supports at most one scalar return value",
+                suggestion="wrap multiple return values in a struct or return a pointer",
+            )
 
     def _emit_wordref(self, name: str, builder: FunctionEmitter) -> None:
         word = self.dictionary.words.get(name)
         if word is None:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"unknown word '{name}'{suffix}")
+            self._raise_compile_error(f"unknown word '{name}'")
         if word.compile_only:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"word '{name}' is compile-time only and cannot be used at runtime{suffix}")
+            self._raise_compile_error(f"word '{name}' is compile-time only and cannot be used at runtime")
         if getattr(word, "inline", False):
             if isinstance(word.definition, Definition):
                 if word.name in self._inline_stack:
-                    suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-                    raise CompileError(f"recursive inline expansion for '{word.name}'{suffix}")
+                    self._raise_compile_error(
+                        f"recursive inline expansion for '{word.name}'",
+                        code="E2104",
+                        hint="inliner detected a recursive cycle",
+                        suggestion="remove `inline` from at least one function in the cycle",
+                    )
                 self._inline_stack.append(word.name)
                 self._emit_inline_definition(word, builder)
                 self._inline_stack.pop()
@@ -13799,11 +14416,9 @@ class Assembler:
     def _emit_tail_wordref(self, name: str, builder: FunctionEmitter) -> bool:
         word = self.dictionary.words.get(name)
         if word is None:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"unknown word '{name}'{suffix}")
+            self._raise_compile_error(f"unknown word '{name}'")
         if word.compile_only:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"word '{name}' is compile-time only and cannot be used at runtime{suffix}")
+            self._raise_compile_error(f"word '{name}' is compile-time only and cannot be used at runtime")
 
         # Tail-jump only for regular runtime words that would otherwise emit a call.
         if getattr(word, "inline", False):
@@ -13841,8 +14456,7 @@ class Assembler:
     def _emit_wordptr(self, name: str, builder: FunctionEmitter) -> None:
         word = self.dictionary.lookup(name)
         if word is None:
-            suffix = f" while emitting '{self._emit_stack[-1]}'" if self._emit_stack else ""
-            raise CompileError(f"unknown word '{name}'{suffix}")
+            self._raise_compile_error(f"unknown word '{name}'")
         if getattr(word, "is_extern", False):
             builder.push_label(name)
             return
@@ -14655,7 +15269,12 @@ def _ct_loop_index(vm: CompileTimeVM) -> None:
     if not vm.loop_stack:
         raise ParseError("'i' used outside of a for loop")
     frame = vm.loop_stack[-1]
-    idx = frame["initial"] - frame["remaining"]
+    if not isinstance(frame, dict):
+        raise ParseError("'i' used outside of a for loop")
+    try:
+        idx = int(frame["initial"]) - int(frame["remaining"])
+    except Exception:
+        raise ParseError("'i' used outside of a for loop") from None
     vm.push(idx)
 
 
@@ -22820,7 +23439,7 @@ def _try_quick_compile_force(argv: Sequence[str], *, emit_status: bool = True) -
         else:
             asm_text = optimized_cached
     except (ParseError, CompileError, CompileTimeError) as exc:
-        use_color = sys.stderr.isatty()
+        use_color = _diagnostic_color_enabled()
         diags = getattr(compiler.parser, "diagnostics", [])
         if diags:
             for diag in diags:
@@ -23234,7 +23853,7 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
             if not no_artifact_mode:
                 _write_source_stamp(compiler, source_link_libs, libs)
         except (ParseError, CompileError, CompileTimeError) as exc:
-            use_color = sys.stderr.isatty()
+            use_color = _diagnostic_color_enabled()
             diags = getattr(compiler.parser, "diagnostics", [])
             if diags:
                 for diag in diags:
@@ -23257,7 +23876,7 @@ def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
 
     if compiled_this_run:
         assert compiler is not None
-        use_color = sys.stderr.isatty()
+        use_color = _diagnostic_color_enabled()
         warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
         if warnings:
             for diag in warnings:
@@ -23357,6 +23976,10 @@ def cli(argv: Sequence[str]) -> int:
     quick_force = _try_quick_compile_force(argv)
     if quick_force is not None:
         return quick_force
+
+    quick_no_cache = _try_quick_compile_no_cache(argv)
+    if quick_no_cache is not None:
+        return quick_no_cache
 
     import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
@@ -23560,6 +24183,8 @@ def cli(argv: Sequence[str]) -> int:
             parser.error("--profile is no longer supported")
         if tok == "--compiler-profile" or tok.startswith("--compiler-profile="):
             parser.error("--compiler-profile is no longer supported")
+        if tok.startswith("--"):
+            parser.error(f"unknown option: {tok}")
     for lib_tok in _consume_unknown_link_tokens(unknown, strict_long_opts=False):
         if lib_tok not in args.libs:
             args.libs.append(lib_tok)
@@ -23992,6 +24617,12 @@ def cli(argv: Sequence[str]) -> int:
         asm_text: Optional[str] = None
         fhash = ""
         cache_asm_hit = False
+        ct_only_parse = bool(
+            args.ct_run_main
+            and args.no_artifact
+            and args.dump_cfg is None
+            and not args.emit_asm
+        )
         if cache and not args.ct_run_main and args.dump_cfg is None and not args.preview:
             fhash = cache.flags_hash(
                 args.debug,
@@ -24015,105 +24646,127 @@ def cli(argv: Sequence[str]) -> int:
             if verbosity >= 1:
                 import time as _time_mod
                 _compile_t0 = _time_mod.perf_counter()
-            if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
-                emission = compiler.compile_preloaded(debug=args.debug, entry_mode=entry_mode)
+
+            if ct_only_parse:
+                compiler.parse_file(args.source)
+                asm_text = ""
+                if args.preview:
+                    print("[preview] compile-time execution trace:")
+                    trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
+                    if trace_text:
+                        print(trace_text)
+                    else:
+                        print("# (no compile-time execution events)")
+                    print("[preview] transformed source (post-macro + post-compile-time):")
+                    preview_text = compiler.last_transformed_source.rstrip()
+                    if preview_text:
+                        print(preview_text)
+                    else:
+                        print("# (no transformed forms)")
+                    print("[preview] end")
+                if verbosity >= 1:
+                    _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
+                    print(f"[v1] parse-only compile-time prep: {_compile_dt:.1f}ms")
             else:
-                emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
-
-            # Snapshot assembly text *before* ct-run-main JIT execution, which may
-            # corrupt Python heap objects depending on memory layout.
-            asm_text = emission.snapshot()
-            if args.preview:
-                print("[preview] compile-time execution trace:")
-                trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
-                if trace_text:
-                    print(trace_text)
+                if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
+                    emission = compiler.compile_preloaded(debug=args.debug, entry_mode=entry_mode)
                 else:
-                    print("# (no compile-time execution events)")
-                print("[preview] transformed source (post-macro + post-compile-time):")
-                preview_text = compiler.last_transformed_source.rstrip()
-                if preview_text:
-                    print(preview_text)
-                else:
-                    print("# (no transformed forms)")
-                print("[preview] end")
-            if verbosity >= 1:
-                _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
-                print(f"[v1] compilation: {_compile_dt:.1f}ms")
-                print(f"[v1] assembly size: {len(asm_text)} bytes")
+                    emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
 
-            has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
+                # Snapshot assembly text *before* ct-run-main JIT execution, which may
+                # corrupt Python heap objects depending on memory layout.
+                asm_text = emission.snapshot()
+                if args.preview:
+                    print("[preview] compile-time execution trace:")
+                    trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
+                    if trace_text:
+                        print(trace_text)
+                    else:
+                        print("# (no compile-time execution events)")
+                    print("[preview] transformed source (post-macro + post-compile-time):")
+                    preview_text = compiler.last_transformed_source.rstrip()
+                    if preview_text:
+                        print(preview_text)
+                    else:
+                        print("# (no transformed forms)")
+                    print("[preview] end")
+                if verbosity >= 1:
+                    _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
+                    print(f"[v1] compilation: {_compile_dt:.1f}ms")
+                    print(f"[v1] assembly size: {len(asm_text)} bytes")
 
-            if asm_post_opt_enabled:
-                use_asm_opt_cache = cache_enabled
-                asm_opt_key_path = args.temp_dir / f"{args.source.stem}.asmopt.key"
-                asm_opt_cache_path = args.temp_dir / f"{args.source.stem}.asmopt.asm"
-                asm_opt_cache_version = "v1"
+                has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
 
-                asm_digest: Optional[str] = None
-                try:
-                    import hashlib
-                    asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
-                except Exception:
-                    asm_digest = None
+                if asm_post_opt_enabled:
+                    use_asm_opt_cache = cache_enabled
+                    asm_opt_key_path = args.temp_dir / f"{args.source.stem}.asmopt.key"
+                    asm_opt_cache_path = args.temp_dir / f"{args.source.stem}.asmopt.asm"
+                    asm_opt_cache_version = "v1"
 
-                optimized_from_cache = False
-                asm_opt_stats: Dict[str, int] = {}
-                asm_opt_pass_logs: List[str] = []
-                if use_asm_opt_cache and asm_digest is not None:
+                    asm_digest: Optional[str] = None
                     try:
-                        cached_key = asm_opt_key_path.read_text(encoding="utf-8").strip()
-                    except OSError:
-                        cached_key = ""
-                    expected_key = f"{asm_opt_cache_version}:{asm_digest}"
-                    if cached_key == expected_key:
-                        try:
-                            asm_text = asm_opt_cache_path.read_text(encoding="utf-8")
-                            optimized_from_cache = True
-                        except OSError:
-                            optimized_from_cache = False
+                        import hashlib
+                        asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
+                    except Exception:
+                        asm_digest = None
 
-                if not optimized_from_cache:
-                    optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
-                        asm_text,
-                        collect_pass_logs=(verbosity >= 4),
-                    )
-                    if optimized_asm != asm_text:
-                        asm_text = optimized_asm
+                    optimized_from_cache = False
+                    asm_opt_stats: Dict[str, int] = {}
+                    asm_opt_pass_logs: List[str] = []
                     if use_asm_opt_cache and asm_digest is not None:
                         try:
-                            asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
-                            asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
-                            asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
+                            cached_key = asm_opt_key_path.read_text(encoding="utf-8").strip()
                         except OSError:
-                            pass
+                            cached_key = ""
+                        expected_key = f"{asm_opt_cache_version}:{asm_digest}"
+                        if cached_key == expected_key:
+                            try:
+                                asm_text = asm_opt_cache_path.read_text(encoding="utf-8")
+                                optimized_from_cache = True
+                            except OSError:
+                                optimized_from_cache = False
 
-                if verbosity >= 1:
-                    if optimized_from_cache:
-                        print("[v1] asm post-opt: cache hit")
-                    else:
-                        changed = sum(asm_opt_stats.values())
-                        print(f"[v1] asm post-opt: {changed} rewrite(s)")
-                if verbosity >= 2 and not optimized_from_cache:
-                    for key in sorted(asm_opt_stats):
-                        if asm_opt_stats[key]:
-                            print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
-                if verbosity >= 4 and not optimized_from_cache:
-                    for msg in asm_opt_pass_logs:
-                        print(f"[v4] asm post-opt {msg}")
+                    if not optimized_from_cache:
+                        optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
+                            asm_text,
+                            collect_pass_logs=(verbosity >= 4),
+                        )
+                        if optimized_asm != asm_text:
+                            asm_text = optimized_asm
+                        if use_asm_opt_cache and asm_digest is not None:
+                            try:
+                                asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
+                                asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
+                                asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
+                            except OSError:
+                                pass
 
-            if cache and not args.ct_run_main:
-                if not fhash:
-                    fhash = cache.flags_hash(
-                        args.debug,
-                        folding_enabled,
-                        peephole_enabled,
-                        auto_inline_enabled,
-                        asm_post_opt_enabled,
-                        string_deduplication_enabled,
-                        entry_mode,
-                    )
-                cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
+                    if verbosity >= 1:
+                        if optimized_from_cache:
+                            print("[v1] asm post-opt: cache hit")
+                        else:
+                            changed = sum(asm_opt_stats.values())
+                            print(f"[v1] asm post-opt: {changed} rewrite(s)")
+                    if verbosity >= 2 and not optimized_from_cache:
+                        for key in sorted(asm_opt_stats):
+                            if asm_opt_stats[key]:
+                                print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
+                    if verbosity >= 4 and not optimized_from_cache:
+                        for msg in asm_opt_pass_logs:
+                            print(f"[v4] asm post-opt {msg}")
+
+                if cache and not args.ct_run_main:
+                    if not fhash:
+                        fhash = cache.flags_hash(
+                            args.debug,
+                            folding_enabled,
+                            peephole_enabled,
+                            auto_inline_enabled,
+                            asm_post_opt_enabled,
+                            string_deduplication_enabled,
+                            entry_mode,
+                        )
+                    cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
 
         # Merge source-level `flags ...` pragmas into effective linker flags.
         if compiler.source_link_flags:
@@ -24180,15 +24833,11 @@ def cli(argv: Sequence[str]) -> int:
             print(f"[info] wrote {cfg_output}")
 
         if args.ct_run_main:
-            try:
-                compiler.run_compile_time_word(
-                    "main",
-                    libs=ct_run_libs,
-                    mmap_leak_check=args.leak_check,
-                )
-            except CompileTimeError as exc:
-                print(f"[error] compile-time execution of 'main' failed: {exc}")
-                return 1
+            compiler.run_compile_time_word(
+                "main",
+                libs=ct_run_libs,
+                mmap_leak_check=args.leak_check,
+            )
             if args.leak_check:
                 has_issues, summary = compiler.parser.compile_time_vm.mmap_leak_check_report()
                 if has_issues:
@@ -24197,8 +24846,23 @@ def cli(argv: Sequence[str]) -> int:
                 print(summary)
     except (ParseError, CompileError, CompileTimeError) as exc:
         # Print all collected diagnostics in Rust-style format
-        use_color = sys.stderr.isatty()
-        diags = getattr(compiler.parser, 'diagnostics', []) if 'compiler' in dir() else []
+        use_color = _diagnostic_color_enabled()
+        diags = list(getattr(compiler.parser, 'diagnostics', [])) if 'compiler' in dir() else []
+        exc_diag = getattr(exc, 'diagnostic', None)
+        if isinstance(exc_diag, Diagnostic):
+            existing_keys = {
+                (d.level, d.message, str(d.path), int(d.line), int(d.column))
+                for d in diags
+            }
+            key = (
+                exc_diag.level,
+                exc_diag.message,
+                str(exc_diag.path),
+                int(exc_diag.line),
+                int(exc_diag.column),
+            )
+            if key not in existing_keys:
+                diags.append(exc_diag)
         if diags:
             for diag in diags:
                 print(diag.format(color=use_color), file=sys.stderr)
@@ -24219,7 +24883,7 @@ def cli(argv: Sequence[str]) -> int:
         return 1
 
     # Print any warnings accumulated during successful compilation
-    use_color = sys.stderr.isatty()
+    use_color = _diagnostic_color_enabled()
     warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
     if warnings:
         for diag in warnings:
@@ -24228,6 +24892,10 @@ def cli(argv: Sequence[str]) -> int:
 
     if args.macro_profile is not None:
         _emit_macro_profile_report(compiler.parser, args.macro_profile)
+
+    if ct_only_parse and args.no_artifact:
+        print("[info] skipped artifact generation (--no-artifact)")
+        return 0
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")

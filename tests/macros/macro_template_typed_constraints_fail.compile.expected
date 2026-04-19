@@ -3,5 +3,6 @@ error: macro 'typed_bad' placeholder '$a:int' expected 'int' token, got 'aa'
     |
   8 |   typed_bad(aa, 2) puti cr
     |  ^^^^^^^^^
+    | = note: while parsing definition 'main'
 
 1 error(s) emitted

@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "compile-time-only word emits rich runtime usage diagnostic with help suggestions"
+}

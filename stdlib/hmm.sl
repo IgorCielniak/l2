@@ -57,6 +57,23 @@ word hfree
     end drop
 end
 
+# hrealloc [*, ptr | new_size] -> [* | new_ptr]
+word hrealloc
+    blocks 8 + @
+    blocks @ for
+        dup @
+        3 pick == if
+            dup 8 + @
+            3 pick swap
+            3 pick realloc
+            over swap dup -rot !
+            -rot 8 + swap !
+            nip ret
+        end
+        8 +
+    end
+end
+
 # copy_alive_block_records [*, old_count, old_addr | new_addr] -> [*]
 word copy_alive_block_records
     2 pick for

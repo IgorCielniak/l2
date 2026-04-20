@@ -63,6 +63,10 @@ jobs:
         run: python3 test.py -v && python3 test.py --ct-run-main -v
         timeout-minutes: 30
 
+      - name: Run leak checks
+        run: python3 test.py --leak-check
+        timeout-minutes: 20
+
       - name: Run integrity checks
         run: |
           python3 main.py --check-integrity

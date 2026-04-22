@@ -11814,6 +11814,37 @@ _FOLDABLE_WORDS: Dict[str, Tuple[int, Callable[..., int]]] = {
 _sanitize_label_cache: Dict[str, str] = {}
 
 
+_X86_64_REGISTERS = frozenset({
+    "rax", "eax", "ax", "al", "ah",
+    "rbx", "ebx", "bx", "bl", "bh",
+    "rcx", "ecx", "cx", "cl", "ch",
+    "rdx", "edx", "dx", "dl", "dh",
+    "rsi", "esi", "si", "sil",
+    "rdi", "edi", "di", "dil",
+    "rbp", "ebp", "bp", "bpl",
+    "rsp", "esp", "sp", "spl",
+    "r8", "r8d", "r8w", "r8b",
+    "r9", "r9d", "r9w", "r9b",
+    "r10", "r10d", "r10w", "r10b",
+    "r11", "r11d", "r11w", "r11b",
+    "r12", "r12d", "r12w", "r12b",
+    "r13", "r13d", "r13w", "r13b",
+    "r14", "r14d", "r14w", "r14b",
+    "r15", "r15d", "r15w", "r15b",
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+    "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7",
+    "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
+    "zmm0", "zmm1", "zmm2", "zmm3", "zmm4", "zmm5", "zmm6", "zmm7",
+    "zmm8", "zmm9", "zmm10", "zmm11", "zmm12", "zmm13", "zmm14", "zmm15",
+    "zmm16", "zmm17", "zmm18", "zmm19", "zmm20", "zmm21", "zmm22", "zmm23",
+    "zmm24", "zmm25", "zmm26", "zmm27", "zmm28", "zmm29", "zmm30", "zmm31",
+    "rip", "eip",
+    # Memory size qualifiers that are also matched by the regex
+    "qword", "dword", "word", "byte", "ptr", "rel",
+})
+
+
 def sanitize_label(name: str) -> str:
     # Keep the special `_start` label unchanged so the program entrypoint
     # remains a plain `_start` symbol expected by the linker.
@@ -13938,6 +13969,10 @@ class Assembler:
         _extern_sub = _RE_ASM_EXTERN.sub
         def repl_sym(m: re.Match) -> str:
             name = m.group(1)
+            # Skip registers and common assembler keywords
+            if name.lower() in _X86_64_REGISTERS:
+                return m.group(0)
+            # Sanitization prefixing is applied to avoid accidental collisions.
             return m.group(0).replace(name, sanitize_label(name))
         for line in body.splitlines():
             if not line.strip():
@@ -13958,6 +13993,10 @@ class Assembler:
             _extern_sub = _RE_ASM_EXTERN.sub
             def repl_sym(m: re.Match) -> str:
                 name = m.group(1)
+                # Skip registers and common assembler keywords
+                if name.lower() in _X86_64_REGISTERS:
+                    return m.group(0)
+                # Sanitization prefixing is applied to avoid accidental collisions.
                 return m.group(0).replace(name, sanitize_label(name))
             cached = []
             body = definition.body.strip("\n")
@@ -18427,6 +18466,30 @@ def _rt_jmp(vm: CompileTimeVM) -> None:
     raise _CTVMJump(resolved)
 
 
+def _rt_call(vm: CompileTimeVM) -> None:
+    target = vm.pop()
+    resolved = vm._resolve_handle(target)
+    if isinstance(resolved, Word):
+        vm._call_word(resolved)
+        return
+    if isinstance(resolved, int):
+        if not vm.runtime_mode:
+            raise ParseError("calling a raw address is only supported in runtime mode")
+        # Ensure we have JIT resources
+        vm._ensure_jit_out()
+        if CompileTimeVM._JIT_FUNC_TYPE is None:
+            CompileTimeVM._JIT_FUNC_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p)
+        jf = CompileTimeVM._JIT_FUNC_TYPE(resolved)
+        out = vm._jit_out2
+        jf(vm.r12, vm.r13, vm._jit_out2_addr)
+        vm.r12 = out[0]
+        vm.r13 = out[1]
+        return
+    raise ParseError(
+        f"call expects an address or word pointer, got {type(resolved).__name__}: {resolved!r}"
+    )
+
+
 def _rt_mmap(vm: CompileTimeVM) -> None:
     """Runtime intrinsic for mmap wrapper word used by stdlib alloc paths.
 
@@ -18704,6 +18767,7 @@ def _register_runtime_intrinsics(dictionary: Dictionary) -> None:
     _RT_MAP: Dict[str, Callable[[CompileTimeVM], None]] = {
         "exit": _rt_exit,
         "jmp": _rt_jmp,
+        "call": _rt_call,
         "mmap": _rt_mmap,
         "munmap": _rt_munmap,
         "mremap": _rt_mremap,

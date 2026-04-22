@@ -12,6 +12,13 @@
     jmp rax
 };
 
+#call [* | addr] -> [*]
+:asm call {
+    mov rax, [r12]
+    add r12, 8
+    call rax
+};
+
 # Reserve 64 bytes in .bss
 # persistent: resb 64
 # push the addr of it

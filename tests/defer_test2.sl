@@ -1,3 +1,4 @@
+import stdlib.sl
 import defer.sl
 
 word a
@@ -8,34 +9,16 @@ word b
     "world" puts
 end
 
-word g
-    "g" puts
-end
-
-word k
+word main
     defer_frame
     &a defer
     &b defer
-
-    g
 
     run_defers
-end
 
-
-func main
-    &a defer
-    &b defer
-
-    k
-fend
-
-word main2
     defer_frame
-    &a defer
     &b defer
-
-    k
+    &a defer
 
     run_defers
 end

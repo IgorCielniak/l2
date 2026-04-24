@@ -59,18 +59,15 @@ end
 
 # hrealloc [*, ptr | new_size] -> [* | new_ptr]
 word hrealloc
-    blocks 8 + @
-    blocks @ for
-        dup @
-        3 pick == if
-            dup 8 + @
-            3 pick swap
-            3 pick realloc
-            over swap dup -rot !
-            -rot 8 + swap !
-            nip ret
+    0 while dup blocks @ < do
+        blocks 8 + @ over 16 * + @ 3 pick == if
+            dup 16 * blocks 8 + @ +
+            dup 8 + @ swap dup @ 2
+            pick 5 pick realloc dup
+            -rot over swap ! 8 + 4
+            pick ! nip nip nip nip ret
         end
-        8 +
+        1 +
     end
 end
 

@@ -34,9 +34,10 @@ word run_defers
     end drop
     cur_frame @ hfree
     defer_count dup @ 1 - !
-    defer_buf defer_count @ 8 * hrealloc
     defer_count @ 0 == if
         defer_buf @ hfree
         defer_buf 0 !
+    else
+        defer_buf defer_count @ 8 * hrealloc
     end
 end

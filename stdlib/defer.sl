@@ -38,6 +38,7 @@ word run_defers
         defer_buf @ hfree
         defer_buf 0 !
     else
-        defer_buf defer_count @ 8 * hrealloc
+        defer_buf @ defer_count @ 8 * hrealloc
+        defer_buf swap !
     end
 end

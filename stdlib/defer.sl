@@ -1,6 +1,6 @@
 import stdlib.sl
 import gvars.sl
-import hmm.sl
+import hma.sl
 
 sized_global defer_buf   8
 sized_global defer_count 8

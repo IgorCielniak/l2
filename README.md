@@ -538,7 +538,7 @@ cc -O2 host.c -I. -Lbuild -ll2eval -Wl,-rpath,$PWD/build -o host
 
 ### 3. Use from L2 code
 
-L2 string literals push two values: `(addr len)`. The runtime `l2_eval` API expects exactly those two arguments.
+L2 string literals push two values: `(addr len)`. The runtime `l2_eval` API expects exactly those two arguments and returns the top integer result produced by the evaluated source when one is available.
 
 Example source: [examples/eval_runtime.sl](examples/eval_runtime.sl)
 
@@ -546,7 +546,7 @@ Example source: [examples/eval_runtime.sl](examples/eval_runtime.sl)
 extern l2_eval 2 1
 
 word main
-	"import stdlib.sl word main 1 2 + puti cr end" l2_eval
+  "1 2 +" l2_eval puti cr
 end
 ```
 

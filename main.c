@@ -15,8 +15,16 @@
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 
 int l2_cli(int argc, char **argv);
+int eval(const char *source, long source_len);
+int eval_cstr(const char *source);
+int eval_program(const char *source, long source_len);
+int eval_program_cstr(const char *source);
+// Legacy aliases for backward compatibility
 int l2_eval(const char *source, long source_len);
 int l2_eval_cstr(const char *source);
+int l2_eval_program(const char *source, long source_len);
+int l2_eval_inline(const char *source, long source_len);
+int l2_eval_inline_cstr(const char *source);
 
 static void *xmalloc(size_t size) {
     void *ptr = malloc(size);
@@ -800,6 +808,27 @@ static CtValue ct_stack_peek(CtValueVec *vec) {
         return v;
     }
     return vec->data[vec->len - 1];
+}
+
+static bool try_parse_int(const char *lexeme, int64_t *out);
+
+static int64_t ct_value_to_int(CtValue v) {
+    if (v.kind == CT_INT) {
+        return v.as.i64;
+    }
+    if (v.kind == CT_STR && v.as.str) {
+        int64_t parsed = 0;
+        if (try_parse_int(v.as.str, &parsed)) {
+            return parsed;
+        }
+    }
+    if (v.kind == CT_TOKEN && v.as.token.lexeme) {
+        int64_t parsed = 0;
+        if (try_parse_int(v.as.token.lexeme, &parsed)) {
+            return parsed;
+        }
+    }
+    return 0;
 }
 
 static CtList *ct_list_new(void) {
@@ -3246,6 +3275,51 @@ static int run_l2_cli_in_child(int argc, char **argv) {
     return 127;
 }
 
+typedef struct {
+    bool initialized;
+    Dictionary dict;
+    Reader reader;
+    Parser parser;
+    CompileTimeVM vm;
+    StrVec include_dirs;
+    char *root_dir;
+    char *stdlib_dir;
+} L2EvalContext;
+
+static L2EvalContext g_eval_ctx;
+
+static char *l2_default_root_dir(void);
+
+static void l2_eval_ctx_init(L2EvalContext *ctx) {
+    if (ctx->initialized) {
+        return;
+    }
+    dictionary_init(&ctx->dict);
+    reader_init(&ctx->reader);
+    parser_init(&ctx->parser, &ctx->dict, &ctx->reader);
+    ct_vm_init(&ctx->vm, &ctx->parser);
+    ctx->parser.ct_vm = &ctx->vm;
+    bootstrap_dictionary(&ctx->dict, &ctx->parser, &ctx->vm);
+    register_builtin_syscall(&ctx->parser);
+    ctx->root_dir = l2_default_root_dir();
+    ctx->stdlib_dir = path_join(ctx->root_dir, "stdlib");
+    VEC_INIT(&ctx->include_dirs);
+    VEC_PUSH(&ctx->include_dirs, str_dup(ctx->root_dir));
+    VEC_PUSH(&ctx->include_dirs, str_dup(ctx->stdlib_dir));
+    ctx->initialized = true;
+}
+
+static void l2_eval_ctx_prepare_parser(L2EvalContext *ctx) {
+    parser_init(&ctx->parser, &ctx->dict, &ctx->reader);
+    ctx->parser.ct_vm = &ctx->vm;
+    ctx->vm.parser = &ctx->parser;
+    ctx->vm.dictionary = &ctx->dict;
+    ctx->vm.loop_remaining.len = 0;
+    ctx->vm.loop_begin.len = 0;
+    ctx->vm.loop_initial.len = 0;
+    ctx->vm.call_stack.len = 0;
+}
+
 static char *make_eval_workdir(void) {
     char *tmpl = str_dup("/tmp/l2eval_XXXXXX");
     int fd = mkstemp(tmpl);
@@ -4851,7 +4925,7 @@ int l2_cli(int argc, char **argv) {
     return 0;
 }
 
-int l2_eval(const char *source, long source_len) {
+int eval_program(const char *source, long source_len) {
     int result = -1;
     char *owned_source = NULL;
     char *work_dir = NULL;
@@ -4930,11 +5004,121 @@ cleanup:
     return result;
 }
 
-int l2_eval_cstr(const char *source) {
+static int l2_eval_inline_with_ctx(L2EvalContext *ctx, const char *source, long source_len) {
+    char *owned_source = NULL;
+    char *work_dir = NULL;
+    char *source_path = NULL;
+    char *root_dir = NULL;
+    char *stdlib_dir = NULL;
+    char *combined = NULL;
+    int result = -1;
+
+    if (!source) {
+        fprintf(stderr, "[error] l2_eval_inline received null source\n");
+        return -1;
+    }
+    if (source_len < 0) {
+        fprintf(stderr, "[error] l2_eval_inline received negative source length\n");
+        return -1;
+    }
+
+    size_t src_len = (size_t)source_len;
+    owned_source = (char *)xmalloc(src_len + 1);
+    memcpy(owned_source, source, src_len);
+    owned_source[src_len] = '\0';
+
+    work_dir = make_eval_workdir();
+    if (!work_dir) {
+        goto cleanup;
+    }
+
+    source_path = str_printf("%s/input.sl", work_dir);
+    write_file(source_path, owned_source);
+    free(owned_source);
+    owned_source = NULL;
+
+    root_dir = l2_default_root_dir();
+    stdlib_dir = path_join(root_dir, "stdlib");
+    (void)stdlib_dir;
+
+    StrMap visited;
+    strmap_init(&visited);
+    FileSpanVec spans;
+    VEC_INIT(&spans);
+    int line_counter = 1;
+    combined = expand_imports(source_path, &ctx->include_dirs, &visited, &spans, &line_counter);
+
+    l2_eval_ctx_prepare_parser(ctx);
+    ctx->parser.file_spans = spans;
+    ctx->parser.primary_path = str_dup(source_path);
+    parse_tokens(&ctx->parser, combined);
+
+    for (size_t i = 0; i < ctx->parser.module.forms.len; i++) {
+        Form form = ctx->parser.module.forms.data[i];
+        if (form.kind != FORM_DEF) {
+            continue;
+        }
+        Definition *def = (Definition *)form.ptr;
+        if (def && str_equals(def->name, "<top>")) {
+            ct_execute_nodes(&ctx->vm, &def->body);
+        }
+    }
+    result = 0;
+    if (ctx->vm.stack.len > 0) {
+        result = (int)ct_value_to_int(ct_stack_peek(&ctx->vm.stack));
+    }
+
+cleanup:
+    free(owned_source);
+    free(combined);
+    if (work_dir) {
+        cleanup_eval_workdir(work_dir);
+    }
+    free(source_path);
+    free(root_dir);
+    free(stdlib_dir);
+    free(work_dir);
+    return result;
+}
+
+int eval(const char *source, long source_len) {
+    l2_eval_ctx_init(&g_eval_ctx);
+    return l2_eval_inline_with_ctx(&g_eval_ctx, source, source_len);
+}
+
+int eval_cstr(const char *source) {
     if (!source) {
         return -1;
     }
-    return l2_eval(source, (long)strlen(source));
+    return eval(source, (long)strlen(source));
+}
+
+int eval_program_cstr(const char *source) {
+    if (!source) {
+        return -1;
+    }
+    return eval_program(source, (long)strlen(source));
+}
+
+// Legacy aliases for backward compatibility
+int l2_eval(const char *source, long source_len) {
+    return eval_program(source, source_len);
+}
+
+int l2_eval_cstr(const char *source) {
+    return eval_program_cstr(source);
+}
+
+int l2_eval_program(const char *source, long source_len) {
+    return eval_program(source, source_len);
+}
+
+int l2_eval_inline(const char *source, long source_len) {
+    return eval(source, source_len);
+}
+
+int l2_eval_inline_cstr(const char *source) {
+    return eval_cstr(source);
 }
 
 #ifndef L2_AS_LIBRARY

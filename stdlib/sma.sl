@@ -2,6 +2,8 @@ import stdlib.sl
 import gvars.sl
 import debug.sl
 
+# sma - small/slow/shit memory allocator
+
 sized_global blocks 16
 
 # [ blocks_count blocks_ptr ]
@@ -19,8 +21,8 @@ word blocks_init
     end
 end
 
-# halloc [* | size] -> [* | ptr]
-word halloc
+# salloc [* | size] -> [* | ptr]
+word salloc
     blocks_init
     blocks @ 1 + blocks swap !
     blocks 8 + @
@@ -31,8 +33,8 @@ word halloc
     nip
 end
 
-# hfree [* | ptr] -> [*]
-word hfree
+# sfree [* | ptr] -> [*]
+word sfree
     blocks 8 + @
     blocks @
     while dup 0 > do
@@ -57,8 +59,8 @@ word hfree
     end drop
 end
 
-# hrealloc [*, ptr | new_size] -> [* | new_ptr]
-word hrealloc
+# srealloc [*, ptr | new_size] -> [* | new_ptr]
+word srealloc
     0 while dup blocks @ < do
         blocks 8 + @ over 16 * + @ 3 pick == if
             dup 16 * blocks 8 + @ +

@@ -1,7 +1,7 @@
 {
-  "description": "runnable check for runtime l2_eval extern wiring",
+  "description": "comprehensive eval and eval_program tests - eval_program outputs numbers, eval uses numeric results",
   "run_example": true,
   "use_l2eval": true,
-  "stdout_regex": "^3\\n?$",
-  "runtime_timeout": 5
+  "stdout_regex": "eval_program:[\\s\\S]*3[\\s\\S]*99[\\s\\S]*28[\\s\\S]*21[\\s\\S]*60[\\s\\S]*15[\\s\\S]*15[\\s\\S]*42[\\s\\S]*777[\\s\\S]*888[\\s\\S]*eval:[\\s\\S]*49[\\s\\S]*18[\\s\\S]*36[\\s\\S]*24[\\s\\S]*42[\\s\\S]*75[\\s\\S]*test complete",
+  "runtime_timeout": 15
 }

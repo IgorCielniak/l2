@@ -14,7 +14,9 @@ int l2_cli(int argc, char **argv);
 /*
  * Compile and run L2 source text at runtime.
  * `source` points to UTF-8 bytes and `source_len` is the byte length.
- * Returns the executed program's exit status on success.
+ * Returns the top integer result produced by the evaluated source when one is
+ * left on the compile-time stack.
+ * Returns 0 when the source leaves no result.
  * Returns -1 when compilation/setup fails.
  */
 int l2_eval(const char *source, long source_len);

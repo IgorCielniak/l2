@@ -1,4 +1,5 @@
-import hmm.sl
+import hma.sl
+import debug.sl
 
 word main
     10 halloc

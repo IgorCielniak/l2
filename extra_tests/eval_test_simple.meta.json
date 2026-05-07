@@ -1,0 +1,4 @@
+{
+  "description": "eval_env stack import smoke test",
+  "use_l2eval": true
+}

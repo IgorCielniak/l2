@@ -17,6 +17,7 @@
 int l2_cli(int argc, char **argv);
 int eval(const char *source, long source_len);
 int eval_cstr(const char *source);
+void eval_env(const char *source, long source_len, long stack_top_addr);
 int eval_program(const char *source, long source_len);
 int eval_program_cstr(const char *source);
 // Legacy aliases for backward compatibility
@@ -3023,6 +3024,8 @@ static void emit_default_prelude(Emission *emission) {
     VEC_PUSH(&emission->text, str_dup("%define DSTK_BYTES 65536"));
     VEC_PUSH(&emission->text, str_dup("%define RSTK_BYTES 65536"));
     VEC_PUSH(&emission->text, str_dup("%define PRINT_BUF_BYTES 4096"));
+    VEC_PUSH(&emission->text, str_dup("global dstack_top"));
+    VEC_PUSH(&emission->text, str_dup("global rstack_top"));
     VEC_PUSH(&emission->text, str_dup("global _start"));
     VEC_PUSH(&emission->text, str_dup("_start:"));
     VEC_PUSH(&emission->text, str_dup("    mov rbx, rsp"));
@@ -3045,6 +3048,8 @@ static void emit_libc_prelude(Emission *emission) {
     VEC_PUSH(&emission->text, str_dup("%define DSTK_BYTES 65536"));
     VEC_PUSH(&emission->text, str_dup("%define RSTK_BYTES 65536"));
     VEC_PUSH(&emission->text, str_dup("%define PRINT_BUF_BYTES 4096"));
+    VEC_PUSH(&emission->text, str_dup("global dstack_top"));
+    VEC_PUSH(&emission->text, str_dup("global rstack_top"));
     VEC_PUSH(&emission->text, str_dup("global main"));
     VEC_PUSH(&emission->text, str_dup("main:"));
     VEC_PUSH(&emission->text, str_dup("    mov [rel sys_argc], rdi"));
@@ -3287,6 +3292,9 @@ typedef struct {
 } L2EvalContext;
 
 static L2EvalContext g_eval_ctx;
+static L2EvalContext g_eval_env_ctx;
+
+extern unsigned char dstack_top;
 
 static char *l2_default_root_dir(void);
 
@@ -5080,6 +5088,119 @@ cleanup:
     free(work_dir);
     return result;
 }
+
+static bool ct_value_to_runtime_cells(const CtValue *value, uint64_t cells[2], size_t *cell_count) {
+    if (!value || !cells || !cell_count) {
+        return false;
+    }
+    switch (value->kind) {
+        case CT_INT:
+            cells[0] = (uint64_t)value->as.i64;
+            *cell_count = 1;
+            return true;
+        case CT_STR: {
+            const char *str = value->as.str ? value->as.str : "";
+            cells[0] = (uint64_t)(uintptr_t)str;
+            cells[1] = (uint64_t)strlen(str);
+            *cell_count = 2;
+            return true;
+        }
+        case CT_TOKEN: {
+            const char *str = value->as.token.lexeme ? value->as.token.lexeme : "";
+            cells[0] = (uint64_t)(uintptr_t)str;
+            cells[1] = (uint64_t)strlen(str);
+            *cell_count = 2;
+            return true;
+        }
+        case CT_NIL:
+            cells[0] = 0;
+            *cell_count = 1;
+            return true;
+        default:
+            return false;
+    }
+}
+
+uintptr_t l2_eval_env_compute(const char *source, long source_len, long stack_top_addr) {
+    if (!source) {
+        fprintf(stderr, "[error] eval_env received null source\n");
+        return (uintptr_t)stack_top_addr + (uintptr_t)(2 * 8);
+    }
+    if (source_len < 0) {
+        fprintf(stderr, "[error] eval_env received negative source length\n");
+        return (uintptr_t)stack_top_addr + (uintptr_t)(2 * 8);
+    }
+
+    l2_eval_ctx_init(&g_eval_env_ctx);
+    g_eval_env_ctx.vm.stack.len = 0;
+    g_eval_env_ctx.vm.rstack.len = 0;
+
+    uintptr_t context_sp = (uintptr_t)stack_top_addr + (uintptr_t)(2 * 8);
+    uintptr_t dstack_top_addr = (uintptr_t)&dstack_top;
+    if (context_sp > dstack_top_addr) {
+        fprintf(stderr, "[error] eval_env stack pointer is above dstack_top\n");
+        return context_sp;
+    }
+    uintptr_t depth_bytes = dstack_top_addr - context_sp;
+    if ((depth_bytes & 7) != 0) {
+        fprintf(stderr, "[error] eval_env stack pointer is misaligned\n");
+        return context_sp;
+    }
+    size_t depth = (size_t)(depth_bytes / 8);
+    for (size_t idx = depth; idx-- > 0;) {
+        uint64_t cell = *(uint64_t *)(context_sp + (uintptr_t)(idx * 8));
+        ct_stack_push(&g_eval_env_ctx.vm.stack, ct_make_int((int64_t)cell));
+    }
+
+    int rc = l2_eval_inline_with_ctx(&g_eval_env_ctx, source, source_len);
+    if (rc < 0) {
+        return context_sp;
+    }
+
+    for (size_t i = 0; i < g_eval_env_ctx.vm.stack.len; i++) {
+        uint64_t cells[2];
+        size_t cell_count = 0;
+        if (!ct_value_to_runtime_cells(&g_eval_env_ctx.vm.stack.data[i], cells, &cell_count)) {
+            fprintf(stderr, "[error] eval_env cannot export compile-time value kind %d\n", g_eval_env_ctx.vm.stack.data[i].kind);
+            return context_sp;
+        }
+    }
+
+    uintptr_t new_sp = dstack_top_addr;
+    for (size_t i = 0; i < g_eval_env_ctx.vm.stack.len; i++) {
+        uint64_t cells[2];
+        size_t cell_count = 0;
+        if (!ct_value_to_runtime_cells(&g_eval_env_ctx.vm.stack.data[i], cells, &cell_count)) {
+            fprintf(stderr, "[error] eval_env cannot export compile-time value kind %d\n", g_eval_env_ctx.vm.stack.data[i].kind);
+            return context_sp;
+        }
+        for (size_t c = 0; c < cell_count; c++) {
+            new_sp -= 8;
+            *(uint64_t *)new_sp = cells[c];
+        }
+    }
+    return new_sp;
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((naked))
+void eval_env(const char *source, long source_len, long stack_top_addr) {
+    __asm__ volatile(
+        "sub $8, %rsp\n"
+        "call l2_eval_env_compute\n"
+        "add $8, %rsp\n"
+        "mov %rax, %r12\n"
+        "ret\n"
+    );
+}
+#else
+void eval_env(const char *source, long source_len, long stack_top_addr) {
+    (void)source;
+    (void)source_len;
+    (void)stack_top_addr;
+    fprintf(stderr, "[error] eval_env is only supported on x86_64 with GCC/Clang\n");
+}
+#endif
 
 int eval(const char *source, long source_len) {
     l2_eval_ctx_init(&g_eval_ctx);

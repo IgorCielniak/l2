@@ -26,6 +26,18 @@ int l2_eval(const char *source, long source_len);
  */
 int l2_eval_cstr(const char *source);
 
+/*
+ * Evaluate L2 source using the caller's data stack as input/output.
+ * `stack_top_addr` must be the data stack pointer (r12) before pushing the
+ * third argument (after the source addr + len are already on the stack).
+ * The current data stack is imported as integers, the L2 source runs, and the
+ * full resulting stack is written back to the runtime stack.
+ * Values are exported as:
+ *  - integers: one cell
+ *  - strings/tokens: addr + len (two cells)
+ */
+void eval_env(const char *source, long source_len, long stack_top_addr);
+
 #ifdef __cplusplus
 }
 #endif

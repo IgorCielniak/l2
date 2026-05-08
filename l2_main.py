@@ -8362,6 +8362,7 @@ class CompileTimeVM:
         # dlopen handles for C extern support
         self._dl_handles: List[Any] = []  # ctypes.CDLL handles
         self._dl_func_cache: Dict[str, Any] = {}  # name -> ctypes callable
+        self._dl_load_errors: Dict[str, str] = {}
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ctypes_struct_cache: Dict[str, Any] = {}
         self.current_location: Optional[SourceLocation] = None
@@ -8859,7 +8860,12 @@ class CompileTimeVM:
             # dlopen libraries for C extern support
             self._dl_handles = []
             self._dl_func_cache = {}
-            all_libs = list(self._ct_libs)
+            self._dl_load_errors = {}
+            all_libs = []
+            dstack_shim = self._ct_runtime_symbol_shim("dstack_top", self._native_data_top)
+            if dstack_shim is not None:
+                all_libs.append(dstack_shim)
+            all_libs.extend(self._ct_libs)
             if libs:
                 for lib in libs:
                     if lib not in all_libs:
@@ -8885,6 +8891,7 @@ class CompileTimeVM:
             self._jit_code_pages.clear()
             self._dl_func_cache.clear()
             self._dl_handles.clear()
+            self._dl_load_errors.clear()
 
     def invoke_with_args(self, word: Word, args: Sequence[Any]) -> None:
         self.reset()
@@ -8940,7 +8947,12 @@ class CompileTimeVM:
             self._jit_code_pages = []
             self._dl_handles = []
             self._dl_func_cache = {}
-            all_libs = list(self._ct_libs)
+            self._dl_load_errors = {}
+            all_libs = []
+            dstack_shim = self._ct_runtime_symbol_shim("dstack_top", self._native_data_top)
+            if dstack_shim is not None:
+                all_libs.append(dstack_shim)
+            all_libs.extend(self._ct_libs)
             if libs:
                 for lib in libs:
                     if lib not in all_libs:
@@ -9114,6 +9126,7 @@ class CompileTimeVM:
     def _dlopen(self, lib_name: str) -> None:
         """Open a shared library and append to _dl_handles."""
         import ctypes.util
+        import ctypes as _ctypes
         # Try as given first (handles absolute paths, "libc.so.6", etc.)
         candidates = [lib_name]
         # If given a static archive (.a), try .so from the same directory
@@ -9127,14 +9140,112 @@ class CompileTimeVM:
         found = ctypes.util.find_library(lib_name)
         if found:
             candidates.append(found)
+        last_error: Optional[BaseException] = None
+        # Prefer RTLD_NOW|RTLD_GLOBAL if available for stronger linkage semantics
+        mode = 0
+        if hasattr(_ctypes, "RTLD_NOW") and hasattr(_ctypes, "RTLD_GLOBAL"):
+            mode = int(_ctypes.RTLD_NOW) | int(_ctypes.RTLD_GLOBAL)
+        elif hasattr(_ctypes, "RTLD_GLOBAL"):
+            mode = int(_ctypes.RTLD_GLOBAL)
+
         for candidate in candidates:
             try:
-                handle = ctypes.CDLL(candidate, use_errno=True)
+                handle = _ctypes.CDLL(candidate, mode=mode, use_errno=True)
                 self._dl_handles.append(handle)
+                # clear any recorded load error for the logical lib_name
+                self._dl_load_errors.pop(lib_name, None)
                 return
-            except OSError:
+            except OSError as exc:
+                last_error = exc
+                # record specific candidate failure for debugging
+                self._dl_load_errors["%s(%s)" % (lib_name, candidate)] = str(exc)
                 continue
         # Not fatal — the library may not be needed at CT
+        if last_error is not None:
+            self._dl_load_errors[lib_name] = str(last_error)
+
+    def _ct_runtime_symbol_shim(self, symbol_name: str, symbol_value: int) -> Optional[str]:
+        """Build a tiny shared object exporting *symbol_name* as an absolute symbol."""
+        import shutil
+        import subprocess
+        import sys
+
+        # Lazy cache on the instance
+        cache = getattr(self, "_ct_shim_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_ct_shim_cache", cache)
+
+        key = (symbol_name, int(symbol_value))
+        if key in cache:
+            return cache[key]
+
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if cc is None:
+            return None
+
+        shim_dir = Path("build") / ".l2cache" / "ct_symbol_shims"
+        try:
+            shim_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+
+        shim_base = shim_dir / f"{symbol_name}_{symbol_value:x}"
+        so_path = shim_base.with_suffix(".so")
+
+        # Only support the assembler shim on Linux for now; other platforms are best-effort
+        if not sys.platform.startswith("linux"):
+            # record a negative cache to avoid retry storms
+            cache[key] = None
+            return None
+
+        if not so_path.exists():
+            asm_path = shim_base.with_suffix(".s")
+            tmp_so = shim_base.with_suffix(".so.tmp")
+            asm_text = textwrap.dedent(
+                f"""
+                .text
+                .globl {symbol_name}_shim_stub
+                .type {symbol_name}_shim_stub, @function
+                {symbol_name}_shim_stub:
+                    ret
+
+                .globl {symbol_name}
+                .set {symbol_name}, 0x{int(symbol_value):x}
+                """
+            ).lstrip()
+            try:
+                asm_path.write_text(asm_text, encoding="utf-8")
+                # build to a temp file then atomically rename
+                proc = subprocess.run(
+                    [cc, "-shared", "-fPIC", str(asm_path), "-o", str(tmp_so)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    try:
+                        tmp_so.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return None
+                try:
+                    tmp_so.replace(so_path)
+                except Exception:
+                    try:
+                        tmp_so.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return None
+            except Exception:
+                try:
+                    so_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+
+        cache[key] = str(so_path)
+        return cache[key]
 
     _CTYPE_MAP: Optional[Dict[str, Any]] = None
 
@@ -9203,6 +9314,9 @@ class CompileTimeVM:
                 return getattr(handle, name)
             except AttributeError:
                 continue
+        if self._dl_load_errors:
+            load_details = "; ".join(f"{lib}: {error}" for lib, error in sorted(self._dl_load_errors.items()))
+            raise ParseError(f"extern '{name}' not found in any loaded library (load failures: {load_details})")
         return None
 
     def _call_extern_ct(self, word: Word) -> None:
@@ -9213,9 +9327,10 @@ class CompileTimeVM:
         if name == "exit":
             raise _CTVMExit()
 
+        eval_env_mode = name == "eval_env"
         func = self._dl_func_cache.get(name)
         if func is None:
-            raw = self._dlsym(name)
+            raw = self._dlsym("l2_eval_env_compute" if eval_env_mode else name)
             if raw is None:
                 raise ParseError(f"extern '{name}' not found in any loaded library")
 
@@ -9235,6 +9350,9 @@ class CompileTimeVM:
                 arg_types = []
                 c_arg_types = [ctypes.c_int64] * inputs
                 c_ret_type = ctypes.c_int64 if outputs > 0 else None
+
+            if eval_env_mode:
+                c_ret_type = ctypes.c_size_t
 
             # Configure the ctypes function object directly
             raw.restype = c_ret_type
@@ -9286,6 +9404,10 @@ class CompileTimeVM:
                 call_args.append(int(raw))
 
         result = func(*call_args)
+
+        if eval_env_mode:
+            self.r12 = int(result)
+            return
 
         if outputs > 0 and result is not None:
             ret_type = _canonical_c_type_name(func._ct_signature[1]) if func._ct_signature else None

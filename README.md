@@ -1,582 +1,505 @@
-# L2
+# L2: A Forth-Inspired Assembly Language with Compile-Time Power
 
-**Give the programmer raw power and get out of the way.**
+> **Give the programmer raw power and get out of the way.**
 
-L2 is a programmable assembly templating engine with a Forth-style stack interface. You write small 'words' that compose into larger programs, and each word compiles to a known, inspectable sequence of x86-64 instructions. The language sits just above raw assembly — close enough to see every byte, high enough to be genuinely productive.
+## What Is L2?
 
-## What is L2?
+L2 is a systems programming language that sits at the sweet spot between **assembly** and **high-level metaprogramming**. It gives you:
 
-At its core, L2 is more than a glorified macro assembler. Its compile-time virtual machine lets you run arbitrary L2 code at compile time: generate words, compute lookup tables, build structs, or emit entire subsystems before a single byte of native code is produced. Text macros, `:py` blocks, and token hooks extend the syntax in ways that feel like language features — because they are.
+- **Direct control**: Every word you write compiles to inspectable x86-64 instructions. No hidden overhead, no garbage collection, no surprise codegen.
+- **Stack-based composition**: Small reusable "words" (functions) compose into larger programs through a universal stack interface.
+- **Compile-time computation**: Run arbitrary L2 code at compile time to generate code, compute constants, build data structures, or implement DSLs—all with **zero runtime overhead**.
+- **Syntax extensibility**: Text macros, token hooks, and pattern rewriting let you craft the syntax you need without forking the compiler.
 
-## Quick Start
+If you've used **Forth** or **Factor**, L2 will feel familiar. If you've hand-written assembly, you'll appreciate having abstraction without mystery.
+
+## Why L2?
+
+### You might choose L2 if you:
+
+- **Want transparency**: Every byte your program emits should be *your* choice, not the compiler's guess.
+- **Need fine-grained control**: Direct memory access, inline assembly, and syscalls are first-class citizens.
+- **Like minimalism**: No stdlib bloat, no implicit behavior. You get allocation, I/O, arrays—the building blocks. Everything else is your design.
+- **Enjoy metaprogramming**: Generate repetitive code safely at compile time, define DSLs, or build code generators without external tools.
+- **Value performance**: Direct assembly execution, early computation of constants, and predictable codegen mean no surprise stalls.
+
+### You might **not** choose L2 if you:
+
+- Need rapid prototyping with maximum convenience (try Python or Go instead).
+- Want memory safety guaranteed by the language (try Rust or Zig instead).
+- Prefer garbage collection and dynamic typing (try Lua or Python instead).
+
+---
+
+## Core Design Principles
+
+1. **Simplicity over Convenience** — No garbage collector, no hidden magic. You own every allocation and every byte.
+
+2. **Transparency** — Every word compiles to a known, inspectable sequence of x86-64 instructions. Use `--emit-asm` to see exactly what runs.
+
+3. **Composability** — Small words build big programs. The stack is the universal interface—no types to reconcile, no generics to instantiate.
+
+4. **Meta-Programmability** — The front-end is user-extensible: text macros, token hooks, compile-time words, and rewrite rules let you reshape syntax without forking the compiler.
+
+5. **Unsafe by Design** — Safety is the programmer's responsibility. L2 trusts you with raw memory, inline assembly, and direct syscalls. With great power comes great responsibility.
+
+6. **Minimal Standard Library** — The stdlib provides building blocks, not policy. You get `alloc`/`free`, `puts`/`puti`, arrays, file I/O etc. Everything else is your architectural choice.
+
+7. **Fun First** — If using L2 feels like a chore, the design has failed.
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
+**Required:**
 - Python 3.7+
 - NASM (Netwide Assembler)
 - GNU binutils (`ld`)
 - Linux x86-64
-- `keystone-engine` (optional, for compile-time `:asm` execution)
 
-### Building
+**Optional:**
+- `keystone-engine` (for compile-time JIT and `:asm` execution; otherwise compile-time words run interpreted)
 
-```bash
-python3 main.py examples/snake.sl -o snake
-./snake
+### Your First L2 Program
+
+Create `hello.sl`:
+
+```
+import stdlib.sl
+
+word main
+  "Hello, World!\n" puts
+  0
+end
 ```
 
-### Tests
+Compile and run:
+
+```bash
+python3 main.py hello.sl -o hello
+./hello
+```
+
+### Running Tests & Examples
+
+Run the test suite:
 
 ```bash
 python3 test.py
 ```
 
-### Macro Expansion Profiling
-
-Use `--macro-profile` to inspect macro expansion hotness and timing during parsing:
+Build and run examples:
 
 ```bash
-python3 main.py tests/macro_ct_superlang.sl --no-artifact --check --macro-profile
+# Conway's Game of Life
+python3 main.py examples/game_of_life.sl -o life
+./life
+
+# Interactive Snake game
+python3 main.py examples/snake.sl -o snake
+./snake
 ```
 
-Optional output targets:
+---
 
-- `--macro-profile` or `--macro-profile stderr`: print to stderr.
-- `--macro-profile -`: print to stdout.
-- `--macro-profile build/macro_profile.txt`: write a report file.
+## Language Features
 
-For transformed-source inspection, use `--preview`:
+### Stack-Based Computation
 
-```bash
-python3 main.py tests/macro_ct_superlang.sl --no-artifact --preview
+L2 uses a data stack (like Forth) as its primary mechanism for passing values. Words pop arguments from the stack and push results back:
+
+```
+import stdlib.sl
+
+word double
+  dup +         # duplicate top, add them
+end
+
+word main
+  5 double      # → 10
+  puti          # print it
+  0
+end
 ```
 
-`--preview` prints the post-parse transformed source after macro expansion and compile-time execution.
+### Definitions & Control Flow
 
-### Complete CT Function Reference
+Define reusable words with `word ... end`. Control flow uses `if`/`else`, `for` loops, and conditionals:
 
-The built-in Compile-Time Reference now includes an auto-generated
-`§ 18 COMPLETE CT FUNCTION INDEX` section with one explicit entry for every
-compile-time callable word (including handler name and execution flags), plus
-template directives such as `ct-call`, `ct-if`, `ct-for`, `emit-list`, and
-their aliases.
+```
+import stdlib.sl
 
-Open it with:
+word factorial
+  dup 1 <= if
+    drop 1
+  else
+    dup 1 - factorial *
+  end
+end
 
-```bash
-python3 main.py --docs
+word main
+  5 factorial puti cr   # prints: 120
+  0
+end
 ```
 
-Or launch the browser docs UI (static, with tab links, search, and detail/source panes):
+### Inline Assembly (`:asm` blocks)
 
-```bash
-python3 main.py --docs-serve
+Drop into raw x86-64 when you need it:
+
+```
+:asm fast-memcpy {
+    mov rax, [r12]       # load src
+    mov rbx, [r12 + 8]   # load dst
+    mov rcx, [r12 + 16]  # load size
+    rep movsb
+};
 ```
 
-Useful options:
+### External C Functions
 
-- `--docs-port 8018`
-- `--docs-host 0.0.0.0`
-- `--docs-no-browser`
+Call C functions directly:
 
-Then switch to the `Compile-Time Reference` tab (or open `/?tab=ct`).
+```
+extern malloc 1 1         # takes 1 arg, returns 1 result
+extern free 1 0
 
-### Cache Modes (`--no-cache` vs `--force`)
+word main
+  1024 malloc
+  free
+  0
+end
+```
 
-The compiler now has three cache-related layers:
+In order to link with libc compile with `-lc` like this:
 
-- Source graph cache: stores the preprocessed import graph (including resolved imports and source-level flags) keyed by source path, defines, include paths, and dependency state.
-- Assembly cache: stores emitted assembly snapshots keyed by dependency content and compiler/optimization flags.
-- Tool incrementality: NASM/linker reruns are skipped when inputs are unchanged.
+```
+python3 main.py file_name.sl -lc
+```
 
-Flag behavior:
 
-- Default mode: all cache layers enabled.
-- `--no-cache`: disables source/assembly cache reads+writes, but still allows NASM/linker up-to-date checks.
-- `--force`: implies `--no-cache` and always recompiles, re-assembles, and re-links.
+### Memory & Arrays
 
-In short:
+Allocate and manipulate memory:
 
-- `--no-cache` means "no compiler cache".
-- `--force` means "rebuild everything now".
+```
+import stdlib.sl
 
-## Metaprogramming Guide
+word main
+  1000 alloc dup         # allocate, keep a copy
+  dup 0 + 42 !64         # store 42 at offset 0
+  dup 8 + 99 !64         # store 99 at offset 8
+  
+  dup 0 + @64 puti cr    # print 42
+  dup 8 + @64 puti cr    # print 99
+  
+  free
+  0
+end
+```
 
-L2 has two complementary metaprogramming layers:
+### Modules & Imports
 
-1. Text macros (`macro ... ;`) for syntax-level expansion.
-2. Compile-time VM words (`compile-time`, `ct-*`) for programmable parser/compiler control.
+Modularize your code:
 
-### Why this is useful in practice
+```
+import stdlib.sl           # standard library
+import my_utils.sl         # your own modules
 
-- Build mini-DSLs without changing compiler source.
-- Generate repetitive code while keeping final assembly explicit.
-- Add project-local syntax sugar that compiles away completely.
-- Control parser behavior for advanced transforms (token hooks and rewrites).
+word main
+  ...
+end
+```
 
-### Text Macros: Legacy and Advanced Forms
+---
 
-Legacy positional form still works:
+## Compile-Time Metaprogramming
 
-```l2
-macro twice 1
-	$0 $0 +
+L2's killer feature is its **compile-time virtual machine**. Run arbitrary L2 code at compile time to:
+
+- Generate repetitive code patterns
+- Compute constants and lookup tables
+- Build custom data structures
+- Implement domain-specific languages (DSLs)
+- Customize parsing and syntax
+
+All with **zero runtime cost**.
+
+### Text Macros
+
+The simplest metaprogramming: parametrized text replacement:
+
+```
+import stdlib.sl
+
+macro double-all (n)
+  $n $n +
 ;
-```
 
-Named parameters improve readability:
-
-```l2
-macro add2 (lhs rhs)
-	$lhs $rhs +
-;
-```
-
-Variadic parameters capture a tail of arguments:
-
-```l2
-macro emit_all (head *tail)
-	$head $*tail
-;
-```
-
-Parameter/placeholder rules:
-
-- `$0`, `$1`, ...: positional placeholders (legacy-compatible).
-- `$name`: named placeholder.
-- `$*name`: splice variadic capture.
-- Placeholder transforms: `$name|upper`, `$name|lower`, `$*name|join:","`.
-- Variadic parameter must be last in the signature.
-
-### Macro Template Control Flow
-
-Text macros can use compile-time control flow directly in the macro body:
-
-```l2
-macro join_with_plus (head *tail)
-	$head
-	ct-for item in tail do
-		$item +
-	end
-;
-
-macro maybe_bump (x *rest)
-	$x
-	ct-if has rest then
-		1 +
-	else
-		0 +
-	end
-;
-```
-
-Template-only control keywords:
-
-- `ct-if <cond> then ... else ... end`
-- `ct-when <cond> ... end` (single-branch shorthand)
-- `ct-unless <cond> ... end` (negated single-branch shorthand)
-- `ct-for <name> in <capture> do ... end`
-- `ct-each <name> in <capture> do ... end`
-- `ct-each <index> <name> in <capture> do ... end` (key/value mode)
-- `ct-for <name> in <capture> sep <template...> do ... end`
-- `ct-each <...> in <capture> sep <template...> do ... end`
-- `ct-let <name> <expr...> do ... end`
-- `ct-let <name> = <expr...> do ... end` (optional `=`)
-- `ct-fn <name> do ... end` (template-local function)
-- `ct-switch <expr...> do ... end`
-- `ct-case <expr...> do ... end`
-- `ct-default do ... end`
-- `ct-match <expr...> do ... end` (expression-style selector)
-- `ct-case <expr...> then <template...>` (inside `ct-match`)
-- `ct-default then <template...>` (inside `ct-match`)
-- `ct-fold <acc> <item> in <capture> with <init...> do ... end`
-- `ct-break` / `ct-continue` (inside `ct-for` / `ct-each` / `ct-fold`)
-- `ct-call <compile-time-word>`
-- `ct-include <path-token>` / `ct-import <path-token>`
-- `ct-comment ... ct-endcomment` (nestable template comments)
-- `ct-strict` / `ct-permissive` (unknown-symbol handling)
-- `ct-version <token>` (per-macro template metadata marker)
-- `ct-error <msg>` / `ct-warning <msg>` / `ct-note <msg>`
-- `emit-list <capture>` / `ct-emit-list <capture>`
-- `emit-block do ... end` / `ct-emit-block do ... end`
-
-Template parser behavior:
-
-- `ct-if` / `ct-when` / `ct-unless` / `ct-for` / `ct-each` are compile-time template directives.
-- `ct-let` creates a local template binding for the block body and supports lexical shadowing.
-- `ct-fn` defines a template-local function callable with `ct-call`.
-- `ct-switch` compares expanded token sequences and executes the first matching `ct-case`; `ct-default` is optional.
-- `ct-match` is the compact expression-style selector; case bodies run until the next `ct-case`, `ct-default`, or closing `end`.
-- `ct-fold` evaluates to the final accumulator value; each loop body result becomes the next accumulator value.
-- `ct-include` splices template nodes from a file (relative to the defining source file).
-- `ct-import` loads template helpers (for example `ct-fn`) once per expansion scope and avoids duplicate imports.
-- `ct-comment ... ct-endcomment` and `ct-#( ... ct-#)` are treated as template-only comments and do not emit runtime tokens.
-- `ct-strict` errors on unknown template symbols; `ct-permissive` treats unknown symbols as empty and emits a warning.
-- `ct-version` stores a macro-local version marker for tooling/introspection.
-- `emit-list`/`ct-emit-list` splices a capture value; `emit-block`/`ct-emit-block` emits an inline template block.
-- Placeholder transforms apply both in emitted placeholders and template guard expressions.
-- Plain runtime control tokens (`if`, `for`, `else`, `end`) are treated as ordinary output tokens.
-- Nested runtime blocks inside `ct-if` / `ct-for` are tracked so their `end` tokens do not accidentally close compile-time directives.
-
-Guard expressions support:
-
-- unary: `not`, `!`
-- binary boolean: `and`, `&&`, `or`, `||`
-- comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
-- grouping with `( ... )`
-- capture/local refs: `$x`, `name`
-- loop predicates: `first`, `last`
-- capture predicates: `has <capture>`, `empty <capture>`
-
-`ct-if` always uses expression parsing. `ct-when` / `ct-unless` keep their shorthand
-form (`has ...`, `empty ...`, etc.) and also accept expression guards when written
-with `then`.
-
-Constant-only guard subexpressions are folded during template parse.
-
-`ct-call` bridges text macros with compile-time words. The target word receives
-a context map on the CT stack:
-
-- `"macro"`: macro name
-- `"captures"`: merged capture map for current scope
-- `"loop"`: loop metadata map (`index`, `count`, `first`, `last`) or `nil`
-
-Return value from the CT word is spliced back into the macro output. It can be
-`nil`, a token/string/number, or nested lists/tuples of token-like values.
-
-These execute only during macro expansion and emit ordinary L2 tokens, so there is no runtime overhead.
-
-### Capture Toolkit
-
-The compile-time API now includes a capture/scope/hygiene toolkit for advanced macro pipelines:
-
-- Hygienic symbols: `ct-gensym`.
-- Capture namespaces in `ct-call` contexts: `args`, `locals`, `globals`.
-- Capture operators: get/has/shape/assert/count/slice/map/filter/separate/join/equal.
-- Typed placeholder constraints in text macro expansions (e.g. `$x:int`).
-- Capture normalization/pretty/clone/coercion helpers.
-- Capture schema declaration + validation (`ct-capture-schema-put`, `ct-capture-schema-validate`).
-- Lifetime/origin/taint metadata and checks for scope-aware metaprogramming.
-- Serialization/compression/hash/diff helpers for memoization and debugging.
-- Replay logs and lint checks for deterministic diagnostics.
-
-### Macro Call Styles
-
-Prefix style (classic):
-
-```l2
-add2 10 32
-```
-
-Call style with comma-separated arguments:
-
-```l2
-add2(10, 32)
-```
-
-Call style is useful when an argument is a token sequence:
-
-```l2
 macro sum3 (a b c)
-	$a $b + $c +
+  $a $b + $c +
 ;
 
-sum3(20 1 +, 10, 11)
+word main
+  sum3(1, 2, 3) puti cr    # prints: 6
+  0
+end
 ```
 
-### Pattern-Matching Macros
+Use compile-time control flow inside macros:
 
-L2 now supports clause-based pattern macros inside normal `macro` definitions:
+```
+import stdlib.sl
 
-```l2
+macro emit-all (*items)
+  ct-for item in items do
+    $item
+  end
+;
+
+word main
+  emit-all(1, 2, 3, 4, 5) + + + + puti cr  # prints: 15
+  0
+end
+```
+
+### Compile-Time Words
+
+Mark a word `compile-time` to run while compiling instead of emitting runtime code:
+
+```
+word build-lookup-table
+  # This runs at compile time
+  0 100 for i
+    i i * ,    # emit i² into data section
+  end
+end
+
+compile-time build-lookup-table
+```
+
+### Pattern Macros & Rewrites
+
+Use pattern-matching macros and rewrite rules for deep code transformation:
+
+```
+# Eliminate redundant operations at parse time
 macro simplify
-	$x:int + 0 => $x ;
-	0 + $x:int => $x ;
+  $x:int + 0 => $x ;
+  0 + $x:int => $x ;
+  $x:int * 1 => $x ;
 ;
 ```
 
-Behavior:
+And syntax rewrites for DSL customization:
 
-- Clauses are checked in definition order.
-- Captures support rewrite syntax: `$x`, `$*xs`, `$x:int`.
-- Reusing the same capture name in one pattern enforces equality.
-- Pattern macros terminate with a trailing `;` after the final clause.
-- Under the hood, this compiles to grammar-stage rewrite rules.
-
-### Compile-Time Registration APIs
-
-You can define text macros from compile-time code:
-
-- `ct-register-text-macro`: register by positional arity.
-- `ct-register-text-macro-signature`: register with named/variadic parameter spec.
-- `ct-register-pattern-macro`: register pattern macro clauses programmatically.
-- `ct-unregister-pattern-macro`: remove a previously registered pattern macro.
-- `ct-word-is-text-macro`: query whether a word is a text macro.
-- `ct-word-is-pattern-macro`: query whether a word is a pattern macro.
-- `ct-get-macro-signature`: retrieve parameter names and variadic parameter.
-- `ct-get-macro-expansion` / `ct-set-macro-expansion`: inspect and update text-macro expansions.
-- `ct-clone-macro` / `ct-rename-macro`: clone/rename text or pattern macros.
-- `ct-macro-doc-get` / `ct-macro-doc-set`: attach free-form documentation strings to macros.
-- `ct-macro-attrs-get` / `ct-macro-attrs-set`: attach structured metadata maps to macros.
-- `ct-list-pattern-macros`: enumerate pattern macro names.
-- `ct-set-pattern-macro-enabled` / `ct-get-pattern-macro-enabled`: toggle/query rule activation.
-- `ct-set-pattern-macro-priority` / `ct-get-pattern-macro-priority`: adjust/query rule priority.
-- `ct-get-pattern-macro-clauses`: inspect registered clause pairs.
-
-### CT-Call Policy Controls
-
-- Typed contracts:
-  - `ct-set-ct-call-contract`, `ct-get-ct-call-contract`
-- Exception handling policy:
-  - `ct-set-ct-call-exception-policy`, `ct-get-ct-call-exception-policy`
-- Sandbox mode + allowlist:
-  - `ct-set-ct-call-sandbox-mode`, `ct-get-ct-call-sandbox-mode`
-  - `ct-set-ct-call-sandbox-allowlist`, `ct-get-ct-call-sandbox-allowlist`
-- Deterministic randomness:
-  - `ct-ctrand-seed`, `ct-ctrand-int`, `ct-ctrand-range`
-- Memoization:
-  - `ct-set-ct-call-memo`, `ct-get-ct-call-memo`
-  - `ct-clear-ct-call-memo`, `ct-get-ct-call-memo-size`
-- Side-effect log:
-  - `ct-set-ct-call-side-effects`, `ct-get-ct-call-side-effects`
-  - `ct-get-ct-call-side-effect-log`, `ct-clear-ct-call-side-effect-log`
-- Recursion and timeout guards:
-  - `ct-set-ct-call-recursion-limit`, `ct-get-ct-call-recursion-limit`
-  - `ct-set-ct-call-timeout-ms`, `ct-get-ct-call-timeout-ms`
-
-Example:
-
-```l2
-# docs:skip-check
-word setup-macros
-	"sum2"                                # name
-	list-new "x" list-append "y" list-append
-	list-new "$x" list-append "$y" list-append "+" list-append
-	ct-register-text-macro-signature
-end
-compile-time setup-macros
+```
+# Custom parsing: transform [a, b, c] into a list
+ct-add-grammar-rewrite "[" "$*items ]" "(list-literal $*items)"
 ```
 
-### Rewrite Rules (Reader/Grammar Stages)
+### More Metaprogramming
 
-For deeper syntax customization, use compile-time rewrites:
+L2 has extensive CT APIs for:
 
-- Reader-stage rewrites: token stream rewrites after lexing.
-- Grammar-stage rewrites: rewrites before normal parse handling.
+- Template control flow: `ct-if`, `ct-for`, `ct-each`, `ct-fold`, `ct-let`, `ct-switch`
+- Capture/scope management for hygienic macros
+- Pattern matching with guards
+- Language extension packs and DSL lifecycle
+- Memoization, sandboxing, and recursion limits
+- Rewrite rule priority, pipelines, and analysis
 
-Core tools include:
+**For the complete API reference:**
 
-- `ct-add-reader-rewrite`, `ct-add-grammar-rewrite`
-- named/priority variants
-- enable/disable, list, clear, remove, and priority query/update words
+- Read the docstring: `python3 main.py --docs`
+- Serve in browser: `python3 main.py --docs-serve --docs-port 8018`
 
-These are best for local syntax normalization patterns and DSL sugar.
+---
 
-### Language Extension Pack APIs (`ct-lang-*`)
+## Building & Compilation
 
-L2 now includes a language-extension registry in the compile-time VM so you can
-create, activate, introspect, and cleanly remove DSL packs without hard-coding
-language-specific behavior in the core parser.
+### Compiler Invocation
 
-New compile-time words:
-
-- `ct-lang-create`
-- `ct-lang-exists?`
-- `ct-lang-list`
-- `ct-lang-activate`
-- `ct-lang-deactivate`
-- `ct-lang-active?`
-- `ct-lang-active-list`
-- `ct-lang-meta-set`
-- `ct-lang-meta-get`
-- `ct-lang-set-auto-validate`
-- `ct-lang-get-auto-validate`
-- `ct-lang-add-validator`
-- `ct-lang-run-validators`
-- `ct-lang-run-active-validators`
-- `ct-lang-set-token-hook`
-- `ct-lang-add-reader-rewrite-named`
-- `ct-lang-add-grammar-rewrite-named`
-- `ct-lang-register-text-macro-signature`
-- `ct-lang-register-pattern-macro`
-- `ct-lang-status`
-- `ct-lang-remove`
-
-Typical lifecycle flow:
-
-1. `ct-lang-create`
-2. register rewrites/macros/hooks
-3. `ct-lang-activate`
-4. optional validator configuration (`ct-lang-add-validator`, auto/manual runs)
-5. introspection via `ct-lang-status`
-6. cleanup via `ct-lang-remove`
-
-### Advanced Pattern/Rewrite Controls
-
-L2 now includes a richer rewrite toolchain for large macro systems:
-
-- Pattern grouping/scope activation:
-  - `ct-set-pattern-macro-group`, `ct-get-pattern-macro-group`
-  - `ct-set-pattern-macro-scope`, `ct-get-pattern-macro-scope`
-  - `ct-set-pattern-group-active`, `ct-set-pattern-scope-active`
-  - `ct-list-active-pattern-groups`, `ct-list-active-pattern-scopes`
-- Pattern clause guards and introspection:
-  - `ct-set-pattern-macro-clause-guard`
-  - `ct-get-pattern-macro-clause-details`
-- Pattern diagnostics and analysis:
-  - `ct-detect-pattern-conflicts`, `ct-detect-pattern-conflicts-named`
-  - `ct-get-rewrite-specificity`
-  - `ct-rewrite-compatibility-matrix`
-- Rewrite pipelines and matcher indexing:
-  - `ct-set-rewrite-pipeline`, `ct-get-rewrite-pipeline`
-  - `ct-set-rewrite-pipeline-active`, `ct-list-rewrite-active-pipelines`
-  - `ct-rebuild-rewrite-index`, `ct-get-rewrite-index-stats`
-- Rewrite transactions and packs:
-  - `ct-rewrite-txn-begin`, `ct-rewrite-txn-commit`, `ct-rewrite-txn-rollback`
-  - `ct-export-rewrite-pack`, `ct-import-rewrite-pack`, `ct-import-rewrite-pack-replace`
-  - `ct-get-rewrite-provenance`
-- Dry-run and fixture tooling:
-  - `ct-rewrite-dry-run`
-  - `ct-rewrite-generate-fixture`
-- Runtime safety/observability:
-  - `ct-set-rewrite-saturation`, `ct-get-rewrite-saturation`
-  - `ct-set-rewrite-max-steps`, `ct-get-rewrite-max-steps`
-  - `ct-set-rewrite-loop-detection`, `ct-get-rewrite-loop-detection`
-  - `ct-get-rewrite-loop-reports`, `ct-clear-rewrite-loop-reports`
-  - `ct-set-rewrite-trace`, `ct-get-rewrite-trace`, `ct-get-rewrite-trace-log`, `ct-clear-rewrite-trace-log`
-  - `ct-get-rewrite-profile`, `ct-clear-rewrite-profile`
-
-Pattern syntax now supports additional operators in rewrite patterns:
-
-- Negative token/capture match: `!token`, `!$x:int`
-- Optional piece: `token?`, `$x?`, `$x:int?`
-- Repetition piece: `token*`, `token+`, `$x:int*`, `$x:int+`
-- Guarded clauses in macro syntax: `... when guard_word => ... ;`
-
-### Safety and Debugging Controls
-
-- `ct-set-macro-expansion-limit` / `ct-get-macro-expansion-limit`
-- `ct-set-macro-preview` / `ct-get-macro-preview`
-- `--macro-preview` (trace each macro/rewrite step)
-- `--preview` (print final transformed source after macro + CT execution)
-
-Use preview when developing complex expansions; keep limits sensible to avoid accidental recursive explosion.
-
-### Execution-Mode Markers
-
-You can explicitly control where a word is allowed to execute:
-
-- `compile-only`: word can execute only during compilation.
-- `runtime` (alias: `runtime-only`): word can execute only at runtime.
-
-Example:
-
-```l2
-word only-runtime
-	1
-end
-runtime
+```bash
+python3 main.py source.sl [options] -o binary
 ```
 
-Trying to execute `only-runtime` from compile-time code now fails with a clear error.
+Common options:
 
-L2 also provides a `CT` word for branching on execution mode:
+- `-o FILE`: Output executable name
+- `-l PATH`: Link against a library (`.so`, `.a`, or system lib like `c`)
+- `--check`: Parse and check without generating output
+- `--emit-asm`: Emit assembly (.asm file) without assembling/linking
+- `--no-artifact`: Skip final linking (useful with `--emit-asm`)
+- `--force`: Rebuild everything (ignore cache)
+- `--no-cache`: Skip compiler caches but allow tool-level incremental builds
+- `-v LEVEL`: Verbosity (1-3 for timing and diagnostics)
 
-- During compile-time execution, `CT` pushes `1`.
-- In emitted runtime code, `CT` pushes `0`.
+### Caching & Optimization
 
-Example:
+L2 has multi-layer caching to speed up recompilation:
 
-```l2
-word maybe-debug
-	CT if
-		"[ct] running in compile-time VM" puts
-	else
-		"[rt] running in runtime code" puts
-	end
-end
+- **Source cache**: Preprocessed imports and dependency graph
+- **Assembly cache**: Emitted x86-64 assembly
+- **Tool-level incrementality**: NASM/linker skip unchanged inputs
+
+Use `--no-cache` to skip compiler caches (but keep NASM/linker incremental builds). Use `--force` to rebuild from scratch.
+
+### Debugging & Profiling
+
+Inspect macro expansion and compile-time behavior:
+
+```bash
+# Show timing for each macro expansion
+python3 main.py source.sl --macro-profile
+
+# Print expanded source after macros/CT execution
+python3 main.py source.sl --no-artifact --preview
+
+# Write detailed profile to file
+python3 main.py source.sl --macro-profile build/profile.txt
 ```
 
-## Runtime Eval Library (From main.c)
+---
 
-You can build a C library from [main.c](main.c) and call into L2 compilation/evaluation at runtime.
+## Documentation & Reference
 
-### 1. Build the library
+### Browse the Compile-Time API
+
+Generate and view the complete API documentation:
+
+```bash
+# View in terminal
+python3 main.py --docs
+
+# Serve in browser with search and tabs
+python3 main.py --docs-serve --docs-port 8018
+```
+
+### Learning Resources
+
+- **Examples**: Start with [examples/](examples/) (Game of Life, Snake, eval_runtime)
+- **Tests**: Run `python3 test.py` to see the test suite
+- **Stdlib**: Browse [stdlib/](stdlib/) for reusable words and patterns
+
+---
+
+## Runtime Eval Library
+
+You can call L2 from C (and vice versa) via the runtime evaluation library built from [main.c](main.c).
+
+### Build the Library
 
 ```bash
 ./tools/build_l2eval_lib.sh
 ```
 
-This produces:
+Produces `build/libl2eval.a` (static) and `build/libl2eval.so` (dynamic).
 
-- [build/libl2eval.a](build/libl2eval.a)
-- [build/libl2eval.so](build/libl2eval.so)
-
-### 2. Use from C
-
-Public header: [libs/l2eval.h](libs/l2eval.h)
-
-Example:
+### Example: Call L2 from C
 
 ```c
-#include <stdio.h>
 #include "libs/l2eval.h"
+#include <stdio.h>
 
 int main(void) {
-		int rc = l2_eval_cstr("word main 0 end");
-		printf("rc=%d\n", rc);
-		return 0;
+    long result = l2_eval_cstr("word main 5 2 * end");
+    printf("5 * 2 = %ld\n", result);  // outputs: 10
+    return 0;
 }
 ```
 
-Build and run:
+Compile and link:
 
 ```bash
-cc -O2 host.c -I. -Lbuild -ll2eval -Wl,-rpath,$PWD/build -o host
-./host
+cc -O2 program.c -I. -Lbuild -ll2eval -Wl,-rpath,build -o program
+./program
 ```
 
-### 3. Use from L2 code
+### Example: Call C from L2
 
-L2 string literals push two values: `(addr len)`. The runtime `l2_eval` API expects exactly those two arguments and returns the top integer result produced by the evaluated source when one is available.
+```
+import stdlib.sl
 
-Example source: [examples/eval_runtime.sl](examples/eval_runtime.sl)
-
-```l2
 extern l2_eval 2 1
 
 word main
-  "1 2 +" l2_eval puti cr
+  "1 2 +" l2_eval         # compile & evaluate L2 code at runtime
+  puti cr
+  0
 end
 ```
 
-Build and run (static link path shown):
-
 ```bash
-python3 main.py examples/eval_runtime.sl -o /tmp/eval_runtime build/libl2eval.a -lc
-/tmp/eval_runtime
+python3 main.py program.sl -o program -lbuild/libl2eval.a -lc
+./program
 ```
-
-## Core Tenets
-
-1. **SIMPLICITY OVER CONVENIENCE** — No garbage collector, no hidden magic. You own every allocation and every free.
-
-2. **TRANSPARENCY** — Every word compiles to a known, inspectable sequence of x86-64 instructions. `--emit-asm` shows exactly what runs on the metal.
-
-3. **COMPOSABILITY** — Small words build big programs. The stack is the universal interface — no types to reconcile, no generics to instantiate.
-
-4. **META-PROGRAMMABILITY** — The front-end is user-extensible: text macros, `:py` blocks, immediate words, and token hooks reshape syntax at compile time.
-
-5. **UNSAFE BY DESIGN** — Safety is the programmer's job, not the language's. L2 trusts you with raw memory, inline assembly, and direct syscalls.
-
-6. **MINIMAL STANDARD LIBRARY** — The stdlib provides building blocks — not policy. It gives you `alloc`/`free`, `puts`/`puti`, arrays, and file I/O. Everything else is your choice.
-
-7. **FUN FIRST** — If using L2 feels like a chore, the design has failed.
 
 ---
 
-L2 is for programmers who want to understand every byte their program emits, and who believe that the best abstraction is the one you built yourself.
+## Architecture & Design
+
+### Compilation Pipeline
+
+1. **Lexing** (Reader): Tokenize source → Token stream
+2. **Macro expansion**: Text macro and pattern rewrite passes
+3. **Parsing**: Build AST from transformed tokens
+4. **Compile-time execution**: Run `compile-time` words and `ct-*` directives
+5. **Code generation**: Emit x86-64 assembly
+6. **Assembly**: `nasm` → object files
+7. **Linking**: `ld` → executable
+
+Each step can be cached and profiled.
+
+### Runtime Model
+
+L2 uses two runtime stacks:
+
+- **Data stack** (r12): Operand stack for computation
+- **Return stack** (r13): Call frames for word calls and `>r` / `r>` operations
+
+Words interact via these stacks—no hidden state, no implicit contexts.
+
+### Compile-Time vs Runtime
+
+- **Compile-time** (`compile-time`, `CT = 1`): Code runs during compilation. Can generate new words, compute constants, and control syntax.
+- **Runtime** (`CT = 0`): Code runs when the executable is invoked. Normal computation happens here.
+
+---
+
+## Contributing & Development
+
+L2 is actively developed. Areas for contribution:
+
+- **Standard library**: More array/string/math utilities
+- **Examples**: Real-world programs showcasing L2
+- **Performance**: Faster parsing, better codegen, optimized stdlib
+- **Documentation**: Guides, tutorials, API docs
+- **Tooling**: Debuggers, profilers, LSP support
+- **Ports**: Support for other architectures (ARM, RISC-V, etc.)
+
+To contribute:
+
+1. Fork or branch
+2. Make changes
+3. Test: `python3 test.py`
+4. Check syntax: `python3 -m py_compile l2_main.py`
+5. Submit a PR with a clear description
+
+---
 
 ## License
 
 Apache-2.0 — See [LICENSE](LICENSE)
+
+---
+
+## Acknowledgments
+
+L2 draws inspiration from:
+- **Forth**: Stack-based composition, minimalism
+- **Lisp**: Meta-programmability and compile-time power
+- **Assembly**: Transparency and direct control
+- **Lua/Zig**: Pragmatic balance of power and clarity

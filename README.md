@@ -1,5 +1,4 @@
-# L2: A Forth-Inspired Assembly Language with Compile-Time Power
-
+# L2: A stack based, compiled, low level and untyped programming language
 > **Give the programmer raw power and get out of the way.**
 
 ## What Is L2?

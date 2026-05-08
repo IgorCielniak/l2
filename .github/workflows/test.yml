@@ -18,14 +18,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential
 
-      - name: Build l2eval static library
+      - name: Build l2eval library
         run: bash tools/build_l2eval_lib.sh
 
-      - name: Upload l2eval artifact
+      - name: Upload l2eval .a artifact
         uses: actions/upload-artifact@v4
         with:
           name: l2eval-static
           path: build/libl2eval.a
+          if-no-files-found: error
+
+      - name: Upload l2eval .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: l2eval-dynamic
+          path: build/libl2eval.so
           if-no-files-found: error
 
   test:
@@ -53,10 +60,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install keystone-engine
 
-      - name: Download l2eval artifact
+      - name: Download l2eval .a artifact
         uses: actions/download-artifact@v4
         with:
           name: l2eval-static
+          path: build
+
+      - name: Download l2eval .so artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: l2eval-dynamic
           path: build
 
       - name: Run tests

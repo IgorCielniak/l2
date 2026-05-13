@@ -195,7 +195,6 @@ word verify_ct_word_inventory_coverage
   "ct-word-is-pattern-macro" meta-word-exists static_assert
   "ct-word-is-text-macro" meta-word-exists static_assert
   "emit-definition" meta-word-exists static_assert
-  "eval" meta-word-exists static_assert
   "i" meta-word-exists static_assert
   "identifier?" meta-word-exists static_assert
   "inject-tokens" meta-word-exists static_assert

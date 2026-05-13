@@ -28,13 +28,13 @@ while i < n:
     start = i
     while i < n and not s[i].isspace():
         i += 1
-    tokens.append((False, s[start:i]))
+    tokens.append((False, s[start:i])) # normal no str tokens have first elem in the tuple as flase
 
 content = tokens
 
 i = 0
 while i < len(content):
-    tok_is_str, tok = content[i]
+    _, tok = content[i]
     if tok == "import":
         i += 2
         continue
@@ -69,7 +69,7 @@ def run(code):
             continue
         if op.lstrip("-").isdigit():
             stack.append(int(op))
-        elif op == "+" or op == "add":
+        elif op == "+":
             b = stack.pop()
             a = stack.pop()
             stack.append(a + b)
@@ -82,8 +82,7 @@ def run(code):
         elif op == "cr":
             print()
         elif op == "puts":
-            v = stack.pop()
-            print(v)
+            print(stack.pop())
         elif op == "<":
             b = stack.pop()
             a = stack.pop()

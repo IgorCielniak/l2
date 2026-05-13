@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import bisect
+import errno
 import importlib.util
 import os
 import random
@@ -49,6 +50,7 @@ def _ensure_keystone() -> bool:
 # Pre-compiled regex patterns used by JIT and BSS code
 _RE_REL_PAT = re.compile(r'\[\s*rel\s+([A-Za-z0-9_.$@]+)\s*\]', re.IGNORECASE)
 _RE_REL_TO_RIP_PAT = re.compile(r'\[\s*rel\s+([^\]]+?)\s*\]', re.IGNORECASE)
+_RE_ABS_MEM_LITERAL_PAT = re.compile(r'\[\s*(-?(?:0x[0-9A-Fa-f]+|\d+))\s*\]')
 _RE_LABEL_PAT = re.compile(r'^(\.\w+|\w+):')
 _RE_BSS_PERSISTENT = re.compile(r'persistent:\s*resb\s+(\d+)')
 _RE_DATA_DECL_PAT = re.compile(r'^\s*([A-Za-z0-9_.$@]+)\s*:\s*([A-Za-z]+)\b(.*)$')
@@ -8364,11 +8366,59 @@ class CompileTimeVM:
         self._dl_func_cache: Dict[str, Any] = {}  # name -> ctypes callable
         self._dl_load_errors: Dict[str, str] = {}
         self._ct_libs: List[str] = []  # library names from -l flags
+        self._ct_source_embed_text: Optional[str] = None
+        self._ct_source_embed_buf: Optional[Any] = None
         self._ctypes_struct_cache: Dict[str, Any] = {}
+        self._in_fork_child: bool = False
         self.current_location: Optional[SourceLocation] = None
         # Coroutine JIT support: save buffer for callee-saved regs (lazily allocated)
         self._jit_save_buf: Optional[Any] = None
         self._jit_save_buf_addr: int = 0
+
+    def set_runtime_embedded_source(self, source_text: Optional[str]) -> None:
+        """Set expanded source text exposed to runtime eval bridges during ct-run-main."""
+        self._ct_source_embed_text = source_text if source_text else None
+        self._ct_source_embed_buf = None
+
+    def _notify_eval_runtime_bridges(self) -> None:
+        """Push stack/source bridge state into loaded eval runtime libraries if available."""
+        if not self.runtime_mode or not self._dl_handles:
+            return
+
+        stack_top = int(self._native_data_top)
+        if stack_top:
+            for handle in self._dl_handles:
+                setter = getattr(handle, "l2_set_eval_stack_top", None)
+                if setter is None:
+                    continue
+                try:
+                    setter.argtypes = [ctypes.c_uint64]
+                    setter.restype = None
+                    setter(stack_top)
+                except Exception:
+                    continue
+
+        source_text = self._ct_source_embed_text
+        if not source_text:
+            return
+        source_bytes = source_text.encode("utf-8", errors="replace")
+        if not source_bytes:
+            return
+
+        # Keep the backing buffer alive for the invocation lifetime.
+        self._ct_source_embed_buf = ctypes.create_string_buffer(source_bytes + b"\0")
+        source_addr = ctypes.addressof(self._ct_source_embed_buf)
+        source_len = len(source_bytes)
+        for handle in self._dl_handles:
+            setter = getattr(handle, "l2_set_embedded_source", None)
+            if setter is None:
+                continue
+            try:
+                setter.argtypes = [ctypes.c_void_p, ctypes.c_longlong]
+                setter.restype = None
+                setter(source_addr, source_len)
+            except Exception:
+                continue
 
     @property
     def memory(self) -> CTMemory:
@@ -8791,6 +8841,56 @@ class CompileTimeVM:
                     return True
         return False
 
+    @staticmethod
+    def _pick_rel_patch_scratch_register(line: str) -> str:
+        for reg in ("r11", "r10", "r9", "r8", "rdx", "rcx", "rbx", "rax"):
+            if re.search(rf'(?<![A-Za-z0-9_]){reg}(?![A-Za-z0-9_])', line) is None:
+                return reg
+        return "r11"
+
+    def _resolve_rel_symbol_expression(self, line: str, symbols: Dict[str, int]) -> Optional[str]:
+        m = _RE_REL_TO_RIP_PAT.search(line)
+        if m is None:
+            return None
+        expr = m.group(1).strip()
+        sym_match = re.match(r"([A-Za-z0-9_.$@]+)(.*)$", expr)
+        if sym_match is None:
+            return None
+        sym = sym_match.group(1)
+        if sym not in symbols:
+            return None
+        suffix = sym_match.group(2)
+        return f"{symbols[sym]}{suffix}"
+
+    def _emit_rel_symbol_patch(self, out_lines: List[str], line: str, addr_expr: Any, *, indent: str = "    ") -> None:
+        scratch = self._pick_rel_patch_scratch_register(line)
+        out_lines.append(f"{indent}push {scratch}")
+        out_lines.append(f"{indent}mov {scratch}, {addr_expr}")
+        out_lines.append(f"{indent}{_RE_REL_TO_RIP_PAT.sub(f'[{scratch}]', line)}")
+        out_lines.append(f"{indent}pop {scratch}")
+
+    def _emit_abs_mem_literal_patch(self, out_lines: List[str], line: str, addr_expr: str, *, indent: str = "    ") -> None:
+        scratch = self._pick_rel_patch_scratch_register(line)
+        out_lines.append(f"{indent}push {scratch}")
+        out_lines.append(f"{indent}mov {scratch}, {addr_expr}")
+        out_lines.append(f"{indent}{_RE_ABS_MEM_LITERAL_PAT.sub(f'[{scratch}]', line, count=1)}")
+        out_lines.append(f"{indent}pop {scratch}")
+
+    def _patch_direct_word_call(self, out_lines: List[str], line: str, current_word: str, local_labels: Set[str]) -> bool:
+        m = re.match(r"^(call|jmp)\s+([A-Za-z_.$][A-Za-z0-9_.$@]*)$", line)
+        if m is None:
+            return False
+        op, target = m.group(1), m.group(2)
+        if target in local_labels or target == current_word:
+            return False
+        target_word = self.dictionary.lookup(target)
+        if target_word is None or target_word.definition is None:
+            return False
+        target_addr = self._compile_raw_jit(target_word)
+        out_lines.append(f"    mov rax, {target_addr}")
+        out_lines.append(f"    {op} rax")
+        return True
+
     def reset(self) -> None:
         self.stack.clear()
         self.return_stack.clear()
@@ -8810,11 +8910,13 @@ class CompileTimeVM:
         runtime_mode: bool = False,
         libs: Optional[List[str]] = None,
         mmap_leak_check: bool = False,
-    ) -> None:
+        argv: Optional[Sequence[str]] = None,
+    ) -> int:
         self.reset()
         self._ensure_jit_out()
         prev_mode = self.runtime_mode
         self.runtime_mode = runtime_mode
+        exit_code = 0
         if runtime_mode:
             self._reset_mmap_leak_tracker(mmap_leak_check)
             # Determine persistent size from BSS overrides if available.
@@ -8825,7 +8927,8 @@ class CompileTimeVM:
                     if m:
                         persistent_size = int(m.group(1))
             self.memory = CTMemory(persistent_size)  # fresh memory per invocation
-            self.memory.setup_argv(sys.argv)
+            runtime_argv = list(argv) if argv is not None else list(sys.argv)
+            self.memory.setup_argv(runtime_argv)
 
             # Allocate native stacks
             self._native_data_stack = ctypes.create_string_buffer(self.NATIVE_STACK_SIZE)
@@ -8835,6 +8938,13 @@ class CompileTimeVM:
             self._native_return_stack = ctypes.create_string_buffer(self.NATIVE_STACK_SIZE)
             self._native_return_top = ctypes.addressof(self._native_return_stack) + self.NATIVE_STACK_SIZE
             self.r13 = self._native_return_top  # empty, grows downward
+
+            # Runtime BSS slots used by list literal helpers and heap checks.
+            list_capture_sp_addr = self.memory.allocate(8)
+            list_capture_tmp_addr = self.memory.allocate(8)
+            list_capture_stack_addr = self.memory.allocate(8 * 1024)
+            CTMemory.write_qword(list_capture_sp_addr, 0)
+            CTMemory.write_qword(list_capture_tmp_addr, 0)
 
             # BSS symbol table for JIT [rel SYMBOL] patching
             self._bss_symbols = {
@@ -8850,8 +8960,12 @@ class CompileTimeVM:
                 "persistent_end": self.memory.persistent_addr + self.memory._persistent_size,
                 "sys_argc": self.memory.sys_argc_addr,
                 "sys_argv": self.memory.sys_argv_addr,
+                "list_capture_sp": list_capture_sp_addr,
+                "list_capture_tmp": list_capture_tmp_addr,
+                "list_capture_stack": list_capture_stack_addr,
             }
             self._materialize_custom_data_symbols()
+            self._in_fork_child = False
 
             # JIT cache is per-invocation (addresses change)
             self._jit_cache = {}
@@ -8872,6 +8986,7 @@ class CompileTimeVM:
                         all_libs.append(lib)
             for lib_name in all_libs:
                 self._dlopen(lib_name)
+            self._notify_eval_runtime_bridges()
 
             # Deep word chains need extra Python stack depth.
             old_limit = sys.getrecursionlimit()
@@ -8881,8 +8996,9 @@ class CompileTimeVM:
             self._reset_mmap_leak_tracker(False)
         try:
             self._call_word(word)
-        except _CTVMExit:
-            pass  # graceful exit from CT execution
+        except _CTVMExit as exc:
+            # Mirror process-exit semantics for ct-run-main/script mode.
+            exit_code = int(getattr(exc, "code", 0)) & 0xFF
         finally:
             self.runtime_mode = prev_mode
             # Clear JIT cache; code pages are libc mmap'd and we intentionally
@@ -8892,6 +9008,7 @@ class CompileTimeVM:
             self._dl_func_cache.clear()
             self._dl_handles.clear()
             self._dl_load_errors.clear()
+        return exit_code
 
     def invoke_with_args(self, word: Word, args: Sequence[Any]) -> None:
         self.reset()
@@ -8899,7 +9016,7 @@ class CompileTimeVM:
             self.push(value)
         self._call_word(word)
 
-    def invoke_repl(self, word: Word, *, libs: Optional[List[str]] = None) -> None:
+    def invoke_repl(self, word: Word, *, libs: Optional[List[str]] = None, argv: Optional[Sequence[str]] = None) -> None:
         """Execute *word* in runtime mode, preserving stack/memory across calls.
 
         On the first call (or after ``reset()``), allocates native stacks and
@@ -8918,7 +9035,8 @@ class CompileTimeVM:
                     if m:
                         persistent_size = int(m.group(1))
             self.memory = CTMemory(persistent_size)
-            self.memory.setup_argv(sys.argv)
+            runtime_argv = list(argv) if argv is not None else list(sys.argv)
+            self.memory.setup_argv(runtime_argv)
 
             self._native_data_stack = ctypes.create_string_buffer(self.NATIVE_STACK_SIZE)
             self._native_data_top = ctypes.addressof(self._native_data_stack) + self.NATIVE_STACK_SIZE
@@ -8927,6 +9045,12 @@ class CompileTimeVM:
             self._native_return_stack = ctypes.create_string_buffer(self.NATIVE_STACK_SIZE)
             self._native_return_top = ctypes.addressof(self._native_return_stack) + self.NATIVE_STACK_SIZE
             self.r13 = self._native_return_top
+
+            list_capture_sp_addr = self.memory.allocate(8)
+            list_capture_tmp_addr = self.memory.allocate(8)
+            list_capture_stack_addr = self.memory.allocate(8 * 1024)
+            CTMemory.write_qword(list_capture_sp_addr, 0)
+            CTMemory.write_qword(list_capture_tmp_addr, 0)
 
             self._bss_symbols = {
                 "dstack": ctypes.addressof(self._native_data_stack),
@@ -8941,24 +9065,24 @@ class CompileTimeVM:
                 "persistent_end": self.memory.persistent_addr + self.memory._persistent_size,
                 "sys_argc": self.memory.sys_argc_addr,
                 "sys_argv": self.memory.sys_argv_addr,
+                "list_capture_sp": list_capture_sp_addr,
+                "list_capture_tmp": list_capture_tmp_addr,
+                "list_capture_stack": list_capture_stack_addr,
             }
             self._materialize_custom_data_symbols()
             self._jit_cache = {}
             self._jit_code_pages = []
             self._dl_handles = []
             self._dl_func_cache = {}
-            self._dl_load_errors = {}
-            all_libs = []
-            dstack_shim = self._ct_runtime_symbol_shim("dstack_top", self._native_data_top)
-            if dstack_shim is not None:
-                all_libs.append(dstack_shim)
-            all_libs.extend(self._ct_libs)
+            self._in_fork_child = False
+            all_libs = list(self._ct_libs)
             if libs:
                 for lib in libs:
                     if lib not in all_libs:
                         all_libs.append(lib)
             for lib_name in all_libs:
                 self._dlopen(lib_name)
+            self._notify_eval_runtime_bridges()
 
             old_limit = sys.getrecursionlimit()
             if old_limit < 10000:
@@ -8967,11 +9091,14 @@ class CompileTimeVM:
             self._repl_libs = list(libs or [])
         else:
             # Subsequent call — open any new libraries not yet loaded
+            if argv is not None:
+                self.memory.setup_argv(list(argv))
             if libs:
                 for lib in libs:
                     if lib not in self._repl_libs:
                         self._dlopen(lib)
                         self._repl_libs.append(lib)
+            self._notify_eval_runtime_bridges()
 
         self._materialize_custom_data_symbols()
 
@@ -9327,10 +9454,40 @@ class CompileTimeVM:
         if name == "exit":
             raise _CTVMExit()
 
-        eval_env_mode = name == "eval_env"
+        # Stack-ABI bridges: these words mutate the native stack pointer rather than
+        # returning normal C values, so call the explicit compute helpers.
+        if name == "eval":
+            source_len = int(self.pop())
+            source_addr = int(self.pop())
+            bridge = self._dl_func_cache.get("__bridge_l2_eval_compute")
+            if bridge is None:
+                bridge = self._dlsym("l2_eval_compute")
+                if bridge is None:
+                    raise ParseError("extern 'eval' requires symbol 'l2_eval_compute'")
+                bridge.restype = ctypes.c_uint64
+                bridge.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_uint64]
+                self._dl_func_cache["__bridge_l2_eval_compute"] = bridge
+            self.r12 = int(bridge(source_addr, source_len, int(self.r12)))
+            return
+
+        if name == "eval_env":
+            stack_top_addr = int(self.pop())
+            source_len = int(self.pop())
+            source_addr = int(self.pop())
+            bridge = self._dl_func_cache.get("__bridge_l2_eval_env_compute")
+            if bridge is None:
+                bridge = self._dlsym("l2_eval_env_compute")
+                if bridge is None:
+                    raise ParseError("extern 'eval_env' requires symbol 'l2_eval_env_compute'")
+                bridge.restype = ctypes.c_uint64
+                bridge.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong]
+                self._dl_func_cache["__bridge_l2_eval_env_compute"] = bridge
+            self.r12 = int(bridge(source_addr, source_len, stack_top_addr))
+            return
+
         func = self._dl_func_cache.get(name)
         if func is None:
-            raw = self._dlsym("l2_eval_env_compute" if eval_env_mode else name)
+            raw = self._dlsym(name)
             if raw is None:
                 raise ParseError(f"extern '{name}' not found in any loaded library")
 
@@ -9350,9 +9507,6 @@ class CompileTimeVM:
                 arg_types = []
                 c_arg_types = [ctypes.c_int64] * inputs
                 c_ret_type = ctypes.c_int64 if outputs > 0 else None
-
-            if eval_env_mode:
-                c_ret_type = ctypes.c_size_t
 
             # Configure the ctypes function object directly
             raw.restype = c_ret_type
@@ -9404,10 +9558,6 @@ class CompileTimeVM:
                 call_args.append(int(raw))
 
         result = func(*call_args)
-
-        if eval_env_mode:
-            self.r12 = int(result)
-            return
 
         if outputs > 0 and result is not None:
             ret_type = _canonical_c_type_name(func._ct_signature[1]) if func._ct_signature else None
@@ -9671,23 +9821,23 @@ class CompileTimeVM:
                 line = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
                               '_jl' + lbl[1:], line)
 
+            abs_mem_match = _RE_ABS_MEM_LITERAL_PAT.search(line)
+            if abs_mem_match is not None:
+                self._emit_abs_mem_literal_patch(lines, line, abs_mem_match.group(1))
+                continue
+
             # Patch [rel SYMBOL] -> concrete address
-            m = _RE_REL_PAT.search(line)
-            if m and m.group(1) in bss:
-                sym = m.group(1)
-                addr = bss[sym]
+            rel_expr = self._resolve_rel_symbol_expression(line, bss)
+            if rel_expr is not None:
                 if line.lstrip().startswith("lea"):
                     # lea REG, [rel X] -> mov REG, addr
-                    line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                    line = _RE_REL_TO_RIP_PAT.sub(rel_expr, line).replace("lea", "mov", 1)
                 else:
-                    # e.g. mov rax, [rel X] or mov byte [rel X], val
-                    # Replace with push/mov-rax/substitute/pop trampoline
-                    lines.append("    push rax")
-                    lines.append(f"    mov rax, {addr}")
-                    new_line = _RE_REL_PAT.sub("[rax]", line)
-                    lines.append(f"    {new_line}")
-                    lines.append("    pop rax")
+                    self._emit_rel_symbol_patch(lines, line, rel_expr)
                     continue
+
+            if self._patch_direct_word_call(lines, line, word.name, _local_labels):
+                continue
             # Convert NASM 'rel' to explicit rip-relative for Keystone
             line = _normalize_rel_to_rip(line)
             lines.append(f"    {line}")
@@ -9799,19 +9949,20 @@ class CompileTimeVM:
                 for lbl in _local_labels:
                     line = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
                                   '_jl' + lbl[1:], line)
-                m = _RE_REL_PAT.search(line)
-                if m and m.group(1) in bss:
-                    sym = m.group(1)
-                    addr = bss[sym]
+                abs_mem_match = _RE_ABS_MEM_LITERAL_PAT.search(line)
+                if abs_mem_match is not None:
+                    self._emit_abs_mem_literal_patch(lines, line, abs_mem_match.group(1))
+                    continue
+                rel_expr = self._resolve_rel_symbol_expression(line, bss)
+                if rel_expr is not None:
                     if line.lstrip().startswith("lea"):
-                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                        line = _RE_REL_TO_RIP_PAT.sub(rel_expr, line).replace("lea", "mov", 1)
                     else:
-                        lines.append("    push rax")
-                        lines.append(f"    mov rax, {addr}")
-                        new_line = _RE_REL_PAT.sub("[rax]", line)
-                        lines.append(f"    {new_line}")
-                        lines.append("    pop rax")
+                        self._emit_rel_symbol_patch(lines, line, rel_expr)
                         continue
+
+                if self._patch_direct_word_call(lines, line, word.name, _local_labels):
+                    continue
                 line = _normalize_rel_to_rip(line)
                 lines.append(f"    {line}")
             lines.append("    ret")
@@ -9887,6 +10038,14 @@ class CompileTimeVM:
                     else:
                         lines.append(f"    mov rax, {length}")
                         lines.append("    mov [r12], rax")
+                elif isinstance(data, float):
+                    val = _get_struct().unpack("q", _get_struct().pack("d", float(data)))[0]
+                    lines.append("    sub r12, 8")
+                    if -0x80000000 <= val <= 0x7FFFFFFF:
+                        lines.append(f"    mov qword [r12], {val}")
+                    else:
+                        lines.append(f"    mov rax, {val}")
+                        lines.append("    mov [r12], rax")
                 else:
                     val = int(data) & 0xFFFFFFFFFFFFFFFF
                     if val >= 0x8000000000000000:
@@ -9951,18 +10110,12 @@ class CompileTimeVM:
                             for lbl in _local_labels:
                                 ln = re.sub(rf'(?<!\w){re.escape(lbl)}(?=\s|:|,|$|\]|\))',
                                             prefix + lbl, ln)
-                            m = _RE_REL_PAT.search(ln)
-                            if m and m.group(1) in bss:
-                                sym = m.group(1)
-                                addr = bss[sym]
+                            rel_expr = self._resolve_rel_symbol_expression(ln, bss)
+                            if rel_expr is not None:
                                 if ln.lstrip().startswith("lea"):
-                                    ln = _RE_REL_PAT.sub(str(addr), ln).replace("lea", "mov", 1)
+                                    ln = _RE_REL_TO_RIP_PAT.sub(rel_expr, ln).replace("lea", "mov", 1)
                                 else:
-                                    lines.append("    push rax")
-                                    lines.append(f"    mov rax, {addr}")
-                                    new_ln = _RE_REL_PAT.sub("[rax]", ln)
-                                    lines.append(f"    {new_ln}")
-                                    lines.append("    pop rax")
+                                    self._emit_rel_symbol_patch(lines, ln, rel_expr)
                                     continue
                             ln = _normalize_rel_to_rip(ln)
                             lines.append(f"    {ln}")
@@ -10098,6 +10251,11 @@ class CompileTimeVM:
                     name = node.data
                     if name not in ("begin", "again", "continue", "exit"):
                         return None
+                    if self.runtime_mode and name == "exit":
+                        # Runtime mode must preserve process-exit semantics.
+                        exit_word = self.dictionary.lookup("exit")
+                        if exit_word is not None and exit_word.runtime_intrinsic is not None:
+                            return None
                 elif wref.runtime_intrinsic is not None:
                     return None
                 elif getattr(wref, "is_extern", False):
@@ -10202,18 +10360,12 @@ class CompileTimeVM:
                     continue
                 for label in local_labels:
                     line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
-                m = _RE_REL_PAT.search(line)
-                if m and m.group(1) in bss:
-                    sym = m.group(1)
-                    addr = bss[sym]
+                rel_expr = self._resolve_rel_symbol_expression(line, bss)
+                if rel_expr is not None:
                     if line.lstrip().startswith("lea"):
-                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                        line = _RE_REL_TO_RIP_PAT.sub(rel_expr, line).replace("lea", "mov", 1)
                     else:
-                        result.append("    push rax")
-                        result.append(f"    mov rax, {addr}")
-                        new_line = _RE_REL_PAT.sub("[rax]", line)
-                        result.append(f"    {new_line}")
-                        result.append("    pop rax")
+                        self._emit_rel_symbol_patch(result, line, rel_expr)
                         continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
                 line = _normalize_rel_to_rip(line)
@@ -10226,7 +10378,11 @@ class CompileTimeVM:
             opc = node._opcode
 
             if opc == OP_LITERAL:
-                val = int(node.data) & 0xFFFFFFFFFFFFFFFF
+                data = node.data
+                if isinstance(data, float):
+                    val = _get_struct().unpack("q", _get_struct().pack("d", float(data)))[0]
+                else:
+                    val = int(data) & 0xFFFFFFFFFFFFFFFF
                 if val >= 0x8000000000000000:
                     val -= 0x10000000000000000
                 lines.append("    sub r12, 8")
@@ -10473,23 +10629,13 @@ class CompileTimeVM:
                 if line == "ret":
                     line = "jmp _ct_save"
                 # Replace [rel SYMBOL] with concrete addresses
-                m = _RE_REL_PAT.search(line)
-                if m and m.group(1) in _bss_symbols:
-                    sym = m.group(1)
-                    addr = _bss_symbols[sym]
+                rel_expr = self._resolve_rel_symbol_expression(line, _bss_symbols)
+                if rel_expr is not None:
                     # lea REG, [rel X]  ->  mov REG, addr
                     if line.lstrip().startswith("lea"):
-                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                        line = _RE_REL_TO_RIP_PAT.sub(rel_expr, line).replace("lea", "mov", 1)
                     else:
-                        # For memory operands like mov byte [rel X], val
-                        # replace [rel X] with [<addr>]
-                        tmp_reg = "rax"
-                        # Use a scratch register to hold the address
-                        patched_body.append(f"push rax")
-                        patched_body.append(f"mov rax, {addr}")
-                        new_line = _RE_REL_PAT.sub("[rax]", line)
-                        patched_body.append(new_line)
-                        patched_body.append(f"pop rax")
+                        self._emit_rel_symbol_patch(patched_body, line, rel_expr, indent="")
                         continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
                 line = _normalize_rel_to_rip(line)
@@ -10626,17 +10772,22 @@ class CompileTimeVM:
 
     def _resolve_words_in_body(self, defn: Definition) -> None:
         """Pre-resolve word name -> Word objects on Op nodes (once per Definition)."""
-        if defn._words_resolved:
+        # In runtime mode we may need a second pass to bind `exit` to the real
+        # runtime word instead of treating it as a structural keyword.
+        if defn._words_resolved and not self.runtime_mode:
             return
         lookup = self.dictionary.lookup
         for node in defn.body:
             if node._opcode == OP_WORD and node._word_ref is None:
                 name = str(node.data)
                 # Skip structural keywords that _execute_nodes handles inline
-                if name not in ("begin", "again", "continue", "exit", "get_addr"):
-                    ref = lookup(name)
-                    if ref is not None:
-                        node._word_ref = ref
+                if name in ("begin", "again", "continue", "get_addr"):
+                    continue
+                if name == "exit" and not self.runtime_mode:
+                    continue
+                ref = lookup(name)
+                if ref is not None:
+                    node._word_ref = ref
         defn._words_resolved = True
 
     def _prepare_definition(self, defn: Definition) -> Tuple[Dict[str, int], Dict[int, int], Dict[int, int]]:
@@ -10742,19 +10893,16 @@ class CompileTimeVM:
                     line = re.sub(rf'(?<!\w){re.escape(label)}(?=\s|:|,|$|\]|\))', prefix + label, line)
 
                 # Patch [rel SYMBOL] -> concrete address
-                m = _RE_REL_PAT.search(line)
-                if m and m.group(1) in bss:
-                    sym = m.group(1)
-                    addr = bss[sym]
+                rel_expr = self._resolve_rel_symbol_expression(line, bss)
+                if rel_expr is not None:
                     if line.lstrip().startswith("lea"):
-                        line = _RE_REL_PAT.sub(str(addr), line).replace("lea", "mov", 1)
+                        line = _RE_REL_TO_RIP_PAT.sub(rel_expr, line).replace("lea", "mov", 1)
                     else:
-                        lines.append("    push rax")
-                        lines.append(f"    mov rax, {addr}")
-                        new_line = _RE_REL_PAT.sub("[rax]", line)
-                        lines.append(f"    {new_line}")
-                        lines.append("    pop rax")
+                        self._emit_rel_symbol_patch(lines, line, rel_expr)
                         continue
+
+                if self._patch_direct_word_call(lines, line, "__merged__", local_labels):
+                    continue
                 # Convert NASM 'rel' to explicit rip-relative for Keystone
                 line = _normalize_rel_to_rip(line)
                 lines.append(f"    {line}")
@@ -11009,6 +11157,13 @@ class CompileTimeVM:
                         ip = begin_stack[-1][0] + 1
                         continue
                     if name == "exit":
+                        if _runtime_mode:
+                            exit_word = _dict_lookup("exit")
+                            if exit_word is not None and exit_word.runtime_intrinsic is not None:
+                                self.current_location = _node.loc
+                                _call_word(exit_word)
+                                ip += 1
+                                continue
                         if begin_stack:
                             frame = begin_stack.pop()
                             ip = frame[1] + 1
@@ -11042,6 +11197,11 @@ class CompileTimeVM:
                             r12 = self.r12 - 16
                             _c_int64_at(r12 + 8).value = addr
                             _c_int64_at(r12).value = length
+                            self.r12 = r12
+                        elif isinstance(data, float):
+                            r12 = self.r12 - 8
+                            bits = _get_struct().unpack("q", _get_struct().pack("d", float(data)))[0]
+                            _c_int64_at(r12).value = bits
                             self.r12 = r12
                         else:
                             r12 = self.r12 - 8
@@ -17613,6 +17773,101 @@ def _ct_get_word_asm(vm: CompileTimeVM) -> None:
     vm.push(None)
 
 
+def _token_slice(source_text: str, start: int, end: int) -> Optional[str]:
+    if start < 0 or end <= start or end > len(source_text):
+        return None
+    snippet = source_text[start:end]
+    return snippet.rstrip()
+
+
+def _ct_find_definition_source(parser: Parser, word_name: str) -> Optional[str]:
+    source_text = parser.source
+    if not isinstance(source_text, str) or not source_text:
+        return None
+    tokens = parser.tokens
+    if not tokens:
+        return None
+
+    best_match: Optional[str] = None
+    count = len(tokens)
+
+    idx = 0
+    while idx + 1 < count:
+        token = tokens[idx]
+        if token.lexeme == "word" and tokens[idx + 1].lexeme == word_name:
+            depth = 0
+            inner = idx + 2
+            while inner < count:
+                lex = tokens[inner].lexeme
+                if lex in ("if", "for", "while", "with"):
+                    depth += 1
+                elif lex == "end":
+                    if depth == 0:
+                        snippet = _token_slice(source_text, token.start, tokens[inner].end)
+                        if snippet:
+                            best_match = snippet
+                        break
+                    depth -= 1
+                inner += 1
+
+        if token.lexeme == ":asm" and tokens[idx + 1].lexeme == word_name:
+            brace_depth = 0
+            inner = idx + 2
+            while inner < count:
+                lex = tokens[inner].lexeme
+                if lex == "{":
+                    brace_depth += 1
+                elif lex == "}":
+                    if brace_depth == 0:
+                        snippet = _token_slice(source_text, token.start, tokens[inner].end)
+                        if snippet:
+                            best_match = snippet
+                        break
+                    brace_depth -= 1
+                inner += 1
+
+        idx += 1
+
+    return best_match
+
+
+def _ct_runtime_get_source(vm: CompileTimeVM) -> None:
+    """Compile-time source lookup for meta-runtime-get-source.
+
+    Stack effect: ( name -- source source_len )
+    """
+    if vm.runtime_mode:
+        name_len = vm.pop_int()
+        name_addr = vm.pop_int()
+        if name_len < 0:
+            raise ParseError("ct-runtime-get-source received negative name length")
+        word_name = ctypes.string_at(name_addr, name_len).decode("utf-8", errors="replace")
+    else:
+        word_name = vm.pop_str()
+
+    snippet = _ct_find_definition_source(vm.parser, word_name)
+    if vm.runtime_mode:
+        if not snippet:
+            vm.push(0)
+            vm.push(0)
+            return
+        source_bytes = snippet.encode("utf-8", errors="replace")
+        source_len = len(source_bytes)
+        source_addr = vm.memory.allocate(source_len + 1)
+        ctypes.memmove(source_addr, source_bytes, source_len)
+        ctypes.c_uint8.from_address(source_addr + source_len).value = 0
+        vm.push(source_addr)
+        vm.push(source_len)
+        return
+
+    if not snippet:
+        vm.push("")
+        vm.push(0)
+        return
+    vm.push(snippet)
+    vm.push(len(snippet.encode("utf-8", errors="replace")))
+
+
 def _ct_parser_pos(vm: CompileTimeVM) -> None:
     vm.push(vm.parser.pos)
 
@@ -18521,49 +18776,6 @@ def _ct_lexer_push_back(vm: CompileTimeVM) -> None:
     vm.push(lexer)
 
 
-def _ct_eval(vm: CompileTimeVM) -> None:
-    """Pop a string from TOS and execute it in the compile-time VM."""
-    if vm.runtime_mode:
-        length = vm.pop_int()
-        addr = vm.pop_int()
-        source = ctypes.string_at(addr, length).decode("utf-8")
-    else:
-        source = vm.pop_str()
-    tokens = list(vm.parser.reader.tokenize(source))
-    # Parse as if inside a definition body to get Op nodes
-    parser = vm.parser
-    # Save parser state
-    old_tokens = parser.tokens
-    old_pos = parser.pos
-    old_iter = parser._token_iter
-    old_exhausted = parser._token_iter_exhausted
-    old_source = parser.source
-    # Set up temporary token stream
-    parser.tokens = list(tokens)
-    parser.pos = 0
-    parser._token_iter = iter([])
-    parser._token_iter_exhausted = True
-    parser.source = "<eval>"
-    # Collect ops by capturing what _handle_token appends
-    temp_defn = Definition(name="__eval__", body=[])
-    parser.context_stack.append(temp_defn)
-    try:
-        while not parser._eof():
-            token = parser._consume()
-            parser._handle_token(token)
-    finally:
-        parser.context_stack.pop()
-        # Restore parser state
-        parser.tokens = old_tokens
-        parser.pos = old_pos
-        parser._token_iter = old_iter
-        parser._token_iter_exhausted = old_exhausted
-        parser.source = old_source
-    # Execute collected ops in the VM
-    if temp_defn.body:
-        vm._execute_nodes(temp_defn.body)
-
-
 # ---------------------------------------------------------------------------
 # Runtime intrinsics that cannot run as native JIT  (for --ct-run-main)
 # ---------------------------------------------------------------------------
@@ -18571,6 +18783,78 @@ def _ct_eval(vm: CompileTimeVM) -> None:
 def _rt_exit(vm: CompileTimeVM) -> None:
     code = vm.pop_int()
     raise _CTVMExit(code)
+
+
+def _rt_drop(vm: CompileTimeVM) -> None:
+    # Runtime asm `drop` has no bounds check and can move r12 above dstack_top.
+    # In ct-run-main/script keep behavior deterministic by treating empty-drop as no-op.
+    if vm.r12 < vm._native_data_top:
+        vm.r12 += 8
+
+
+def _rt_resolve_word_pointer(vm: CompileTimeVM, value: Any) -> Word:
+    resolved = vm._resolve_handle(value)
+    if isinstance(resolved, Word):
+        return resolved
+    if isinstance(resolved, int):
+        mapped = vm._handles.objects.get(resolved)
+        if isinstance(mapped, Word):
+            return mapped
+    raise ParseError(
+        f"expected word pointer on runtime stack, got {type(resolved).__name__}: {resolved!r}"
+    )
+
+
+def _rt_catch_runtime_error(vm: CompileTimeVM) -> None:
+    """Execute a callback in a forked child and push signal/errno style result."""
+    target_word = _rt_resolve_word_pointer(vm, vm.pop())
+
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        vm.push(-int(exc.errno or 1))
+        return
+
+    if pid == 0:
+        try:
+            vm._in_fork_child = True
+            vm._call_word(target_word)
+            os._exit(0)
+        except _CTVMExit as exc:
+            os._exit(int(getattr(exc, "code", 0)) & 0xFF)
+        except BaseException:
+            os._exit(1)
+
+    while True:
+        try:
+            _wait_pid, status = os.waitpid(pid, 0)
+            break
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            vm.push(-int(exc.errno or 1))
+            return
+
+    if os.WIFSIGNALED(status):
+        vm.push(int(os.WTERMSIG(status)))
+        return
+    if os.WIFEXITED(status):
+        vm.push(0)
+        return
+    vm.push(-1)
+
+
+def _rt_try(vm: CompileTimeVM) -> None:
+    _rt_catch_runtime_error(vm)
+    signal = int(vm.pop())
+    vm.push(1 if signal == 0 else 0)
+
+
+def _rt_try_with_error(vm: CompileTimeVM) -> None:
+    _rt_catch_runtime_error(vm)
+    signal = int(vm.pop())
+    vm.push(signal)
+    vm.push(1 if signal == 0 else 0)
 
 
 def _rt_jmp(vm: CompileTimeVM) -> None:
@@ -18888,8 +19172,12 @@ def _register_runtime_intrinsics(dictionary: Dictionary) -> None:
     """
     _RT_MAP: Dict[str, Callable[[CompileTimeVM], None]] = {
         "exit": _rt_exit,
+        "drop": _rt_drop,
         "jmp": _rt_jmp,
         "call": _rt_call,
+        "catch_runtime_error": _rt_catch_runtime_error,
+        "try": _rt_try,
+        "try_with_error": _rt_try_with_error,
         "mmap": _rt_mmap,
         "munmap": _rt_munmap,
         "mremap": _rt_mremap,
@@ -19230,7 +19518,7 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("lexer-expect", _ct_lexer_expect, compile_only=True)
     register("lexer-collect-brace", _ct_lexer_collect_brace, compile_only=True)
     register("lexer-push-back", _ct_lexer_push_back, compile_only=True)
-    register("eval", _ct_eval, compile_only=True)
+    register("ct-runtime-get-source", _ct_runtime_get_source)
 
 
 
@@ -19903,18 +20191,20 @@ class Compiler:
         *,
         libs: Optional[List[str]] = None,
         mmap_leak_check: bool = False,
-    ) -> None:
+        argv: Optional[Sequence[str]] = None,
+    ) -> int:
         word = self.dictionary.lookup(name)
         if word is None:
             raise CompileTimeError(f"word '{name}' not defined; cannot run at compile time")
         # Skip if already executed via a ``compile-time <name>`` directive.
-        if name in self.parser.compile_time_vm._ct_executed and not mmap_leak_check:
-            return
-        self.parser.compile_time_vm.invoke(
+        if name in self.parser.compile_time_vm._ct_executed:
+            return 0
+        return self.parser.compile_time_vm.invoke(
             word,
             runtime_mode=True,
             libs=libs,
             mmap_leak_check=mmap_leak_check,
+            argv=argv,
         )
 
     def run_compile_time_word_repl(self, name: str, *, libs: Optional[List[str]] = None) -> None:
@@ -20870,6 +21160,43 @@ def run_linker(obj_path: Path, exe_path: Path, debug: bool = False, libs=None, *
     _run_cmd(cmd)
 
 
+def _render_source_embed_asm(source_text: str) -> str:
+    payload = source_text.encode("utf-8")
+    db_bytes = payload + b"\0"
+    lines: List[str] = [
+        "section .data",
+        "global l2_source_embed",
+        "global l2_source_embed_len",
+        "align 8",
+        "l2_source_embed:",
+    ]
+    chunk_size = 16
+    for idx in range(0, len(db_bytes), chunk_size):
+        chunk = db_bytes[idx:idx + chunk_size]
+        encoded = ", ".join(f"0x{byte:02x}" for byte in chunk)
+        lines.append(f"    db {encoded}")
+    lines.extend(
+        [
+            "align 8",
+            "l2_source_embed_len:",
+            f"    dq {len(payload)}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _append_source_embed_to_asm(asm_text: str, source_text: Optional[str]) -> str:
+    if not source_text:
+        return asm_text
+    if "l2_source_embed:" in asm_text:
+        return asm_text
+    embed_block = _render_source_embed_asm(source_text)
+    trimmed = asm_text.rstrip()
+    if not trimmed:
+        return embed_block
+    return f"{trimmed}\n\n{embed_block}"
+
+
 def build_static_library(obj_path: Path, archive_path: Path) -> None:
     import subprocess
     parent = archive_path.parent
@@ -20883,6 +21210,7 @@ def _load_sidecar_meta_libs(source: Path) -> List[str]:
     meta_path = source.with_suffix(".meta.json")
     if not meta_path.exists():
         return []
+    ct_run_exit_code = 0
     try:
         import json
         payload = json.loads(meta_path.read_text())
@@ -24280,9 +24608,21 @@ def cli(argv: Sequence[str]) -> int:
     )
     parser.add_argument("--ct-run-main", action="store_true", help="execute 'main' via the compile-time VM after parsing")
     parser.add_argument(
+        "--ct-argv",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="append argv item used during --ct-run-main/--script execution (repeatable)",
+    )
+    parser.add_argument(
         "--leak-check",
         action="store_true",
         help="run 'main' in CTVM, intercept mmap/munmap/mremap syscalls, and fail on leaked mappings",
+    )
+    parser.add_argument(
+        "--source-embed",
+        action="store_true",
+        help="embed expanded source code into the final artifact",
     )
     parser.add_argument("--no-artifact", action="store_true", help="compile source but skip producing final output artifact")
     parser.add_argument("--docs", action="store_true", help="open searchable TUI for word/function documentation")
@@ -25081,10 +25421,34 @@ def cli(argv: Sequence[str]) -> int:
             print(f"[info] wrote {cfg_output}")
 
         if args.ct_run_main:
-            compiler.run_compile_time_word(
-                "main",
+            bridge_source = compiler._last_loaded_source if args.source_embed else None
+            compiler.parser.compile_time_vm.set_runtime_embedded_source(bridge_source)
+        else:
+            compiler.parser.compile_time_vm.set_runtime_embedded_source(None)
+
+        if args.ct_run_main:
+            ct_entry = "main"
+            start_word = compiler.dictionary.lookup("_start")
+            if start_word is not None and start_word.definition is not None:
+                ct_entry = "_start"
+
+            ct_argv0_path = args.output if args.output is not None else Path("a.out")
+            try:
+                rel_argv0 = os.path.relpath(str(ct_argv0_path), start=os.getcwd())
+                if rel_argv0 and not rel_argv0.startswith("..") and not os.path.isabs(rel_argv0):
+                    ct_argv0 = rel_argv0 if rel_argv0.startswith("./") else f"./{rel_argv0}"
+                else:
+                    ct_argv0 = str(ct_argv0_path)
+            except Exception:
+                ct_argv0 = str(ct_argv0_path)
+
+            ct_runtime_argv = [ct_argv0, *[str(item) for item in (args.ct_argv or [])]]
+
+            ct_run_exit_code = compiler.run_compile_time_word(
+                ct_entry,
                 libs=ct_run_libs,
                 mmap_leak_check=args.leak_check,
+                argv=ct_runtime_argv,
             )
             if args.leak_check:
                 has_issues, summary = compiler.parser.compile_time_vm.mmap_leak_check_report()
@@ -25092,6 +25456,9 @@ def cli(argv: Sequence[str]) -> int:
                     print(summary, file=sys.stderr)
                     return 1
                 print(summary)
+
+        if args.source_embed and not ct_only_parse:
+            asm_text = _append_source_embed_to_asm(asm_text, compiler._last_loaded_source)
     except (ParseError, CompileError, CompileTimeError) as exc:
         # Print all collected diagnostics in Rust-style format
         use_color = _diagnostic_color_enabled()
@@ -25143,7 +25510,7 @@ def cli(argv: Sequence[str]) -> int:
 
     if ct_only_parse and args.no_artifact:
         print("[info] skipped artifact generation (--no-artifact)")
-        return 0
+        return ct_run_exit_code if args.ct_run_main else 0
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")
@@ -25164,7 +25531,7 @@ def cli(argv: Sequence[str]) -> int:
 
     if args.no_artifact:
         print("[info] skipped artifact generation (--no-artifact)")
-        return 0
+        return ct_run_exit_code if args.ct_run_main else 0
 
     # --- incremental: skip nasm if .o newer than .asm ---
     need_nasm = args.force or asm_changed or not obj_path.exists()

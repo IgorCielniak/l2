@@ -1,0 +1,4 @@
+{
+  "use_l2eval": true,
+  "compile_args": ["--source-embed"]
+}

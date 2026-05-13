@@ -76,6 +76,8 @@ def _parse_strict_force_source(argv):
         if tok == "--force":
             saw_force = True
             continue
+        if tok in ("-s", "--silent"):
+            continue
         if tok.startswith("-"):
             return None
         if source_token is None:
@@ -98,6 +100,8 @@ def _parse_strict_no_cache_source(argv):
         if tok == "--no-cache":
             saw_no_cache = True
             continue
+        if tok in ("-s", "--silent"):
+            continue
         if tok.startswith("-"):
             return None
         if source_token is None:
@@ -109,6 +113,10 @@ def _parse_strict_no_cache_source(argv):
     if os.path.splitext(source_token)[1].lower() != ".sl":
         return None
     return source_token
+
+
+def _argv_requests_silent(argv):
+    return any(tok in ("-s", "--silent") for tok in argv)
 
 
 def _request_force_worker_line(line):
@@ -223,12 +231,14 @@ def _try_ultra_fast_force(argv):
     source_token = _parse_strict_force_source(argv)
     if source_token is None:
         return None
+    silent = _argv_requests_silent(argv)
 
     for _attempt in range(2):
         try:
             rc, detail = _run_force_worker_request(source_token)
             if rc == 0:
-                print("[info] built a.out")
+                if not silent:
+                    print("[info] built a.out")
                 return 0
             if detail:
                 if not detail.endswith("\n"):

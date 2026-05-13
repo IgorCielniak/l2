@@ -42,6 +42,7 @@ word memcpy
     r> dup -rot - swap
 end
 
+# for qword values, for byte by byte seting see memset_bytes
 #memset [*, addr, len | value] -> [*]
 word memset
     swap
@@ -60,6 +61,7 @@ word memset_bytes
     2drop drop
 end
 
+# for qword values, for byte by byte dumping see memdump_bytes
 #memdump [*, addr | len] -> [* | addr]
 word memdump
     for
@@ -82,8 +84,24 @@ word realloc
     swap -rot free
 end
 
-#stack_pointer [*] -> [* | rsp]
+#stack_pointer [*] -> [* | r12]
 :asm stack_pointer {
+    mov rax, r12
+    sub r12, 8
+    mov [r12], rax
+}
+;
+
+#get_stack_top [*] -> [* | r12]
+:asm get_stack_top {
+    mov rax, r12
+    sub r12, 8
+    mov [r12], rax
+}
+;
+
+#native_stack_pointer [*] -> [* | rsp]
+:asm native_stack_pointer {
     mov rax, rsp
     sub r12, 8
     mov [r12], rax
@@ -100,8 +118,19 @@ end
 }
 ;
 
-#stack_soft_limit_bytes [*] -> [* | bytes_or_neg_errno]
+#stack_soft_limit_bytes [*] -> [* | bytes]
+# Exact program data-stack capacity (dstack..dstack_top).
 :asm stack_soft_limit_bytes {
+    lea rax, [rel dstack_top]
+    lea rbx, [rel dstack]
+    sub rax, rbx
+    sub r12, 8
+    mov [r12], rax
+}
+;
+
+#native_stack_soft_limit_bytes [*] -> [* | bytes] || [* | neg_errno]
+:asm native_stack_soft_limit_bytes {
     sub rsp, 16
     mov rax, 97             ; getrlimit
     mov rdi, 3              ; RLIMIT_STACK
@@ -121,46 +150,113 @@ end
 }
 ;
 
-#stack_bounds_estimate [*] -> [*, low | high]
-word stack_bounds_estimate
-    stack_soft_limit_bytes
-    stack_pointer
-    over + swap
-end
+#stack_bounds [*] -> [*, low | high]
+:asm stack_bounds {
+    lea rax, [rel dstack]       ; low
+    lea rbx, [rel dstack_top]   ; high
+    sub r12, 8
+    mov [r12], rax
+    sub r12, 8
+    mov [r12], rbx
+}
+;
 
-#is_stack_addr [* | addr] -> [* | flag]
-:asm is_stack_addr {
-    mov rbx, [r12]          ; addr
-    add r12, 8
-
-    ; r15 = current stack top estimate (saved rsp before temp frame)
+#native_stack_bounds_estimate [*] -> [*, low | high]
+:asm native_stack_bounds_estimate {
     mov r15, rsp
-
-    ; getrlimit(RLIMIT_STACK, &rlim)
     sub rsp, 16
     mov rax, 97
     mov rdi, 3
     mov rsi, rsp
     syscall
     cmp rax, 0
-    jl .false
+    jl .fail
 
     mov rcx, [rsp]          ; soft stack limit
+    add rsp, 16
     mov rdx, r15            ; high
-    sub rdx, rcx            ; low approx = high - soft_limit
+    cmp rcx, -1             ; RLIM_INFINITY => unknown low bound
+    je .infinite
+    mov rax, rdx
+    sub rax, rcx            ; low estimate = high - soft_limit
+    jmp .push
+
+.infinite:
+    xor rax, rax
+    jmp .push
+
+.fail:
+    add rsp, 16
+    xor rax, rax
+    xor rdx, rdx
+
+.push:
+    sub r12, 8
+    mov [r12], rax
+    sub r12, 8
+    mov [r12], rdx
+}
+;
+
+#is_stack_addr [* | addr] -> [* | flag]
+# Exact check against L2 program data-stack allocation.
+:asm is_stack_addr {
+    mov rbx, [r12]          ; addr
+    add r12, 8
+
+    lea rcx, [rel dstack]       ; low
+    lea rdx, [rel dstack_top]   ; high
+
+    cmp rbx, rcx
+    jb .false
+    cmp rbx, rdx
+    ja .false
+
+    sub r12, 8
+    mov qword [r12], 1
+    ret
+
+.false:
+    sub r12, 8
+    mov qword [r12], 0
+}
+;
+
+#is_native_stack_addr [* | addr] -> [* | flag]
+# Uses RLIMIT_STACK, so this is a best-effort native stack check.
+:asm is_native_stack_addr {
+    mov rbx, [r12]          ; addr
+    add r12, 8
+
+    mov r15, rsp            ; high estimate
+    sub rsp, 16
+    mov rax, 97
+    mov rdi, 3
+    mov rsi, rsp
+    syscall
+    cmp rax, 0
+    jl .fail
+
+    mov rcx, [rsp]          ; soft stack limit
+    add rsp, 16
+    cmp rcx, -1
+    je .false
+
+    mov rdx, r15
+    sub rdx, rcx            ; low estimate
 
     cmp rbx, rdx
     jb .false
     cmp rbx, r15
     ja .false
 
-    add rsp, 16
     sub r12, 8
     mov qword [r12], 1
     ret
 
-.false:
+.fail:
     add rsp, 16
+.false:
     sub r12, 8
     mov qword [r12], 0
 }
@@ -177,7 +273,10 @@ end
     syscall
     mov r14, rax
 
-    lea r15, [rel data_end] ; conservative low bound for classic brk heap
+    ; Place the floor above the runtime .bss area so data/return stacks and
+    ; static buffers are not misclassified as brk-heap addresses.
+    lea r15, [rel list_capture_stack]
+    add r15, 8192             ; list_capture_stack: resq 1024
 
     cmp rbx, r15
     jb .false
@@ -199,10 +298,14 @@ word is_mmap_addr
     dup is_stack_addr if
         drop 0
     else
-        dup is_brk_heap_addr if
+        dup is_native_stack_addr if
             drop 0
         else
-            brk_current >=
+            dup is_brk_heap_addr if
+                drop 0
+            else
+                brk_current >=
+            end
         end
     end
 end

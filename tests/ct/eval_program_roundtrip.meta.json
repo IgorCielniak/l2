@@ -1,0 +1,4 @@
+{
+  "description": "compile-time eval_program roundtrip test",
+  "use_l2eval": true
+}

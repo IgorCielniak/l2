@@ -1,10 +1,8 @@
-extern eval 2 0
 extern eval_program 2 1
 
 import stdlib.sl
 
 word main
-   "eval_program:" puts cr
    "import stdlib.sl word main 1 2 + puti cr end" eval_program drop
    "import stdlib.sl word main 99 puti cr end" eval_program drop
    "import stdlib.sl word main 5 5 * 3 + puti cr end" eval_program drop
@@ -15,22 +13,6 @@ word main
    "import stdlib.sl word main 42 puti cr end" eval_program drop
    "import stdlib.sl word main 777 puti cr end" eval_program drop
    "import stdlib.sl word main 888 puti cr end" eval_program drop
-
-   "eval:" puts cr
-   "word square dup * end" eval drop
-   "7 square" eval puti cr
-   "word twice dup + end" eval drop
-   "9 twice" eval puti cr
-   "word combo dup square swap twice + end" eval drop
-   "3 combo" eval puti cr
-   "word remix dup square swap twice + end" eval drop
-   "4 remix" eval puti cr
-   "word inc 1 + end" eval drop
-   "41 inc" eval puti cr
-   "word composed dup square swap twice + dup + end" eval drop
-   "2 composed" eval puti cr
-
-   "test complete" puts cr
+   "eval_program ok" puts cr
    0
 end
-

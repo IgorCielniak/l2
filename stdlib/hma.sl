@@ -17,7 +17,7 @@ import gvars.sl
 # halloc/hfree/hrealloc auto-initialize the heap.
 # Regions are automatically unmapped when completely freed.
 
-sized_global h_state 32
+sized_global h_state 40
 
 # ---- State accessors ----
 
@@ -51,6 +51,14 @@ end
 
 word h_grow_size!
     h_state 24 + swap !
+end
+
+word h_alloc_count@
+    h_state 32 + @
+end
+
+word h_alloc_count!
+    h_state 32 + swap !
 end
 
 # ---- Region node accessors ----
@@ -296,6 +304,7 @@ word hinit
     0 h_free_head!
     0 h_regions!
     0 h_grow_size!
+    0 h_alloc_count!
     0 h_init_flag!
     dup 0 <= if drop 1048576 end
     h_page_align
@@ -306,6 +315,7 @@ word hinit
 end
 
 # hshutdown [*] -> [*]
+# Releases all allocator regions and resets allocator state.
 word hshutdown
     h_regions@
     while dup 0 != do
@@ -318,6 +328,7 @@ word hshutdown
     0 h_regions!
     0 h_free_head!
     0 h_grow_size!
+    0 h_alloc_count!
     0 h_init_flag!
 end
 
@@ -337,6 +348,7 @@ end
 # ---- Public API ----
 
 # halloc [* | size] -> [* | ptr]
+# On successful allocation increments allocation count.
 word halloc
     h_ensure_init
     h_req_block_size
@@ -373,10 +385,12 @@ word halloc
         1 h_block_set
         drop
     end
+    h_alloc_count@ 1 + h_alloc_count!
     rdrop
 end
 
 # hfree [* | ptr] -> [*]
+# Decrements allocation count; if it reaches zero, calls hshutdown.
 word hfree
     h_init_flag@ 0 == if drop ret end
     dup 0 == if drop ret end
@@ -412,6 +426,16 @@ word hfree
         h_free_list_insert
     end
     drop
+
+    h_alloc_count@ dup 0 > if
+        1 - dup h_alloc_count!
+        0 == if
+            hshutdown
+        end
+    else
+        drop
+    end
+
     rdrop
 end
 

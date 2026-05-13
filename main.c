@@ -15,17 +15,23 @@
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 
 int l2_cli(int argc, char **argv);
-int eval(const char *source, long source_len);
-int eval_cstr(const char *source);
 void eval_env(const char *source, long source_len, long stack_top_addr);
 int eval_program(const char *source, long source_len);
 int eval_program_cstr(const char *source);
+const char *l2_get_source_from_embedded(const char *func_name, long *out_len);
+void l2_set_embedded_source(const char *source, long source_len);
+void l2_set_eval_stack_top(uintptr_t stack_top_addr);
 // Legacy aliases for backward compatibility
 int l2_eval(const char *source, long source_len);
 int l2_eval_cstr(const char *source);
 int l2_eval_program(const char *source, long source_len);
 int l2_eval_inline(const char *source, long source_len);
 int l2_eval_inline_cstr(const char *source);
+void eval(const char *source, long source_len);
+int eval_cstr(const char *source);
+int eval_scalar(const char *source, long source_len);
+
+
 
 static void *xmalloc(size_t size) {
     void *ptr = malloc(size);
@@ -35,6 +41,9 @@ static void *xmalloc(size_t size) {
     }
     return ptr;
 }
+
+
+
 
 static void *xrealloc(void *ptr, size_t size) {
     void *out = realloc(ptr, size);
@@ -241,6 +250,10 @@ typedef struct {
 typedef struct Word Word;
 typedef struct CompileTimeVM CompileTimeVM;
 typedef struct Parser Parser;
+
+/* forward-declare ct intrinsic used in bootstrap */
+static void ct_intrinsic_eval_program(CompileTimeVM *vm);
+
 
 typedef void (*MacroFn)(Parser *parser);
 typedef void (*IntrinsicEmitter)(FunctionEmitter *builder);
@@ -673,6 +686,12 @@ struct Parser {
     bool uses_libm;
     char *primary_path;
 };
+
+/* forward declarations for helpers used by CT eval intrinsic */
+static char *path_dirname(const char *path);
+static char *l2_default_root_dir(void);
+static char *expand_imports_from_source(const char *content, const char *base_dir, StrVec *include_dirs, StrMap *visited, FileSpanVec *spans, int *line_counter);
+static void parse_tokens(Parser *parser, const char *source);
 
 typedef enum {
     CT_NIL,
@@ -1302,11 +1321,13 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
     if (strcmp(word->name, "puti") == 0) {
         int64_t v = ct_pop_int(vm);
         fprintf(stdout, "%lld", (long long)v);
+        fflush(stdout);
         return true;
     }
     if (strcmp(word->name, "putu") == 0) {
         int64_t v = ct_pop_int(vm);
         fprintf(stdout, "%llu", (unsigned long long)v);
+        fflush(stdout);
         return true;
     }
     if (strcmp(word->name, "print") == 0) {
@@ -1323,6 +1344,7 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
             free(txt);
         }
         fputc('\n', stdout);
+        fflush(stdout);
         return true;
     }
     if (asm_def && asm_def->effect_string_io) {
@@ -1333,12 +1355,14 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
                 out = stderr;
             }
             fputs(v.as.str ? v.as.str : "", out);
+            fflush(out);
         } else if (v.kind == CT_TOKEN) {
             FILE *out = stdout;
             if (strcmp(word->name, "ewrite_buf") == 0) {
                 out = stderr;
             }
             fputs(v.as.token.lexeme ? v.as.token.lexeme : "", out);
+            fflush(out);
         } else {
             ct_stack_pop(&vm->stack);
         }
@@ -1353,6 +1377,7 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
             ch = (unsigned char)v.as.str[0];
         }
         fputc(ch, stdout);
+        fflush(stdout);
         return true;
     }
     return false;
@@ -1524,6 +1549,11 @@ static void ct_word_call(CompileTimeVM *vm, Word *word) {
         def = word->ct_definition;
     }
     if (!def) {
+        if (word->ct_intrinsic) {
+            word->ct_intrinsic(vm);
+            vm->call_stack.len--;
+            return;
+        }
         if (word->asm_def || word->ct_asm_def) {
             AsmDefinition *asm_def = word->ct_asm_def ? word->ct_asm_def : word->asm_def;
             ct_try_asm_io(vm, word, asm_def);
@@ -2532,6 +2562,7 @@ static void ct_intrinsic_bss_set(CompileTimeVM *vm) {
     ct_intrinsic_bss_append(vm);
 }
 
+
 static Word *register_ct_intrinsic(Dictionary *dict, const char *name, CompileTimeIntrinsic fn) {
     Word *word = dictionary_lookup(dict, name);
     if (!word) {
@@ -2622,6 +2653,7 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "bss-clear", ct_intrinsic_bss_clear);
     register_ct_intrinsic(dict, "bss-append", ct_intrinsic_bss_append);
     register_ct_intrinsic(dict, "bss-set", ct_intrinsic_bss_set);
+    register_ct_intrinsic(dict, "eval_program", ct_intrinsic_eval_program);
     register_ct_intrinsic(dict, "use-l2-ct", ct_intrinsic_use_l2_ct);
     register_ct_intrinsic(dict, "shunt", ct_intrinsic_shunt);
     register_ct_intrinsic(dict, "emit-definition", ct_intrinsic_emit_definition);
@@ -3198,6 +3230,40 @@ static char *emission_snapshot(Emission *emission) {
     return buf;
 }
 
+/* helper prototypes (defined later) */
+static Emission emit_module(Parser *parser, Dictionary *dict, bool debug);
+static char *emission_snapshot(Emission *emission);
+static char *make_eval_workdir(void);
+static void write_file(const char *path, const char *data);
+static void run_nasm(const char *asm_path, const char *obj_path, bool debug);
+static void run_linker(const char *obj_path, const char *exe_path, bool debug, StrVec *libs, bool shared, bool use_libc);
+static void run_cmd(char *const argv[]);
+static void cleanup_eval_workdir(const char *work_dir);
+
+static void ct_intrinsic_eval_program(CompileTimeVM *vm) {
+    long source_len = -1;
+    char *source = NULL;
+    if (vm->stack.len >= 2 && vm->stack.data[vm->stack.len - 1].kind == CT_INT && vm->stack.data[vm->stack.len - 2].kind == CT_STR) {
+        source_len = (long)ct_pop_int(vm);
+        source = ct_pop_str(vm);
+    } else {
+        source = ct_pop_str(vm);
+        if (source) {
+            source_len = (long)strlen(source);
+        }
+    }
+    if (!source) {
+        ct_stack_push(&vm->stack, ct_make_int(0));
+        return;
+    }
+
+    /* Call the runtime eval_program which uses the CT VM internally.
+       This ensures IO (puti, print, etc.) is executed at compile time. */
+    int result = eval_program(source, source_len);
+    ct_stack_push(&vm->stack, ct_make_int((int64_t)result));
+    free(source);
+}
+
 static void write_file(const char *path, const char *data) {
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -3289,12 +3355,64 @@ typedef struct {
     StrVec include_dirs;
     char *root_dir;
     char *stdlib_dir;
+    bool embedded_seeded;
 } L2EvalContext;
 
 static L2EvalContext g_eval_ctx;
 static L2EvalContext g_eval_env_ctx;
 
+static uintptr_t g_l2_eval_stack_top_override = 0;
+static char *g_l2_source_embed_owned = NULL;
+static const unsigned char *g_l2_source_embed_ptr = NULL;
+static size_t g_l2_source_embed_len = 0;
+
+static const unsigned char *l2_eval_get_embedded_source(size_t *out_len);
+
+void l2_set_eval_stack_top(uintptr_t stack_top_addr) {
+    g_l2_eval_stack_top_override = stack_top_addr;
+}
+
+void l2_set_embedded_source(const char *source, long source_len) {
+    free(g_l2_source_embed_owned);
+    g_l2_source_embed_owned = NULL;
+    g_l2_source_embed_ptr = NULL;
+    g_l2_source_embed_len = 0;
+
+    if (!source || source_len <= 0) {
+        return;
+    }
+
+    size_t len = (size_t)source_len;
+    g_l2_source_embed_owned = (char *)xmalloc(len + 1);
+    memcpy(g_l2_source_embed_owned, source, len);
+    g_l2_source_embed_owned[len] = '\0';
+    g_l2_source_embed_ptr = (const unsigned char *)g_l2_source_embed_owned;
+    g_l2_source_embed_len = len;
+}
+
+#ifdef L2_AS_LIBRARY
+extern unsigned char dstack_top __attribute__((weak));
+static unsigned char l2_eval_fallback_stack[8 * 1024 * 1024];
+
+static uintptr_t l2_eval_stack_top_addr(void) {
+    if (g_l2_eval_stack_top_override != 0) {
+        return g_l2_eval_stack_top_override;
+    }
+    if (&dstack_top != NULL) {
+        return (uintptr_t)&dstack_top;
+    }
+    return (uintptr_t)(l2_eval_fallback_stack + sizeof(l2_eval_fallback_stack));
+}
+#else
 extern unsigned char dstack_top;
+
+static uintptr_t l2_eval_stack_top_addr(void) {
+    if (g_l2_eval_stack_top_override != 0) {
+        return g_l2_eval_stack_top_override;
+    }
+    return (uintptr_t)&dstack_top;
+}
+#endif
 
 static char *l2_default_root_dir(void);
 
@@ -3314,6 +3432,7 @@ static void l2_eval_ctx_init(L2EvalContext *ctx) {
     VEC_INIT(&ctx->include_dirs);
     VEC_PUSH(&ctx->include_dirs, str_dup(ctx->root_dir));
     VEC_PUSH(&ctx->include_dirs, str_dup(ctx->stdlib_dir));
+    ctx->embedded_seeded = false;
     ctx->initialized = true;
 }
 
@@ -3327,6 +3446,44 @@ static void l2_eval_ctx_prepare_parser(L2EvalContext *ctx) {
     ctx->vm.loop_initial.len = 0;
     ctx->vm.call_stack.len = 0;
 }
+
+static void l2_eval_seed_embedded_program(L2EvalContext *ctx) {
+    if (!ctx || ctx->embedded_seeded) {
+        return;
+    }
+    size_t embed_len = 0;
+    const unsigned char *embed_source = l2_eval_get_embedded_source(&embed_len);
+    if (!embed_source || embed_len == 0) {
+        ctx->embedded_seeded = true;
+        return;
+    }
+
+    char *owned_source = (char *)xmalloc(embed_len + 1);
+    memcpy(owned_source, embed_source, embed_len);
+    owned_source[embed_len] = '\0';
+    char *root_dir = str_dup(ctx->root_dir ? ctx->root_dir : l2_default_root_dir());
+    StrMap visited;
+    FileSpanVec spans;
+    VEC_INIT(&spans);
+    strmap_init(&visited);
+    int line_counter = 1;
+    char *expanded = expand_imports_from_source(owned_source, root_dir, &ctx->include_dirs, &visited, &spans, &line_counter);
+    if (expanded && *expanded) {
+        parse_tokens(&ctx->parser, expanded);
+    }
+
+    for (size_t i = 0; i < spans.len; i++) {
+        free(spans.data[i].path);
+    }
+    VEC_FREE(&spans);
+    strmap_free(&visited);
+    free(expanded);
+    free(root_dir);
+    free(owned_source);
+    ctx->embedded_seeded = true;
+}
+
+static int l2_eval_inline_with_ctx(L2EvalContext *ctx, const char *source, long source_len);
 
 static char *make_eval_workdir(void) {
     char *tmpl = str_dup("/tmp/l2eval_XXXXXX");
@@ -3538,6 +3695,388 @@ static char *path_join(const char *a, const char *b) {
     return str_printf("%s%s%s", a, has_sep ? "" : "/", b);
 }
 
+#if defined(__GNUC__)
+extern const unsigned char l2_source_embed[] __attribute__((weak));
+extern const unsigned long long l2_source_embed_len __attribute__((weak));
+#else
+extern const unsigned char l2_source_embed[];
+extern const unsigned long long l2_source_embed_len;
+#endif
+
+static const unsigned char *l2_eval_get_embedded_source(size_t *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+
+    if (g_l2_source_embed_ptr && g_l2_source_embed_len > 0) {
+        if (out_len) {
+            *out_len = g_l2_source_embed_len;
+        }
+        return g_l2_source_embed_ptr;
+    }
+
+    if (&l2_source_embed_len == NULL || &l2_source_embed == NULL) {
+        return NULL;
+    }
+    size_t len = (size_t)l2_source_embed_len;
+    if (len == 0) {
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = len;
+    }
+    return l2_source_embed;
+}
+
+static void rstrip_inplace(char *text) {
+    if (!text) {
+        return;
+    }
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) {
+        text[--len] = '\0';
+    }
+}
+
+static bool source_token_equals(const char *source, size_t start, size_t end, const char *text) {
+    size_t text_len = strlen(text);
+    return (end >= start) && (end - start == text_len) && memcmp(source + start, text, text_len) == 0;
+}
+
+static bool source_next_token(const char *source, size_t source_len, size_t *cursor, size_t *start_out, size_t *end_out) {
+    size_t pos = *cursor;
+    while (pos < source_len) {
+        unsigned char ch = (unsigned char)source[pos];
+        if (isspace(ch)) {
+            pos++;
+            continue;
+        }
+        if (ch == '#') {
+            while (pos < source_len && source[pos] != '\n') {
+                pos++;
+            }
+            continue;
+        }
+        break;
+    }
+    if (pos >= source_len) {
+        *cursor = pos;
+        return false;
+    }
+
+    size_t start = pos;
+    char ch = source[pos];
+    if (ch == '"') {
+        pos++;
+        while (pos < source_len) {
+            if (source[pos] == '\\' && pos + 1 < source_len) {
+                pos += 2;
+                continue;
+            }
+            if (source[pos] == '"') {
+                pos++;
+                break;
+            }
+            pos++;
+        }
+    } else if (ch == '(' || ch == ')' || ch == '{' || ch == '}' || ch == '[' || ch == ']' || ch == ';') {
+        pos++;
+    } else {
+        while (pos < source_len) {
+            ch = source[pos];
+            if (isspace((unsigned char)ch) || ch == '#' || ch == '(' || ch == ')' || ch == '{' || ch == '}' || ch == '[' || ch == ']' || ch == ';') {
+                break;
+            }
+            pos++;
+        }
+    }
+
+    *cursor = pos;
+    *start_out = start;
+    *end_out = pos;
+    return true;
+}
+
+static char *trim_definition_source_text(char *text) {
+    if (!text) {
+        return NULL;
+    }
+    rstrip_inplace(text);
+    return text;
+}
+
+static char *copy_embedded_source_slice(size_t start, size_t end, long *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    size_t source_len = 0;
+    const unsigned char *embed_source = l2_eval_get_embedded_source(&source_len);
+    if (!embed_source) {
+        return NULL;
+    }
+    if (source_len == 0 || start >= end || end > source_len) {
+        return NULL;
+    }
+    char *copy = (char *)xmalloc((end - start) + 1);
+    memcpy(copy, embed_source + start, end - start);
+    copy[end - start] = '\0';
+    trim_definition_source_text(copy);
+    if (out_len) {
+        *out_len = (long)strlen(copy);
+    }
+    return copy;
+}
+
+static const char *find_embedded_definition_source(const char *func_name, long *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!func_name || !*func_name) {
+        return NULL;
+    }
+
+    size_t source_len = 0;
+    const unsigned char *embed_source = l2_eval_get_embedded_source(&source_len);
+    if (!embed_source) {
+        return NULL;
+    }
+
+    const char *source = (const char *)embed_source;
+    if (source_len == 0) {
+        return NULL;
+    }
+
+    char *best_copy = NULL;
+    long best_len = 0;
+
+    size_t cursor = 0;
+    while (true) {
+        size_t start = 0;
+        size_t end = 0;
+        if (!source_next_token(source, source_len, &cursor, &start, &end)) {
+            break;
+        }
+        if (!source_token_equals(source, start, end, "word")) {
+            continue;
+        }
+
+        size_t name_start = 0;
+        size_t name_end = 0;
+        if (!source_next_token(source, source_len, &cursor, &name_start, &name_end)) {
+            break;
+        }
+        if (!source_token_equals(source, name_start, name_end, func_name)) {
+            continue;
+        }
+
+        size_t body_start = start;
+        size_t depth = 0;
+        while (true) {
+            size_t body_tok_start = 0;
+            size_t body_tok_end = 0;
+            if (!source_next_token(source, source_len, &cursor, &body_tok_start, &body_tok_end)) {
+                break;
+            }
+            if (source_token_equals(source, body_tok_start, body_tok_end, "if") ||
+                source_token_equals(source, body_tok_start, body_tok_end, "for") ||
+                source_token_equals(source, body_tok_start, body_tok_end, "while") ||
+                source_token_equals(source, body_tok_start, body_tok_end, "with")) {
+                depth++;
+                continue;
+            }
+            if (source_token_equals(source, body_tok_start, body_tok_end, "end")) {
+                if (depth == 0) {
+                    free(best_copy);
+                    best_copy = copy_embedded_source_slice(body_start, body_tok_end, &best_len);
+                    goto next_definition_word;
+                }
+                depth--;
+            }
+        }
+
+next_definition_word:
+        continue;
+    }
+
+    cursor = 0;
+    while (true) {
+        size_t start = 0;
+        size_t end = 0;
+        if (!source_next_token(source, source_len, &cursor, &start, &end)) {
+            break;
+        }
+        if (!source_token_equals(source, start, end, ":asm")) {
+            continue;
+        }
+
+        size_t name_start = 0;
+        size_t name_end = 0;
+        if (!source_next_token(source, source_len, &cursor, &name_start, &name_end)) {
+            break;
+        }
+        if (!source_token_equals(source, name_start, name_end, func_name)) {
+            continue;
+        }
+
+        size_t body_start = start;
+        size_t brace_depth = 0;
+        while (true) {
+            size_t body_tok_start = 0;
+            size_t body_tok_end = 0;
+            if (!source_next_token(source, source_len, &cursor, &body_tok_start, &body_tok_end)) {
+                break;
+            }
+            if (source_token_equals(source, body_tok_start, body_tok_end, "{")) {
+                brace_depth++;
+                continue;
+            }
+            if (source_token_equals(source, body_tok_start, body_tok_end, "}")) {
+                if (brace_depth == 0) {
+                    free(best_copy);
+                    best_copy = copy_embedded_source_slice(body_start, body_tok_end, &best_len);
+                    goto next_definition_asm;
+                }
+                brace_depth--;
+            }
+        }
+
+next_definition_asm:
+        continue;
+    }
+
+    if (best_copy && out_len) {
+        *out_len = best_len;
+    }
+    return best_copy;
+}
+
+const char *l2_get_source_from_embedded(const char *func_name, long *out_len) {
+    return find_embedded_definition_source(func_name, out_len);
+}
+
+static bool l2_eval_token_candidate(const char *token) {
+    if (!token || !*token) {
+        return false;
+    }
+    if (token[0] == '"') {
+        return false;
+    }
+    if (strlen(token) == 1 && strchr("(){}[];:+-*/%<>=!&|^~,", token[0]) != NULL) {
+        return false;
+    }
+
+    int64_t parsed = 0;
+    if (try_parse_int(token, &parsed)) {
+        return false;
+    }
+
+    static const char *keywords[] = {
+        "word", "end", ":asm", "if", "else", "for", "while", "with", "begin",
+        "do", "ret", "return", "extern", "priority", "compile-time", "immediate",
+        "runtime", "runtime-only", "inline", "struct", "cstruct", "macro",
+        "import", "include", "bss", "list", "var", "const"
+    };
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strcmp(token, keywords[i]) == 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool l2_eval_strvec_contains(const StrVec *vec, const char *value) {
+    if (!vec || !value) {
+        return false;
+    }
+    for (size_t i = 0; i < vec->len; i++) {
+        if (strcmp(vec->data[i], value) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void l2_eval_preload_word_from_embedded(
+    L2EvalContext *ctx,
+    const char *word_name,
+    StrVec *visited,
+    int depth
+) {
+    if (!ctx || !word_name || !*word_name || depth > 64) {
+        return;
+    }
+    if (l2_eval_strvec_contains(visited, word_name)) {
+        return;
+    }
+    VEC_PUSH(visited, str_dup(word_name));
+
+    long def_len = 0;
+    const char *def_src = find_embedded_definition_source(word_name, &def_len);
+    if (!def_src || def_len <= 0) {
+        return;
+    }
+
+    size_t cursor = 0;
+    size_t source_len = (size_t)def_len;
+    while (true) {
+        size_t tok_start = 0;
+        size_t tok_end = 0;
+        if (!source_next_token(def_src, source_len, &cursor, &tok_start, &tok_end)) {
+            break;
+        }
+        size_t tok_len = tok_end - tok_start;
+        char *token = (char *)xmalloc(tok_len + 1);
+        memcpy(token, def_src + tok_start, tok_len);
+        token[tok_len] = '\0';
+
+        if (l2_eval_token_candidate(token) && !dictionary_lookup(&ctx->dict, token)) {
+            l2_eval_preload_word_from_embedded(ctx, token, visited, depth + 1);
+        }
+        free(token);
+    }
+
+    parse_tokens(&ctx->parser, def_src);
+}
+
+static void l2_eval_preload_eval_dependencies(L2EvalContext *ctx, const char *source) {
+    if (!ctx || !source) {
+        return;
+    }
+    size_t embed_len = 0;
+    if (!l2_eval_get_embedded_source(&embed_len) || embed_len == 0) {
+        return;
+    }
+
+    StrVec visited;
+    VEC_INIT(&visited);
+
+    size_t cursor = 0;
+    size_t source_len = strlen(source);
+    while (true) {
+        size_t tok_start = 0;
+        size_t tok_end = 0;
+        if (!source_next_token(source, source_len, &cursor, &tok_start, &tok_end)) {
+            break;
+        }
+
+        size_t tok_len = tok_end - tok_start;
+        char *token = (char *)xmalloc(tok_len + 1);
+        memcpy(token, source + tok_start, tok_len);
+        token[tok_len] = '\0';
+
+        if (l2_eval_token_candidate(token)) {
+            l2_eval_preload_word_from_embedded(ctx, token, &visited, 0);
+        }
+        free(token);
+    }
+
+    for (size_t i = 0; i < visited.len; i++) {
+        free(visited.data[i]);
+    }
+    VEC_FREE(&visited);
+}
+
 static char *l2_default_root_dir(void) {
     const char *env_root = getenv("L2_ROOT");
     if (env_root && env_root[0] != '\0') {
@@ -3705,6 +4244,123 @@ static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visi
     }
     free(content);
     free(base_dir);
+    return out;
+}
+
+static char *expand_imports_from_source(const char *content, const char *base_dir, StrVec *include_dirs, StrMap *visited, FileSpanVec *spans, int *line_counter) {
+    const char *key = "<eval_source>";
+    if (strmap_has(visited, key)) {
+        return str_dup("");
+    }
+    strmap_set(visited, key, (void *)1);
+    StrVec parts;
+    VEC_INIT(&parts);
+    const char *cursor = content;
+    int local_line = 1;
+    int span_start = *line_counter;
+    int span_local_start = local_line;
+    bool span_active = false;
+    while (*cursor) {
+        const char *line_end = strchr(cursor, '\n');
+        size_t len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+        char *line = (char *)xmalloc(len + 1);
+        memcpy(line, cursor, len);
+        line[len] = '\0';
+        char *trim = line;
+        while (*trim && isspace((unsigned char)*trim)) {
+            trim++;
+        }
+        bool is_import = false;
+        if (str_starts_with(trim, "import") && (trim[6] == ' ' || trim[6] == '\t')) {
+            trim += 6;
+            while (*trim && isspace((unsigned char)*trim)) {
+                trim++;
+            }
+            char *end = trim;
+            while (*end && !isspace((unsigned char)*end) && *end != '#') {
+                end++;
+            }
+            if (end > trim) {
+                char *import_path = (char *)xmalloc((size_t)(end - trim) + 1);
+                memcpy(import_path, trim, (size_t)(end - trim));
+                import_path[end - trim] = '\0';
+                char *resolved = resolve_import(base_dir, import_path, include_dirs);
+                if (!resolved) {
+                    fprintf(stderr, "[error] import not found: %s\n", import_path);
+                    exit(1);
+                }
+                if (span_active) {
+                    FileSpan span = {0};
+                    span.path = str_dup("<eval>");
+                    span.start_line = span_start;
+                    span.end_line = *line_counter;
+                    span.local_start_line = span_local_start;
+                    VEC_PUSH(spans, span);
+                    span_active = false;
+                }
+                char *expanded = expand_imports(resolved, include_dirs, visited, spans, line_counter);
+                if (expanded && *expanded) {
+                    VEC_PUSH(&parts, expanded);
+                }
+                VEC_PUSH(&parts, str_dup("\n"));
+                (*line_counter)++;
+
+                const char *remainder = end;
+                while (*remainder && isspace((unsigned char)*remainder)) {
+                    remainder++;
+                }
+                if (*remainder && *remainder != '#') {
+                    if (!span_active) {
+                        span_start = *line_counter;
+                        span_local_start = local_line;
+                        span_active = true;
+                    }
+                    VEC_PUSH(&parts, str_dup(remainder));
+                    VEC_PUSH(&parts, str_dup("\n"));
+                    (*line_counter)++;
+                }
+
+                local_line++;
+                free(resolved);
+                free(import_path);
+                is_import = true;
+            }
+        }
+        if (!is_import) {
+            if (!span_active) {
+                span_start = *line_counter;
+                span_local_start = local_line;
+                span_active = true;
+            }
+            VEC_PUSH(&parts, line);
+            VEC_PUSH(&parts, str_dup("\n"));
+            (*line_counter)++;
+            local_line++;
+        } else {
+            free(line);
+        }
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+    if (span_active) {
+        FileSpan span = {0};
+        span.path = str_dup("<eval>");
+        span.start_line = span_start;
+        span.end_line = *line_counter;
+        span.local_start_line = span_local_start;
+        VEC_PUSH(spans, span);
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < parts.len; i++) {
+        total += strlen(parts.data[i]);
+    }
+    char *out = (char *)xmalloc(total + 1);
+    out[0] = '\0';
+    for (size_t i = 0; i < parts.len; i++) {
+        strcat(out, parts.data[i]);
+    }
     return out;
 }
 
@@ -4936,12 +5592,12 @@ int l2_cli(int argc, char **argv) {
 int eval_program(const char *source, long source_len) {
     int result = -1;
     char *owned_source = NULL;
-    char *work_dir = NULL;
-    char *source_path = NULL;
-    char *output_path = NULL;
-    char *temp_dir = NULL;
     char *root_dir = NULL;
     char *stdlib_dir = NULL;
+    char *combined = NULL;
+    StrMap visited;
+    FileSpanVec spans;
+    L2EvalContext ctx = {0};
 
     if (!source) {
         fprintf(stderr, "[error] l2_eval received null source\n");
@@ -4957,58 +5613,35 @@ int eval_program(const char *source, long source_len) {
     memcpy(owned_source, source, src_len);
     owned_source[src_len] = '\0';
 
-    work_dir = make_eval_workdir();
-    if (!work_dir) {
-        goto cleanup;
-    }
-
-    source_path = str_printf("%s/input.sl", work_dir);
-    output_path = str_printf("%s/input.out", work_dir);
-    temp_dir = str_printf("%s/build", work_dir);
     root_dir = l2_default_root_dir();
     stdlib_dir = path_join(root_dir, "stdlib");
-    write_file(source_path, owned_source);
-    free(owned_source);
-    owned_source = NULL;
 
-    char *compile_argv[] = {
-        "l2-eval",
-        "-I",
-        root_dir,
-        "-I",
-        stdlib_dir,
-        source_path,
-        "-o",
-        output_path,
-        "--temp-dir",
-        temp_dir,
-        NULL,
-    };
-    int compile_status = run_l2_cli_in_child(10, compile_argv);
-    if (compile_status != 0) {
-        result = -compile_status;
-        goto cleanup;
-    }
+    l2_eval_ctx_init(&ctx);
+    VEC_PUSH(&ctx.include_dirs, str_dup(root_dir));
+    VEC_PUSH(&ctx.include_dirs, str_dup(stdlib_dir));
 
-    char *run_argv[] = {
-        output_path,
-        NULL,
-    };
-    result = run_cmd_status(run_argv);
+    strmap_init(&visited);
+    VEC_INIT(&spans);
+    int line_counter = 1;
+    combined = expand_imports_from_source(owned_source, root_dir, &ctx.include_dirs, &visited, &spans, &line_counter);
+
+    l2_eval_ctx_prepare_parser(&ctx);
+    ctx.parser.file_spans = spans;
+    ctx.parser.primary_path = str_dup("<eval>");
+    char *program = str_printf("%s\nmain\n", combined);
+    result = l2_eval_inline_with_ctx(&ctx, program, (long)strlen(program));
+    free(program);
 
 cleanup:
     if (owned_source) {
         free(owned_source);
     }
-    if (work_dir) {
-        cleanup_eval_workdir(work_dir);
-    }
-    free(source_path);
-    free(output_path);
-    free(temp_dir);
+    free(combined);
     free(root_dir);
     free(stdlib_dir);
-    free(work_dir);
+    if (ctx.parser.primary_path) {
+        free(ctx.parser.primary_path);
+    }
     return result;
 }
 
@@ -5035,16 +5668,6 @@ static int l2_eval_inline_with_ctx(L2EvalContext *ctx, const char *source, long 
     memcpy(owned_source, source, src_len);
     owned_source[src_len] = '\0';
 
-    work_dir = make_eval_workdir();
-    if (!work_dir) {
-        goto cleanup;
-    }
-
-    source_path = str_printf("%s/input.sl", work_dir);
-    write_file(source_path, owned_source);
-    free(owned_source);
-    owned_source = NULL;
-
     root_dir = l2_default_root_dir();
     stdlib_dir = path_join(root_dir, "stdlib");
     (void)stdlib_dir;
@@ -5054,11 +5677,13 @@ static int l2_eval_inline_with_ctx(L2EvalContext *ctx, const char *source, long 
     FileSpanVec spans;
     VEC_INIT(&spans);
     int line_counter = 1;
-    combined = expand_imports(source_path, &ctx->include_dirs, &visited, &spans, &line_counter);
+    combined = expand_imports_from_source(owned_source, root_dir, &ctx->include_dirs, &visited, &spans, &line_counter);
 
     l2_eval_ctx_prepare_parser(ctx);
+    l2_eval_seed_embedded_program(ctx);
     ctx->parser.file_spans = spans;
-    ctx->parser.primary_path = str_dup(source_path);
+    ctx->parser.primary_path = str_dup("<eval>");
+    l2_eval_preload_eval_dependencies(ctx, combined);
     parse_tokens(&ctx->parser, combined);
 
     for (size_t i = 0; i < ctx->parser.module.forms.len; i++) {
@@ -5079,13 +5704,8 @@ static int l2_eval_inline_with_ctx(L2EvalContext *ctx, const char *source, long 
 cleanup:
     free(owned_source);
     free(combined);
-    if (work_dir) {
-        cleanup_eval_workdir(work_dir);
-    }
-    free(source_path);
     free(root_dir);
     free(stdlib_dir);
-    free(work_dir);
     return result;
 }
 
@@ -5136,7 +5756,7 @@ uintptr_t l2_eval_env_compute(const char *source, long source_len, long stack_to
     g_eval_env_ctx.vm.rstack.len = 0;
 
     uintptr_t context_sp = (uintptr_t)stack_top_addr + (uintptr_t)(2 * 8);
-    uintptr_t dstack_top_addr = (uintptr_t)&dstack_top;
+    uintptr_t dstack_top_addr = l2_eval_stack_top_addr();
     if (context_sp > dstack_top_addr) {
         fprintf(stderr, "[error] eval_env stack pointer is above dstack_top\n");
         return context_sp;
@@ -5202,16 +5822,84 @@ void eval_env(const char *source, long source_len, long stack_top_addr) {
 }
 #endif
 
-int eval(const char *source, long source_len) {
+uintptr_t l2_eval_compute(const char *source, long source_len, long stack_top_addr) {
+    if (!source) {
+        fprintf(stderr, "[error] eval received null source\n");
+        return (uintptr_t)stack_top_addr;
+    }
+    if (source_len < 0) {
+        fprintf(stderr, "[error] eval received negative source length\n");
+        return (uintptr_t)stack_top_addr;
+    }
+
     l2_eval_ctx_init(&g_eval_ctx);
-    return l2_eval_inline_with_ctx(&g_eval_ctx, source, source_len);
+    g_eval_ctx.vm.stack.len = 0;
+    g_eval_ctx.vm.rstack.len = 0;
+
+    int rc = l2_eval_inline_with_ctx(&g_eval_ctx, source, source_len);
+    if (rc < 0) {
+        return (uintptr_t)stack_top_addr;
+    }
+
+    uintptr_t new_sp = (uintptr_t)stack_top_addr;
+    if (new_sp == 0) {
+        new_sp = l2_eval_stack_top_addr();
+    }
+    for (size_t i = 0; i < g_eval_ctx.vm.stack.len; i++) {
+        uint64_t cells[2];
+        size_t cell_count = 0;
+        if (!ct_value_to_runtime_cells(&g_eval_ctx.vm.stack.data[i], cells, &cell_count)) {
+            fprintf(stderr, "[error] eval cannot export compile-time value kind %d\n", g_eval_ctx.vm.stack.data[i].kind);
+            return (uintptr_t)stack_top_addr;
+        }
+        for (size_t c = 0; c < cell_count; c++) {
+            new_sp -= 8;
+            *(uint64_t *)new_sp = cells[c];
+        }
+    }
+    return new_sp;
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((naked))
+void eval(const char *source, long source_len) {
+    __asm__ volatile(
+        "mov %r12, %rdx\n"
+        "sub $8, %rsp\n"
+        "call l2_eval_compute\n"
+        "add $8, %rsp\n"
+        "mov %rax, %r12\n"
+        "ret\n"
+    );
+}
+#else
+void eval(const char *source, long source_len) {
+    (void)source; (void)source_len;
+    fprintf(stderr, "[error] eval (stack-returning) is only supported on x86_64 with GCC/Clang\n");
+}
+#endif
+
+int eval_scalar(const char *source, long source_len) {
+    if (!source) {
+        return -1;
+    }
+    uintptr_t sp = l2_eval_compute(source, source_len, 0);
+    if (sp == 0) {
+        return -1;
+    }
+    // Get the last value from the returned stack
+    if (sp >= l2_eval_stack_top_addr()) {
+        return 0;
+    }
+    int64_t result = *(int64_t *)sp;
+    return (int)result;
 }
 
 int eval_cstr(const char *source) {
     if (!source) {
         return -1;
     }
-    return eval(source, (long)strlen(source));
+    return eval_scalar(source, (long)strlen(source));
 }
 
 int eval_program_cstr(const char *source) {
@@ -5223,11 +5911,11 @@ int eval_program_cstr(const char *source) {
 
 // Legacy aliases for backward compatibility
 int l2_eval(const char *source, long source_len) {
-    return eval_program(source, source_len);
+    return eval_scalar(source, source_len);
 }
 
 int l2_eval_cstr(const char *source) {
-    return eval_program_cstr(source);
+    return eval_cstr(source);
 }
 
 int l2_eval_program(const char *source, long source_len) {
@@ -5235,7 +5923,7 @@ int l2_eval_program(const char *source, long source_len) {
 }
 
 int l2_eval_inline(const char *source, long source_len) {
-    return eval(source, source_len);
+    return eval_scalar(source, source_len);
 }
 
 int l2_eval_inline_cstr(const char *source) {

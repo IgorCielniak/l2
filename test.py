@@ -52,18 +52,6 @@ DOC_EXAMPLE_RE = re.compile(r"^\s*Example:\s*$", re.IGNORECASE)
 DOC_L2_KEYWORD_RE = re.compile(r"\b(word|macro|:asm|:py|compile-time|compile-only|runtime|runtime-only|extern|import|struct|cstruct)\b")
 DOC_PLACEHOLDER_RE = re.compile(r"<[A-Za-z_][^>\n]*>")
 DOC_SKIP_MARKER_RE = re.compile(r"(?im)^\s*(?:#\s*)?(?:docs:skip-check|l2-test:skip)\b")
-SCRIPT_RUNTIME_SENSITIVE_RE = re.compile(
-    r"(?m)^\s*extern\b"
-    r"|\bargv@\b"
-    r"|\bargc\b"
-    r"|\bcatch_runtime_error\b"
-    r"|\btry_with_error\b"
-    r"|\bassert_msg\b"
-    r"|\bstack_pointer\b"
-    r"|\bis_(?:mmap|brk_heap|stack)_addr\b"
-    r"|\bbrk_current\b"
-    r"|:asm\s+_start\b",
-)
 
 
 def colorize(text: str, color: str) -> str:
@@ -658,45 +646,30 @@ class TestRunner:
     def _script_mode_for_case(self, case: TestCase) -> bool:
         if not self.args.script:
             return False
-        if self._is_example_source(case.source):
-            return False
         if case.config.expect_compile_error:
             return False
-        if case.config.expected_exit != 0:
-            return False
-        if case.config.args is not None or case.config.stdin is not None:
-            return False
-        if case.config.use_l2eval:
-            return False
-        if case.config.libs:
-            return False
-        artifact = self._extract_artifact_from_compile_args(case.config.compile_args)
-        if artifact not in (None, "exe"):
-            return False
-        source_text = case.source.read_text(encoding="utf-8", errors="ignore")
-        if SCRIPT_RUNTIME_SENSITIVE_RE.search(source_text):
+        if case.config.compile_only:
             return False
         return True
 
     def _ct_run_main_for_case(self, case: TestCase) -> bool:
-        return self.args.ct_run_main and not self._is_example_source(case.source)
+        if not self.args.ct_run_main:
+            return False
+        if case.config.expect_compile_error:
+            return False
+        return True
 
     def _leak_check_mode_for_case(self, case: TestCase) -> bool:
         """Run case via compiler --leak-check when compile-time execution is compatible."""
         if not self.args.leak_check:
             return False
-        if self._is_example_source(case.source):
+        if case.config.compile_only:
             return False
         if case.config.expect_compile_error:
             return False
         if case.config.expected_exit != 0:
             return False
         if case.runtime_args():
-            return False
-        source_text = case.source.read_text(encoding="utf-8", errors="ignore")
-        if SCRIPT_RUNTIME_SENSITIVE_RE.search(source_text):
-            return False
-        if re.search(r"(?m)^\s*compile-time\s+main\b", source_text):
             return False
         return True
 
@@ -744,8 +717,11 @@ class TestRunner:
             fixture_libs = self._prepare_case_native_libs(case)
         except RuntimeError as exc:
             return CaseResult(case, "failed", "fixture", str(exc))
+        script_mode = self._script_mode_for_case(case)
+        leak_check_mode = self._leak_check_mode_for_case(case)
+        ct_runtime_exec_mode = script_mode or leak_check_mode
         compile_proc = self._compile(case, extra_libs=fixture_libs)
-        if not case.config.expect_compile_error and compile_proc.returncode != 0:
+        if not case.config.expect_compile_error and compile_proc.returncode != 0 and not ct_runtime_exec_mode:
             fallback = self._compile_doc_example_fallback(case, compile_proc, fixture_libs)
             if fallback is not None and fallback.returncode == 0:
                 compile_proc = fallback
@@ -753,13 +729,11 @@ class TestRunner:
             result = self._handle_expected_compile_failure(case, compile_proc)
             result.duration = time.perf_counter() - start
             return result
-        if compile_proc.returncode != 0:
+        if compile_proc.returncode != 0 and not ct_runtime_exec_mode:
             details = self._format_process_output(compile_proc)
             duration = time.perf_counter() - start
             return CaseResult(case, "failed", "compile", f"compiler exited {compile_proc.returncode}", details, duration)
         updated_notes: List[str] = []
-        script_mode = self._script_mode_for_case(case)
-        leak_check_mode = self._leak_check_mode_for_case(case)
         if not script_mode and not leak_check_mode:
             compile_status, compile_note, compile_details = self._check_compile_output(case, compile_proc)
             if compile_status == "failed":
@@ -779,7 +753,7 @@ class TestRunner:
         if script_mode or leak_check_mode:
             run_proc = subprocess.CompletedProcess(
                 args=compile_proc.args,
-                returncode=0,
+                returncode=compile_proc.returncode,
                 stdout=self._script_runtime_stdout(compile_proc.stdout),
                 stderr=self._script_runtime_stderr(compile_proc.stderr),
             )
@@ -869,8 +843,11 @@ class TestRunner:
         elif script_mode:
             cmd.append("--ct-run-main")
             cmd.append("--no-artifact")
-        elif ct_run_main_mode:
+        elif ct_run_main_mode and not case.config.compile_only:
             cmd.append("--ct-run-main")
+        if ct_run_main_mode or script_mode or leak_check_mode:
+            for runtime_arg in case.runtime_args():
+                cmd.extend(["--ct-argv", runtime_arg])
         if self.args.verbose:
             print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
         # When --ct-run-main is used, the compiler executes main at compile time,
@@ -981,9 +958,22 @@ class TestRunner:
 
     def _prepare_l2eval_libs(self, case: TestCase) -> List[str]:
         lib_path = (self.root / "build" / "libl2eval.a").resolve()
+        so_path = (self.root / "build" / "libl2eval.so").resolve()
+        main_c = (self.root / "main.c").resolve()
 
         if not self._l2eval_ready:
-            if not lib_path.exists():
+            needs_build = not lib_path.exists() or not so_path.exists()
+            if not needs_build:
+                try:
+                    main_mtime = main_c.stat().st_mtime_ns
+                    needs_build = (
+                        lib_path.stat().st_mtime_ns < main_mtime
+                        or so_path.stat().st_mtime_ns < main_mtime
+                    )
+                except OSError:
+                    needs_build = True
+
+            if needs_build:
                 if not self.l2eval_builder.exists():
                     raise RuntimeError(f"missing l2eval builder script: {self.l2eval_builder}")
 
@@ -1003,7 +993,7 @@ class TestRunner:
 
             self._l2eval_ready = True
 
-        if not lib_path.exists():
+        if not lib_path.exists() or not so_path.exists():
             raise RuntimeError(f"l2eval library missing after build: {lib_path}")
         return [str(lib_path), "c"]
 

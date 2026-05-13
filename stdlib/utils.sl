@@ -446,7 +446,7 @@ word emit_strs
     while r@ 0 > do
         dup strlen dup r> swap - >r
         over over + rswap r> 1 + >r rswap
-        while dup c@ 0 == do 1 + r> 1 - >r end
+        while dup c@ 0 == r@ 0 > band do 1 + r> 1 - >r end
     end
     drop rdrop
 end

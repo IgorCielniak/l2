@@ -11,6 +11,53 @@
 word meta-reader-add ct-add-reader-rewrite end
 compile-only
 
+# ---------------------------------------------------------------------------
+#  Runtime helpers
+# ---------------------------------------------------------------------------
+
+# Runtime function: retrieve L2 source code for a function from embedded source data.
+# C signature: const char *l2_get_source_from_embedded(const char *func_name, long *out_len)
+extern const char *l2_get_source_from_embedded(const char *func_name, long *out_len)
+
+word meta-runtime-get-source-embedded
+	# ( name_ptr name_len -- src_ptr src_len )
+	drop
+	8 alloc >r
+	r@ l2_get_source_from_embedded
+	dup 0 ==
+	if
+		drop
+		r> 8 free
+		0 0
+	else
+		r@ @
+		r> 8 free
+	end
+end
+
+# Provide a runtime body for ct-runtime-get-source while keeping the compiler
+# intrinsic implementation available for compile-time execution.
+word ct-runtime-get-source
+	meta-runtime-get-source-embedded
+end
+
+# Provide a runtime body for ct-executing? for codegen paths that reference it.
+# Compile-time/runtime intrinsics still override behavior in VM execution modes.
+word ct-executing?
+	0
+end
+
+word meta-runtime-get-source
+	# ( name -- src src_len ) in CT, ( name_ptr name_len -- src_ptr src_len ) in runtime
+	CT 1 ==
+	if
+		ct-runtime-get-source
+	else
+		meta-runtime-get-source-embedded
+	end
+end
+
+
 # Compatibility wrapper around ct-add-reader-rewrite-named.
 word meta-reader-add-named ct-add-reader-rewrite-named end
 compile-only
@@ -1124,4 +1171,27 @@ word meta-expect-lexeme
 		parse-error
 	end
 end
+compile-only
+
+# ---------------------------------------------------------------------------
+#  Compiler state and debug support
+# ---------------------------------------------------------------------------
+
+# Compatibility wrapper around ct-debug-enabled?.
+word meta-debug-enabled? ct-debug-enabled? end
+compile-only
+
+# Compatibility wrapper around ct-get-compiler-flags.
+word meta-compiler-flags-get ct-get-compiler-flags end
+compile-only
+
+# Compatibility wrapper around ct-set-compiler-flags.
+word meta-compiler-flags-set ct-set-compiler-flags end
+compile-only
+
+# Backward-compatible aliases.
+word meta-get-compiler-flags meta-compiler-flags-get end
+compile-only
+
+word meta-set-compiler-flags meta-compiler-flags-set end
 compile-only

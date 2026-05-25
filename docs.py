@@ -680,16 +680,17 @@ def _run_docs_tui(
         {
             "name": "flags",
             "category": "Modules",
-            "syntax": "flags <token...> | flags \"<token...>\"",
-            "summary": "Provide linker/include flags from source.",
+            "syntax": "flags \"<cli flags>\"",
+            "summary": "Provide compiler flags from source.",
             "detail": (
                 "Processed during source loading before tokenization. "
                 "Supports shell-like token splitting. "
                 "`-I`/`--include` update import search paths (relative to the "
-                "current file when not absolute). Other tokens are forwarded "
-                "as linker/runtime library flags.\n\n"
+                "current file when not absolute). The quoted string is replayed "
+                "through the normal CLI parser, so source pragmas can set the "
+                "same compiler options you would pass on the command line.\n\n"
                 "Examples:\n"
-                "  flags -lc -lm -L. -I.\n"
+                "  flags \"-lc -lm -L. -I.\"\n"
                 "  flags \"-lc -lm -L. -I.\""
             ),
         },

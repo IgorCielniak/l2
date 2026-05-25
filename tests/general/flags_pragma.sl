@@ -1,4 +1,4 @@
-flags -L.
+flags "-L."
 flags "-Iimport_helpers -lc"
 
 import stdlib/stdlib.sl

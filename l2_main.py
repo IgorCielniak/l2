@@ -20100,8 +20100,13 @@ class Compiler:
         except ValueError as exc:
             raise ParseError(f"invalid flags directive at {path}:{line_no}: {exc}") from exc
 
+        if len(tokens) > 1:
+            raise ParseError(
+                f"flags directive expects a single quoted string at {path}:{line_no}"
+            )
+
         # Allow a quoted shell-style bundle like: flags "-lc -lm -L. -I."
-        if len(tokens) == 1 and re.search(r"\s-[A-Za-z]", tokens[0]):
+        if len(tokens) == 1 and any(ch.isspace() for ch in tokens[0]):
             try:
                 tokens = shlex.split(tokens[0], posix=True)
             except ValueError as exc:
@@ -24800,21 +24805,6 @@ def cli(argv: Sequence[str]) -> int:
         for action in parser._actions
         if getattr(action, "dest", None) and action.dest != "help"
     }
-    source_flag_skip_dests = {
-        "source",
-        "clean",
-        "docs",
-        "repl",
-        "docs_root",
-        "docs_query",
-        "docs_serve",
-        "docs_host",
-        "docs_port",
-        "docs_no_browser",
-        "docs_all",
-        "docs_include_tests",
-        "preview",
-    }
 
     if args.macro_expansion_limit < 1:
         parser.error("--macro-expansion-limit must be >= 1")
@@ -25013,10 +25003,7 @@ def cli(argv: Sequence[str]) -> int:
                 if compiler.source_cli_flags:
                     probe_tokens = [str(args.source), *compiler.source_cli_flags]
                     src_args, src_unknown = parser.parse_known_args(probe_tokens)
-                    # Flags that don't make sense from source-level pragmas.
                     for dest, default in parser_defaults.items():
-                        if dest in source_flag_skip_dests:
-                            continue
                         cur_val = getattr(args, dest)
                         src_val = getattr(src_args, dest)
                         if isinstance(default, list):

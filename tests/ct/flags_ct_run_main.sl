@@ -1,4 +1,4 @@
-flags --ct-run-main --no-artifact
+flags "--ct-run-main --no-artifact"
 
 import stdlib/stdlib.sl
 import stdlib/io.sl

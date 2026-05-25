@@ -1,0 +1,10 @@
+[preview] compile-time execution trace:
+# (no compile-time execution events)
+[preview] transformed source (post-macro + post-compile-time):
+word main
+    7
+    puti
+    0
+end
+[preview] end
+[info] skipped artifact generation (--no-artifact)

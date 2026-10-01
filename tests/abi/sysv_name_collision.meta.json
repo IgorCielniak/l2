@@ -1,0 +1,5 @@
+{
+  "compile_only": true,
+  "compile_args": ["--artifact", "shared", "--c-abi", "--emit-asm"],
+  "description": "Punctuation-bearing function names receive distinct automatic C wrappers."
+}

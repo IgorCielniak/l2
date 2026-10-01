@@ -1,0 +1,4 @@
+{
+  "description": "l2_compile snippets that exercise :asm stdlib words (dup, swap, over, +, *, -)",
+  "use_l2": true
+}

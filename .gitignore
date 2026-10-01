@@ -1,0 +1,10 @@
+# Vendored third-party binaries fetched by tools/fetch_keystone.sh
+# (kept out of git — regenerable via `bash tools/fetch_keystone.sh`).
+tools/vendor/libkeystone.so
+
+# Build outputs
+build/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

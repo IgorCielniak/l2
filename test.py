@@ -337,12 +337,18 @@ class TestCaseConfig:
     requires: List[str] = field(default_factory=list)
     libs: List[str] = field(default_factory=list)
     compile_args: List[str] = field(default_factory=list)
+    ct_run_main: Optional[bool] = None
+    expected_events: List[str] = field(default_factory=list)
     run_example: bool = False
     smoke_run: bool = False
     stdout_regex: Optional[str] = None
     stderr_regex: Optional[str] = None
     runtime_timeout: Optional[float] = None
-    use_l2eval: bool = False
+    external_caller: Optional[str] = None
+    # Whether the test should be linked against libl2 (the runtime library
+    # formerly known as libl2eval).  The legacy "use_l2eval" meta key is
+    # still accepted.
+    use_l2: bool = False
 
     @classmethod
     def from_meta(cls, data: Dict[str, Any]) -> "TestCaseConfig":
@@ -403,6 +409,18 @@ class TestCaseConfig:
             if not isinstance(ca, list) or not all(isinstance(item, str) for item in ca):
                 raise ValueError("compile_args must be a list of strings")
             cfg.compile_args = list(ca)
+        if "ct_run_main" in data:
+            ct_run_main = data["ct_run_main"]
+            if not isinstance(ct_run_main, bool):
+                raise ValueError("ct_run_main must be a boolean")
+            cfg.ct_run_main = ct_run_main
+        if "expected_events" in data:
+            expected_events = data["expected_events"]
+            if not isinstance(expected_events, list) or not all(
+                isinstance(item, str) and item.strip() for item in expected_events
+            ):
+                raise ValueError("expected_events must be a list of non-empty event names")
+            cfg.expected_events = [item.strip() for item in expected_events]
         if "run_example" in data:
             cfg.run_example = bool(data["run_example"])
         if "smoke_run" in data:
@@ -424,8 +442,15 @@ class TestCaseConfig:
             if timeout <= 0:
                 raise ValueError("runtime_timeout must be > 0")
             cfg.runtime_timeout = timeout
-        if "use_l2eval" in data:
-            cfg.use_l2eval = bool(data["use_l2eval"])
+        if "external_caller" in data:
+            caller = data["external_caller"]
+            if not isinstance(caller, str) or not caller.strip():
+                raise ValueError("external_caller must be a non-empty string")
+            cfg.external_caller = caller.strip()
+        if "use_l2" in data:
+            cfg.use_l2 = bool(data["use_l2"])
+        elif "use_l2eval" in data:
+            cfg.use_l2 = bool(data["use_l2eval"])
         return cfg
 
 
@@ -489,11 +514,11 @@ class TestRunner:
         self.doc_examples_dir = self.build_dir / DOC_EXAMPLES_DIRNAME
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.main_py = self.root / "main.py"
-        self.l2eval_builder = self.root / "tools" / "build_l2eval_lib.sh"
+        self.l2_builder = self.root / "tools" / "build_l2_lib.sh"
         self.base_env = os.environ.copy()
         self._module_cache: Dict[str, bool] = {}
         self.run_example_patterns = list(args.run_example or [])
-        self._l2eval_ready = False
+        self._l2_ready = False
         extra_entries = list(DEFAULT_EXTRA_TESTS)
         if args.extra:
             extra_entries.extend(args.extra)
@@ -653,6 +678,8 @@ class TestRunner:
         return True
 
     def _ct_run_main_for_case(self, case: TestCase) -> bool:
+        if case.config.ct_run_main is not None:
+            return self.args.ct_run_main and case.config.ct_run_main
         if not self.args.ct_run_main:
             return False
         if case.config.expect_compile_error:
@@ -733,6 +760,10 @@ class TestRunner:
             details = self._format_process_output(compile_proc)
             duration = time.perf_counter() - start
             return CaseResult(case, "failed", "compile", f"compiler exited {compile_proc.returncode}", details, duration)
+        event_error = self._check_expected_events(case)
+        if event_error:
+            duration = time.perf_counter() - start
+            return CaseResult(case, "failed", "events", event_error, duration=duration)
         updated_notes: List[str] = []
         if not script_mode and not leak_check_mode:
             compile_status, compile_note, compile_details = self._check_compile_output(case, compile_proc)
@@ -750,7 +781,13 @@ class TestRunner:
             if updated_notes:
                 return CaseResult(case, "updated", "compile", "; ".join(updated_notes), details=None, duration=duration)
             return CaseResult(case, "passed", "compile", "compile-only", details=None, duration=duration)
-        if script_mode or leak_check_mode:
+        if case.config.external_caller:
+            try:
+                run_proc = self._run_external_caller(case)
+            except RuntimeError as exc:
+                duration = time.perf_counter() - start
+                return CaseResult(case, "failed", "external-run", str(exc), details=None, duration=duration)
+        elif script_mode or leak_check_mode:
             run_proc = subprocess.CompletedProcess(
                 args=compile_proc.args,
                 returncode=compile_proc.returncode,
@@ -814,6 +851,90 @@ class TestRunner:
         message = "smoke-run ok" if case.config.smoke_run else "ok"
         return CaseResult(case, "passed", "run", message, details=None, duration=duration)
 
+    def _check_expected_events(self, case: TestCase) -> Optional[str]:
+        if not case.config.expected_events:
+            return None
+        event_path = case.build_dir / f"{case.binary_stub}.events.jsonl"
+        try:
+            records = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+        except OSError as exc:
+            return f"event stream was not written: {exc}"
+        except json.JSONDecodeError as exc:
+            return f"event stream contains invalid JSON: {exc}"
+        event_types = {
+            str(record.get("type", record.get("event", "")))
+            for record in records
+            if isinstance(record, dict)
+        }
+        missing = [event for event in case.config.expected_events if event not in event_types]
+        if missing:
+            return f"event stream is missing expected events: {', '.join(missing)}"
+        return None
+
+    def _run_external_caller(self, case: TestCase) -> subprocess.CompletedProcess[str]:
+        """Compile and run a native caller against a library artifact case."""
+        caller = Path(case.config.external_caller or "")
+        if not caller.is_absolute():
+            caller = case.source.parent / caller
+        if not caller.exists():
+            raise RuntimeError(f"external caller not found: {caller}")
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if cc is None:
+            raise RuntimeError("no C compiler found (expected one of: cc, gcc, clang)")
+
+        library = case.binary_path
+        if library.suffix not in {".so", ".a"}:
+            raise RuntimeError(f"external caller requires a library artifact, got {library.name}")
+        library_name = library.name
+        if library_name.startswith("lib"):
+            library_name = library_name[3:]
+        library_name = Path(library_name).stem
+        executable = case.build_dir / f"{case.binary_stub}_caller"
+        cmd = [
+            cc,
+            "-O2",
+            "-I",
+            str(case.build_dir),
+            str(caller),
+            "-L",
+            str(case.build_dir),
+            f"-l{library_name}",
+            f"-Wl,-rpath,{case.build_dir}",
+            "-o",
+            str(executable),
+        ]
+        if self.args.verbose:
+            print(f"\n{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
+        compile_proc = subprocess.run(
+            cmd,
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=self._env_for(case),
+        )
+        if compile_proc.returncode != 0:
+            raise RuntimeError("failed to compile external caller:\n" + self._format_process_output(compile_proc))
+
+        runtime_cmd = wrap_runtime_command([str(executable), *case.runtime_args()])
+        if self.args.verbose:
+            print(f"\n{format_status('CMD', 'blue')} {quote_cmd(runtime_cmd)}")
+        stdin_data = case.stdin_data()
+        timeout = case.config.runtime_timeout if case.config.runtime_timeout is not None else self.args.runtime_timeout
+        try:
+            return subprocess.run(
+                runtime_cmd,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                env=self._env_for(case),
+                input=stdin_data,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return subprocess.CompletedProcess(runtime_cmd, 124, stdout, stderr + "\nexternal caller timed out")
+
     def _compile(
         self,
         case: TestCase,
@@ -838,6 +959,9 @@ class TestRunner:
         for lib in (extra_libs or []):
             cmd.extend(["-l", lib])
         cmd.extend(case.config.compile_args)
+        if case.config.expected_events:
+            event_path = case.build_dir / f"{case.binary_stub}.events.jsonl"
+            cmd.extend(["--events-stream", str(event_path)])
         if leak_check_mode:
             cmd.append("--leak-check")
         elif script_mode:
@@ -905,8 +1029,8 @@ class TestRunner:
 
     def _prepare_case_native_libs(self, case: TestCase) -> List[str]:
         """Build optional per-test native C fixtures and return linkable artifacts."""
-        if case.config.use_l2eval:
-            return self._prepare_l2eval_libs(case)
+        if case.config.use_l2:
+            return self._prepare_l2_libs(case)
 
         c_source = case.source.with_suffix(".c")
         if not c_source.exists():
@@ -956,12 +1080,12 @@ class TestRunner:
 
         return [str(archive_path.resolve())]
 
-    def _prepare_l2eval_libs(self, case: TestCase) -> List[str]:
-        lib_path = (self.root / "build" / "libl2eval.a").resolve()
-        so_path = (self.root / "build" / "libl2eval.so").resolve()
+    def _prepare_l2_libs(self, case: TestCase) -> List[str]:
+        lib_path = (self.root / "build" / "libl2.a").resolve()
+        so_path = (self.root / "build" / "libl2.so").resolve()
         main_c = (self.root / "main.c").resolve()
 
-        if not self._l2eval_ready:
+        if not self._l2_ready:
             needs_build = not lib_path.exists() or not so_path.exists()
             if not needs_build:
                 try:
@@ -974,10 +1098,10 @@ class TestRunner:
                     needs_build = True
 
             if needs_build:
-                if not self.l2eval_builder.exists():
-                    raise RuntimeError(f"missing l2eval builder script: {self.l2eval_builder}")
+                if not self.l2_builder.exists():
+                    raise RuntimeError(f"missing l2 builder script: {self.l2_builder}")
 
-                cmd = ["bash", str(self.l2eval_builder)]
+                cmd = ["bash", str(self.l2_builder)]
                 if self.args.verbose:
                     print(f"{format_status('CMD', 'blue')} {quote_cmd(cmd)}")
 
@@ -989,12 +1113,12 @@ class TestRunner:
                     env=self._env_for(case),
                 )
                 if proc.returncode != 0:
-                    raise RuntimeError("failed to build l2eval library:\n" + self._format_process_output(proc))
+                    raise RuntimeError("failed to build l2 library:\n" + self._format_process_output(proc))
 
-            self._l2eval_ready = True
+            self._l2_ready = True
 
         if not lib_path.exists() or not so_path.exists():
-            raise RuntimeError(f"l2eval library missing after build: {lib_path}")
+            raise RuntimeError(f"l2 library missing after build: {lib_path}")
         return [str(lib_path), "c"]
 
     def _run_binary(self, case: TestCase) -> subprocess.CompletedProcess[str]:
@@ -1293,7 +1417,37 @@ class TestRunner:
     def _env_for(self, case: TestCase) -> Dict[str, str]:
         env = dict(self.base_env)
         env.update(case.config.env)
+        # Point libl2's runtime keystone loader at the pip-bundled
+        # libkeystone.so when it's available.  Tests can still override
+        # L2_KEYSTONE_PATH explicitly via their meta.json env; and if
+        # keystone isn't installed we simply leave the var unset so
+        # `l2_ks_available()` returns 0 and the test can branch on it.
+        if "L2_KEYSTONE_PATH" not in env:
+            ks_path = self._locate_bundled_keystone()
+            if ks_path:
+                env["L2_KEYSTONE_PATH"] = ks_path
         return env
+
+    def _locate_bundled_keystone(self) -> Optional[str]:
+        cached = getattr(self, "_keystone_path_cache", None)
+        if cached is not None:
+            return cached or None
+        path = ""
+        # Prefer the copy vendored into the repo by tools/fetch_keystone.sh.
+        vendored = self.root / "tools" / "vendor" / "libkeystone.so"
+        if vendored.exists():
+            path = str(vendored)
+        else:
+            try:
+                spec = importlib.util.find_spec("keystone")
+            except (ImportError, ValueError):
+                spec = None
+            if spec and spec.origin:
+                candidate = Path(spec.origin).parent / "libkeystone.so"
+                if candidate.exists():
+                    path = str(candidate)
+        self._keystone_path_cache = path
+        return path or None
 
     def _module_available(self, module: str) -> bool:
         if module not in self._module_cache:

@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Focused Python-side EventBus integration checks for tooling authors."""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from l2_main import Compiler, EventBus
+
+
+class EventBusToolingTests(unittest.TestCase):
+    def test_glob_replay_and_compiler_events(self) -> None:
+        bus = EventBus(8)
+        seen = []
+        handle = bus.subscribe("word.compile.*", seen.append)
+        compiler = Compiler(event_bus=bus)
+        compiler.compile_source("word main 0 end\n")
+        self.assertIn("word.compile.begin", [item["event"] for item in seen])
+        self.assertTrue(bus.unsubscribe(handle))
+        self.assertGreater(bus.stats()["events_published"], 0)
+
+    def test_recent_zero_limit_is_empty(self) -> None:
+        bus = EventBus(8)
+        bus.publish("one")
+        bus.publish("two")
+        self.assertEqual(bus.recent(limit=0), [])
+
+    def test_observer_failures_are_isolated_but_extension_failures_propagate(self) -> None:
+        bus = EventBus()
+        bus.subscribe("observer.*", lambda _event: (_ for _ in ()).throw(RuntimeError("observer")))
+        bus.publish("observer.event")
+
+        bus.subscribe(
+            "extension.*",
+            lambda _event: (_ for _ in ()).throw(RuntimeError("extension")),
+            propagate_errors=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "extension"):
+            bus.publish("extension.event")
+
+    def test_replay_observer_failures_are_isolated_and_extension_failure_unsubscribes(self) -> None:
+        bus = EventBus()
+        bus.publish("replay.event")
+
+        def fail(_event):
+            raise RuntimeError("replay observer")
+
+        bus.subscribe("replay.*", fail, replay=True)
+        self.assertEqual(bus.stats()["subscribers"], 1)
+
+        with self.assertRaisesRegex(RuntimeError, "replay observer"):
+            bus.subscribe("replay.*", fail, replay=True, propagate_errors=True)
+        self.assertEqual(bus.stats()["subscribers"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

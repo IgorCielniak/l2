@@ -1,0 +1,4 @@
+{
+  "description": "stress test: many l2_compile / call / l2_release cycles do not leak or crash",
+  "use_l2": true
+}

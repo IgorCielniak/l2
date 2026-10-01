@@ -1,0 +1,6 @@
+error: suffix 'on-event' requires a preceding word definition
+  --> event_closure_rejected.sl:1
+    |
+  1 | on-event compiler.generated {
+
+1 error(s) emitted

@@ -1,8 +1,8 @@
 {
   "description": "comprehensive eval and eval_program tests - eval_program outputs numbers, eval uses numeric results",
   "run_example": true,
-  "use_l2eval": true,
-  "libs": ["build/libl2eval.a"],
+  "use_l2": true,
+  "libs": ["build/libl2.a"],
   "stdout_regex": "eval_program:[\\s\\S]*3[\\s\\S]*99[\\s\\S]*28[\\s\\S]*21[\\s\\S]*60[\\s\\S]*15[\\s\\S]*15[\\s\\S]*42[\\s\\S]*777[\\s\\S]*888[\\s\\S]*eval:[\\s\\S]*49[\\s\\S]*18[\\s\\S]*16[\\s\\S]*test complete",
   "runtime_timeout": 15
 }

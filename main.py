@@ -1,413 +1,360 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for the L2 compiler implementation.
+"""Thin daemon client for the integrated L2 compiler.
 
-This module re-exports symbols from l2_main so imports like `import main`
-continue to work, while script execution uses a small entrypoint that avoids
-re-parsing the full compiler source on every invocation.
+Imports continue to re-export l2_main symbols. Script execution routes requests
+through the background daemon by default, with a direct compile fallback.
 """
+
+from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 
-_FORCE_WORKER_TOKEN = "--__l2-force-worker"
-_FORCE_WORKER_SOCKET = os.path.join("build", ".l2_force_worker.sock")
-_FORCE_WORKER_PID = os.path.join("build", ".l2_force_worker.pid")
-_FORCE_WORKER_DEBUG = os.environ.get("L2_FORCE_WORKER_DEBUG", "0") not in ("0", "", "false", "False")
+_DAEMON_SOCKET = "build/.l2_daemon.sock"
+_DAEMON_PID = "build/.l2_daemon.pid"
+_DAEMON_TIMEOUT = 120.0
+_DAEMON_LEASE_TTL = 2.5
 
 
-def _force_worker_log(message: str) -> None:
-    if _FORCE_WORKER_DEBUG:
-        sys.stderr.write(f"[force-worker] {message}\n")
+def _split_control_args(argv: Sequence[str]) -> tuple[list[str], bool]:
+    passthrough: list[str] = []
+    force_local = False
+
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--no-daemon":
+            force_local = True
+            i += 1
+            continue
+        passthrough.append(tok)
+        i += 1
+
+    return passthrough, force_local
 
 
-def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+# Flags whose semantics require direct stdio access (TTY, long-running server,
+# child process pass-through) and must therefore bypass the daemon subprocess.
+_LOCAL_ONLY_FLAGS = frozenset(
+    {
+        "--docs",
+        "--docs-serve",
+        "--repl",
+        "--run",
+        "--dbg",
+    }
+)
 
 
-def _read_force_worker_pid() -> int:
-    try:
-        with open(_FORCE_WORKER_PID, "r", encoding="utf-8") as fh:
-            raw = fh.read().strip()
-    except OSError:
-        return 0
-    if not raw:
-        return 0
-    try:
-        return int(raw)
-    except ValueError:
-        return 0
-
-
-def _write_force_worker_pid(pid: int) -> None:
-    try:
-        with open(_FORCE_WORKER_PID, "w", encoding="utf-8") as fh:
-            fh.write(str(int(pid)))
-            fh.write("\n")
-    except OSError:
-        pass
-
-
-def _remove_force_worker_file(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def _decode_worker_message(payload: str) -> str:
-    return payload.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
-
-
-def _encode_worker_message(message: str) -> str:
-    return message.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
-
-
-def _parse_strict_force_source(argv):
-    source_token = None
-    saw_force = False
+def _requires_local_execution(argv) -> bool:
     for tok in argv:
-        if tok == "--force":
-            saw_force = True
-            continue
-        if tok in ("-s", "--silent"):
-            continue
-        if tok.startswith("-"):
+        if tok in _LOCAL_ONLY_FLAGS:
+            return True
+        if tok == "--help" or tok == "-h":
+            # argparse help is trivial; still fine through daemon, but keep
+            # it local so `python main.py --help` never depends on daemon health.
+            return True
+    return False
+
+
+def _read_stdin_for_daemon():
+    try:
+        if sys.stdin.isatty():
             return None
-        if source_token is None:
-            source_token = tok
-            continue
+    except Exception:
         return None
-    if not saw_force or source_token is None:
+    try:
+        return sys.stdin.read()
+    except Exception:
         return None
-    if os.path.splitext(source_token)[1].lower() != ".sl":
-        return None
-    return source_token
 
 
-def _parse_strict_no_cache_source(argv):
-    source_token = None
-    saw_no_cache = False
-    for tok in argv:
-        if tok == "--force":
-            return None
-        if tok == "--no-cache":
-            saw_no_cache = True
-            continue
-        if tok in ("-s", "--silent"):
-            continue
-        if tok.startswith("-"):
-            return None
-        if source_token is None:
-            source_token = tok
-            continue
-        return None
-    if not saw_no_cache or source_token is None:
-        return None
-    if os.path.splitext(source_token)[1].lower() != ".sl":
-        return None
-    return source_token
-
-
-def _argv_requests_silent(argv):
-    return any(tok in ("-s", "--silent") for tok in argv)
-
-
-def _request_force_worker_line(line):
+def _daemon_send(payload, timeout: float = _DAEMON_TIMEOUT):
+    import json
     import socket
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(2.0)
-        sock.connect(_FORCE_WORKER_SOCKET)
-        sock.sendall((line + "\n").encode("utf-8"))
-        chunks = b""
-        while not chunks.endswith(b"\n"):
-            block = sock.recv(256)
-            if not block:
-                break
-            chunks += block
-
-    if not chunks:
-        raise RuntimeError("empty force-worker response")
-
-    return chunks.decode("utf-8", errors="replace").split("\n", 1)[0]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(timeout)
+        conn.connect(_DAEMON_SOCKET)
+        conn.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+        raw = conn.makefile("rb").readline(4 * 1024 * 1024)
+    response = json.loads(raw.decode("utf-8"))
+    if not isinstance(response, dict):
+        raise RuntimeError("invalid compiler daemon response")
+    return response
 
 
-def _ping_force_worker(*, require_v2=False):
-    if require_v2:
-        return _request_force_worker_line("PING2") == "PONG2"
-    return _request_force_worker_line("PING") == "PONG"
+def _daemon_ping() -> bool:
+    try:
+        return bool(_daemon_send({"cmd": "ping"}, 0.2).get("ok"))
+    except Exception:
+        return False
 
 
-def _run_force_worker_request(source_token):
-    color_flag = "1" if sys.stderr.isatty() else "0"
-    response = _request_force_worker_line(f"RUN\t{color_flag}\t{source_token}")
-    if not (response.startswith("RC\t") or response.startswith("RC2\t")):
-        raise RuntimeError("invalid force-worker response")
-    parts = response.split("\t", 2)
-    code = int(parts[1])
-    detail = _decode_worker_message(parts[2]) if len(parts) >= 3 else ""
-    return code, detail
+def _proc_start_time_ns(pid: int) -> Optional[int]:
+    import os
+
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if ")" not in stat_text:
+        return None
+    rest = stat_text.rsplit(")", 1)[1].strip()
+    fields = rest.split()
+    if len(fields) < 20:
+        return None
+    try:
+        start_ticks = int(fields[19])
+    except ValueError:
+        return None
+    try:
+        clk_tck = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, OSError, ValueError):
+        clk_tck = 100
+    if clk_tck <= 0:
+        clk_tck = 100
+    return int(start_ticks * (1_000_000_000 / clk_tck))
 
 
-def _run_no_cache_worker_request(source_token):
-    color_flag = "1" if sys.stderr.isatty() else "0"
-    response = _request_force_worker_line(f"RUN_NC\t{color_flag}\t{source_token}")
-    if not (response.startswith("RC\t") or response.startswith("RC2\t")):
-        raise RuntimeError("invalid no-cache worker response")
-    parts = response.split("\t", 2)
-    code = int(parts[1])
-    detail = _decode_worker_message(parts[2]) if len(parts) >= 3 else ""
-    return code, detail
+def _daemon_lease_pid(*, socket_path: str = _DAEMON_SOCKET, ttl: float = _DAEMON_LEASE_TTL) -> Optional[int]:
+    """Return the live daemon PID only if the lease matches the current daemon instance.
+
+    The lease is considered valid only when it is fresh, the process is still
+    alive, the command line still marks it as a daemon, and the recorded process
+    start time matches /proc/<pid>/stat. This avoids accepting a stale PID that
+    has been reused by another process.
+    """
+    import json
+    import os
+    import time
+
+    lease_path = Path(socket_path + ".lease")
+    try:
+        payload = json.loads(lease_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    ts_ns = payload.get("ts_ns")
+    start_time_ns = payload.get("start_time_ns")
+    if not isinstance(pid, int) or not isinstance(ts_ns, int) or not isinstance(start_time_ns, int):
+        return None
+    if time.time_ns() - ts_ns > int(ttl * 1_000_000_000):
+        return None
+    try:
+        proc_path = Path(f"/proc/{pid}")
+        if not proc_path.exists():
+            return None
+        cmdline = proc_path.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    daemon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "l2_main.py")
+    if "--daemon-serve" not in cmdline or daemon_path not in cmdline:
+        return None
+    proc_start_ns = _proc_start_time_ns(pid)
+    if proc_start_ns is None or proc_start_ns != start_time_ns:
+        return None
+    return pid
 
 
-def _start_force_worker():
-    import subprocess
+def _shutdown_daemon(*, socket_path: str = _DAEMON_SOCKET, pid_path: str = _DAEMON_PID, timeout: float = 2.0) -> None:
+    import errno
+    import os
     import signal
     import time
 
     try:
-        if _ping_force_worker(require_v2=True):
-            return True
-    except (OSError, RuntimeError, ValueError) as exc:
-        _force_worker_log(f"pre-spawn ping failed: {exc}")
+        _daemon_send({"cmd": "shutdown"}, socket_path, 1.0)
+    except Exception:
+        pass
 
-    os.makedirs("build", exist_ok=True)
-    pid = _read_force_worker_pid()
-    if pid > 0 and _pid_is_alive(pid):
-        _force_worker_log(f"terminating stale worker pid={pid}")
+    try:
+        pid_text = Path(pid_path).read_text(encoding="utf-8").strip()
+        pid = int(pid_text)
+    except (OSError, ValueError):
+        pid = None
+
+    if pid is not None:
         try:
             os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pid = None
+        if pid is not None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError as exc:
+                    if exc.errno in {errno.ESRCH}:
+                        break
+                time.sleep(0.02)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    for artifact in (Path(socket_path), Path(pid_path), Path(socket_path + ".lease")):
+        try:
+            artifact.unlink()
         except OSError:
             pass
 
-        grace_deadline = time.monotonic() + 0.25
-        while time.monotonic() < grace_deadline and _pid_is_alive(pid):
-            time.sleep(0.01)
-        if _pid_is_alive(pid):
-            _force_worker_log(f"worker pid={pid} did not exit after SIGTERM")
 
-    _remove_force_worker_file(_FORCE_WORKER_SOCKET)
-    _remove_force_worker_file(_FORCE_WORKER_PID)
+def _ensure_daemon() -> bool:
+    if _daemon_ping():
+        return True
 
-    proc = subprocess.Popen(
-        [sys.executable, __file__, _FORCE_WORKER_TOKEN],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-    )
-    _write_force_worker_pid(proc.pid)
+    import fcntl
+    import os
+    import signal
+    import subprocess
+    import time
 
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        if os.path.exists(_FORCE_WORKER_SOCKET):
+    os.makedirs(os.path.dirname(_DAEMON_SOCKET) or ".", exist_ok=True)
+    lock_fd = os.open(_DAEMON_SOCKET + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    owns_lock = False
+    try:
+        deadline = time.monotonic() + 0.35
+        while time.monotonic() < deadline:
+            if _daemon_ping():
+                return True
             try:
-                if _ping_force_worker(require_v2=True):
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                owns_lock = True
+                break
+            except BlockingIOError:
+                time.sleep(0.01)
+        if not owns_lock:
+            if _daemon_ping():
+                return True
+            endpoint_missing = not os.path.exists(_DAEMON_SOCKET) and not os.path.exists(_DAEMON_PID)
+            stale_pid = _daemon_lease_pid(socket_path=_DAEMON_SOCKET) if endpoint_missing else None
+            if stale_pid is None:
+                return False
+
+            # Give the daemon one bounded grace period to finish a drain/reload
+            # before we explicitly terminate the stale process.
+            deadline = time.monotonic() + 11.0
+            while time.monotonic() < deadline:
+                if _daemon_ping():
                     return True
-            except (OSError, RuntimeError, ValueError):
-                continue
-        time.sleep(0.01)
-
-    if proc.poll() is None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    owns_lock = True
+                    break
+                except BlockingIOError:
+                    time.sleep(0.01)
+            if not owns_lock:
+                if _daemon_ping():
+                    return True
+                _shutdown_daemon(socket_path=_DAEMON_SOCKET, pid_path=_DAEMON_PID)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if _daemon_ping():
+                        return True
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        owns_lock = True
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.01)
+                if not owns_lock:
+                    return _daemon_ping()
+        if _daemon_ping():
+            return True
         try:
-            proc.terminate()
+            os.unlink(_DAEMON_SOCKET)
         except OSError:
             pass
-    return False
+        daemon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "l2_main.py")
+        env = os.environ.copy()
+        env["L2_DAEMON_LOCK_FD"] = str(lock_fd)
+        subprocess.Popen(
+            [sys.executable, daemon_path, "--daemon-serve", "--socket", _DAEMON_SOCKET, "--pid", _DAEMON_PID],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(lock_fd,),
+            start_new_session=True,
+            env=env,
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if _daemon_ping():
+                return True
+            time.sleep(0.01)
+        return False
+    finally:
+        os.close(lock_fd)
 
 
-def _try_ultra_fast_force(argv):
-    if os.environ.get("L2_FORCE_WORKER", "1") in ("0", "false", "False"):
-        return None
-
-    source_token = _parse_strict_force_source(argv)
-    if source_token is None:
-        return None
-    silent = _argv_requests_silent(argv)
-
+def _run_via_daemon(argv):
+    stdin_data = _read_stdin_for_daemon()
+    response = None
     for _attempt in range(2):
+        if not _ensure_daemon():
+            continue
         try:
-            rc, detail = _run_force_worker_request(source_token)
-            if rc == 0:
-                if not silent:
-                    print("[info] built a.out")
-                return 0
-            if detail:
-                if not detail.endswith("\n"):
-                    detail += "\n"
-                sys.stderr.write(detail)
-                return 1
-            return None
-        except (OSError, RuntimeError, ValueError) as exc:
-            _force_worker_log(f"worker request failed: {exc}")
-            if not _start_force_worker():
-                continue
-    return None
-
-
-def _try_ultra_fast_no_cache(argv):
-    # Preserve interactive output behavior in TTY sessions.
-    if sys.stdout.isatty():
-        return None
-    if os.environ.get("L2_NO_CACHE_WORKER", "1") in ("0", "false", "False"):
+            response = _daemon_send({
+                "cmd": "run",
+                "argv": list(argv),
+                "wants_color": bool(getattr(sys.stderr, "isatty", lambda: False)()),
+                "stdin": stdin_data,
+                "tool_path": os.environ.get("PATH", ""),
+            })
+            break
+        except Exception:
+            # A self-reload can close the socket between start and request.
+            # Reconnect once so the normal client path remains transparent.
+            continue
+    if response is None:
         return None
 
-    source_token = _parse_strict_no_cache_source(argv)
-    if source_token is None:
-        return None
+    if not response.get("ok"):
+        err = str(response.get("error", "daemon request failed"))
+        if err:
+            if not err.endswith("\n"):
+                err += "\n"
+            sys.stderr.write(err)
+        return 1
 
-    for _attempt in range(2):
-        try:
-            rc, detail = _run_no_cache_worker_request(source_token)
-            if rc == 0:
-                return 0
-            if detail:
-                if not detail.endswith("\n"):
-                    detail += "\n"
-                sys.stderr.write(detail)
-                return 1
-            return None
-        except (OSError, RuntimeError, ValueError) as exc:
-            _force_worker_log(f"no-cache worker request failed: {exc}")
-            if not _start_force_worker():
-                continue
-    return None
+    out = str(response.get("stdout", ""))
+    err = str(response.get("stderr", ""))
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
 
-
-def _run_force_worker():
-    import io
-    import socket
-    from contextlib import redirect_stderr, redirect_stdout
-    from l2_main import cli as _worker_cli
-    from l2_main import _try_quick_compile_force as _worker_quick_force
-
-    def _parse_worker_run_payload(payload: str):
-        # Backward-compatible protocol parsing:
-        # legacy payload: "<source>"
-        # current payload: "<0|1>\t<source>"
-        wants_color = False
-        source_token = payload
-        if "\t" in payload:
-            maybe_color, rest = payload.split("\t", 1)
-            if maybe_color in ("0", "1"):
-                wants_color = maybe_color == "1"
-                source_token = rest
-        return source_token, wants_color
-
-    os.makedirs("build", exist_ok=True)
-    _remove_force_worker_file(_FORCE_WORKER_SOCKET)
-    _write_force_worker_pid(os.getpid())
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-        server.bind(_FORCE_WORKER_SOCKET)
-        server.listen(8)
-        server.settimeout(300.0)
-        while True:
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                break
-            except OSError:
-                break
-
-            with conn:
-                chunks = []
-                while True:
-                    block = conn.recv(65536)
-                    if not block:
-                        break
-                    chunks.append(block)
-                    if b"\n" in block:
-                        break
-
-                try:
-                    line = b"".join(chunks).decode("utf-8", errors="replace").split("\n", 1)[0]
-                except Exception:
-                    line = ""
-
-                if line == "PING":
-                    conn.sendall(b"PONG\n")
-                    continue
-                if line == "PING2":
-                    conn.sendall(b"PONG2\n")
-                    continue
-
-                rc = 1
-                detail = ""
-                try:
-                    mode = "force"
-                    wants_color = False
-                    if line.startswith("RUN\t"):
-                        source_token, wants_color = _parse_worker_run_payload(line.split("\t", 1)[1])
-                    elif line.startswith("RUN_NC\t"):
-                        mode = "no-cache"
-                        source_token, wants_color = _parse_worker_run_payload(line.split("\t", 1)[1])
-                    else:
-                        raise RuntimeError("invalid force-worker request")
-                    out_buf = io.StringIO()
-                    err_buf = io.StringIO()
-                    prev_force_color = os.environ.get("L2_FORCE_COLOR")
-                    os.environ["L2_FORCE_COLOR"] = "1" if wants_color else "0"
-                    try:
-                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                            if mode == "force":
-                                result = _worker_quick_force([source_token, "--force"], emit_status=False)
-                                if result is None:
-                                    result = _worker_cli([source_token, "--force"])
-                            else:
-                                result = _worker_cli([source_token, "--no-cache"])
-                    finally:
-                        if prev_force_color is None:
-                            os.environ.pop("L2_FORCE_COLOR", None)
-                        else:
-                            os.environ["L2_FORCE_COLOR"] = prev_force_color
-                    rc = int(result) if result is not None else 0
-                    if rc != 0:
-                        detail = err_buf.getvalue().strip() or out_buf.getvalue().strip()
-                except SystemExit as exc:
-                    code = exc.code
-                    if isinstance(code, int):
-                        rc = code
-                    elif code is None:
-                        rc = 0
-                    else:
-                        rc = 1
-                except Exception as exc:
-                    rc = 1
-                    detail = f"force worker exception: {exc}"
-                payload = f"RC2\t{int(rc)}"
-                if detail:
-                    payload += f"\t{_encode_worker_message(detail)}"
-                conn.sendall((payload + "\n").encode("utf-8"))
-
-    _remove_force_worker_file(_FORCE_WORKER_SOCKET)
-    _remove_force_worker_file(_FORCE_WORKER_PID)
+    code = response.get("code", 1)
+    try:
+        return int(code)
+    except Exception:
+        return 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == _FORCE_WORKER_TOKEN:
-        _run_force_worker()
-        raise SystemExit(0)
+    argv, force_local = _split_control_args(sys.argv[1:])
 
-    quick_no_cache = _try_ultra_fast_no_cache(sys.argv[1:])
-    if quick_no_cache is not None:
-        raise SystemExit(quick_no_cache)
+    if _requires_local_execution(argv):
+        force_local = True
 
-    quick_force = _try_ultra_fast_force(sys.argv[1:])
-    if quick_force is not None:
-        raise SystemExit(quick_force)
+    if not force_local:
+        import os
 
-    from l2_main import main as _entry_main
+        daemon_enabled = os.environ.get("L2_DAEMON", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if daemon_enabled:
+            result = _run_via_daemon(argv)
+            if result is not None:
+                raise SystemExit(result)
 
-    _entry_main()
+    from l2_main import cli as _entry_cli
+
+    raise SystemExit(_entry_cli(argv))
 else:
     from l2_main import *  # noqa: F401,F403
     from l2_main import main as _entry_main

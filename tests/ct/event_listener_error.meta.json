@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "L2 compile-event listener errors must fail compilation instead of being swallowed."
+}

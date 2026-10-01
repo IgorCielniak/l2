@@ -1,0 +1,4 @@
+{
+  "description": "l2_compile returns a callable native pointer; call runs the snippet",
+  "use_l2": true
+}

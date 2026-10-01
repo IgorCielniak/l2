@@ -1,0 +1,5 @@
+{
+  "compile_args": ["--no-cache"],
+  "expected_events": ["compile", "compile.begin", "compile.end"],
+  "stdout_regex": "(?s)^(?:\\{\\\"answer\\\":42\\}\\n)?event-objects-ok$"
+}

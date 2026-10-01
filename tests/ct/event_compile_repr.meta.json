@@ -1,0 +1,5 @@
+{
+  "compile_only": true,
+  "compile_args": ["--no-cache", "--no-artifact"],
+  "description": "Compiler event payloads can be accessed and printed as normalized JSON at compile time."
+}

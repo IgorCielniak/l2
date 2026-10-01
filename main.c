@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  /* for dladdr / Dl_info (used by the JIT loader) */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +13,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
 #include <dirent.h>
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
@@ -21,6 +26,11 @@ int eval_program_cstr(const char *source);
 const char *l2_get_source_from_embedded(const char *func_name, long *out_len);
 void l2_set_embedded_source(const char *source, long source_len);
 void l2_set_eval_stack_top(uintptr_t stack_top_addr);
+typedef enum {
+    L2_EVAL_STATUS_OK = 0,
+    L2_EVAL_STATUS_ERROR = 1
+} l2_eval_status_t;
+l2_eval_status_t l2_eval_ex(const char *source, long source_len, int64_t *out_result);
 // Legacy aliases for backward compatibility
 int l2_eval(const char *source, long source_len);
 int l2_eval_cstr(const char *source);
@@ -30,6 +40,22 @@ int l2_eval_inline_cstr(const char *source);
 void eval(const char *source, long source_len);
 int eval_cstr(const char *source);
 int eval_scalar(const char *source, long source_len);
+
+// Runtime compilation returns an executable L2-ABI trampoline; release it with
+// l2_release. Snippets use the C CT VM fallback when native JIT is unavailable.
+
+void *l2_compile(const char *source, long source_len);
+void *l2_compile_cstr(const char *source);
+void l2_release(void *fn_ptr);
+uint64_t l2_invoke_trampoline(void *fn, uint64_t r12_in);
+
+// Keystone is loaded lazily. JIT code uses L2's r12 stack ABI and is released
+// with l2_jit_release; set L2_KEYSTONE_PATH to select a library explicitly.
+int l2_ks_available(void);
+int l2_ks_assemble(const char *asm_src, uint8_t **out_buf, size_t *out_len);
+void *l2_jit_from_asm(const char *asm_src, long src_len);
+void *l2_jit_from_asm_cstr(const char *asm_src);
+void l2_jit_release(void *fn_ptr);
 
 
 
@@ -1316,6 +1342,9 @@ static Token ct_pop_token(CompileTimeVM *vm) {
 
 static void ct_word_call(CompileTimeVM *vm, Word *word);
 static char *ct_string_from_value(CtValue v);
+// Try a JIT-safe :asm word on an integer-only CT stack; otherwise use the
+// existing CT execution path.
+static bool ct_try_asm_jit(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def);
 
 static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def) {
     if (strcmp(word->name, "puti") == 0) {
@@ -1534,6 +1563,10 @@ static void ct_word_call(CompileTimeVM *vm, Word *word) {
                 vm->call_stack.len--;
                 return;
             }
+            if (ct_try_asm_jit(vm, word, word->ct_asm_def)) {
+                vm->call_stack.len--;
+                return;
+            }
             vm->call_stack.len--;
             return;
         }
@@ -1556,7 +1589,14 @@ static void ct_word_call(CompileTimeVM *vm, Word *word) {
         }
         if (word->asm_def || word->ct_asm_def) {
             AsmDefinition *asm_def = word->ct_asm_def ? word->ct_asm_def : word->asm_def;
-            ct_try_asm_io(vm, word, asm_def);
+            if (ct_try_asm_io(vm, word, asm_def)) {
+                vm->call_stack.len--;
+                return;
+            }
+            if (ct_try_asm_jit(vm, word, asm_def)) {
+                vm->call_stack.len--;
+                return;
+            }
             vm->call_stack.len--;
             return;
         }
@@ -2562,6 +2602,58 @@ static void ct_intrinsic_bss_set(CompileTimeVM *vm) {
     ct_intrinsic_bss_append(vm);
 }
 
+/* eval_env stubs consume full-compiler-only data/BSS/prelude arguments. */
+static void ct_intrinsic_data_append(CompileTimeVM *vm) {
+    char *line = ct_pop_str(vm);
+    free(line);
+}
+
+static void ct_intrinsic_data_set(CompileTimeVM *vm) {
+    (void)ct_pop_list(vm);
+}
+
+static void ct_intrinsic_ct_current_token(CompileTimeVM *vm) {
+    if (vm->parser && vm->parser->has_last_token) {
+        ct_stack_push(&vm->stack, ct_make_token(vm->parser->last_token));
+        return;
+    }
+    Token tok = {0};
+    tok.lexeme = str_dup("");
+    ct_stack_push(&vm->stack, ct_make_token(tok));
+}
+
+static void ct_intrinsic_inject_lexemes(CompileTimeVM *vm) {
+    CtValue template_v = ct_stack_pop(&vm->stack);
+    CtList *list = ct_pop_list(vm);
+    Token template = {0};
+    if (template_v.kind == CT_TOKEN) {
+        template = template_v.as.token;
+    }
+    TokenVec injected;
+    VEC_INIT(&injected);
+    int column = template.column > 0 ? template.column : 1;
+    for (size_t i = 0; i < list->items.len; i++) {
+        CtValue v = list->items.data[i];
+        Token tok = {0};
+        if (v.kind == CT_TOKEN) {
+            tok.lexeme = v.as.token.lexeme ? str_dup(v.as.token.lexeme) : str_dup("");
+        } else if (v.kind == CT_STR) {
+            tok.lexeme = v.as.str ? str_dup(v.as.str) : str_dup("");
+        } else {
+            tok.lexeme = ct_string_from_value(v);
+        }
+        tok.line = template.line;
+        tok.column = column;
+        tok.start = template.start;
+        tok.end = template.end;
+        if (tok.lexeme) {
+            column += (int)strlen(tok.lexeme);
+        }
+        VEC_PUSH(&injected, tok);
+    }
+    parser_inject_tokens(vm->parser, &injected);
+}
+
 
 static Word *register_ct_intrinsic(Dictionary *dict, const char *name, CompileTimeIntrinsic fn) {
     Word *word = dictionary_lookup(dict, name);
@@ -2642,6 +2734,10 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "next-token", ct_intrinsic_next_token);
     register_ct_intrinsic(dict, "peek-token", ct_intrinsic_peek_token);
     register_ct_intrinsic(dict, "inject-tokens", ct_intrinsic_inject_tokens);
+    register_ct_intrinsic(dict, "inject-lexemes", ct_intrinsic_inject_lexemes);
+    register_ct_intrinsic(dict, "ct-current-token", ct_intrinsic_ct_current_token);
+    register_ct_intrinsic(dict, "data-append", ct_intrinsic_data_append);
+    register_ct_intrinsic(dict, "data-set", ct_intrinsic_data_set);
     register_ct_intrinsic(dict, "set-token-hook", ct_intrinsic_set_token_hook);
     register_ct_intrinsic(dict, "clear-token-hook", ct_intrinsic_clear_token_hook);
     register_ct_intrinsic(dict, "parse-error", ct_intrinsic_parse_error);
@@ -4690,21 +4786,49 @@ static void parse_tokens(Parser *parser, const char *source) {
             }
             size_t body_start = (size_t)brace.end;
             size_t body_end = body_start;
+            /* Collect the body tokens; used as fallback when the tokens
+             * were injected (via inject-lexemes) and don't carry valid
+             * source positions we can slice from parser->source. */
+            StrVec asm_body_toks;
+            VEC_INIT(&asm_body_toks);
             while (!parser_eof(parser)) {
                 Token next = parser_next_token(parser);
                 if (next.lexeme && strcmp(next.lexeme, "}") == 0) {
                     body_end = (size_t)next.start;
                     break;
                 }
+                if (next.lexeme) {
+                    VEC_PUSH(&asm_body_toks, str_dup(next.lexeme));
+                }
             }
-            if (body_end <= body_start) {
+            char *body = NULL;
+            if (body_end > body_start && parser->source) {
+                size_t body_len = body_end - body_start;
+                body = (char *)xmalloc(body_len + 1);
+                memcpy(body, parser->source + body_start, body_len);
+                body[body_len] = '\0';
+            } else if (asm_body_toks.len > 0) {
+                /* Reconstruct body from tokens (injected via inject-lexemes). */
+                size_t total = 0;
+                for (size_t i = 0; i < asm_body_toks.len; i++) {
+                    total += strlen(asm_body_toks.data[i]) + 1;
+                }
+                body = (char *)xmalloc(total + 1);
+                body[0] = '\0';
+                for (size_t i = 0; i < asm_body_toks.len; i++) {
+                    if (i > 0) {
+                        strcat(body, " ");
+                    }
+                    strcat(body, asm_body_toks.data[i]);
+                }
+            } else {
                 fprintf(stderr, "[error] missing '}' to terminate asm body\n");
                 exit(1);
             }
-            size_t body_len = body_end - body_start;
-            char *body = (char *)xmalloc(body_len + 1);
-            memcpy(body, parser->source + body_start, body_len);
-            body[body_len] = '\0';
+            for (size_t i = 0; i < asm_body_toks.len; i++) {
+                free(asm_body_toks.data[i]);
+            }
+            VEC_FREE(&asm_body_toks);
             AsmDefinition *def = (AsmDefinition *)xmalloc(sizeof(AsmDefinition));
             memset(def, 0, sizeof(AsmDefinition));
             def->name = str_dup(name_tok.lexeme);
@@ -5589,7 +5713,7 @@ int l2_cli(int argc, char **argv) {
     return 0;
 }
 
-int eval_program(const char *source, long source_len) {
+static int eval_program_in_process(const char *source, long source_len) {
     int result = -1;
     char *owned_source = NULL;
     char *root_dir = NULL;
@@ -5641,6 +5765,66 @@ cleanup:
     free(stdlib_dir);
     if (ctx.parser.primary_path) {
         free(ctx.parser.primary_path);
+    }
+    return result;
+}
+
+int eval_program(const char *source, long source_len) {
+    if (!source || source_len < 0) {
+        return eval_program_in_process(source, source_len);
+    }
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        fprintf(stderr, "[error] eval_program pipe failed: %s\n", strerror(errno));
+        return -1;
+    }
+    fflush(stdout);
+    fflush(stderr);
+
+    pid_t child_pid = fork();
+    if (child_pid < 0) {
+        int saved_errno = errno;
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        fprintf(stderr, "[error] eval_program fork failed: %s\n", strerror(saved_errno));
+        return -1;
+    }
+    if (child_pid == 0) {
+        close(result_pipe[0]);
+        int result = eval_program_in_process(source, source_len);
+        fflush(stdout);
+        fflush(stderr);
+        ssize_t written;
+        do {
+            written = write(result_pipe[1], &result, sizeof(result));
+        } while (written < 0 && errno == EINTR);
+        close(result_pipe[1]);
+        _exit(written == (ssize_t)sizeof(result) ? 0 : 1);
+    }
+
+    close(result_pipe[1]);
+    int result = -1;
+    size_t received = 0;
+    while (received < sizeof(result)) {
+        ssize_t count = read(result_pipe[0], (char *)&result + received, sizeof(result) - received);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            break;
+        }
+        received += (size_t)count;
+    }
+    close(result_pipe[0]);
+
+    int wait_status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child_pid, &wait_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child_pid || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0 || received != sizeof(result)) {
+        return -1;
     }
     return result;
 }
@@ -5773,9 +5957,8 @@ uintptr_t l2_eval_env_compute(const char *source, long source_len, long stack_to
     }
 
     int rc = l2_eval_inline_with_ctx(&g_eval_env_ctx, source, source_len);
-    if (rc < 0) {
-        return context_sp;
-    }
+    // rc is the top stack value, not a status code; negative results are valid.
+    (void)rc;
 
     for (size_t i = 0; i < g_eval_env_ctx.vm.stack.len; i++) {
         uint64_t cells[2];
@@ -5837,7 +6020,9 @@ uintptr_t l2_eval_compute(const char *source, long source_len, long stack_top_ad
     g_eval_ctx.vm.rstack.len = 0;
 
     int rc = l2_eval_inline_with_ctx(&g_eval_ctx, source, source_len);
-    if (rc < 0) {
+    // A negative result can equal the error sentinel; an empty CT stack
+    // distinguishes setup failure from a valid negative result.
+    if (rc < 0 && g_eval_ctx.vm.stack.len == 0) {
         return (uintptr_t)stack_top_addr;
     }
 
@@ -5887,12 +6072,37 @@ int eval_scalar(const char *source, long source_len) {
     if (sp == 0) {
         return -1;
     }
-    // Get the last value from the returned stack
     if (sp >= l2_eval_stack_top_addr()) {
         return 0;
     }
     int64_t result = *(int64_t *)sp;
     return (int)result;
+}
+
+l2_eval_status_t l2_eval_ex(const char *source, long source_len, int64_t *out_result) {
+    if (!source || source_len < 0 || !out_result) {
+        return L2_EVAL_STATUS_ERROR;
+    }
+
+    l2_eval_ctx_init(&g_eval_ctx);
+    g_eval_ctx.vm.stack.len = 0;
+    g_eval_ctx.vm.rstack.len = 0;
+
+    int result = l2_eval_inline_with_ctx(&g_eval_ctx, source, source_len);
+    if (result < 0 && g_eval_ctx.vm.stack.len == 0) {
+        return L2_EVAL_STATUS_ERROR;
+    }
+    if (g_eval_ctx.vm.stack.len == 0) {
+        *out_result = 0;
+        return L2_EVAL_STATUS_OK;
+    }
+
+    CtValue top = ct_stack_peek(&g_eval_ctx.vm.stack);
+    if (top.kind != CT_INT) {
+        return L2_EVAL_STATUS_ERROR;
+    }
+    *out_result = top.as.i64;
+    return L2_EVAL_STATUS_OK;
 }
 
 int eval_cstr(const char *source) {
@@ -5929,6 +6139,840 @@ int l2_eval_inline(const char *source, long source_len) {
 int l2_eval_inline_cstr(const char *source) {
     return eval_cstr(source);
 }
+
+// l2_compile / l2_release implementation. The SysV trampoline and source share
+// an executable mapping, with the source after the reserved trampoline slot.
+
+#if defined(__x86_64__)
+
+typedef struct l2_compiled_entry {
+    void *page;
+    size_t size;
+    struct l2_compiled_entry *next;
+} l2_compiled_entry_t;
+
+static l2_compiled_entry_t *g_l2_compiled_head = NULL;
+
+#define L2_COMPILE_TRAMPOLINE_SLOT 64
+
+// Compile snippets to native code with Keystone when they use supported
+// r12-based operations; all other snippets use the eval trampoline.
+
+static L2EvalContext g_l2_ct_jit_ctx;
+static bool g_l2_ct_jit_ctx_ready = false;
+static long g_l2_ct_jit_seq = 0;
+
+// Convert NASM size prefixes and strip comments for Keystone's Intel syntax.
+// Returns a new string and frees the input.
+static char *l2_ct_asm_intelize(char *asm_text) {
+    if (!asm_text) return NULL;
+    size_t in_len = strlen(asm_text);
+    size_t cap = in_len * 2 + 64;
+    char *out = (char *)xmalloc(cap);
+    size_t o = 0;
+    static const char *sizes[] = { "qword", "dword", "word", "byte", "tword", NULL };
+    for (size_t i = 0; i < in_len;) {
+        char c = asm_text[i];
+        // Skip ';' comments up to end of line.
+        if (c == ';') {
+            while (i < in_len && asm_text[i] != '\n') i++;
+            continue;
+        }
+        bool matched = false;
+        for (int s = 0; sizes[s]; s++) {
+            size_t slen = strlen(sizes[s]);
+            if (i + slen + 1 > in_len) continue;
+            if (memcmp(asm_text + i, sizes[s], slen) != 0) continue;
+            if (i > 0) {
+                char prev = asm_text[i - 1];
+                if (prev != ' ' && prev != '\t' && prev != '\n') continue;
+            }
+            size_t j = i + slen;
+            if (j >= in_len || asm_text[j] != ' ') continue;
+            size_t k = j + 1;
+            while (k < in_len && asm_text[k] == ' ') k++;
+            if (k >= in_len || asm_text[k] != '[') continue;
+            memcpy(out + o, sizes[s], slen); o += slen;
+            memcpy(out + o, " ptr", 4); o += 4;
+            i = j;
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            out[o++] = asm_text[i++];
+        }
+        if (o + 8 >= cap) {
+            cap = cap * 2;
+            out = (char *)realloc(out, cap);
+        }
+    }
+    out[o] = '\0';
+    free(asm_text);
+    return out;
+}
+
+static void l2_ct_jit_ctx_init_once(void) {
+    if (g_l2_ct_jit_ctx_ready) {
+        return;
+    }
+    l2_eval_ctx_init(&g_l2_ct_jit_ctx);
+    l2_eval_seed_embedded_program(&g_l2_ct_jit_ctx);
+
+    // Prime the context with stdlib :asm words, loading stdlib.sl from disk
+    // when this library was built without embedded source.
+    char *primer = str_dup("import stdlib/stdlib.sl\n");
+    StrMap visited;
+    strmap_init(&visited);
+    FileSpanVec spans;
+    VEC_INIT(&spans);
+    int line_counter = 1;
+    char *expanded = expand_imports_from_source(primer,
+                                                 g_l2_ct_jit_ctx.root_dir,
+                                                 &g_l2_ct_jit_ctx.include_dirs,
+                                                 &visited, &spans, &line_counter);
+    if (expanded && *expanded) {
+        parse_tokens(&g_l2_ct_jit_ctx.parser, expanded);
+    }
+    for (size_t i = 0; i < spans.len; i++) free(spans.data[i].path);
+    VEC_FREE(&spans);
+    strmap_free(&visited);
+    free(expanded);
+    free(primer);
+
+    g_l2_ct_jit_ctx_ready = true;
+}
+
+// Bare JIT pages initialize only r12, so reject runtime symbols, syscalls,
+// externs, and r13 references that require the normal runtime environment.
+static bool l2_ct_asm_is_jit_safe(const char *asm_text) {
+    if (!asm_text) return false;
+    static const char *banned[] = {
+        "[rel ",
+        "syscall",
+        "extern ",
+        "section ",
+        "[abs ",
+        // r13 is not initialized in a bare JIT page; use the trampoline instead.
+        "r13",
+        NULL,
+    };
+    for (int i = 0; banned[i]; i++) {
+        if (strstr(asm_text, banned[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Render a flat snippet with its entry point first, followed by JIT-safe
+// stdlib :asm definitions needed to resolve calls.
+static char *l2_ct_render_snippet_asm(const char *source, long source_len) {
+    l2_ct_jit_ctx_init_once();
+    L2EvalContext *ctx = &g_l2_ct_jit_ctx;
+
+    long uid = ++g_l2_ct_jit_seq;
+    char snippet_name[64];
+    snprintf(snippet_name, sizeof(snippet_name), "__l2_ct_snip_%ld", uid);
+
+    char *wrapped = str_printf("word %s\n%.*s\nend\n",
+                                snippet_name, (int)source_len, source);
+    if (!wrapped) return NULL;
+
+    size_t forms_before = ctx->parser.module.forms.len;
+    // parse_tokens reuses its token vector, so discard the primer tokens.
+    for (size_t i = 0; i < ctx->parser.tokens.len; i++) {
+        free(ctx->parser.tokens.data[i].lexeme);
+    }
+    ctx->parser.tokens.len = 0;
+    parse_tokens(&ctx->parser, wrapped);
+    free(wrapped);
+
+    Definition *snippet_def = NULL;
+    for (size_t i = ctx->parser.module.forms.len; i > forms_before; i--) {
+        Form form = ctx->parser.module.forms.data[i - 1];
+        if (form.kind == FORM_DEF) {
+            Definition *d = (Definition *)form.ptr;
+            if (d && str_equals(d->name, snippet_name)) {
+                snippet_def = d;
+                break;
+            }
+        }
+    }
+    if (!snippet_def) return NULL;
+
+    Emission emission;
+    emission_init(&emission);
+    EmitContext ectx;
+    ectx.emission = &emission;
+    ectx.dictionary = &ctx->dict;
+    strmap_init(&ectx.string_labels);
+    strmap_init(&ectx.externs);
+    strmap_init(&ectx.label_cache);
+    ectx.unique_id = 0;
+    ectx.debug = false;
+
+    // Keep the entry point at the start of the assembled blob.
+    VEC_PUSH(&emission.text, str_dup("l2_ct_entry:"));
+    FunctionEmitter builder;
+    emitter_init(&builder, &emission.text, false);
+    StrVec inline_stack;
+    VEC_INIT(&inline_stack);
+    emit_ops(&ectx, &builder, &snippet_def->body, &inline_stack);
+    emit_line(&builder, "    ret");
+    VEC_FREE(&inline_stack);
+
+    // Use the dictionary to avoid duplicate forms; unsafe bodies are skipped
+    // and cause JIT fallback if referenced.
+    StrMap *dwords = &ctx->dict.words;
+    for (size_t i = 0; i < dwords->cap; i++) {
+        if (!dwords->keys || !dwords->keys[i]) continue;
+        Word *word = (Word *)dwords->values[i];
+        if (!word || !word->asm_def) continue;
+        AsmDefinition *def = word->asm_def;
+        if (def->compile_only || !def->body) continue;
+        if (!l2_ct_asm_is_jit_safe(def->body)) continue;
+        emit_asm_definition(&ectx, def);
+    }
+
+    // Keystone consumes flat instruction text, not section directives.
+    size_t total = 0;
+    for (size_t i = 0; i < emission.text.len; i++) {
+        if (emission.text.data[i]) total += strlen(emission.text.data[i]) + 1;
+    }
+    char *asm_text = (char *)xmalloc(total + 1);
+    asm_text[0] = '\0';
+    for (size_t i = 0; i < emission.text.len; i++) {
+        if (emission.text.data[i]) {
+            strcat(asm_text, emission.text.data[i]);
+            strcat(asm_text, "\n");
+        }
+    }
+
+    for (size_t i = 0; i < emission.text.len; i++) free(emission.text.data[i]);
+    for (size_t i = 0; i < emission.data.len; i++) free(emission.data.data[i]);
+    for (size_t i = 0; i < emission.bss.len; i++) free(emission.bss.data[i]);
+    VEC_FREE(&emission.text);
+    VEC_FREE(&emission.data);
+    VEC_FREE(&emission.bss);
+    strmap_free(&ectx.string_labels);
+    strmap_free(&ectx.externs);
+    strmap_free(&ectx.label_cache);
+
+    return asm_text;
+}
+
+// Return an executable page on success, or -1 so the caller can use the
+// eval trampoline.
+static int l2_compile_try_jit(const char *source, long source_len,
+                               void **out_page, size_t *out_size) {
+    if (!source || source_len < 0) return -1;
+    if (!out_page || !out_size) return -1;
+
+    char *asm_text = l2_ct_render_snippet_asm(source, source_len);
+    if (!asm_text) return -1;
+
+    if (!l2_ct_asm_is_jit_safe(asm_text)) {
+        free(asm_text);
+        return -1;
+    }
+
+    // Keystone uses Intel syntax and rejects NASM size qualifiers/comments.
+    asm_text = l2_ct_asm_intelize(asm_text);
+    if (!asm_text) return -1;
+
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    int rc = l2_ks_assemble(asm_text, &bytes, &len);
+    free(asm_text);
+    if (rc != 0 || !bytes || len == 0) {
+        free(bytes);
+        return -1;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    size_t alloc = ((len + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+
+    void *page = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        free(bytes);
+        return -1;
+    }
+    memcpy(page, bytes, len);
+    free(bytes);
+    if (mprotect(page, alloc, PROT_READ | PROT_EXEC) != 0) {
+        munmap(page, alloc);
+        return -1;
+    }
+    __builtin___clear_cache((char *)page, (char *)page + len);
+
+    *out_page = page;
+    *out_size = alloc;
+    return 0;
+}
+
+// Per-word JIT cache; entries live as long as the primed CT context.
+typedef struct AsmJitCacheEntry {
+    char *word_name;
+    void *entry_pt;
+    size_t page_size;
+    struct AsmJitCacheEntry *next;
+} AsmJitCacheEntry;
+
+static AsmJitCacheEntry *g_asm_jit_word_cache = NULL;
+
+static void *asm_jit_cache_lookup(const char *name) {
+    if (!name) return NULL;
+    for (AsmJitCacheEntry *e = g_asm_jit_word_cache; e; e = e->next) {
+        if (strcmp(e->word_name, name) == 0) return e->entry_pt;
+    }
+    return NULL;
+}
+
+static void asm_jit_cache_insert(const char *name, void *entry_pt, size_t page_size) {
+    AsmJitCacheEntry *e = (AsmJitCacheEntry *)xmalloc(sizeof(*e));
+    e->word_name = str_dup(name);
+    e->entry_pt = entry_pt;
+    e->page_size = page_size;
+    e->next = g_asm_jit_word_cache;
+    g_asm_jit_word_cache = e;
+}
+
+// JIT a CT :asm call when safe; otherwise preserve its normal handling.
+static bool ct_try_asm_jit(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def) {
+    if (!vm || !word || !word->name) return false;
+    if (!asm_def || !asm_def->body) return false;
+    // Runtime cells do not preserve CT value kinds, so only integers can be
+    // marshalled safely.
+    for (size_t i = 0; i < vm->stack.len; i++) {
+        if (vm->stack.data[i].kind != CT_INT) return false;
+    }
+    if (!l2_ct_asm_is_jit_safe(asm_def->body)) return false;
+
+    void *fn = asm_jit_cache_lookup(word->name);
+    if (!fn) {
+        // Compile the word name in the primed context to emit its call target.
+        void *page = NULL;
+        size_t sz = 0;
+        if (l2_compile_try_jit(word->name, (long)strlen(word->name),
+                                &page, &sz) != 0) {
+            return false;
+        }
+        asm_jit_cache_insert(word->name, page, sz);
+        fn = page;
+    }
+
+    // Match the L2 stack layout and reserve space for values pushed by the word.
+    size_t headroom = 64;
+    size_t cap = vm->stack.len + headroom;
+    uint64_t *scratch = (uint64_t *)xmalloc(cap * sizeof(uint64_t));
+    memset(scratch, 0, cap * sizeof(uint64_t));
+    uintptr_t base = (uintptr_t)(scratch + cap);
+    uintptr_t sp = base;
+    // Push bottom first so TOS ends up at [sp].
+    for (size_t i = 0; i < vm->stack.len; i++) {
+        sp -= 8;
+        *(uint64_t *)sp = (uint64_t)vm->stack.data[i].as.i64;
+    }
+
+    uintptr_t new_sp = (uintptr_t)l2_invoke_trampoline(fn, (uint64_t)sp);
+    if (new_sp > base || new_sp < (uintptr_t)scratch) {
+        // Reject an invalid stack pointer without altering the CT stack.
+        free(scratch);
+        return false;
+    }
+
+    size_t new_len = (base - new_sp) / 8;
+    vm->stack.len = 0;
+    // Push bottom-first into the CT VM stack so TOS remains the same.
+    for (ssize_t i = (ssize_t)new_len - 1; i >= 0; i--) {
+        uint64_t cell = *(uint64_t *)(new_sp + (uintptr_t)(i * 8));
+        ct_stack_push(&vm->stack, ct_make_int((int64_t)cell));
+    }
+    free(scratch);
+    return true;
+}
+
+void *l2_compile(const char *source, long source_len) {
+    if (!source || source_len < 0) {
+        fprintf(stderr, "[error] l2_compile received invalid source\n");
+        return NULL;
+    }
+
+    // Try native JIT first.  On any failure fall back to the eval
+    // trampoline that dispatches through l2_eval_compute at call time.
+    void *jit_page = NULL;
+    size_t jit_size = 0;
+    if (l2_compile_try_jit(source, source_len, &jit_page, &jit_size) == 0) {
+        l2_compiled_entry_t *entry = (l2_compiled_entry_t *)malloc(sizeof(*entry));
+        if (entry) {
+            entry->page = jit_page;
+            entry->size = jit_size;
+            entry->next = g_l2_compiled_head;
+            g_l2_compiled_head = entry;
+        }
+        return jit_page;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        page_size = 4096;
+    }
+
+    size_t needed = (size_t)L2_COMPILE_TRAMPOLINE_SLOT + (size_t)source_len + 1;
+    size_t alloc = ((needed + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+
+    void *page = mmap(NULL, alloc, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        fprintf(stderr, "[error] l2_compile mmap failed: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    uint8_t *code = (uint8_t *)page;
+    char *src_slot = (char *)page + L2_COMPILE_TRAMPOLINE_SLOT;
+    memcpy(src_slot, source, (size_t)source_len);
+    src_slot[source_len] = '\0';
+
+    size_t off = 0;
+    // Build the SysV trampoline and pass the live L2 data stack to the VM.
+    code[off++] = 0x55;
+    code[off++] = 0x48; code[off++] = 0x89; code[off++] = 0xE5;
+    code[off++] = 0x48; code[off++] = 0x83; code[off++] = 0xE4; code[off++] = 0xF0;
+    code[off++] = 0x48; code[off++] = 0xBF;
+    void *src_ptr_val = src_slot;
+    memcpy(code + off, &src_ptr_val, sizeof(void *)); off += 8;
+    code[off++] = 0x48; code[off++] = 0xBE;
+    int64_t slen_val = (int64_t)source_len;
+    memcpy(code + off, &slen_val, 8); off += 8;
+    code[off++] = 0x4C; code[off++] = 0x89; code[off++] = 0xE2;
+    code[off++] = 0x48; code[off++] = 0xB8;
+    void *fn_ptr = (void *)&l2_eval_compute;
+    memcpy(code + off, &fn_ptr, sizeof(void *)); off += 8;
+    code[off++] = 0xFF; code[off++] = 0xD0;
+    code[off++] = 0x49; code[off++] = 0x89; code[off++] = 0xC4;
+    code[off++] = 0x48; code[off++] = 0x89; code[off++] = 0xEC;
+    code[off++] = 0x5D;
+    code[off++] = 0xC3;
+
+    if (off > (size_t)L2_COMPILE_TRAMPOLINE_SLOT) {
+        // Keep the generated code within its reserved slot.
+        fprintf(stderr, "[error] l2_compile trampoline overflow (%zu > %d)\n",
+                off, L2_COMPILE_TRAMPOLINE_SLOT);
+        munmap(page, alloc);
+        return NULL;
+    }
+
+    l2_compiled_entry_t *entry = (l2_compiled_entry_t *)malloc(sizeof(*entry));
+    if (entry) {
+        entry->page = page;
+        entry->size = alloc;
+        entry->next = g_l2_compiled_head;
+        g_l2_compiled_head = entry;
+    }
+    // Flush the instruction cache after writing executable bytes.
+    __builtin___clear_cache((char *)page, (char *)page + off);
+    return page;
+}
+
+void *l2_compile_cstr(const char *source) {
+    if (!source) {
+        return NULL;
+    }
+    return l2_compile(source, (long)strlen(source));
+}
+
+void l2_release(void *fn_ptr) {
+    if (!fn_ptr) {
+        return;
+    }
+    l2_compiled_entry_t **prev = &g_l2_compiled_head;
+    while (*prev) {
+        if ((*prev)->page == fn_ptr) {
+            l2_compiled_entry_t *victim = *prev;
+            *prev = victim->next;
+            if (munmap(victim->page, victim->size) != 0) {
+                fprintf(stderr, "[warn] l2_release munmap failed: %s\n", strerror(errno));
+            }
+            free(victim);
+            return;
+        }
+        prev = &(*prev)->next;
+    }
+    fprintf(stderr, "[warn] l2_release: pointer %p not tracked\n", fn_ptr);
+}
+
+/* SysV bridge that invokes an L2 function with a caller-supplied r12 stack. */
+#if defined(__x86_64__)
+uint64_t l2_invoke_trampoline(void *fn, uint64_t r12_in) {
+    uint64_t r12_out;
+    __asm__ volatile (
+        "movq %[in], %%r12\n\t"
+        "callq *%[fn]\n\t"
+        "movq %%r12, %[out]\n\t"
+        : [out] "=&r" (r12_out)
+        : [fn] "r" (fn), [in] "r" (r12_in)
+        : "r12", "memory", "cc",
+          "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11"
+    );
+    return r12_out;
+}
+#else
+uint64_t l2_invoke_trampoline(void *fn, uint64_t r12_in) {
+    (void)fn; (void)r12_in;
+    fprintf(stderr, "[error] l2_invoke_trampoline unimplemented on this arch\n");
+    return r12_in;
+}
+#endif
+
+// -----------------------------------------------------------------------------
+// Keystone-backed JIT implementation.
+// -----------------------------------------------------------------------------
+
+// Declare Keystone's stable C ABI directly so development headers are optional.
+typedef int l2_ks_arch_t;
+struct l2_ks_engine_opaque;
+typedef struct l2_ks_engine_opaque l2_ks_engine_t;
+
+#define L2_KS_ARCH_X86  4  /* KS_ARCH_X86  == 4 in keystone.h */
+#define L2_KS_MODE_64   8  /* KS_MODE_64   == 1 << 3         */
+#define L2_KS_OPT_SYNTAX        1  /* KS_OPT_SYNTAX          */
+#define L2_KS_OPT_SYNTAX_NASM   2  /* KS_OPT_SYNTAX_NASM     */
+
+typedef int (*l2_ks_open_fn)(l2_ks_arch_t arch, int mode, l2_ks_engine_t **ks);
+typedef int (*l2_ks_close_fn)(l2_ks_engine_t *ks);
+typedef int (*l2_ks_asm_fn)(l2_ks_engine_t *ks, const char *string,
+                            uint64_t address, unsigned char **encoding,
+                            size_t *encoding_size, size_t *stat_count);
+typedef void (*l2_ks_free_fn)(unsigned char *p);
+typedef int (*l2_ks_errno_fn)(l2_ks_engine_t *ks);
+typedef const char *(*l2_ks_strerror_fn)(int err);
+typedef int (*l2_ks_option_fn)(l2_ks_engine_t *ks, int type, size_t value);
+
+typedef struct {
+    void *handle;
+    l2_ks_engine_t *engine;
+    l2_ks_open_fn open_fn;
+    l2_ks_close_fn close_fn;
+    l2_ks_asm_fn asm_fn;
+    l2_ks_free_fn free_fn;
+    l2_ks_errno_fn errno_fn;
+    l2_ks_strerror_fn strerror_fn;
+    l2_ks_option_fn option_fn;
+    int available;   // 1 iff engine successfully opened
+    int probed;      // 1 iff we've attempted to load
+} l2_ks_state_t;
+
+static l2_ks_state_t g_ks_state = {0};
+
+static const char *l2_ks_lib_candidates[] = {
+    /* system fallbacks: use whatever the loader finds on default paths */
+    "libkeystone.so.0",
+    "libkeystone.so",
+    "/usr/lib/x86_64-linux-gnu/libkeystone.so.0",
+    "/usr/lib/x86_64-linux-gnu/libkeystone.so",
+    "/usr/local/lib/libkeystone.so.0",
+    "/usr/local/lib/libkeystone.so",
+    NULL,
+};
+
+/* Compile-time vendored paths.  build_l2_lib.sh defines
+ * L2_SOURCE_ROOT so we can find tools/vendor/libkeystone.so shipped
+ * with the repository (see tools/fetch_keystone.sh). */
+static const char *l2_ks_vendored_paths[] = {
+#ifdef L2_SOURCE_ROOT
+    L2_SOURCE_ROOT "/tools/vendor/libkeystone.so",
+    L2_SOURCE_ROOT "/build/libkeystone.so",
+#endif
+    NULL,
+};
+
+/* Try to locate a vendored libkeystone.so sitting next to the loaded
+ * libl2.so on disk.  Only relevant for the shared build. */
+static void *l2_ks_try_sibling_of_libl2(void) {
+#ifdef L2_AS_LIBRARY
+    Dl_info info;
+    /* pass any symbol defined in this TU; use ourselves */
+    if (!dladdr((void *)&l2_ks_try_sibling_of_libl2, &info) || !info.dli_fname) {
+        return NULL;
+    }
+    const char *fname = info.dli_fname;
+    const char *slash = strrchr(fname, '/');
+    if (!slash) return NULL;
+    size_t dirlen = (size_t)(slash - fname);
+    /* candidate patterns to try relative to libl2's directory */
+    static const char *rels[] = {
+        "/libkeystone.so",
+        "/libkeystone.so.0",
+        "/../tools/vendor/libkeystone.so",
+        NULL,
+    };
+    char buf[4096];
+    for (const char **r = rels; *r; ++r) {
+        if (dirlen + strlen(*r) + 1 >= sizeof(buf)) continue;
+        memcpy(buf, fname, dirlen);
+        strcpy(buf + dirlen, *r);
+        void *h = dlopen(buf, RTLD_NOW | RTLD_LOCAL);
+        if (h) return h;
+    }
+#endif
+    return NULL;
+}
+
+static int l2_ks_init(void) {
+    if (g_ks_state.probed) {
+        return g_ks_state.available;
+    }
+    g_ks_state.probed = 1;
+
+    const char *env_path = getenv("L2_KEYSTONE_PATH");
+    void *h = NULL;
+    if (env_path && *env_path) {
+        h = dlopen(env_path, RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            fprintf(stderr, "[warn] l2_jit: dlopen(%s) failed: %s\n",
+                    env_path, dlerror());
+        }
+    }
+    /* Prefer the vendored copy that ships with the repo before
+     * consulting system paths, so libl2 stays self-contained. */
+    for (const char **p = l2_ks_vendored_paths; !h && *p; ++p) {
+        h = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!h) {
+        h = l2_ks_try_sibling_of_libl2();
+    }
+    for (const char **p = l2_ks_lib_candidates; !h && *p; ++p) {
+        h = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!h) {
+        fprintf(stderr, "[warn] l2_jit: libkeystone not found; "
+                        "run tools/fetch_keystone.sh or set "
+                        "L2_KEYSTONE_PATH to override\n");
+        return 0;
+    }
+    g_ks_state.handle      = h;
+    g_ks_state.open_fn     = (l2_ks_open_fn)     dlsym(h, "ks_open");
+    g_ks_state.close_fn    = (l2_ks_close_fn)    dlsym(h, "ks_close");
+    g_ks_state.asm_fn      = (l2_ks_asm_fn)      dlsym(h, "ks_asm");
+    g_ks_state.free_fn     = (l2_ks_free_fn)     dlsym(h, "ks_free");
+    g_ks_state.errno_fn    = (l2_ks_errno_fn)    dlsym(h, "ks_errno");
+    g_ks_state.strerror_fn = (l2_ks_strerror_fn) dlsym(h, "ks_strerror");
+    g_ks_state.option_fn   = (l2_ks_option_fn)   dlsym(h, "ks_option");
+
+    if (!g_ks_state.open_fn || !g_ks_state.close_fn ||
+        !g_ks_state.asm_fn  || !g_ks_state.free_fn) {
+        fprintf(stderr, "[warn] l2_jit: libkeystone missing required symbols\n");
+        dlclose(h);
+        memset(&g_ks_state, 0, sizeof(g_ks_state));
+        g_ks_state.probed = 1;
+        return 0;
+    }
+
+    int rc = g_ks_state.open_fn(L2_KS_ARCH_X86, L2_KS_MODE_64, &g_ks_state.engine);
+    if (rc != 0 || !g_ks_state.engine) {
+        fprintf(stderr, "[warn] l2_jit: ks_open failed (rc=%d)\n", rc);
+        dlclose(h);
+        memset(&g_ks_state, 0, sizeof(g_ks_state));
+        g_ks_state.probed = 1;
+        return 0;
+    }
+    // Keystone rejects x86-64 NASM syntax; emitted code is converted to Intel syntax.
+    g_ks_state.available = 1;
+    return 1;
+}
+
+int l2_ks_available(void) {
+    return l2_ks_init();
+}
+
+int l2_ks_assemble(const char *asm_src, uint8_t **out_buf, size_t *out_len) {
+    if (!asm_src || !out_buf || !out_len) {
+        return -1;
+    }
+    *out_buf = NULL;
+    *out_len = 0;
+    if (!l2_ks_init()) {
+        return -1;
+    }
+
+    unsigned char *encoding = NULL;
+    size_t size = 0;
+    size_t stat_count = 0;
+    int rc = g_ks_state.asm_fn(g_ks_state.engine, asm_src, 0,
+                               &encoding, &size, &stat_count);
+    if (rc != 0) {
+        int err = g_ks_state.errno_fn ? g_ks_state.errno_fn(g_ks_state.engine) : -1;
+        const char *msg = (g_ks_state.strerror_fn && err >= 0)
+                          ? g_ks_state.strerror_fn(err) : "unknown";
+        fprintf(stderr, "[error] l2_ks_assemble: keystone error %d: %s\n", err, msg);
+        if (encoding) {
+            g_ks_state.free_fn(encoding);
+        }
+        return -1;
+    }
+    if (!encoding || size == 0) {
+        if (encoding) {
+            g_ks_state.free_fn(encoding);
+        }
+        fprintf(stderr, "[error] l2_ks_assemble: keystone produced no bytes\n");
+        return -1;
+    }
+    uint8_t *out = (uint8_t *)malloc(size);
+    if (!out) {
+        g_ks_state.free_fn(encoding);
+        return -1;
+    }
+    memcpy(out, encoding, size);
+    g_ks_state.free_fn(encoding);
+    *out_buf = out;
+    *out_len = size;
+    return 0;
+}
+
+// Executable-memory manager (W^X): mmap RW, copy, mprotect RX.  Pages
+// are tracked in an intrusive list so l2_jit_release can find their
+// size for munmap without a lookup table.
+typedef struct l2_jit_entry {
+    void *page;
+    size_t size;
+    struct l2_jit_entry *next;
+} l2_jit_entry_t;
+
+static l2_jit_entry_t *g_l2_jit_head = NULL;
+
+static void *l2_jit_install(const uint8_t *bytes, size_t len) {
+    if (!bytes || len == 0) {
+        return NULL;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        page_size = 4096;
+    }
+    size_t alloc = ((len + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+
+    void *page = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        fprintf(stderr, "[error] l2_jit_install: mmap failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    memcpy(page, bytes, len);
+    if (mprotect(page, alloc, PROT_READ | PROT_EXEC) != 0) {
+        fprintf(stderr, "[error] l2_jit_install: mprotect failed: %s\n", strerror(errno));
+        munmap(page, alloc);
+        return NULL;
+    }
+    __builtin___clear_cache((char *)page, (char *)page + len);
+
+    l2_jit_entry_t *entry = (l2_jit_entry_t *)malloc(sizeof(*entry));
+    if (entry) {
+        entry->page = page;
+        entry->size = alloc;
+        entry->next = g_l2_jit_head;
+        g_l2_jit_head = entry;
+    }
+    return page;
+}
+
+void *l2_jit_from_asm(const char *asm_src, long src_len) {
+    if (!asm_src || src_len < 0) {
+        return NULL;
+    }
+    // Keystone reads asm_src until NUL, so ensure a NUL-terminated copy
+    // when the caller passed a length.  L2 string literals are already
+    // NUL-terminated but we don't want to rely on that.
+    char *nul_src = (char *)malloc((size_t)src_len + 1);
+    if (!nul_src) {
+        return NULL;
+    }
+    memcpy(nul_src, asm_src, (size_t)src_len);
+    nul_src[src_len] = '\0';
+
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    int rc = l2_ks_assemble(nul_src, &bytes, &len);
+    free(nul_src);
+    if (rc != 0) {
+        return NULL;
+    }
+    void *fn = l2_jit_install(bytes, len);
+    free(bytes);
+    return fn;
+}
+
+void *l2_jit_from_asm_cstr(const char *asm_src) {
+    if (!asm_src) {
+        return NULL;
+    }
+    return l2_jit_from_asm(asm_src, (long)strlen(asm_src));
+}
+
+void l2_jit_release(void *fn_ptr) {
+    if (!fn_ptr) {
+        return;
+    }
+    l2_jit_entry_t **prev = &g_l2_jit_head;
+    while (*prev) {
+        if ((*prev)->page == fn_ptr) {
+            l2_jit_entry_t *victim = *prev;
+            *prev = victim->next;
+            if (munmap(victim->page, victim->size) != 0) {
+                fprintf(stderr, "[warn] l2_jit_release: munmap failed: %s\n", strerror(errno));
+            }
+            free(victim);
+            return;
+        }
+        prev = &(*prev)->next;
+    }
+    fprintf(stderr, "[warn] l2_jit_release: pointer %p not tracked\n", fn_ptr);
+}
+
+#else  /* !__x86_64__ */
+
+void *l2_compile(const char *source, long source_len) {
+    (void)source; (void)source_len;
+    fprintf(stderr, "[error] l2_compile is only supported on x86_64\n");
+    return NULL;
+}
+
+void *l2_compile_cstr(const char *source) {
+    (void)source;
+    return NULL;
+}
+
+void l2_release(void *fn_ptr) {
+    (void)fn_ptr;
+}
+
+int l2_ks_available(void) { return 0; }
+
+int l2_ks_assemble(const char *asm_src, uint8_t **out_buf, size_t *out_len) {
+    (void)asm_src;
+    if (out_buf) *out_buf = NULL;
+    if (out_len) *out_len = 0;
+    fprintf(stderr, "[error] l2_ks_assemble is only supported on x86_64\n");
+    return -1;
+}
+
+void *l2_jit_from_asm(const char *asm_src, long src_len) {
+    (void)asm_src; (void)src_len;
+    fprintf(stderr, "[error] l2_jit_from_asm is only supported on x86_64\n");
+    return NULL;
+}
+
+void *l2_jit_from_asm_cstr(const char *asm_src) {
+    (void)asm_src;
+    return NULL;
+}
+
+void l2_jit_release(void *fn_ptr) {
+    (void)fn_ptr;
+}
+
+#endif  /* __x86_64__ */
 
 #ifndef L2_AS_LIBRARY
 int main(int argc, char **argv) {

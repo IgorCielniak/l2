@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  build-l2eval:
+  build-l2:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,27 +16,27 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential unzip
 
-      - name: Build l2eval library
-        run: bash tools/build_l2eval_lib.sh
+      - name: Build l2 runtime library
+        run: bash tools/build_l2_lib.sh
 
-      - name: Upload l2eval .a artifact
+      - name: Upload libl2 .a artifact
         uses: actions/upload-artifact@v4
         with:
-          name: l2eval-static
-          path: build/libl2eval.a
+          name: l2-static
+          path: build/libl2.a
           if-no-files-found: error
 
-      - name: Upload l2eval .so artifact
+      - name: Upload libl2 .so artifact
         uses: actions/upload-artifact@v4
         with:
-          name: l2eval-dynamic
-          path: build/libl2eval.so
+          name: l2-dynamic
+          path: build/libl2.so
           if-no-files-found: error
 
   test:
-    needs: build-l2eval
+    needs: build-l2
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -53,27 +53,29 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm binutils
+          sudo apt-get install -y nasm binutils unzip
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install keystone-engine
 
-      - name: Download l2eval .a artifact
+      - name: Fetch vendored libkeystone
+        run: bash tools/fetch_keystone.sh
+
+      - name: Download libl2 .a artifact
         uses: actions/download-artifact@v4
         with:
-          name: l2eval-static
+          name: l2-static
           path: build
 
-      - name: Download l2eval .so artifact
+      - name: Download libl2 .so artifact
         uses: actions/download-artifact@v4
         with:
-          name: l2eval-dynamic
+          name: l2-dynamic
           path: build
 
       - name: Run tests
-        run: python3 test.py -v && python3 test.py --ct-run-main -v
+        run: python3 test.py -v && python3 test.py --ct-run-main -v && python3 tools/test_stack_effects.py && python3 tools/test_l2_api.py && python3 tools/test_event_bus.py && python3 tools/test_daemon.py
         timeout-minutes: 30
 
       - name: Run leak checks

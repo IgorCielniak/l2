@@ -136,7 +136,7 @@ again
 end
 compile-only
 
-word fn-body->postfix-program      # bodyLexemes -- postfix
+word fn-body->postfix-program      # fn-body->postfix-program [* | bodyLexemes] -> [* | postfix]
 	list-new swap list-new swap      # out cur body
 begin
 	dup list-empty? if
@@ -185,12 +185,12 @@ end
 compile-only
 
 
-word fn-body->tokens                # bodyLexemes -- tokens
+word fn-body->tokens                # fn-body->tokens [* | bodyLexemes] -> [* | tokens]
 	fn-body->postfix-program
 end
 compile-only
 
-word fn-emit-prologue             # params out -- params out
+word fn-emit-prologue             # fn-emit-prologue [*, params | out] -> [*, params | out]
 	over list-length              # params out n
 begin
 	dup 0 > if
@@ -206,7 +206,7 @@ again
 end
 compile-only
 
-word fn-emit-epilogue             # params out -- out
+word fn-emit-epilogue             # fn-emit-epilogue [*, params | out] -> [* | out]
 	over list-length >r           # params out   (r: n)
 begin
 	r> dup 0 > if
@@ -221,7 +221,7 @@ again
 end
 compile-only
 
-word fn-translate-prologue-loop   # count --
+word fn-translate-prologue-loop   # fn-translate-prologue-loop [* | count] -> [*]
 	dup 0 > if
 		1 -
 		0 rpick ">r" list-append drop
@@ -231,7 +231,7 @@ word fn-translate-prologue-loop   # count --
 end
 compile-only
 
-word fn-translate-epilogue-loop   # count --
+word fn-translate-epilogue-loop   # fn-translate-epilogue-loop [* | count] -> [*]
 	dup 0 > if
 		1 -
 		0 rpick "rdrop" list-append drop
@@ -241,7 +241,7 @@ word fn-translate-epilogue-loop   # count --
 end
 compile-only
 
-word fn-param-index                # params name -- params idx flag
+word fn-param-index                # fn-param-index [*, params | name] -> [*, params, idx | flag]
 	>r                             # params        (r: name)
 	0                              # params idx
 
@@ -264,7 +264,7 @@ end
 compile-only
 
 
-word fn-build-param-map            # params -- params map
+word fn-build-param-map            # fn-build-param-map [* | params] -> [*, params | map]
 	map-new                         # params map
 	0                               # params map idx
 	begin
@@ -284,7 +284,7 @@ end
 compile-only
 
 
-word fn-build-param-type-map       # params -- typeMap
+word fn-build-param-type-map       # fn-build-param-type-map [* | params] -> [* | typeMap]
 	map-new                         # params typeMap
 	0                               # params typeMap idx
 	begin
@@ -305,7 +305,7 @@ end
 compile-only
 
 
-word fn-map-increment-values       # map -- map
+word fn-map-increment-values       # fn-map-increment-values [* | map] -> [* | map]
 	dup map-clone                   # map original clone
 	over map-keys                   # map original clone keys
 begin
@@ -334,7 +334,7 @@ end
 compile-only
 
 
-word fn-vars-push-binding          # vars name -- vars'
+word fn-vars-push-binding          # fn-vars-push-binding [*, vars | name] -> [* | vars']
 	swap
 	fn-map-increment-values
 	swap
@@ -343,13 +343,13 @@ end
 compile-only
 
 
-word fn-list-copy                  # list -- copy
+word fn-list-copy                  # fn-list-copy [* | list] -> [* | copy]
 	list-new swap list-extend
 end
 compile-only
 
 
-word fn-call-close-index           # expr -- closeIdx found
+word fn-call-close-index           # fn-call-close-index [* | expr] -> [*, closeIdx | found]
 	2 0                               # expr idx depth
 begin
 	2 pick list-length               # expr idx depth len
@@ -392,7 +392,7 @@ end
 compile-only
 
 
-word fn-call-syntax-expr?          # expr -- flag
+word fn-call-syntax-expr?          # fn-call-syntax-expr? [* | expr] -> [* | flag]
 	dup list-length 3 < if drop 0 exit end
 	dup 0 list-get identifier? 0 == if drop 0 exit end
 	dup 1 list-get "(" string= 0 == if drop 0 exit end
@@ -411,7 +411,7 @@ end
 compile-only
 
 
-word fn-call-args-split            # inner -- args
+word fn-call-args-split            # fn-call-args-split [* | inner] -> [* | args]
 	list-new swap list-new swap 0 swap   # args cur depth inner
 begin
 	dup list-empty? if
@@ -482,7 +482,7 @@ end
 compile-only
 
 
-word fn-rewrite-call-expr          # expr -- expr postfix_flag
+word fn-rewrite-call-expr          # fn-rewrite-call-expr [* | expr] -> [*, expr | postfix_flag]
 	dup list-length 3 < if 0 exit end
 	dup 0 list-get identifier? 0 == if 0 exit end
 	dup 1 list-get "(" string= 0 == if 0 exit end
@@ -499,7 +499,7 @@ end
 compile-only
 
 
-word fn-list-drop-front-n          # list n -- list
+word fn-list-drop-front-n          # fn-list-drop-front-n [*, list | n] -> [* | list]
 	>r                                # list      (r: n)
 begin
 	r> dup 0 > if                     # list n
@@ -515,7 +515,7 @@ end
 compile-only
 
 
-word fn-stmt-expr-from             # stmt n -- expr
+word fn-stmt-expr-from             # fn-stmt-expr-from [*, stmt | n] -> [* | expr]
 	swap
 	fn-list-copy
 	swap
@@ -553,7 +553,7 @@ end
 compile-only
 
 
-word fn-expr-has-operator?         # expr -- flag
+word fn-expr-has-operator?         # fn-expr-has-operator? [* | expr] -> [* | flag]
 	fn-list-copy
 	begin
 		dup list-empty? if
@@ -573,7 +573,7 @@ end
 compile-only
 
 
-word fn-token-type                 # typeMap tok -- type
+word fn-token-type                 # fn-token-type [*, typeMap | tok] -> [* | type]
 	dup string>number
 	if
 		drop
@@ -594,7 +594,7 @@ end
 compile-only
 
 
-word fn-expr-type                  # expr typeMap -- type
+word fn-expr-type                  # fn-expr-type [*, expr | typeMap] -> [* | type]
 	>r                                # expr          (r: typeMap)
 	dup fn-expr-has-operator? if
 		drop
@@ -616,7 +616,7 @@ end
 compile-only
 
 
-word fn-type-compatible?           # targetType exprType -- flag
+word fn-type-compatible?           # fn-type-compatible? [*, targetType | exprType] -> [* | flag]
 	2dup string= if
 		drop
 		drop
@@ -635,7 +635,7 @@ end
 compile-only
 
 
-word fn-parse-let-stmt             # stmt -- type name expr
+word fn-parse-let-stmt             # fn-parse-let-stmt [* | stmt] -> [*, type, name | expr]
 	dup fn-stmt-decl? 0 == if "invalid let statement in fn body" parse-error end
 	dup 1 list-get
 	over 2 list-get
@@ -644,7 +644,7 @@ end
 compile-only
 
 
-word fn-parse-assign-stmt          # stmt -- name expr
+word fn-parse-assign-stmt          # fn-parse-assign-stmt [* | stmt] -> [*, name | expr]
 	dup fn-stmt-assign? 0 == if "invalid assignment statement in fn body" parse-error end
 	dup 0 list-get
 	swap 2 fn-stmt-expr-from
@@ -652,7 +652,7 @@ end
 compile-only
 
 
-word fn-split-statements           # bodyLexemes -- statements
+word fn-split-statements           # fn-split-statements [* | bodyLexemes] -> [* | statements]
 	list-new swap list-new swap      # statements cur body
 begin
 	dup list-empty? if
@@ -697,7 +697,7 @@ end
 compile-only
 
 
-word fn-out-append-repeat          # out count lexeme -- out
+word fn-out-append-repeat          # fn-out-append-repeat [*, out, count | lexeme] -> [* | out]
 	>r                                # out count   (r: lexeme)
 begin
 	dup 0 > if
@@ -713,7 +713,7 @@ end
 compile-only
 
 
-word fn-ctx-get                    # ctx key -- value
+word fn-ctx-get                    # fn-ctx-get [*, ctx | key] -> [* | value]
 	map-get
 	if
 		swap drop
@@ -726,43 +726,43 @@ end
 compile-only
 
 
-word fn-ctx-set                    # ctx key value -- ctx
+word fn-ctx-set                    # fn-ctx-set [*, ctx, key | value] -> [* | ctx]
 	map-set
 end
 compile-only
 
 
-word fn-ctx-set-out                # ctx out -- ctx
+word fn-ctx-set-out                # fn-ctx-set-out [*, ctx | out] -> [* | ctx]
 	swap "out" rot fn-ctx-set
 end
 compile-only
 
 
-word fn-ctx-set-vars               # ctx vars -- ctx
+word fn-ctx-set-vars               # fn-ctx-set-vars [*, ctx | vars] -> [* | ctx]
 	swap "vars" rot fn-ctx-set
 end
 compile-only
 
 
-word fn-ctx-set-types              # ctx types -- ctx
+word fn-ctx-set-types              # fn-ctx-set-types [*, ctx | types] -> [* | ctx]
 	swap "types" rot fn-ctx-set
 end
 compile-only
 
 
-word fn-ctx-set-locals             # ctx n -- ctx
+word fn-ctx-set-locals             # fn-ctx-set-locals [*, ctx | n] -> [* | ctx]
 	swap "locals" rot fn-ctx-set
 end
 compile-only
 
 
-word fn-ctx-set-params-count       # ctx n -- ctx
+word fn-ctx-set-params-count       # fn-ctx-set-params-count [*, ctx | n] -> [* | ctx]
 	swap "params_count" rot fn-ctx-set
 end
 compile-only
 
 
-word fn-ctx-set-out-vars           # ctx out vars -- ctx
+word fn-ctx-set-out-vars           # fn-ctx-set-out-vars [*, ctx, out | vars] -> [* | ctx]
 	>r                                # ctx out      (r: vars)
 	fn-ctx-set-out                    # ctx'
 	r>
@@ -771,7 +771,7 @@ end
 compile-only
 
 
-word fn-ctx-inc-locals             # ctx -- ctx
+word fn-ctx-inc-locals             # fn-ctx-inc-locals [* | ctx] -> [* | ctx]
 	dup "locals" fn-ctx-get
 	1 +
 	fn-ctx-set-locals
@@ -779,14 +779,14 @@ end
 compile-only
 
 
-word fn-ctx-out-vars               # ctx -- ctx out vars
+word fn-ctx-out-vars               # fn-ctx-out-vars [* | ctx] -> [*, ctx, out | vars]
 	dup "out" fn-ctx-get
 	over "vars" fn-ctx-get
 end
 compile-only
 
 
-word fn-append-expression          # out vars expr -- out vars
+word fn-append-expression          # fn-append-expression [*, out, vars | expr] -> [*, out | vars]
 	fn-rewrite-call-expr
 	if
 	else
@@ -800,7 +800,7 @@ end
 compile-only
 
 
-word fn-compile-expr-stmt          # ctx stmt isLast -- ctx
+word fn-compile-expr-stmt          # fn-compile-expr-stmt [*, ctx, stmt | isLast] -> [* | ctx]
 	>r                                # ctx stmt    (r: isLast)
 	dup list-empty? if "empty function statement in fn body" parse-error end
 	over fn-ctx-out-vars              # ctx stmt ctx out vars
@@ -821,7 +821,7 @@ end
 compile-only
 
 
-word fn-compile-let-stmt           # ctx stmt isLast -- ctx
+word fn-compile-let-stmt           # fn-compile-let-stmt [*, ctx, stmt | isLast] -> [* | ctx]
 	if "invalid trailing function statement in fn body" parse-error end
 	fn-parse-let-stmt                 # ctx type name expr
 
@@ -869,7 +869,7 @@ end
 compile-only
 
 
-word fn-compile-assign-stmt        # ctx stmt isLast -- ctx
+word fn-compile-assign-stmt        # fn-compile-assign-stmt [*, ctx, stmt | isLast] -> [* | ctx]
 	if "invalid trailing function statement in fn body" parse-error end
 	fn-parse-assign-stmt              # ctx name expr
 
@@ -907,7 +907,7 @@ end
 compile-only
 
 
-word fn-compile-statement          # ctx stmt isLast -- ctx
+word fn-compile-statement          # fn-compile-statement [*, ctx, stmt | isLast] -> [* | ctx]
 	1 pick fn-stmt-decl? if
 		fn-compile-let-stmt
 		exit
@@ -921,7 +921,7 @@ end
 compile-only
 
 
-word fn-compile-statements         # ctx statements -- ctx
+word fn-compile-statements         # fn-compile-statements [*, ctx | statements] -> [* | ctx]
 begin
 	dup list-empty? if
 		drop
@@ -942,7 +942,7 @@ end
 compile-only
 
 
-word fn-translate-token            # out map tok -- out map
+word fn-translate-token            # fn-translate-token [*, out, map | tok] -> [*, out | map]
 	# number?
 	dup string>number              # out map tok num ok
 	if
@@ -983,7 +983,7 @@ end
 compile-only
 
 
-word fn-translate-postfix-loop     # map out postfix -- map out
+word fn-translate-postfix-loop     # fn-translate-postfix-loop [*, map, out | postfix] -> [*, map | out]
 	begin
 		dup list-empty? if
 			drop
@@ -1001,7 +1001,7 @@ end
 compile-only
 
 
-word fn-translate-postfix          # postfix params -- out
+word fn-translate-postfix          # fn-translate-postfix [*, postfix | params] -> [* | out]
 	swap                             # params postfix
 	list-new                         # params postfix out
 
@@ -1024,7 +1024,7 @@ word fn-translate-postfix          # postfix params -- out
 end
 compile-only
 
-word fn-build-body                # bodyLexemes params -- body
+word fn-build-body                # fn-build-body [*, bodyLexemes | params] -> [* | body]
 	swap >r                         # params        (r: bodyLexemes)
 
 	list-new
@@ -1091,12 +1091,12 @@ macro function 0
 	fn
 ;
 
-word fn-dsl-set-doc                # name doc --
+word fn-dsl-set-doc                # fn-dsl-set-doc [*, name | doc] -> [*]
 	ct-macro-doc-set drop
 end
 compile-only
 
-word fn-dsl-set-attrs              # name kind --
+word fn-dsl-set-attrs              # fn-dsl-set-attrs [*, name | kind] -> [*]
 	map-new
 	"category" "fn.dsl" map-set
 	swap
@@ -1121,12 +1121,12 @@ word fn-dsl-parser-session-rollback
 end
 compile-only
 
-word fn-dsl-parser-collect-until   # delimiter -- tokens found
+word fn-dsl-parser-collect-until   # fn-dsl-parser-collect-until [* | delimiter] -> [*, tokens | found]
 	ct-parser-collect-until
 end
 compile-only
 
-word fn-dsl-parser-collect-balanced   # open close -- tokens found
+word fn-dsl-parser-collect-balanced   # fn-dsl-parser-collect-balanced [*, open | close] -> [*, tokens | found]
 	ct-parser-collect-balanced
 end
 compile-only
@@ -1151,12 +1151,12 @@ word fn-dsl-token-clone
 end
 compile-only
 
-word fn-dsl-token-rename          # token lexeme -- token
+word fn-dsl-token-rename          # fn-dsl-token-rename [*, token | lexeme] -> [* | token]
 	token-with-lexeme
 end
 compile-only
 
-word fn-dsl-token-shift-column    # token delta -- token
+word fn-dsl-token-shift-column    # fn-dsl-token-shift-column [*, token | delta] -> [* | token]
 	token-shift-column
 end
 compile-only
@@ -1171,19 +1171,19 @@ word fn-dsl-rewrite-scope-pop
 end
 compile-only
 
-word fn-dsl-rewrite-run           # stage token-list -- token-list patches
+word fn-dsl-rewrite-run           # fn-dsl-rewrite-run [*, stage | token-list] -> [*, token-list | patches]
 	ct-rewrite-run-on-list
 end
 compile-only
 
-word fn-dsl-rewrite-run-scoped    # stage token-list -- token-list patches
+word fn-dsl-rewrite-run-scoped    # fn-dsl-rewrite-run-scoped [*, stage | token-list] -> [*, token-list | patches]
 	fn-dsl-rewrite-scope-push drop
 	fn-dsl-rewrite-run
 	fn-dsl-rewrite-scope-pop static_assert
 end
 compile-only
 
-word fn-dsl-parser-tail-lexemes   # -- list
+word fn-dsl-parser-tail-lexemes   # fn-dsl-parser-tail-lexemes [*] -> [* | list]
 	ct-parser-tail
 	list-new swap
 begin
@@ -1201,7 +1201,7 @@ again
 end
 compile-only
 
-word fn-dsl-parser-diff-lexemes   # start end -- list
+word fn-dsl-parser-diff-lexemes   # fn-dsl-parser-diff-lexemes [*, start | end] -> [* | list]
 	fn-dsl-parser-diff
 	"lexemes" map-get
 end
@@ -1539,7 +1539,7 @@ word fn-dsl-register-macros
 end
 compile-only
 
-word fn-dsl-pattern-append-clause   # clauses pattern replacement -- clauses'
+word fn-dsl-pattern-append-clause   # fn-dsl-pattern-append-clause [*, clauses, pattern | replacement] -> [* | clauses']
 	>r
 	list-new
 	swap
@@ -1709,7 +1709,7 @@ word fn-dsl-assert-ct-surface
 end
 compile-only
 
-word fn-dsl-upsert-grammar-alias   # name alias target --
+word fn-dsl-upsert-grammar-alias   # fn-dsl-upsert-grammar-alias [*, name, alias | target] -> [*]
 	>r >r
 	dup ct-remove-grammar-rewrite drop
 	list-new r> list-append
@@ -1718,12 +1718,12 @@ word fn-dsl-upsert-grammar-alias   # name alias target --
 end
 compile-only
 
-word fn-dsl-bind-rewrite-pipeline  # name --
+word fn-dsl-bind-rewrite-pipeline  # fn-dsl-bind-rewrite-pipeline [* | name] -> [*]
 	"grammar" swap "fn.dsl" ct-set-rewrite-pipeline drop
 end
 compile-only
 
-word fn-dsl-upsert-grammar-rule    # name pattern replacement --
+word fn-dsl-upsert-grammar-rule    # fn-dsl-upsert-grammar-rule [*, name, pattern | replacement] -> [*]
 	>r >r
 	dup ct-remove-grammar-rewrite drop
 	r> r>

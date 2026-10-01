@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "The removed brace-closure form of on-event must be rejected."
+}

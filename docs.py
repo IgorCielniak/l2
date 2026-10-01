@@ -11,7 +11,7 @@ import html
 import json
 import re
 
-_CT_REF_SECTION_RE = re.compile(r"^\s*§\s*\d+\s+(.+?)\s*$")
+_CT_REF_SECTION_RE = re.compile(r"^\s*§\s*\d+[A-Za-z]?\s+(.+?)\s*$")
 _CT_REF_WORD_RE = re.compile(r"^\s{2,}[A-Za-z0-9_?.:+\-*/<>=!&]+(?:\s{2,}|\s+\[)")
 _CT_REF_ENTRY_LINE_RE = re.compile(r"^\s{2,}([A-Za-z0-9][A-Za-z0-9_?.:+\-*/<>=!&]*)(?:\s{2,}|\s+\[|$)")
 import sys
@@ -47,20 +47,24 @@ class DocEntry:
 
 
 _DOC_STACK_RE = re.compile(r"^\s*#\s*([^\s]+)\s*(.*)$")
-_DOC_WORD_RE = re.compile(r"^\s*(?:inline\s+)?word\s+([^\s]+)\b")
+_DOC_UNNAMED_STACK_RE = re.compile(
+    r"^\s*#\s*(\[[^\]]*\]\s*->\s*\[[^\]]*\](?:\s*\|\|\s*\[[^\]]*\])*)\s*$"
+)
+_DOC_WORD_RE = re.compile(r"^\s*(?:inline\s+)?word\s+([^\s]+)")
 _DOC_ASM_RE = re.compile(r"^\s*:asm\s+([^\s{]+)")
 _DOC_PY_RE = re.compile(r"^\s*:py\s+([^\s{]+)")
 _DOC_MACRO_RE = re.compile(r"^\s*macro\s+([^\s]+)(?:\s+(\d+))?")
 
 
-def _extract_stack_comment(text: str) -> Optional[Tuple[str, str]]:
+def _extract_stack_comment(text: str) -> Optional[Tuple[Optional[str], str]]:
+    unnamed = _DOC_UNNAMED_STACK_RE.match(text)
+    if unnamed is not None:
+        return None, unnamed.group(1).strip()
     match = _DOC_STACK_RE.match(text)
     if match is None:
         return None
     name = match.group(1).strip()
     tail = match.group(2).strip()
-    if not name:
-        return None
     if "->" not in tail:
         return None
     return name, tail
@@ -103,7 +107,7 @@ def _collect_leading_doc_comments(lines: Sequence[str], def_index: int, name: st
         parsed = _extract_stack_comment(raw)
         if parsed is not None:
             comment_name, effect = parsed
-            if comment_name == name and not stack_effect:
+            if (comment_name is None or comment_name == name) and not stack_effect:
                 stack_effect = effect
             idx -= 1
             continue
@@ -115,6 +119,34 @@ def _collect_leading_doc_comments(lines: Sequence[str], def_index: int, name: st
 
     comments.reverse()
     return stack_effect, " ".join(comments)
+
+
+def _parse_stack_effect_counts(effect: str) -> Tuple[int, int]:
+    """Count fixed input/output items, using -1 for variable or unknown arity."""
+    if not effect or "->" not in effect:
+        return (-1, -1)
+    main = effect.split("||", 1)[0].strip()
+    parts = main.split("->", 1)
+    if len(parts) != 2:
+        return (-1, -1)
+
+    def count_items(side: str) -> int:
+        if "..." in side:
+            return -1
+        side = side.strip()
+        if side.startswith("["):
+            side = side[1:]
+        if side.endswith("]"):
+            side = side[:-1]
+        if not side.strip():
+            return 0
+        return sum(
+            1
+            for item in side.replace("|", ",").split(",")
+            if item.strip() and item.strip() != "*"
+        )
+
+    return count_items(parts[0]), count_items(parts[1])
 
 
 def _scan_doc_file(
@@ -142,6 +174,13 @@ def _scan_doc_file(
             continue
         defined_names.add(name)
         stack_effect, description = _collect_leading_doc_comments(lines, idx, name)
+        if not stack_effect and "#" in line:
+            inline_comment = line[line.find("#"):]
+            parsed_effect = _extract_stack_comment(inline_comment)
+            if parsed_effect is not None:
+                comment_name, effect = parsed_effect
+                if comment_name is None or comment_name == name:
+                    stack_effect = effect
         # Auto-generate stack effect for macros from arg count
         if kind == "macro" and not stack_effect:
             if macro_args > 0:
@@ -838,6 +877,39 @@ def _run_docs_tui(
             ),
         },
         {
+            "name": "on-event",
+            "category": "Events",
+            "syntax": "word <listener> <body> end on-event <pattern>",
+            "summary": "Register a compile-time word as a compiler event listener.",
+            "detail": (
+                "Use `on-event` as a suffix after a word definition. The word is "
+                "marked compile-only and called for matching compiler events; "
+                "patterns support shell-style globs such as `word.compile.*`. "
+                "The event record is pushed onto the compile-time stack, and the "
+                "listener's stack changes are discarded when it returns. Listener "
+                "errors propagate as compilation errors. This is compile-time only.\n\n"
+                "Example:\n"
+                "  word inspect_compile_event\n"
+                "    get-event-type \"compile\" string= static_assert\n"
+                "  end on-event compile"
+            ),
+        },
+        {
+            "name": "emit-event",
+            "category": "Events",
+            "syntax": "emit-event <name>",
+            "summary": "Publish a named event during compilation.",
+            "detail": (
+                "Publishes a user event with its source location. It does not "
+                "attach a custom payload; use `event-object-create`, "
+                "`event-object-prop-append`, and `event-object-emit` when structured "
+                "event data is needed. Events are available to compile-time "
+                "listeners and external compiler tooling.\n\n"
+                "Example:\n"
+                "  emit-event build.started"
+            ),
+        },
+        {
             "name": "syscall",
             "category": "System",
             "syntax": "<argN> ... <arg0> <count> <nr> syscall",
@@ -1409,6 +1481,37 @@ def _run_docs_tui(
         "  clear-token-hook                         [compile-only]\n"
         "    [*] -> [*]\n"
         "    Remove the currently active token hook.\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 1A  COMPILER EVENT BUS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "    `on-event <pattern>` registers the preceding compile-time\n"
+        "    word as a listener. Patterns use shell-style globs such as\n"
+        "    `word.compile.*`, `import.*`, or `*`. The event record is\n"
+        "    pushed onto the CT stack for the handler; its stack changes\n"
+        "    are discarded when it returns. Listeners cannot run in the\n"
+        "    runtime VM.\n"
+        "\n"
+        "      word inspect_word_compile_event\n"
+        "        get-event-payload\n"
+        "        \"name\" map-get static_assert\n"
+        "        drop drop\n"
+        "      end on-event word.compile.begin\n"
+        "\n"
+        "    Event records include `event`/`type`, `name`,\n"
+        "    `timestamp_ns`, optional `location`, and `payload`/`data`.\n"
+        "    Read them with `get-event-type`, `get-event-name`,\n"
+        "    `get-event-timestamp`, and `get-event-payload`.\n"
+        "\n"
+        "    `emit-event <name>` publishes a user event during compilation\n"
+        "    with its source location. For structured payloads, use\n"
+        "    `event-object-create`, `event-object-prop-append`, and\n"
+        "    `event-object-emit`; `event-object-prop-get` reads a field.\n"
+        "    Lower-level `event-subscribe`, `event-unsubscribe`, and\n"
+        "    `event-emit` are available to compiler extensions. Python\n"
+        "    tools can use the same EventBus; `--events-stream PATH`\n"
+        "    writes JSON Lines, and daemon clients can subscribe live.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2633,6 +2736,24 @@ def _run_docs_tui(
         "    -v2 for per-function details, and -v3 or -v4 for\n"
         "    full optimization tracing.\n"
         "\n"
+        "  HOW DO I EXPOSE L2 FUNCTIONS TO C?\n"
+        "\n"
+        "    Build a shared, static, or object artifact with --c-abi:\n"
+        "\n"
+        "      python3 main.py library.sl --artifact shared --c-abi\n"
+        "\n"
+        "    Every runtime function gets an l2_<name> wrapper; no\n"
+        "    export marker or stack-effect comment is needed. C names\n"
+        "    preserve ordinary identifiers, replace punctuation with\n"
+        "    underscores, and add a unique suffix when names collide.\n"
+        "\n"
+        "    Each wrapper has the form int64_t l2_name(size_t argc, ...).\n"
+        "    Pass argc int64_t variadic arguments after the count. The\n"
+        "    wrapper pushes them in order onto the L2 data stack, calls\n"
+        "    the function, and returns the top stack value as int64_t.\n"
+        "    The function must leave a result on the stack. This is the\n"
+        "    x86-64 System V ABI; it is not a Windows x64 interface.\n"
+        "\n"
         "  HOW DO I CALL C FUNCTIONS?\n"
         "\n"
         "    Declare them with the C-style extern syntax:\n"
@@ -2751,41 +2872,47 @@ def _run_docs_tui(
         "\n"
         "  ARCHITECTURE OVERVIEW\n"
         "\n"
-        "    The L2 compiler is a single-pass, single-file Python\n"
-        "    program (~13K lines) with these major stages:\n"
+        "    The command-line path has a client/coordinator layer and\n"
+        "    a separate source-to-binary compiler pipeline.\n"
         "\n"
-        "    1. READER/TOKENIZER\n"
-        "       Splits source into whitespace-delimited tokens.\n"
-        "       Tracks line, column, and byte offsets per token.\n"
-        "       Line comments (starting with #) are discarded by the\n"
-        "       tokenizer and do not become runtime operations.\n"
+        "    1. CLI CLIENT AND DAEMON COORDINATOR\n"
+        "       `main.py` is the normal CLI client. It starts the\n"
+        "       background compiler on demand and sends requests over a\n"
+        "       local Unix socket. `l2_main.py --daemon-serve` owns the\n"
+        "       bounded request queue, worker pool, compilation history,\n"
+        "       cache state, and event subscriptions. Use `--no-daemon`\n"
+        "       or `L2_DAEMON=0` to run the compiler directly.\n"
         "\n"
-        "    2. IMPORT RESOLUTION\n"
-        "       'import' and 'cimport' directives are resolved\n"
-        "       recursively. Each file is loaded once. Imports are\n"
-        "       concatenated into a single token stream with\n"
-        "       FileSpan markers for error reporting.\n"
+        "    2. ISOLATED COMPILER WORKERS\n"
+        "       Persistent worker processes accept compiler requests;\n"
+        "       each request runs in a forked child with captured stdio\n"
+        "       and forwarded events. The client PATH is passed per\n"
+        "       request so tools installed after daemon startup, such as\n"
+        "       NASM, remain discoverable. The daemon can watch compiler\n"
+        "       sources and reload after active requests drain.\n"
         "\n"
-        "    3. PARSER\n"
-        "       Walks the token stream and builds an IR Module of\n"
-        "       Op lists (one per word definition). Key features:\n"
-        "       - Word/asm/py/extern definitions -> dictionary\n"
-        "       - Control flow (if/else/end, while/do/end, for)\n"
-        "         compiled to label-based jumps\n"
-        "       - Macro expansion (text macros with $N params)\n"
-        "       - Token hooks for user-extensible syntax\n"
-        "       - Compile-time VM execution of immediate words\n"
+        "    3. SOURCE LOADING AND PREPROCESSING\n"
+        "       Imports and C headers are resolved recursively before\n"
+        "       tokenization. Source spans retain file/line locations\n"
+        "       across the combined module.\n"
         "\n"
-        "    4. ASSEMBLER / CODE GENERATOR\n"
-        "       Converts the Op IR into NASM x86-64 assembly.\n"
-        "       Handles calling conventions, extern C FFI with\n"
-        "       full System V ABI support (register classification,\n"
-        "       struct passing, SSE arguments).\n"
+        "    4. TOKENIZER, PARSER, AND COMPILE-TIME VM\n"
+        "       The tokenizer tracks source locations. The parser\n"
+        "       expands macros and builds per-word IR while CT words,\n"
+        "       hooks, and event listeners can inspect or transform\n"
+        "       compilation state.\n"
         "\n"
-        "    5. NASM + LINKER\n"
-        "       The assembly is assembled by NASM into an object\n"
-        "       file, then linked (via ld or ld.lld) into the final\n"
-        "       binary.\n"
+        "    5. OPTIMIZATION AND CODE GENERATION\n"
+        "       The compiler optimizes the word IR and emits NASM\n"
+        "       x86-64 assembly, including the System V C FFI and\n"
+        "       optional --c-abi wrappers. `--emit-asm` stops here.\n"
+        "\n"
+        "    6. EXTERNAL TOOLCHAIN\n"
+        "       NASM assembles the generated source into an object;\n"
+        "       the platform linker produces the requested executable,\n"
+        "       shared library, static library, or object artifact.\n"
+        "       Tool lookup uses the PATH supplied by the current CLI\n"
+        "       request, not only the daemon's startup environment.\n"
         "\n"
         "  CONFORMANCE NOTES\n"
         "\n"
@@ -2928,43 +3055,6 @@ def _run_docs_tui(
         "\n"
         "═══════════════════════════════════════════════════════════════\n"
     )
-
-    def _parse_sig_counts(effect: str) -> Tuple[int, int]:
-        """Parse stack effect to (n_args, n_returns).
-
-        Counts all named items (excluding ``*``) on each side of ``->``.
-        Items before ``|`` are deeper stack elements; items after are top.
-        Both count as args/returns.
-
-        Handles dual-return with ``||``:
-          ``[* | x] -> [* | y] || [*, x | z]``
-        Takes the first branch for counting.
-        Returns (-1, -1) for unparseable effects.
-        """
-        if not effect or "->" not in effect:
-            return (-1, -1)
-        # Split off dual-return: take first branch
-        main = effect.split("||")[0].strip()
-        parts = main.split("->", 1)
-        if len(parts) != 2:
-            return (-1, -1)
-        lhs, rhs = parts[0].strip(), parts[1].strip()
-
-        def _count_items(side: str) -> int:
-            s = side.strip()
-            if s.startswith("["):
-                s = s[1:]
-            if s.endswith("]"):
-                s = s[:-1]
-            s = s.strip()
-            if not s:
-                return 0
-            # Flatten both sides of pipe and count all non-* items
-            all_items = s.replace("|", ",")
-            return len([x.strip() for x in all_items.split(",")
-                        if x.strip() and x.strip() != "*"])
-
-        return (_count_items(lhs), _count_items(rhs))
 
     def _safe_addnstr(scr: Any, y: int, x: int, text: str, maxlen: int, attr: int = 0) -> None:
         h, w = scr.getmaxyx()
@@ -3238,7 +3328,7 @@ def _run_docs_tui(
             if filter_args >= 0 or filter_returns >= 0:
                 filtered = []
                 for e in result:
-                    n_args, n_rets = _parse_sig_counts(e.stack_effect)
+                    n_args, n_rets = _parse_stack_effect_counts(e.stack_effect)
                     if filter_args >= 0 and n_args != filter_args:
                         continue
                     if filter_returns >= 0 and n_rets != filter_returns:
@@ -6988,6 +7078,10 @@ def _example_for_word(word_name: str, stack_effect: str, category: str) -> str:
 
 
 def _examples_for_word(word_name: str, stack_effect: str, category: str) -> List[str]:
+    if "..." in stack_effect:
+        override = _EXAMPLE_OVERRIDES.get(word_name)
+        return [override] if override is not None else []
+
     primary = _example_for_word(word_name, stack_effect, category)
     signature = _example_from_stack_signature(word_name, stack_effect)
     signature_alt = _example_from_stack_signature_alt(word_name, stack_effect)

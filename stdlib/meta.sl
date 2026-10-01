@@ -19,8 +19,8 @@ compile-only
 # C signature: const char *l2_get_source_from_embedded(const char *func_name, long *out_len)
 extern const char *l2_get_source_from_embedded(const char *func_name, long *out_len)
 
+#meta-runtime-get-source-embedded [*, name_ptr | name_len] -> [*, src_ptr | src_len]
 word meta-runtime-get-source-embedded
-	# ( name_ptr name_len -- src_ptr src_len )
 	drop
 	8 alloc >r
 	r@ l2_get_source_from_embedded
@@ -47,8 +47,10 @@ word ct-executing?
 	0
 end
 
+# meta-runtime-get-source
+# at compile time: [* | name] -> [*, src | src_len]
+# at runtime:      [*, name_ptr | name_len] -> [*, src_ptr | src_len]
 word meta-runtime-get-source
-	# ( name -- src src_len ) in CT, ( name_ptr name_len -- src_ptr src_len ) in runtime
 	CT 1 ==
 	if
 		ct-runtime-get-source

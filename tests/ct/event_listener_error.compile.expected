@@ -1,0 +1,8 @@
+error: intentional listener failure
+  --> event_listener_error.sl:2:33
+    |
+  2 |   "intentional listener failure" parse-error
+    |                                 ^
+    | = note: compile-time stack: reject_compile_event -> parse-error
+
+1 error(s) emitted

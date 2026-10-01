@@ -9,7 +9,7 @@ import stdlib/mem.sl
 macro WIDTH 0 80 ;
 macro GENERATIONS 0 40 ;
 
-# Apply Rule 110 to three cells (left center right -- new_state)
+# rule110 [*, left, center | right] -> [* | new_state]
 word rule110
     swap 2 *     # center*2
     rot 4 *      # left*4
@@ -27,12 +27,12 @@ word rule110
     end end end end end end end end
 end
 
-# Print a single cell (state -- )
+# print_cell [* | state] -> [*]
 word print_cell
     if 35 putc else 32 putc end
 end
 
-# Print the current generation (addr -- )
+# print_gen [* | addr] -> [*]
 word print_gen
     WIDTH 
     while dup 0 > do
@@ -44,14 +44,14 @@ word print_gen
     10 putc
 end
 
-# Get cell with wraparound (ptr idx -- value)
+# get_cell [*, ptr | idx] -> [* | value]
 word get_cell
     dup 0 < if WIDTH + end
     dup WIDTH >= if WIDTH - end
     8 * + @
 end
 
-# Compute next generation (current next --)
+# next_gen [*, current | next] -> [*]
 word next_gen
     over over   # current next current next
     0           # current next current next i
@@ -95,7 +95,7 @@ word next_gen
     2drop
 end
 
-# Copy qword array (dest src count --)
+# copy_arr [*, dest, src | count] -> [*]
 word copy_arr
     while dup 0 > do
         over @              # get src value

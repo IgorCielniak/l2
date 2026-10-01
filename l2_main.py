@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import bisect
 import errno
+import fcntl
 import importlib.util
 import os
 import random
@@ -21,7 +22,20 @@ import shlex
 import sys
 import textwrap
 import time
+import fnmatch
+import json
+import threading
+import socket
+import socketserver
+import signal
+import subprocess
+import uuid
+import logging
+import hashlib
+from logging.handlers import RotatingFileHandler
+from collections import deque, OrderedDict
 from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 TYPE_CHECKING = False
 if TYPE_CHECKING:
     from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Union, Tuple
@@ -74,6 +88,119 @@ def _normalize_rel_to_rip(line: str) -> str:
 
 DEFAULT_MACRO_EXPANSION_LIMIT = 256
 _SOURCE_PATH = Path("<source>")
+
+
+class EventBus:
+    """Thread-safe, synchronous compiler event bus.
+
+    Events are plain JSON-compatible dictionaries.  Subscribers receive the
+    complete event record and may use shell-style patterns such as
+    ``word.compile.*``.  Subscriber failures are deliberately isolated from
+    compilation: observability must never make a valid build fail.
+    """
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._events: Deque[Dict[str, Any]] = deque(maxlen=max(1, int(capacity)))
+        self._subscribers: Dict[int, Tuple[str, Callable[[Dict[str, Any]], None], bool]] = {}
+        self._lock = threading.RLock()
+        self._next_handle = 1
+        self._published = 0
+
+    def publish(self, event: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "event": str(event),
+            "timestamp_ns": time.time_ns(),
+            "payload": dict(payload or {}),
+        }
+        return self.publish_record(record)
+
+    def publish_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Publish an already-shaped event without changing its timestamp.
+
+        The daemon uses this when forwarding events produced by an isolated
+        compiler worker.  Keeping the original record makes event ordering and
+        latency visible to external tooling.
+        """
+        event_type = str(record.get("type", record.get("event", "unknown")))
+        payload = dict(record.get("payload", record.get("data")) or {})
+        normalized = {
+            "event": event_type,
+            "type": event_type,
+            "timestamp_ns": int(record.get("timestamp_ns", time.time_ns())),
+            "name": str(record.get("name", payload.get("name", event_type))),
+            "payload": payload,
+            "data": payload,
+        }
+        if "location" in record:
+            normalized["location"] = record["location"]
+        elif "source_location" in payload:
+            normalized["location"] = payload["source_location"]
+        with self._lock:
+            self._events.append(normalized)
+            self._published += 1
+            callbacks = [
+                (callback, propagate_errors)
+                for pattern, callback, propagate_errors in self._subscribers.values()
+                if fnmatch.fnmatchcase(normalized["event"], pattern)
+            ]
+        for callback, propagate_errors in callbacks:
+            try:
+                callback(normalized)
+            except Exception:
+                if propagate_errors:
+                    raise
+                # Tooling callbacks are observers, not compiler extensions.
+                continue
+        return normalized
+
+    def subscribe(
+        self,
+        pattern: str,
+        callback: Callable[[Dict[str, Any]], None],
+        *,
+        replay: bool = False,
+        propagate_errors: bool = False,
+    ) -> int:
+        if not pattern:
+            raise ValueError("event subscription pattern must not be empty")
+        with self._lock:
+            handle = self._next_handle
+            self._next_handle += 1
+            self._subscribers[handle] = (str(pattern), callback, bool(propagate_errors))
+            history = [dict(item) for item in self._events if fnmatch.fnmatchcase(str(item["event"]), str(pattern))] if replay else []
+        for record in history:
+            try:
+                callback(record)
+            except Exception:
+                if propagate_errors:
+                    self.unsubscribe(handle)
+                    raise
+        return handle
+
+    def unsubscribe(self, handle: int) -> bool:
+        with self._lock:
+            return self._subscribers.pop(int(handle), None) is not None
+
+    def recent(self, pattern: str = "*", limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = [dict(item) for item in self._events if fnmatch.fnmatchcase(str(item["event"]), pattern)]
+            if limit is None:
+                return rows
+            count = int(limit)
+            return rows[-count:] if count > 0 else []
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {"subscribers": len(self._subscribers), "events_published": self._published, "buffered_events": len(self._events)}
+
+
+def _event_location(token: Optional["Token"], parser: Optional["Parser"] = None) -> Dict[str, Any]:
+    if token is None:
+        return {}
+    if parser is not None:
+        loc = parser.location_for_token(token)
+        return {"path": str(loc.path), "line": loc.line, "column": loc.column}
+    return {"line": token.line, "column": token.column}
 
 
 def _env_flag(name: str) -> Optional[bool]:
@@ -376,18 +503,17 @@ def _make_loc(path: Path, line: int, column: int) -> SourceLocation:
 
 _READER_REGEX_CACHE: Dict[frozenset, "re.Pattern[str]"] = {}
 
-_STACK_EFFECT_PAREN_RE = re.compile(r'\(([^)]*--[^)]*)\)')
-_STACK_EFFECT_BARE_RE = re.compile(r'#\s*(\S+(?:\s+\S+)*?)\s+--\s')
+_STACK_EFFECT_RE = re.compile(r'\[([^\]]*)\]\s*->\s*\[([^\]]*)\]')
 
-def _parse_stack_effect_comment(source: str, word_token_start: int) -> Optional[int]:
-    """Extract the input count from a stack-effect comment near a 'word' token.
+def _parse_stack_effect_comment_full(
+    source: str, word_token_start: int
+) -> Optional[Tuple[Optional[int], Optional[int]]]:
+    """Extract ``(inputs, outputs)`` from a stack-effect comment.
 
-    Looks for ``# ... (a b -- c)`` or ``# a b -- c`` on the same line as
-    *word_token_start* or on the immediately preceding line.  Returns the
-    number of inputs (names before ``--``) or *None* if no effect comment
-    is found.
+    Counts named items in the bracketed arrow form for compiler metadata,
+    excluding the preserved-stack ``*`` marker. A side containing ``...``
+    is variable-arity and is returned as ``None``.
     """
-    # Find the line containing the word token
     line_start = source.rfind('\n', 0, word_token_start)
     line_start = 0 if line_start == -1 else line_start + 1
     line_end = source.find('\n', word_token_start)
@@ -401,18 +527,23 @@ def _parse_stack_effect_comment(source: str, word_token_start: int) -> Optional[
         lines_to_check.append(source[prev_start:prev_end])
 
     for line in lines_to_check:
-        if '#' not in line or '--' not in line:
+        comment_start = line.find('#')
+        if comment_start == -1:
             continue
-        # Prefer parenthesized effect: # text (a b -- c)
-        m = _STACK_EFFECT_PAREN_RE.search(line)
-        if m:
-            parts = m.group(1).split('--')
-            inputs_part = parts[0].strip()
-            return len(inputs_part.split()) if inputs_part else 0
-        # Bare effect on same line as word: # a b -- c
-        m = _STACK_EFFECT_BARE_RE.search(line)
-        if m:
-            return len(m.group(1).split())
+        match = _STACK_EFFECT_RE.search(line[comment_start + 1:])
+        if match is None:
+            continue
+
+        def count_items(side: str) -> Optional[int]:
+            if "..." in side:
+                return None
+            return sum(
+                1
+                for item in re.split(r'[,|]', side)
+                if item.strip() and item.strip() != '*'
+            )
+
+        return count_items(match.group(1)), count_items(match.group(2))
     return None
 
 class Reader:
@@ -815,12 +946,13 @@ _PARSE_LITERAL_CACHE: Dict[str, Any] = {}
 
 class Definition:
     __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'terminator', 'inline',
-                 'stack_inputs', '_label_positions', '_for_pairs', '_begin_pairs',
-                 '_words_resolved', '_merged_runs')
+                 'stack_inputs', 'stack_outputs', '_label_positions',
+                 '_for_pairs', '_begin_pairs', '_words_resolved', '_merged_runs')
 
     def __init__(self, name: str, body: List[Op], immediate: bool = False,
                  compile_only: bool = False, runtime_only: bool = False, terminator: str = "end", inline: bool = False,
-                 stack_inputs: Optional[int] = None) -> None:
+                 stack_inputs: Optional[int] = None,
+                 stack_outputs: Optional[int] = None) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
@@ -829,6 +961,7 @@ class Definition:
         self.terminator = terminator
         self.inline = inline
         self.stack_inputs = stack_inputs
+        self.stack_outputs = stack_outputs
         self._label_positions = None
         self._for_pairs = None
         self._begin_pairs = None
@@ -837,11 +970,12 @@ class Definition:
 
 
 class AsmDefinition:
-    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'inline', 'effects', '_inline_lines')
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'inline', 'effects', '_inline_lines', 'stack_inputs', 'stack_outputs')
 
     def __init__(self, name: str, body: str, immediate: bool = False,
                  compile_only: bool = False, runtime_only: bool = False, inline: bool = False,
-                 effects: Set[str] = None, _inline_lines: Optional[List[str]] = None) -> None:
+                 effects: Set[str] = None, _inline_lines: Optional[List[str]] = None,
+                 stack_inputs: Optional[int] = None, stack_outputs: Optional[int] = None) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
@@ -850,6 +984,8 @@ class AsmDefinition:
         self.inline = inline
         self.effects = effects if effects is not None else set()
         self._inline_lines = _inline_lines
+        self.stack_inputs = stack_inputs
+        self.stack_outputs = stack_outputs
 
 
 class Module:
@@ -3660,7 +3796,11 @@ class MacroEngine:
             raise ParseError(
                 f"macro expansion depth limit ({parser.macro_expansion_limit}) exceeded while expanding '{word.name}'"
             )
+        if parser.event_bus is not None:
+            parser.event_bus.publish("macro.expand.begin", {"name": word.name, "invocation_site": _event_location(token, parser)})
         replaced = self.expand_macro_template(word, captures, call_token=token)
+        if parser.event_bus is not None:
+            parser.event_bus.publish("macro.expand.end", {"name": word.name, "invocation_site": _event_location(token, parser), "tokens": len(replaced)})
 
         insertion: List[Token] = [None] * len(replaced)  # type: ignore[list-item]
         base_column = max(1, token.column)
@@ -4322,6 +4462,7 @@ class Parser:
         *,
         macro_expansion_limit: int = DEFAULT_MACRO_EXPANSION_LIMIT,
         macro_preview: bool = False,
+        event_bus: Optional[EventBus] = None,
     ) -> None:
         if macro_expansion_limit < 1:
             raise ValueError("macro_expansion_limit must be >= 1")
@@ -4329,6 +4470,7 @@ class Parser:
         self.reader = reader or Reader()
         self.macro_expansion_limit = macro_expansion_limit
         self.macro_preview = macro_preview
+        self.event_bus = event_bus
         self.tokens: List[Token] = []
         self._token_iter: Optional[Iterable[Token]] = None
         self._token_iter_exhausted = True
@@ -4465,6 +4607,11 @@ class Parser:
     def _record_diagnostic_obj(self, diag: Diagnostic) -> None:
         """Record a prebuilt diagnostic and enforce max-error limit."""
         self.diagnostics.append(diag)
+        if self.event_bus is not None:
+            self.event_bus.publish(
+                "parse.error" if diag.level == "error" else "parse.warning",
+                {"message": diag.message, "level": diag.level, "path": str(diag.path), "line": diag.line, "column": diag.column, "code": diag.code},
+            )
         if diag.level == "error" and sum(1 for d in self.diagnostics if d.level == "error") >= self._max_errors:
             raise ParseError(f"too many errors ({self._max_errors}), aborting", diagnostic=diag)
 
@@ -7842,13 +7989,21 @@ class Parser:
             )
         name_token = self._consume()
         priority = self._consume_pending_priority()
+        effect = _parse_stack_effect_comment_full(self.source, token.start)
+        stack_inputs = effect[0] if effect is not None else None
+        stack_outputs = effect[1] if effect is not None else None
         definition = Definition(
             name=name_token.lexeme,
             body=[],
             terminator=terminator,
             inline=inline,
-            stack_inputs=_parse_stack_effect_comment(self.source, token.start),
+            stack_inputs=stack_inputs,
+            stack_outputs=stack_outputs,
         )
+        if self.event_bus is not None:
+            payload = {"name": definition.name, "kind": "regular", "source_location": _event_location(name_token, self), "phase": "begin"}
+            self.event_bus.publish("word.compile.begin", payload)
+            self.event_bus.publish("compile", payload)
         self.context_stack.append(definition)
         candidate = Word(name=definition.name, priority=priority)
         candidate.definition = definition
@@ -7886,6 +8041,8 @@ class Parser:
             raise ParseError("nested definitions are not supported yet")
         module.forms.append(ctx)
         self.last_defined = word
+        if self.event_bus is not None:
+            self.event_bus.publish("word.compile.end", {"name": ctx.name, "kind": "regular", "duration_ns": 0, "size_bytes": len(ctx.body)})
 
     def _parse_effect_annotations(self) -> List[str]:
         """Parse a '(effects ...)' clause that follows a :asm name."""
@@ -7960,7 +8117,20 @@ class Parser:
         if reconstruct_from_tokens:
             asm_body = _reconstruct_asm_from_tokens(body_tokens)
         priority = self._consume_pending_priority()
-        definition = AsmDefinition(name=name_token.lexeme, body=asm_body, inline=inline_def)
+        effect = _parse_stack_effect_comment_full(self.source, token.start)
+        stack_inputs = effect[0] if effect is not None else None
+        stack_outputs = effect[1] if effect is not None else None
+        definition = AsmDefinition(
+            name=name_token.lexeme,
+            body=asm_body,
+            inline=inline_def,
+            stack_inputs=stack_inputs,
+            stack_outputs=stack_outputs,
+        )
+        if self.event_bus is not None:
+            payload = {"name": definition.name, "kind": "asm", "source_location": _event_location(name_token, self), "phase": "begin"}
+            self.event_bus.publish("word.compile.begin", payload)
+            self.event_bus.publish("compile", payload)
         if effect_names is not None:
             definition.effects = set(effect_names)
         candidate = Word(name=definition.name, priority=priority)
@@ -7972,6 +8142,8 @@ class Parser:
             definition.immediate = word.immediate
             definition.compile_only = word.compile_only
             definition.runtime_only = word.runtime_only
+        if self.event_bus is not None:
+            self.event_bus.publish("word.compile.end", {"name": definition.name, "kind": "asm", "duration_ns": 0, "size_bytes": len(asm_body.encode("utf-8"))})
         module = self.context_stack[-1]
         if not isinstance(module, Module):
             raise ParseError("asm definitions must be top-level forms")
@@ -8365,6 +8537,11 @@ class CompileTimeVM:
         self._dl_handles: List[Any] = []  # ctypes.CDLL handles
         self._dl_func_cache: Dict[str, Any] = {}  # name -> ctypes callable
         self._dl_load_errors: Dict[str, str] = {}
+        # Native code pointers returned by libl2 factories
+        # (l2_compile / l2_jit_from_asm).  `call` on one of these
+        # dispatches through l2_invoke_trampoline so the target sees
+        # the CT VM's `r12` in the actual r12 register.
+        self._libl2_trampolines: Set[int] = set()
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ct_source_embed_text: Optional[str] = None
         self._ct_source_embed_buf: Optional[Any] = None
@@ -8975,6 +9152,7 @@ class CompileTimeVM:
             self._dl_handles = []
             self._dl_func_cache = {}
             self._dl_load_errors = {}
+            self._libl2_trampolines = set()
             all_libs = []
             dstack_shim = self._ct_runtime_symbol_shim("dstack_top", self._native_data_top)
             if dstack_shim is not None:
@@ -9008,6 +9186,7 @@ class CompileTimeVM:
             self._dl_func_cache.clear()
             self._dl_handles.clear()
             self._dl_load_errors.clear()
+            self._libl2_trampolines.clear()
         return exit_code
 
     def invoke_with_args(self, word: Word, args: Sequence[Any]) -> None:
@@ -9074,6 +9253,7 @@ class CompileTimeVM:
             self._jit_code_pages = []
             self._dl_handles = []
             self._dl_func_cache = {}
+            self._libl2_trampolines = set()
             self._in_fork_child = False
             all_libs = list(self._ct_libs)
             if libs:
@@ -9446,6 +9626,51 @@ class CompileTimeVM:
             raise ParseError(f"extern '{name}' not found in any loaded library (load failures: {load_details})")
         return None
 
+    def _libl2_invoke_bridge(self) -> Any:
+        """Cached ctypes binding for l2_invoke_trampoline (r12-in/r12-out)."""
+        bridge = self._dl_func_cache.get("__bridge_l2_invoke_trampoline")
+        if bridge is None:
+            bridge = self._dlsym("l2_invoke_trampoline")
+            if bridge is None:
+                raise ParseError(
+                    "libl2 was loaded but 'l2_invoke_trampoline' is missing "
+                    "(rebuild libl2 from the current main.c)"
+                )
+            bridge.restype = ctypes.c_uint64
+            bridge.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            self._dl_func_cache["__bridge_l2_invoke_trampoline"] = bridge
+        return bridge
+
+    def _call_libl2_trampoline_factory(self, name: str, word: Word) -> int:
+        """Invoke l2_compile / l2_jit_from_asm and return the raw fn ptr.
+
+        Argument marshalling follows the extern declaration on the L2
+        side: `_cstr` variants take a single pointer, the plain
+        variants take (source_ptr, source_len).
+        """
+        bridge_key = f"__bridge_{name}"
+        bridge = self._dl_func_cache.get(bridge_key)
+        if bridge is None:
+            bridge = self._dlsym(name)
+            if bridge is None:
+                raise ParseError(f"extern '{name}' not found in any loaded library")
+            bridge.restype = ctypes.c_void_p
+            if name.endswith("_cstr"):
+                bridge.argtypes = [ctypes.c_void_p]
+            else:
+                bridge.argtypes = [ctypes.c_void_p, ctypes.c_longlong]
+            self._dl_func_cache[bridge_key] = bridge
+        if name.endswith("_cstr"):
+            source_addr = int(self.pop())
+            raw = bridge(source_addr)
+        else:
+            source_len = int(self.pop())
+            source_addr = int(self.pop())
+            raw = bridge(source_addr, source_len)
+        if raw is None:
+            raise ParseError(f"{name} returned NULL")
+        return int(raw)
+
     def _call_extern_ct(self, word: Word) -> None:
         """Call an extern C function via dlsym/ctypes on the native stacks."""
         name = word.name
@@ -9483,6 +9708,34 @@ class CompileTimeVM:
                 bridge.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong]
                 self._dl_func_cache["__bridge_l2_eval_env_compute"] = bridge
             self.r12 = int(bridge(source_addr, source_len, stack_top_addr))
+            return
+
+        # libl2 trampoline factories: call the C function normally, then
+        # remember the returned pointer so `call` can invoke it via the
+        # r12-in/r12-out ABI (see _rt_call and l2_invoke_trampoline).
+        if name in ("l2_compile", "l2_compile_cstr",
+                    "l2_jit_from_asm", "l2_jit_from_asm_cstr"):
+            fn_ptr = self._call_libl2_trampoline_factory(name, word)
+            self._libl2_trampolines.add(int(fn_ptr))
+            self.push(int(fn_ptr))
+            return
+
+        # Companion releases: call through as usual but also drop the
+        # pointer from our tracking set so later reuse of the address
+        # (unlikely but possible) does not misroute `call`.
+        if name in ("l2_release", "l2_jit_release"):
+            fn_ptr = int(self.pop())
+            self._libl2_trampolines.discard(fn_ptr)
+            bridge_key = f"__bridge_{name}"
+            bridge = self._dl_func_cache.get(bridge_key)
+            if bridge is None:
+                bridge = self._dlsym(name)
+                if bridge is None:
+                    raise ParseError(f"extern '{name}' not found in any loaded library")
+                bridge.restype = None
+                bridge.argtypes = [ctypes.c_void_p]
+                self._dl_func_cache[bridge_key] = bridge
+            bridge(fn_ptr)
             return
 
         func = self._dl_func_cache.get(name)
@@ -9577,6 +9830,9 @@ class CompileTimeVM:
 
     def _call_word(self, word: Word) -> None:
         self.call_stack.append(word.name)
+        _event_start = time.perf_counter_ns()
+        if self.parser.event_bus is not None:
+            self.parser.event_bus.publish("ct.execute.begin", {"word": word.name, "runtime_mode": self.runtime_mode})
         try:
             if word.runtime_only:
                 raise ParseError(
@@ -9729,6 +9985,8 @@ class CompileTimeVM:
             )
             raise CompileTimeError(message, diagnostic=diag) from None
         finally:
+            if self.parser.event_bus is not None:
+                self.parser.event_bus.publish("ct.execute.end", {"word": word.name, "duration_ns": time.perf_counter_ns() - _event_start, "runtime_mode": self.runtime_mode})
             self.call_stack.pop()
 
     # -- Native JIT execution (runtime_mode) --------------------------------
@@ -10544,6 +10802,8 @@ class CompileTimeVM:
         definition = word.definition
         if not _ensure_keystone():
             raise ParseError("keystone is required for compile-time :asm execution; install keystone-engine")
+        import ctypes as _ctypes
+        globals().setdefault("ctypes", _ctypes)
         if not isinstance(definition, AsmDefinition):  # pragma: no cover - defensive
             raise ParseError(f"word '{word.name}' has no asm body")
         asm_body = definition.body.strip("\n")
@@ -11491,12 +11751,13 @@ class CompileTimeVM:
 
 
 class Emission:
-    __slots__ = ('text', 'data', 'bss')
+    __slots__ = ('text', 'data', 'bss', 'c_header')
 
-    def __init__(self, text: List[str] = None, data: List[str] = None, bss: List[str] = None) -> None:
+    def __init__(self, text: List[str] = None, data: List[str] = None, bss: List[str] = None, c_header: str = "") -> None:
         self.text = text if text is not None else []
         self.data = data if data is not None else []
         self.bss = bss if bss is not None else []
+        self.c_header = c_header
 
     def snapshot(self) -> str:
         parts: List[str] = []
@@ -12508,8 +12769,10 @@ class Assembler:
         enable_stack_check: bool = True,
         loop_unroll_threshold: int = 8,
         verbosity: int = 0,
+        event_bus: Optional[EventBus] = None,
     ) -> None:
         self.dictionary = dictionary
+        self.event_bus = event_bus
         self._string_literals: Dict[str, Tuple[str, int]] = {}
         self._string_literal_counter: int = 0
         self._float_literals: Dict[float, str] = {}
@@ -13562,7 +13825,7 @@ class Assembler:
             # depth tracks values on the data stack relative to entry.
             # 'main' starts with an empty stack.  For other words we can
             # only check underflows when a stack-effect comment provides
-            # the input count (e.g. ``# a b -- c`` -> 2 inputs).
+            # the input count.
             si = defn.stack_inputs
             if si is not None:
                 known_entry_depth = si
@@ -13702,7 +13965,7 @@ class Assembler:
         for name in externs:
             text.append(f"extern {name}")
 
-    def emit(self, module: Module, debug: bool = False, entry_mode: str = "program") -> Emission:
+    def emit(self, module: Module, debug: bool = False, entry_mode: str = "program", c_abi: bool = False, module_name: str = "l2") -> Emission:
         if entry_mode not in {"program", "library"}:
             raise CompileError(f"unknown entry mode '{entry_mode}'")
         is_program = entry_mode == "program"
@@ -13792,6 +14055,8 @@ class Assembler:
                 _early_reachable = None  # library mode: optimize everything
 
             if self.enable_loop_unroll:
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.begin", {"pass": "loop-unroll"})
                 if _v >= 1: _t0 = _time_mod.perf_counter()
                 for defn in definitions:
                     if isinstance(defn, Definition):
@@ -13800,7 +14065,11 @@ class Assembler:
                         self._unroll_constant_for_loops(defn)
                 if _v >= 1:
                     print(f"[v1] loop unrolling: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.end", {"pass": "loop-unroll"})
             if self.enable_peephole_optimization:
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.begin", {"pass": "peephole"})
                 if _v >= 1: _t0 = _time_mod.perf_counter()
                 if _v >= 4:
                     for defn in definitions:
@@ -13831,7 +14100,11 @@ class Assembler:
                             self._peephole_optimize_definition(defn)
                 if _v >= 1:
                     print(f"[v1] peephole optimization: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.end", {"pass": "peephole"})
             if self.enable_constant_folding:
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.begin", {"pass": "constant-fold"})
                 if _v >= 1: _t0 = _time_mod.perf_counter()
                 if _v >= 4:
                     for defn in definitions:
@@ -13862,6 +14135,8 @@ class Assembler:
                             self._fold_constants_in_definition(defn)
                 if _v >= 1:
                     print(f"[v1] constant folding: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
+                if self.event_bus is not None:
+                    self.event_bus.publish("optimization.end", {"pass": "constant-fold"})
 
             if _v >= 1:
                 _t0 = _time_mod.perf_counter()
@@ -13908,14 +14183,16 @@ class Assembler:
 
                 reachable = self._reachable_runtime_defs(runtime_defs, extra_roots=extra_roots)
                 if len(reachable) != len(runtime_defs):
-                    if _v >= 2:
-                        eliminated = [defn.name for defn in runtime_defs if defn.name not in reachable]
+                    eliminated = [defn.name for defn in runtime_defs if defn.name not in reachable]
                     _n_before_dce = len(runtime_defs)
                     runtime_defs = [defn for defn in runtime_defs if defn.name in reachable]
                     if _v >= 1:
                         print(f"[v1] DCE: {_n_before_dce} -> {len(runtime_defs)} definitions ({_n_before_dce - len(runtime_defs)} eliminated)")
                     if _v >= 2 and eliminated:
                         print(f"[v2] DCE eliminated: {', '.join(eliminated)}")
+                    if self.event_bus is not None:
+                        for name in eliminated:
+                            self.event_bus.publish("dce.eliminate", {"name": name, "reason": "unreachable"})
                 # Ensure `_start` is preserved even if not reachable from
                 # `main` or the discovered roots; user-provided `_start`
                 # must override the default stub.
@@ -13947,6 +14224,7 @@ class Assembler:
 
             if _v >= 1: _t0 = _time_mod.perf_counter()
             for definition in runtime_defs:
+                _event_start = time.perf_counter_ns()
                 if _v >= 3:
                     body_len = len(definition.body) if isinstance(definition, Definition) else 0
                     kind = "asm" if isinstance(definition, AsmDefinition) else "def"
@@ -13956,6 +14234,17 @@ class Assembler:
                         for i, node in enumerate(definition.body):
                             print(f"[v3]   [{i}] {node.op}({node.data!r})")
                 self._emit_definition(definition, emission.text, debug=debug)
+                if self.event_bus is not None:
+                    self.event_bus.publish(
+                        "emit.section",
+                        {"section": "text", "word": definition.name, "bytes_appended": len("\n".join(emission.text).encode("utf-8"))},
+                    )
+                    self.event_bus.publish(
+                        "word.compile.end",
+                        {"name": definition.name, "kind": "asm" if isinstance(definition, AsmDefinition) else "regular", "duration_ns": time.perf_counter_ns() - _event_start, "size_bytes": 0},
+                    )
+            if c_abi:
+                self._emit_sysv_wrappers(definitions, emission, module, module_name=module_name)
             if _v >= 1:
                 print(f"[v1] code emission: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
 
@@ -14839,6 +15128,132 @@ class Assembler:
         builder.emit("    add r13, 8")
         builder.emit(f"{end_label}:")
 
+    def _emit_sysv_wrappers(
+        self,
+        definitions: Sequence[Union[Definition, AsmDefinition]],
+        emission: Emission,
+        module: Module,
+        module_name: str = "l2",
+    ) -> None:
+        targets = [
+            d for d in definitions
+            if not getattr(d, "compile_only", False)
+            and not getattr(d, "immediate", False)
+        ]
+
+        if not targets:
+            return
+
+        arg_regs = ["rsi", "rdx", "rcx", "r8", "r9"]
+        wrapper_lines: List[str] = [
+            "",
+            "; -----------------------------------------------------------------------------",
+            "; SysV C ABI Wrappers",
+            "; -----------------------------------------------------------------------------",
+        ]
+        header_decls: List[str] = []
+        guard = re.sub(r'[^a-zA-Z0-9_]', '_', module_name).upper()
+        wrapper_symbols: Set[str] = set()
+        c_names = [re.sub(r'[^a-zA-Z0-9_]', '_', d.name) for d in targets]
+        for index, c_name in enumerate(c_names):
+            if c_name and c_name[0].isdigit():
+                c_names[index] = "_" + c_name
+        c_name_counts: Dict[str, int] = {}
+        for c_name in c_names:
+            c_name_counts[c_name] = c_name_counts.get(c_name, 0) + 1
+        reserved_c_names = set(c_names)
+        used_c_names: Set[str] = set()
+
+        for defn, base_c_name in zip(targets, c_names):
+            c_name = base_c_name
+            if c_name_counts[base_c_name] > 1:
+                c_name = f"{base_c_name}__{defn.name.encode('utf-8').hex()}"
+                while c_name in reserved_c_names or c_name in used_c_names:
+                    c_name += "_"
+            elif c_name in used_c_names:
+                raise CompileError(
+                    f"function '{defn.name}' collides with another SysV wrapper symbol 'l2_{c_name}'"
+                )
+            used_c_names.add(c_name)
+            wrapper_sym = f"l2_{c_name}"
+            if wrapper_sym in wrapper_symbols:
+                raise CompileError(
+                    f"function '{defn.name}' collides with another SysV wrapper symbol '{wrapper_sym}'"
+                )
+            wrapper_symbols.add(wrapper_sym)
+
+            wrapper_lines.extend([
+                f"global {wrapper_sym}",
+                f"{wrapper_sym}:",
+                "    push rbp",
+                "    mov rbp, rsp",
+                "    push rbx",
+                "    push r12",
+                "    push r13",
+                "    sub rsp, 56",
+                "    mov [rbp - 80], rdi",
+                f"    mov [rbp - 72], {arg_regs[0]}",
+                f"    mov [rbp - 64], {arg_regs[1]}",
+                f"    mov [rbp - 56], {arg_regs[2]}",
+                f"    mov [rbp - 48], {arg_regs[3]}",
+                f"    mov [rbp - 40], {arg_regs[4]}",
+                "    lea r12, [rel dstack_top]",
+                "    lea r13, [rel rstack_top]",
+                "    xor ecx, ecx",
+                f".l2_{c_name}_args_loop:",
+                "    cmp rcx, [rbp - 80]",
+                f"    jae .l2_{c_name}_args_done",
+                "    cmp rcx, 5",
+                f"    jae .l2_{c_name}_stack_arg",
+                "    mov rax, [rbp + rcx * 8 - 72]",
+                f"    jmp .l2_{c_name}_push_arg",
+                f".l2_{c_name}_stack_arg:",
+                "    mov rax, [rbp + rcx * 8 - 24]",
+                f".l2_{c_name}_push_arg:",
+                "    sub r12, 8",
+                "    mov [r12], rax",
+                "    inc rcx",
+                f"    jmp .l2_{c_name}_args_loop",
+                f".l2_{c_name}_args_done:",
+            ])
+
+            wrapper_lines.append(f"    call {sanitize_label(defn.name)}")
+            wrapper_lines.extend([
+                "    mov rax, [r12]",
+                "    add r12, 8",
+            ])
+
+            wrapper_lines.extend([
+                "    add rsp, 56",
+                "    pop r13",
+                "    pop r12",
+                "    pop rbx",
+                "    pop rbp",
+                "    ret",
+                "",
+            ])
+
+            header_decls.append(f"int64_t {wrapper_sym}(size_t argc, ...);")
+
+        emission.text.extend(wrapper_lines)
+
+        decls_formatted = "\n".join(header_decls)
+        emission.c_header = (
+            f"/* Auto-generated by L2 compiler with --c-abi. Do not edit. */\n"
+            f"#ifndef L2_WRAPPERS_{guard}_H\n"
+            f"#define L2_WRAPPERS_{guard}_H\n\n"
+            f"#include <stdint.h>\n\n"
+            f"#include <stddef.h>\n\n"
+            f"#ifdef __cplusplus\n"
+            f"extern \"C\" {{\n"
+            f"#endif\n\n"
+            f"{decls_formatted}\n\n"
+            f"#ifdef __cplusplus\n"
+            f"}}\n"
+            f"#endif\n\n"
+            f"#endif /* L2_WRAPPERS_{guard}_H */\n"
+        )
+
     def _runtime_prelude(self, entry_mode: str, has_user_start: bool = False) -> List[str]:
         lines: List[str] = [
             "%define DSTK_BYTES 65536",
@@ -14940,6 +15355,52 @@ def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     if parser._pending_inline_definition:
         raise ParseError("duplicate 'inline' before definition")
     parser._pending_inline_definition = True
+    return None
+
+
+def macro_on_event(ctx: MacroContext) -> Optional[List[Op]]:
+    """Register the preceding compile-time word as a compiler event listener."""
+    parser = ctx.parser
+    pattern_token = parser.next_token()
+    if pattern_token.lexeme in ("{", "where"):
+        raise ParseError("on-event requires an event pattern after the word definition")
+    word = parser.most_recent_definition()
+    if word is None:
+        raise ParseError("suffix 'on-event' requires a preceding word definition")
+    if word.runtime_only or word.immediate:
+        raise ParseError(f"event listener '{word.name}' must be compile-only")
+    word.compile_only = True
+    if word.definition is not None:
+        word.definition.compile_only = True
+
+    def _invoke_listener(record: Dict[str, Any]) -> None:
+        vm = parser.compile_time_vm
+        if vm.runtime_mode:
+            raise ParseError("compile-time event listeners cannot run in runtime VM mode")
+        saved_stack = list(vm.stack)
+        try:
+            vm.push(record)
+            vm._call_word(word)
+        finally:
+            vm.stack[:] = saved_stack
+
+    if parser.event_bus is None:
+        raise ParseError("on-event requires the compiler event bus")
+    parser.event_bus.subscribe(
+        pattern_token.lexeme.strip('"'),
+        _invoke_listener,
+        propagate_errors=True,
+    )
+    return None
+
+
+def macro_emit_event(ctx: MacroContext) -> Optional[List[Op]]:
+    """Publish an event from L2 compile-time source: ``emit-event name``."""
+    parser = ctx.parser
+    token = parser.next_token()
+    if parser.event_bus is None:
+        raise ParseError("emit-event requires the compiler event bus")
+    parser.event_bus.publish(token.lexeme.strip('"'), {"source_location": _event_location(token, parser)})
     return None
 
 
@@ -16928,6 +17389,11 @@ def _ct_capture_pretty(vm: CompileTimeVM) -> None:
     vm.push(json.dumps(_capture_normalize_value(value), sort_keys=True, ensure_ascii=True, indent=2))
 
 
+def _ct_repr(vm: CompileTimeVM) -> None:
+    value = vm._resolve_handle(vm.pop())
+    vm.push(_capture_serialize_text(value))
+
+
 def _ct_capture_clone(vm: CompileTimeVM) -> None:
     value = vm._resolve_handle(vm.pop())
     vm.push(_capture_deep_clone(value))
@@ -17453,6 +17919,148 @@ def _ct_set_rewrite_trace(vm: CompileTimeVM) -> None:
     vm.parser.rewrite_trace_enabled = bool(enabled)
 
 
+def _ct_event_subscribe(vm: CompileTimeVM) -> None:
+    """Subscribe a CT callback to an event pattern.
+
+    The callback may be a Python callable (used by compiler extensions) or a
+    CT word name.  Named CT words receive the event dictionary on their stack.
+    L2 list/closure values remain ordinary CT values, so embedders can also
+    install callable closures directly without widening the runtime ABI.
+    """
+    callback = vm.pop()
+    pattern = vm.pop_str()
+    bus = vm.parser.event_bus
+    if bus is None:
+        vm.push(0)
+        return
+
+    def _invoke(record: Dict[str, Any]) -> None:
+        if callable(callback):
+            callback(record)
+            return
+        if isinstance(callback, str):
+            word = vm.dictionary.lookup(callback)
+            if word is None:
+                raise ParseError(f"event subscriber references unknown CT word '{callback}'")
+            if vm.runtime_mode:
+                raise ParseError("compile-time event subscribers cannot run in runtime VM mode")
+            saved_stack = list(vm.stack)
+            try:
+                vm.push(record)
+                vm._call_word(word)
+            finally:
+                vm.stack[:] = saved_stack
+            return
+        raise ParseError("event subscriber must be a callable or CT word name")
+
+    vm.push(bus.subscribe(pattern, _invoke, propagate_errors=True))
+
+
+def _event_object_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+        event["payload"] = payload
+        event["data"] = payload
+    return payload
+
+
+def _ct_event_object_create(vm: CompileTimeVM) -> None:
+    event_type = vm.pop_str()
+    payload: Dict[str, Any] = {}
+    vm.push({
+        "event": event_type,
+        "type": event_type,
+        "name": event_type,
+        "timestamp_ns": time.time_ns(),
+        "payload": payload,
+        "data": payload,
+    })
+
+
+def _ct_event_object_prop_append(vm: CompileTimeVM) -> None:
+    value = vm.pop()
+    key = vm.pop_str()
+    event = _ensure_dict(vm.pop())
+    _event_object_payload(event)[key] = value
+    if key in {"type", "event", "name", "timestamp_ns", "location"}:
+        event[key] = value
+    vm.push(event)
+
+
+def _ct_event_object_prop_get(vm: CompileTimeVM) -> None:
+    key = vm.pop_str()
+    event = _ensure_dict(vm.pop())
+    if key in event:
+        value = event[key]
+    else:
+        payload = _event_object_payload(event)
+        if key not in payload:
+            vm.push(event)
+            vm.push(None)
+            vm.push(0)
+            return
+        value = payload[key]
+    vm.push(event)
+    vm.push(value)
+    vm.push(1)
+
+
+def _ct_event_type(vm: CompileTimeVM) -> None:
+    event = _ensure_dict(vm.pop())
+    vm.push(event)
+    vm.push(str(event.get("type", event.get("event", ""))))
+
+
+def _ct_event_name(vm: CompileTimeVM) -> None:
+    event = _ensure_dict(vm.pop())
+    vm.push(event)
+    vm.push(str(event.get("name", "")))
+
+
+def _ct_event_timestamp(vm: CompileTimeVM) -> None:
+    event = _ensure_dict(vm.pop())
+    vm.push(event)
+    vm.push(int(event.get("timestamp_ns", 0)))
+
+
+def _ct_event_payload(vm: CompileTimeVM) -> None:
+    event = _ensure_dict(vm.pop())
+    vm.push(event)
+    vm.push(_event_object_payload(event))
+
+
+def _ct_event_unsubscribe(vm: CompileTimeVM) -> None:
+    bus = vm.parser.event_bus
+    handle = int(vm.pop())
+    vm.push(1 if bus is not None and bus.unsubscribe(handle) else 0)
+
+
+def _ct_event_emit(vm: CompileTimeVM) -> None:
+    payload = vm.pop()
+    event = vm.pop_str()
+    bus = vm.parser.event_bus
+    if bus is None:
+        vm.push(0)
+        return
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ParseError("event-emit payload must be a CT map or nil")
+    bus.publish(event, payload)
+    vm.push(1)
+
+
+def _ct_event_object_emit(vm: CompileTimeVM) -> None:
+    event = _ensure_dict(vm.pop())
+    bus = vm.parser.event_bus
+    if bus is None:
+        vm.push(0)
+        return
+    bus.publish_record(event)
+    vm.push(1)
+
+
 def _ct_get_rewrite_trace(vm: CompileTimeVM) -> None:
     vm.push(1 if vm.parser.rewrite_trace_enabled else 0)
 
@@ -17834,7 +18442,8 @@ def _ct_find_definition_source(parser: Parser, word_name: str) -> Optional[str]:
 def _ct_runtime_get_source(vm: CompileTimeVM) -> None:
     """Compile-time source lookup for meta-runtime-get-source.
 
-    Stack effect: ( name -- source source_len )
+    Stack effect: CT ``[* | name] -> [*, source | source_len]``;
+    runtime ``[*, name_addr | name_len] -> [*, source | source_len]``.
     """
     if vm.runtime_mode:
         name_len = vm.pop_int()
@@ -18879,6 +19488,15 @@ def _rt_call(vm: CompileTimeVM) -> None:
         vm._call_word(resolved)
         return
     if isinstance(resolved, int):
+        # Native pointers returned by libl2 factories use the L2
+        # runtime ABI (r12 register as data-stack pointer).  Dispatch
+        # them through l2_invoke_trampoline so the pointed-to native
+        # code sees the CT VM's r12 in the actual r12 register.
+        libl2_set = getattr(vm, "_libl2_trampolines", None)
+        if libl2_set is not None and resolved in libl2_set:
+            bridge = vm._libl2_invoke_bridge()
+            vm.r12 = int(bridge(resolved, int(vm.r12)))
+            return
         if not vm.runtime_mode:
             raise ParseError("calling a raw address is only supported in runtime mode")
         # Ensure we have JIT resources
@@ -19392,6 +20010,7 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-capture-filter", _ct_capture_filter, compile_only=True)
     register("ct-capture-normalize", _ct_capture_normalize, compile_only=True)
     register("ct-capture-pretty", _ct_capture_pretty, compile_only=True)
+    register("ct-repr", _ct_repr, compile_only=True)
     register("ct-capture-clone", _ct_capture_clone, compile_only=True)
     register("ct-capture-global-set", _ct_capture_global_set, compile_only=True)
     register("ct-capture-global-get", _ct_capture_global_get, compile_only=True)
@@ -19468,6 +20087,17 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-get-rewrite-loop-reports", _ct_get_rewrite_loop_reports, compile_only=True)
     register("ct-clear-rewrite-loop-reports", _ct_clear_rewrite_loop_reports, compile_only=True)
     register("ct-set-rewrite-trace", _ct_set_rewrite_trace, compile_only=True)
+    register("event-subscribe", _ct_event_subscribe, compile_only=True)
+    register("event-unsubscribe", _ct_event_unsubscribe, compile_only=True)
+    register("event-emit", _ct_event_emit, compile_only=True)
+    register("event-object-create", _ct_event_object_create, compile_only=True)
+    register("event-object-prop-append", _ct_event_object_prop_append, compile_only=True)
+    register("event-object-prop-get", _ct_event_object_prop_get, compile_only=True)
+    register("event-object-emit", _ct_event_object_emit, compile_only=True)
+    register("get-event-type", _ct_event_type, compile_only=True)
+    register("get-event-name", _ct_event_name, compile_only=True)
+    register("get-event-timestamp", _ct_event_timestamp, compile_only=True)
+    register("get-event-payload", _ct_event_payload, compile_only=True)
     register("ct-get-rewrite-trace", _ct_get_rewrite_trace, compile_only=True)
     register("ct-get-rewrite-trace-log", _ct_get_rewrite_trace_log, compile_only=True)
     register("ct-clear-rewrite-trace-log", _ct_clear_rewrite_trace_log, compile_only=True)
@@ -19716,6 +20346,8 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="runtime", immediate=True, macro=macro_runtime))
     dictionary.register(Word(name="runtime-only", immediate=True, macro=macro_runtime))
     dictionary.register(Word(name="inline", immediate=True, macro=macro_inline))
+    dictionary.register(Word(name="on-event", immediate=True, macro=macro_on_event))
+    dictionary.register(Word(name="emit-event", immediate=True, macro=macro_emit_event))
     dictionary.register(Word(name="label", immediate=True, macro=macro_label))
     dictionary.register(Word(name="goto", immediate=True, macro=macro_goto))
     dictionary.register(Word(name="compile-time", immediate=True, macro=macro_compile_time))
@@ -19926,8 +20558,10 @@ class Compiler:
         macro_preview: bool = False,
         defines: Optional[Sequence[str]] = None,
         source_graph_cache: Optional["SourceGraphCache"] = None,
+        event_bus: Optional[EventBus] = None,
     ) -> None:
         self.reader = Reader()
+        self.event_bus = event_bus
         self.dictionary = bootstrap_dictionary()
         self._syscall_label_counter = 0
         self._register_syscall_words()
@@ -19936,8 +20570,9 @@ class Compiler:
             self.reader,
             macro_expansion_limit=macro_expansion_limit,
             macro_preview=macro_preview,
+            event_bus=event_bus,
         )
-        self.assembler = Assembler(self.dictionary)
+        self.assembler = Assembler(self.dictionary, event_bus=event_bus)
         if include_paths is None:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
@@ -20146,8 +20781,12 @@ class Compiler:
         *,
         debug: bool = False,
         entry_mode: str = "program",
+        c_abi: bool = False,
+        module_name: str = "l2",
     ) -> Emission:
         self.last_transformed_source = ""
+        if self.event_bus is not None:
+            self.event_bus.publish("compile.begin", {"source": str(self._last_loaded_path or "<memory>"), "bytes": len(source.encode("utf-8"))})
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
@@ -20155,12 +20794,19 @@ class Compiler:
             module,
             focus_names=self._preview_focus_names,
         )
-        return self.assembler.emit(module, debug=debug, entry_mode=entry_mode)
+        emission = self.assembler.emit(
+            module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
+        )
+        if self.event_bus is not None:
+            self.event_bus.publish("compile.end", {"source": str(self._last_loaded_path or "<memory>"), "output_artifact": module_name, "size_bytes": len(emission.snapshot().encode("utf-8"))})
+        return emission
 
     def parse_file(self, path: Path) -> None:
         """Parse a source file to populate the dictionary without emitting assembly."""
         self._reset_source_flag_state()
         source, spans = self._load_source_graph(path)
+        if self.event_bus is not None:
+            self.event_bus.publish("compile.begin", {"source": str(path), "bytes": len(source.encode("utf-8"))})
         self.last_transformed_source = ""
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
@@ -20169,18 +20815,38 @@ class Compiler:
             module,
             focus_names=self._preview_focus_names,
         )
+        if self.event_bus is not None:
+            self.event_bus.publish("compile.end", {"source": str(path), "output_artifact": None})
 
-    def compile_file(self, path: Path, *, debug: bool = False, entry_mode: str = "program") -> Emission:
+    def compile_file(
+        self,
+        path: Path,
+        *,
+        debug: bool = False,
+        entry_mode: str = "program",
+        c_abi: bool = False,
+        module_name: Optional[str] = None,
+    ) -> Emission:
         self._reset_source_flag_state()
         source, spans = self._load_source_graph(path)
-        return self.compile_source(source, spans=spans, debug=debug, entry_mode=entry_mode)
+        mod_name = module_name or path.stem
+        return self.compile_source(
+            source, spans=spans, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=mod_name
+        )
 
     def collect_source_flags(self, path: Path) -> None:
         """Load source/import graph only to collect source-level pragma flags."""
         self._reset_source_flag_state()
         self._load_source_graph(path)
 
-    def compile_preloaded(self, *, debug: bool = False, entry_mode: str = "program") -> Emission:
+    def compile_preloaded(
+        self,
+        *,
+        debug: bool = False,
+        entry_mode: str = "program",
+        c_abi: bool = False,
+        module_name: str = "l2",
+    ) -> Emission:
         if self._last_loaded_source is None or self._last_loaded_spans is None:
             raise CompileError("no preloaded source available")
         return self.compile_source(
@@ -20188,6 +20854,8 @@ class Compiler:
             spans=self._last_loaded_spans,
             debug=debug,
             entry_mode=entry_mode,
+            c_abi=c_abi,
+            module_name=module_name,
         )
 
     def run_compile_time_word(
@@ -20443,6 +21111,9 @@ class Compiler:
             return
         seen.add(path)
 
+        if self.event_bus is not None:
+            self.event_bus.publish("import.begin", {"path": str(path), "depth": len(seen) - 1})
+
         try:
             contents = path.read_text()
         except FileNotFoundError as exc:
@@ -20472,6 +21143,8 @@ class Compiler:
                         local_start_line=1,
                     )
                 )
+            if self.event_bus is not None:
+                self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": len(seen) - 1})
             return
 
         in_py_block = False
@@ -20742,6 +21415,8 @@ class Compiler:
                     local_start_line=segment_start_local,
                 )
             )
+        if self.event_bus is not None:
+            self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": len(seen) - 1})
 
         if _ifdef_stack:
             raise ParseError(f"unterminated ifdef/ifndef ({len(_ifdef_stack)} level(s) deep) in {path}")
@@ -20932,6 +21607,7 @@ class BuildCache:
         asm_post_opt: bool,
         string_deduplication: bool,
         entry_mode: str,
+        c_abi: bool = False,
     ) -> str:
         # Include the compiler's own mtime so any change to main.py
         # (codegen improvements, bug fixes) invalidates cached results.
@@ -20944,7 +21620,7 @@ class BuildCache:
             f"peephole={peephole},auto_inline={auto_inline},"
             f"asm_post_opt={asm_post_opt},"
             f"string_deduplication={string_deduplication},"
-            f"entry_mode={entry_mode},compiler_mtime={compiler_mtime}"
+            f"entry_mode={entry_mode},c_abi={c_abi},compiler_mtime={compiler_mtime}"
         )
 
     def _file_info(self, path: Path) -> dict:
@@ -23255,6 +23931,11 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
         return
 
     impl_text = texts["l2_main.py"]
+    impl_definitions = {
+        node.name
+        for node in ast.parse(impl_text).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
     main_py_text = texts["main.py"]
     docs_text = texts["docs.py"]
     main_c_text = texts["main.c"]
@@ -23267,10 +23948,15 @@ def _run_integrity_prompt_feature_matrix_checks(errors: List[str]) -> None:
             and "if args.force:\n        args.no_cache = True" in impl_text,
         ),
         (
-            "quick force/no-cache workers are available in main.py",
-            '_FORCE_WORKER_TOKEN = "--__l2-force-worker"' in main_py_text
-            and "def _try_ultra_fast_force(" in main_py_text
-            and "def _try_ultra_fast_no_cache(" in main_py_text,
+            "daemon requests use the canonical CLI with event observation",
+            "def _run_cli_captured(" in impl_text
+            and "cli(argv, event_observer=event_observer)" in impl_text
+            and "return_code, stdout, stderr = _run_cli_captured(" in impl_text,
+        ),
+        (
+            "quick compiler bypasses are absent",
+            "_try_quick_compile_force" not in impl_definitions
+            and "_try_quick_compile_no_cache" not in impl_definitions,
         ),
         (
             "source graph cache is wired in CLI path",
@@ -23609,9 +24295,6 @@ def _run_integrity_compiler_file_contract_checks(errors: List[str]) -> None:
 
     # --- main.py contract checks ---
     required_main_fragments = [
-        '_FORCE_WORKER_TOKEN = "--__l2-force-worker"',
-        "def _try_ultra_fast_force(",
-        "def _try_ultra_fast_no_cache(",
         "if __name__ == \"__main__\":",
         "from l2_main import main as _entry_main",
         "from l2_main import *",
@@ -23627,9 +24310,19 @@ def _run_integrity_compiler_file_contract_checks(errors: List[str]) -> None:
                 main_top_imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             main_top_imports.add(node.module)
-    for must_import in ("os", "sys"):
+    for must_import in ("sys",):
         if must_import not in main_top_imports:
             errors.append(f"main.py missing top-level import '{must_import}'")
+
+    if "def _run_cli_captured(" not in l2_text or "return_code, stdout, stderr = _run_cli_captured(" not in l2_text:
+        errors.append("l2_main.py daemon does not route requests through the canonical CLI")
+    l2_definitions = {
+        node.name
+        for node in trees["l2_main.py"].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    if "_try_quick_compile_force" in l2_definitions or "_try_quick_compile_no_cache" in l2_definitions:
+        errors.append("l2_main.py still contains a quick compiler bypass")
 
     # --- docs.py contract checks ---
     docs_required_defs = {
@@ -23844,724 +24537,11 @@ def _emit_macro_profile_report(parser: Parser, destination: Optional[str]) -> No
     print(f"[info] wrote macro profile to {out_path}")
 
 
-_QUICK_FORCE_ASM_OPT_CACHE_MAX = 64
-_QUICK_FORCE_ASM_OPT_CACHE: Dict[str, str] = {}
-_QUICK_FORCE_TOKEN_CACHE_MAX = 32
-_QUICK_FORCE_TOKEN_CACHE: Dict[str, Tuple[Token, ...]] = {}
-
-
-def _try_quick_compile_force(argv: Sequence[str], *, emit_status: bool = True) -> Optional[int]:
-    """Fast path for strict full-rebuild benchmark invocations.
-
-    Supported shape only:
-      python main.py <source>.sl --force
-
-    Semantics intentionally preserved:
-      - always recompiles source
-      - always re-runs NASM
-      - always re-runs linker
-    """
-    source_token: Optional[str] = None
-    saw_force = False
-    for tok in argv:
-        if tok == "--force":
-            saw_force = True
-            continue
-        if tok.startswith("-"):
-            return None
-        if source_token is None:
-            source_token = tok
-            continue
-        return None
-
-    if not saw_force or source_token is None:
-        return None
-
-    source = Path(source_token)
-    if source.suffix.lower() != ".sl":
-        return None
-
-    temp_dir = Path("build")
-    output = Path("a.out")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    asm_path = temp_dir / (source.stem + ".asm")
-    obj_path = temp_dir / (source.stem + ".o")
-    include_paths = [Path("."), Path("./stdlib")]
-    compiler: Optional[Compiler] = Compiler(
-        include_paths=include_paths,
-        macro_expansion_limit=DEFAULT_MACRO_EXPANSION_LIMIT,
-        macro_preview=False,
-        defines=[],
-    )
-    compiler.assembler.enable_constant_folding = True
-    compiler.assembler.enable_peephole_optimization = True
-    compiler.assembler.enable_loop_unroll = True
-    compiler.assembler.enable_auto_inline = True
-    compiler.assembler.enable_string_deduplication = True
-    compiler.assembler.enable_extern_type_check = True
-    compiler.assembler.enable_stack_check = True
-    compiler.assembler.verbosity = 0
-    compiler.parser._warnings_enabled = set()
-    compiler.parser._werror = False
-    compiler.parser.capture_op_locations = False
-    compiler.parser.enable_dead_macro_elimination = True
-    compiler.parser.enable_unused_rewrite_elimination = True
-    compiler.parser.dictionary.warn_callback = None
-
-    libs: List[str] = []
-    asm_text = ""
-    source_resolved = source.resolve()
-
-    try:
-        cached_graph = _quick_no_cache_load_cached_graph(source_resolved)
-        if cached_graph is not None:
-            source_cli_flags = list(cached_graph.get("source_cli_flags", ()))
-            source_link_flags = list(cached_graph.get("source_link_flags", ()))
-            source_include_paths = [Path(p) for p in cached_graph.get("source_include_paths", ())]
-            cached_source = cached_graph.get("source")
-            span_rows = cached_graph.get("spans")
-            if isinstance(cached_source, str) and isinstance(span_rows, list):
-                cached_spans: List[FileSpan] = []
-                for row in span_rows:
-                    if (
-                        isinstance(row, (list, tuple))
-                        and len(row) == 4
-                        and isinstance(row[0], str)
-                        and isinstance(row[1], int)
-                        and isinstance(row[2], int)
-                        and isinstance(row[3], int)
-                    ):
-                        cached_spans.append(FileSpan(Path(row[0]), row[1], row[2], row[3]))
-                compiler._last_loaded_path = source_resolved
-                compiler._last_loaded_source = cached_source
-                compiler._last_loaded_spans = cached_spans
-                compiler.source_cli_flags = source_cli_flags
-                compiler.source_link_flags = source_link_flags
-                compiler.source_include_paths = source_include_paths
-            else:
-                cached_graph = None
-
-        if cached_graph is None:
-            compiler.collect_source_flags(source)
-            _quick_no_cache_store_cached_graph(source_resolved, compiler)
-
-        # Source-level CLI flags can alter broader behavior; delegate to full CLI.
-        if compiler.source_cli_flags:
-            return None
-
-        normalized_include_paths: List[Path] = []
-        seen_include_paths: Set[Path] = set()
-        for include_base in [Path("."), Path("./stdlib"), *compiler.source_include_paths]:
-            resolved = include_base.expanduser().resolve()
-            if resolved in seen_include_paths:
-                continue
-            seen_include_paths.add(resolved)
-            normalized_include_paths.append(resolved)
-        compiler.include_paths = normalized_include_paths
-        compiler._import_resolve_cache.clear()
-
-        for flag in compiler.source_link_flags:
-            if flag not in libs:
-                libs.append(flag)
-        for lib in _load_sidecar_meta_libs(source):
-            if lib not in libs:
-                libs.append(lib)
-
-        source_text = compiler._last_loaded_source
-        source_spans = compiler._last_loaded_spans
-        if source_text is None or source_spans is None:
-            emission = compiler.compile_file(source, debug=False, entry_mode="program")
-        else:
-            parser = compiler.parser
-            parser.file_spans = source_spans
-
-            source_hash: Optional[str] = None
-            try:
-                import hashlib
-                source_hash = hashlib.blake2b(source_text.encode("utf-8"), digest_size=16).hexdigest()
-            except Exception:
-                source_hash = None
-
-            tokens_template: Optional[Tuple[Token, ...]] = None
-            if source_hash is not None:
-                tokens_template = _QUICK_FORCE_TOKEN_CACHE.get(source_hash)
-            if tokens_template is None:
-                tokens_template = tuple(compiler.reader.tokenize(source_text))
-                if source_hash is not None:
-                    _QUICK_FORCE_TOKEN_CACHE[source_hash] = tokens_template
-                    if len(_QUICK_FORCE_TOKEN_CACHE) > _QUICK_FORCE_TOKEN_CACHE_MAX:
-                        _QUICK_FORCE_TOKEN_CACHE.clear()
-
-            module = parser.parse(list(tokens_template), source_text)
-            emission = compiler.assembler.emit(module, debug=False, entry_mode="program")
-
-        asm_text = emission.snapshot()
-        asm_digest: Optional[str] = None
-        try:
-            import hashlib
-            asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
-        except Exception:
-            asm_digest = None
-
-        optimized_cached: Optional[str] = None
-        if asm_digest is not None:
-            optimized_cached = _QUICK_FORCE_ASM_OPT_CACHE.get(asm_digest)
-
-        if optimized_cached is None:
-            optimized_asm, _asm_stats, _asm_pass_logs = optimize_emitted_asm_text(
-                asm_text,
-                collect_pass_logs=False,
-            )
-            asm_text = optimized_asm
-            if asm_digest is not None:
-                _QUICK_FORCE_ASM_OPT_CACHE[asm_digest] = optimized_asm
-                if len(_QUICK_FORCE_ASM_OPT_CACHE) > _QUICK_FORCE_ASM_OPT_CACHE_MAX:
-                    _QUICK_FORCE_ASM_OPT_CACHE.clear()
-        else:
-            asm_text = optimized_cached
-    except (ParseError, CompileError, CompileTimeError) as exc:
-        use_color = _diagnostic_color_enabled()
-        diags = getattr(compiler.parser, "diagnostics", [])
-        if diags:
-            for diag in diags:
-                print(diag.format(color=use_color), file=sys.stderr)
-            error_count = sum(1 for d in diags if d.level == "error")
-            warn_count = sum(1 for d in diags if d.level == "warning")
-            summary_parts: List[str] = []
-            if error_count:
-                summary_parts.append(f"{error_count} error(s)")
-            if warn_count:
-                summary_parts.append(f"{warn_count} warning(s)")
-            if summary_parts:
-                print(f"\n{' and '.join(summary_parts)} emitted", file=sys.stderr)
-        else:
-            print(f"[error] {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"[error] unexpected failure: {exc}", file=sys.stderr)
-        return 1
-
-    # Force mode semantics: always re-run compiler, assembler, and linker.
-    # Keep NASM/link full-rebuild behavior while avoiding redundant asm rewrites.
-    write_asm = True
-    if asm_path.exists():
-        try:
-            existing_asm = asm_path.read_text(encoding="utf-8")
-        except OSError:
-            existing_asm = None
-        if existing_asm == asm_text:
-            write_asm = False
-    if write_asm:
-        asm_path.write_text(asm_text, encoding="utf-8")
-    run_nasm(asm_path, obj_path, debug=False)
-    if output.parent and not output.parent.exists():
-        output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        output.unlink(missing_ok=True)
-    except OSError:
-        pass
-    run_linker(obj_path, output, debug=False, libs=libs, shared=False)
-    if emit_status:
-        print(f"[info] built {output}")
-    return 0
-
-
-_QUICK_NO_CACHE_GRAPH_CACHE_MAX = 64
-_QUICK_NO_CACHE_GRAPH_CACHE: Dict[Path, Dict[str, Any]] = {}
-
-
-def _quick_no_cache_deps_fresh(dep_entries: Sequence[Tuple[str, int, int]]) -> bool:
-    for dep_path, dep_mtime_ns, dep_size in dep_entries:
-        try:
-            st = Path(dep_path).stat()
-        except OSError:
-            return False
-        if st.st_mtime_ns != dep_mtime_ns or st.st_size != dep_size:
-            return False
-    return True
-
-
-def _quick_no_cache_capture_deps(source: Path, spans: Sequence[FileSpan]) -> List[Tuple[str, int, int]]:
-    dep_paths: Set[Path] = {source}
-    for span in spans:
-        try:
-            dep_paths.add(span.path.resolve())
-        except Exception:
-            continue
-
-    deps: List[Tuple[str, int, int]] = []
-    for dep_path in sorted(dep_paths, key=lambda p: str(p)):
-        try:
-            st = dep_path.stat()
-        except OSError:
-            return []
-        deps.append((dep_path.as_posix(), int(st.st_mtime_ns), int(st.st_size)))
-    return deps
-
-
-def _quick_no_cache_load_cached_graph(source: Path) -> Optional[Dict[str, Any]]:
-    entry = _QUICK_NO_CACHE_GRAPH_CACHE.get(source)
-    if entry is None:
-        return None
-
-    deps = entry.get("deps")
-    if not isinstance(deps, list) or not deps:
-        _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
-        return None
-
-    dep_entries: List[Tuple[str, int, int]] = []
-    for dep in deps:
-        if (
-            not isinstance(dep, (list, tuple))
-            or len(dep) != 3
-            or not isinstance(dep[0], str)
-            or not isinstance(dep[1], int)
-            or not isinstance(dep[2], int)
-        ):
-            _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
-            return None
-        dep_entries.append((dep[0], dep[1], dep[2]))
-
-    if not _quick_no_cache_deps_fresh(dep_entries):
-        _QUICK_NO_CACHE_GRAPH_CACHE.pop(source, None)
-        return None
-
-    return entry
-
-
-def _quick_no_cache_store_cached_graph(source: Path, compiler: Compiler) -> None:
-    cached_source = compiler._last_loaded_source
-    spans = compiler._last_loaded_spans
-    if cached_source is None or spans is None:
-        return
-
-    deps = _quick_no_cache_capture_deps(source, spans)
-    if not deps:
-        return
-
-    span_rows: List[Tuple[str, int, int, int]] = []
-    for span in spans:
-        try:
-            span_path = span.path.resolve().as_posix()
-        except Exception:
-            continue
-        span_rows.append((span_path, int(span.start_line), int(span.end_line), int(span.local_start_line)))
-
-    _QUICK_NO_CACHE_GRAPH_CACHE[source] = {
-        "deps": deps,
-        "source": cached_source,
-        "spans": span_rows,
-        "source_link_flags": tuple(compiler.source_link_flags),
-        "source_include_paths": tuple(str(p) for p in compiler.source_include_paths),
-        "source_cli_flags": tuple(compiler.source_cli_flags),
-    }
-
-    if len(_QUICK_NO_CACHE_GRAPH_CACHE) > _QUICK_NO_CACHE_GRAPH_CACHE_MAX:
-        _QUICK_NO_CACHE_GRAPH_CACHE.clear()
-
-
-def _try_quick_compile_no_cache(argv: Sequence[str]) -> Optional[int]:
-    """Fast path for benchmark-style invocations.
-
-    Supported shape only:
-      python main.py <source>.sl --no-cache
-
-    Any other option shape falls back to the full argparse-driven CLI.
-    """
-    source_token: Optional[str] = None
-    saw_no_cache = False
-    saw_no_artifact = False
-    saw_check = False
-    for tok in argv:
-        if tok == "--force":
-            return None
-        if tok == "--no-cache":
-            saw_no_cache = True
-            continue
-        if tok == "--no-artifact":
-            saw_no_artifact = True
-            continue
-        if tok == "--check":
-            saw_check = True
-            continue
-        if tok.startswith("-"):
-            return None
-        if source_token is None:
-            source_token = tok
-            continue
-        return None
-
-    if not saw_no_cache or source_token is None:
-        return None
-
-    source = Path(source_token)
-    if source.suffix.lower() != ".sl":
-        return None
-    source_resolved = source.resolve()
-    no_artifact_mode = saw_no_artifact or saw_check
-
-    include_paths = [Path("."), Path("./stdlib")]
-
-    def _new_compiler() -> Compiler:
-        compiler = Compiler(
-            include_paths=include_paths,
-            macro_expansion_limit=DEFAULT_MACRO_EXPANSION_LIMIT,
-            macro_preview=False,
-            defines=[],
-        )
-        compiler.assembler.enable_constant_folding = True
-        compiler.assembler.enable_peephole_optimization = True
-        compiler.assembler.enable_loop_unroll = True
-        compiler.assembler.enable_auto_inline = True
-        compiler.assembler.enable_string_deduplication = True
-        compiler.assembler.enable_extern_type_check = True
-        compiler.assembler.enable_stack_check = True
-        compiler.assembler.verbosity = 0
-        compiler.parser._warnings_enabled = set()
-        compiler.parser._werror = False
-        compiler.parser.enable_dead_macro_elimination = True
-        compiler.parser.enable_unused_rewrite_elimination = True
-        compiler.parser.dictionary.warn_callback = None
-        return compiler
-
-    compiler: Optional[Compiler] = None
-
-    temp_dir = Path("build")
-    output = Path("a.out")
-    artifact_kind = "exe"
-
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    asm_path = temp_dir / (source.stem + ".asm")
-    obj_path = temp_dir / (source.stem + ".o")
-    source_stamp_path = temp_dir / f"{source.stem}.src_stamp"
-    source_fast_stamp_path = temp_dir / f"{source.stem}.src_stamp.fast"
-
-    def _load_source_stamp() -> Optional[Dict[str, Any]]:
-        try:
-            import json
-            payload = json.loads(source_stamp_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        if payload.get("version") != 1:
-            return None
-        deps = payload.get("deps")
-        if not isinstance(deps, list):
-            return None
-        return payload
-
-    def _source_stamp_fresh(payload: Dict[str, Any]) -> bool:
-        deps = payload.get("deps")
-        if not isinstance(deps, list) or not deps:
-            return False
-        sidecar_exists_now = source.with_suffix(".meta.json").exists()
-        if bool(payload.get("sidecar_meta_present", False)) != sidecar_exists_now:
-            return False
-        for dep in deps:
-            if not isinstance(dep, dict):
-                return False
-            raw_path = dep.get("path")
-            mtime_ns = dep.get("mtime_ns")
-            size = dep.get("size")
-            if not isinstance(raw_path, str) or not isinstance(mtime_ns, int) or not isinstance(size, int):
-                return False
-            try:
-                st = Path(raw_path).stat()
-            except OSError:
-                return False
-            if st.st_mtime_ns != mtime_ns or st.st_size != size:
-                return False
-        return True
-
-    def _write_source_stamp(
-        compiler: Compiler,
-        source_link_libs: Sequence[str],
-        all_link_libs: Sequence[str],
-    ) -> None:
-        dep_paths: Set[Path] = {source.resolve()}
-        loaded_spans = compiler._last_loaded_spans or []
-        for span in loaded_spans:
-            try:
-                dep_paths.add(span.path.resolve())
-            except Exception:
-                continue
-
-        sidecar_meta = source.with_suffix(".meta.json")
-        if sidecar_meta.exists():
-            dep_paths.add(sidecar_meta.resolve())
-
-        dep_payload: List[Dict[str, Any]] = []
-        for dep_path in sorted(dep_paths, key=lambda p: str(p)):
-            try:
-                st = dep_path.stat()
-            except OSError:
-                continue
-            dep_payload.append(
-                {
-                    "path": dep_path.as_posix(),
-                    "mtime_ns": int(st.st_mtime_ns),
-                    "size": int(st.st_size),
-                }
-            )
-
-        payload: Dict[str, Any] = {
-            "version": 1,
-            "source_link_libs": [str(lib) for lib in source_link_libs],
-            "sidecar_meta_present": sidecar_meta.exists(),
-            "deps": dep_payload,
-        }
-        try:
-            import json
-            source_stamp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        except OSError:
-            pass
-
-        fast_lines: List[str] = [
-            "v1",
-            f"sidecar\t{1 if sidecar_meta.exists() else 0}",
-        ]
-        for dep in dep_payload:
-            fast_lines.append(
-                f"dep\t{dep['path']}\t{dep['mtime_ns']}\t{dep['size']}"
-            )
-        for lib in all_link_libs:
-            fast_lines.append(f"lib\t{str(lib)}")
-        try:
-            source_fast_stamp_path.write_text("\n".join(fast_lines) + "\n", encoding="utf-8")
-        except OSError:
-            pass
-
-    libs: List[str] = []
-    asm_text = ""
-    compiled_this_run = False
-
-    stamp_payload: Optional[Dict[str, Any]] = None
-    can_reuse_compilation = False
-    if not no_artifact_mode:
-        stamp_payload = _load_source_stamp()
-        can_reuse_compilation = (
-            stamp_payload is not None
-            and asm_path.exists()
-            and _source_stamp_fresh(stamp_payload)
-        )
-
-    if can_reuse_compilation:
-        source_link_libs = [
-            lib
-            for lib in stamp_payload.get("source_link_libs", [])
-            if isinstance(lib, str) and lib
-        ]
-        for lib in source_link_libs:
-            if lib not in libs:
-                libs.append(lib)
-        for lib in _load_sidecar_meta_libs(source):
-            if lib not in libs:
-                libs.append(lib)
-
-    if not can_reuse_compilation:
-        try:
-            compiler = _new_compiler()
-            source_cli_flags: List[str] = []
-            source_link_flags: List[str] = []
-            source_include_paths: List[Path] = []
-            cached_graph = _quick_no_cache_load_cached_graph(source_resolved)
-
-            if cached_graph is not None:
-                source_cli_flags = list(cached_graph.get("source_cli_flags", ()))
-                source_link_flags = list(cached_graph.get("source_link_flags", ()))
-                source_include_paths = [Path(p) for p in cached_graph.get("source_include_paths", ())]
-                cached_source = cached_graph.get("source")
-                span_rows = cached_graph.get("spans")
-                if isinstance(cached_source, str) and isinstance(span_rows, list):
-                    cached_spans: List[FileSpan] = []
-                    for row in span_rows:
-                        if (
-                            isinstance(row, (list, tuple))
-                            and len(row) == 4
-                            and isinstance(row[0], str)
-                            and isinstance(row[1], int)
-                            and isinstance(row[2], int)
-                            and isinstance(row[3], int)
-                        ):
-                            cached_spans.append(FileSpan(Path(row[0]), row[1], row[2], row[3]))
-                    compiler._last_loaded_path = source_resolved
-                    compiler._last_loaded_source = cached_source
-                    compiler._last_loaded_spans = cached_spans
-                    compiler.source_cli_flags = source_cli_flags
-                    compiler.source_link_flags = source_link_flags
-                    compiler.source_include_paths = source_include_paths
-                else:
-                    cached_graph = None
-
-            if cached_graph is None:
-                compiler.collect_source_flags(source)
-                _quick_no_cache_store_cached_graph(source_resolved, compiler)
-                source_cli_flags = list(compiler.source_cli_flags)
-                source_link_flags = list(compiler.source_link_flags)
-                source_include_paths = list(compiler.source_include_paths)
-
-            # Source-level CLI flags can imply complex option semantics; keep full CLI for those.
-            if source_cli_flags:
-                return None
-
-            normalized_include_paths: List[Path] = []
-            seen_include_paths: Set[Path] = set()
-            for include_base in [Path("."), Path("./stdlib"), *source_include_paths]:
-                resolved = include_base.expanduser().resolve()
-                if resolved not in seen_include_paths:
-                    seen_include_paths.add(resolved)
-                    normalized_include_paths.append(resolved)
-            compiler.include_paths = normalized_include_paths
-            compiler._import_resolve_cache.clear()
-
-            source_link_libs = []
-            for flag in source_link_flags:
-                if flag not in source_link_libs:
-                    source_link_libs.append(flag)
-                if flag not in libs:
-                    libs.append(flag)
-            for lib in _load_sidecar_meta_libs(source):
-                if lib not in libs:
-                    libs.append(lib)
-
-            if compiler._last_loaded_path == source_resolved and compiler._last_loaded_source is not None:
-                emission = compiler.compile_preloaded(debug=False, entry_mode="program")
-            else:
-                emission = compiler.compile_file(source, debug=False, entry_mode="program")
-            asm_text = emission.snapshot()
-            compiled_this_run = True
-            if not no_artifact_mode:
-                _write_source_stamp(compiler, source_link_libs, libs)
-        except (ParseError, CompileError, CompileTimeError) as exc:
-            use_color = _diagnostic_color_enabled()
-            diags = getattr(compiler.parser, "diagnostics", [])
-            if diags:
-                for diag in diags:
-                    print(diag.format(color=use_color), file=sys.stderr)
-                error_count = sum(1 for d in diags if d.level == "error")
-                warn_count = sum(1 for d in diags if d.level == "warning")
-                summary_parts: List[str] = []
-                if error_count:
-                    summary_parts.append(f"{error_count} error(s)")
-                if warn_count:
-                    summary_parts.append(f"{warn_count} warning(s)")
-                if summary_parts:
-                    print(f"\n{' and '.join(summary_parts)} emitted", file=sys.stderr)
-            else:
-                print(f"[error] {exc}", file=sys.stderr)
-            return 1
-        except Exception as exc:
-            print(f"[error] unexpected failure: {exc}", file=sys.stderr)
-            return 1
-
-    if compiled_this_run:
-        assert compiler is not None
-        use_color = _diagnostic_color_enabled()
-        warnings = [d for d in compiler.parser.diagnostics if d.level == "warning"]
-        if warnings:
-            for diag in warnings:
-                print(diag.format(color=use_color), file=sys.stderr)
-            print(f"\n{len(warnings)} warning(s) emitted", file=sys.stderr)
-
-    if no_artifact_mode:
-        print("[info] skipped artifact generation (--no-artifact)")
-        return 0
-
-    asm_changed = False
-    if compiled_this_run:
-        asm_changed = True
-        if asm_path.exists():
-            try:
-                existing_asm = asm_path.read_text()
-            except OSError:
-                existing_asm = ""
-            if existing_asm == asm_text:
-                asm_changed = False
-        if asm_changed:
-            asm_path.write_text(asm_text)
-
-    need_nasm = asm_changed or not obj_path.exists()
-    if not need_nasm:
-        try:
-            need_nasm = obj_path.stat().st_mtime < asm_path.stat().st_mtime
-        except OSError:
-            need_nasm = True
-    if need_nasm:
-        run_nasm(asm_path, obj_path, debug=False)
-
-    if output.parent and not output.parent.exists():
-        output.parent.mkdir(parents=True, exist_ok=True)
-
-    link_stamp = temp_dir / f"{output.name}.link_src"
-    link_fingerprint_parts = [
-        f"obj={obj_path.resolve()}",
-        f"artifact={artifact_kind}",
-        "debug=0",
-    ]
-
-    def _lib_file_from_token(tok: str) -> Optional[Path]:
-        if tok.startswith("-l:") and len(tok) > 3:
-            return Path(tok[3:]).expanduser()
-        if tok.startswith("-"):
-            return None
-        return Path(tok).expanduser()
-
-    for lib in libs:
-        link_fingerprint_parts.append(f"lib={lib}")
-        lib_file = _lib_file_from_token(lib)
-        if lib_file is None:
-            continue
-        try:
-            resolved = lib_file.resolve()
-            st = resolved.stat()
-        except OSError:
-            continue
-        link_fingerprint_parts.append(
-            f"libfile={resolved}:mtime_ns={st.st_mtime_ns}:size={st.st_size}"
-        )
-    link_fingerprint = "\n".join(link_fingerprint_parts)
-
-    # Keep external tool invocations incremental even in --no-cache mode.
-    # --no-cache here means "skip source/asm cache", not "force relink".
-    need_link = need_nasm or not output.exists()
-    if not need_link:
-        try:
-            recorded = link_stamp.read_text()
-        except OSError:
-            recorded = ""
-        if recorded != link_fingerprint:
-            need_link = True
-    if not need_link:
-        try:
-            need_link = output.stat().st_mtime < obj_path.stat().st_mtime
-        except OSError:
-            need_link = True
-
-    if need_link:
-        try:
-            output.unlink(missing_ok=True)
-        except OSError:
-            pass
-        run_linker(obj_path, output, debug=False, libs=libs, shared=False)
-
-    if need_link:
-        link_stamp.write_text(link_fingerprint)
-        print(f"[info] built {output}")
-    else:
-        print(f"[info] {output} is up to date")
-    return 0
-
-
-def cli(argv: Sequence[str]) -> int:
-    quick_force = _try_quick_compile_force(argv)
-    if quick_force is not None:
-        return quick_force
-
-    quick_no_cache = _try_quick_compile_no_cache(argv)
-    if quick_no_cache is not None:
-        return quick_no_cache
-
+def cli(
+    argv: Sequence[str],
+    *,
+    event_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="L2 compiler driver")
     parser.add_argument(
@@ -24582,7 +24562,20 @@ def cli(argv: Sequence[str]) -> int:
         help="add import search path (repeatable)",
     )
     parser.add_argument("--artifact", choices=["exe", "shared", "static", "obj"], default="exe", help="choose final artifact type")
+    parser.add_argument(
+        "--c-abi",
+        "--sysv-wrappers",
+        dest="c_abi",
+        action="store_true",
+        help="emit SysV C ABI wrappers and companion C header for runtime functions (requires --artifact shared, static, or obj)",
+    )
     parser.add_argument("--emit-asm", action="store_true", help="stop after generating asm")
+    parser.add_argument(
+        "--events-stream",
+        default=None,
+        metavar="PATH",
+        help="write compiler events as JSON Lines to a file path",
+    )
     parser.add_argument("--temp-dir", type=Path, default=Path("build"))
     parser.add_argument("--debug", action="store_true", help="compile with debug info")
     parser.add_argument("--run", action="store_true", help="run the built binary after successful build")
@@ -24800,6 +24793,24 @@ def cli(argv: Sequence[str]) -> int:
     if not args.no_cache:
         source_graph_cache = SourceGraphCache(args.temp_dir / ".l2cache" / "graphs")
 
+    # The in-language event system is always present.  The JSON stream is an
+    # optional external observer layered on top of that same bus.
+    event_bus: Optional[EventBus] = EventBus()
+    if event_observer is not None:
+        event_bus.subscribe("*", event_observer)
+    if args.events_stream is not None:
+        stream_arg = str(args.events_stream)
+        try:
+            event_stream = open(stream_arg, "w", encoding="utf-8", buffering=1)
+        except OSError as exc:
+            parser.error(f"cannot open --events-stream {stream_arg!r}: {exc}")
+
+        def _write_event(record: Dict[str, Any]) -> None:
+            event_stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+            event_stream.flush()
+
+        event_bus.subscribe("*", _write_event)
+
     parser_defaults = {
         action.dest: action.default
         for action in parser._actions
@@ -24946,6 +24957,7 @@ def cli(argv: Sequence[str]) -> int:
         macro_preview=args.macro_preview,
         defines=args.defines,
         source_graph_cache=source_graph_cache,
+        event_bus=event_bus,
     )
     compiler.assembler.enable_constant_folding = folding_enabled
     compiler.assembler.enable_peephole_optimization = peephole_enabled
@@ -25104,6 +25116,8 @@ def cli(argv: Sequence[str]) -> int:
             parser.error("--run/--dbg are only available when --artifact exe is selected")
         if args.no_artifact and (args.run or args.dbg):
             parser.error("--run/--dbg are not available with --no-artifact")
+        if getattr(args, "c_abi", False) and artifact_kind not in {"shared", "static", "obj"}:
+            parser.error("--c-abi requires --artifact shared, static, or obj")
 
         if output_was_auto and not args.repl and not args.no_artifact:
             stem = args.source.stem
@@ -25198,7 +25212,9 @@ def cli(argv: Sequence[str]) -> int:
             and args.dump_cfg is None
             and not args.emit_asm
         )
-        if cache and not args.ct_run_main and args.dump_cfg is None and not args.preview:
+        # An event consumer must observe the compiler pipeline even when the
+        # artifact cache is warm; otherwise an IDE sees an empty stream.
+        if cache and event_observer is None and args.events_stream is None and not args.ct_run_main and args.dump_cfg is None and not args.preview:
             fhash = cache.flags_hash(
                 args.debug,
                 folding_enabled,
@@ -25207,6 +25223,7 @@ def cli(argv: Sequence[str]) -> int:
                 asm_post_opt_enabled,
                 string_deduplication_enabled,
                 entry_mode,
+                c_abi=getattr(args, "c_abi", False),
             )
             manifest = cache.load_manifest(args.source)
             if manifest and cache.check_fresh(manifest, fhash):
@@ -25243,10 +25260,16 @@ def cli(argv: Sequence[str]) -> int:
                     _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
                     print(f"[v1] parse-only compile-time prep: {_compile_dt:.1f}ms")
             else:
+                mod_name = args.source.stem if args.source else "l2"
+                c_abi_flag = getattr(args, "c_abi", False)
                 if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
-                    emission = compiler.compile_preloaded(debug=args.debug, entry_mode=entry_mode)
+                    emission = compiler.compile_preloaded(
+                        debug=args.debug, entry_mode=entry_mode, c_abi=c_abi_flag, module_name=mod_name
+                    )
                 else:
-                    emission = compiler.compile_file(args.source, debug=args.debug, entry_mode=entry_mode)
+                    emission = compiler.compile_file(
+                        args.source, debug=args.debug, entry_mode=entry_mode, c_abi=c_abi_flag, module_name=mod_name
+                    )
 
                 # Snapshot assembly text *before* ct-run-main JIT execution, which may
                 # corrupt Python heap objects depending on memory layout.
@@ -25503,6 +25526,16 @@ def cli(argv: Sequence[str]) -> int:
     asm_path = args.temp_dir / (args.source.stem + ".asm")
     obj_path = args.temp_dir / (args.source.stem + ".o")
 
+    # A C ABI artifact always carries its companion declaration header,
+    # regardless of whether the caller requested assembly-only output.
+    if getattr(args, "c_abi", False) and args.output is not None:
+        c_header = getattr(locals().get("emission"), "c_header", "")
+        if c_header:
+            header_path = args.output.with_suffix(".h")
+            header_path.parent.mkdir(parents=True, exist_ok=True)
+            header_path.write_text(c_header, encoding="utf-8")
+            print(f"[info] wrote {header_path}")
+
     # --- incremental: skip nasm if assembly unchanged ---
     asm_changed = True
     if not args.force and asm_path.exists():
@@ -25621,7 +25654,976 @@ def cli(argv: Sequence[str]) -> int:
     return 0
 
 
+DAEMON_SOCKET_PATH = os.path.join("build", ".l2_daemon.sock")
+DAEMON_PID_PATH = os.path.join("build", ".l2_daemon.pid")
+DAEMON_STATE_PATH = os.path.join("build", ".l2_daemon_state.json")
+DAEMON_TIMEOUT = 120.0
+DAEMON_CODE_FILES = ("l2_main.py", "main.py", "docs.py")
+
+
+def _daemon_code_hash() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in DAEMON_CODE_FILES:
+        path = root / name
+        digest.update(name.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+    return digest.hexdigest()
+
+
+def _daemon_memory_rss() -> int:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _daemon_open_fds() -> int:
+    try:
+        return len(list(Path("/proc/self/fd").iterdir()))
+    except OSError:
+        return 0
+
+
+def daemon_enabled_by_default() -> bool:
+    return os.environ.get("L2_DAEMON", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _daemon_send(payload: Dict[str, Any], socket_path: str = DAEMON_SOCKET_PATH, timeout: float = DAEMON_TIMEOUT) -> Dict[str, Any]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(timeout)
+        conn.connect(socket_path)
+        conn.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+        raw = conn.makefile("rb").readline(4 * 1024 * 1024)
+    row = json.loads(raw.decode("utf-8"))
+    if not isinstance(row, dict):
+        raise RuntimeError("invalid compiler daemon response")
+    return row
+
+
+def _daemon_alive(socket_path: str = DAEMON_SOCKET_PATH) -> bool:
+    try:
+        return bool(_daemon_send({"cmd": "ping"}, socket_path, 0.35).get("ok"))
+    except Exception:
+        return False
+
+
+def _daemon_stuck_on_start_lock(lock_fd: int, socket_path: str) -> Optional[int]:
+    """Find only a daemon process deadlocked reacquiring its own startup lock."""
+    try:
+        inode = str(os.fstat(lock_fd).st_ino)
+        rows = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for row in rows:
+        fields = row.split()
+        if len(fields) < 6 or fields[1] != "FLOCK" or fields[5].rsplit(":", 1)[-1] != inode:
+            continue
+        try:
+            pid = int(fields[4])
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+            wait_channel = Path(f"/proc/{pid}/task/{pid}/wchan").read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            continue
+        if "--daemon-serve" in cmdline and socket_path in cmdline and wait_channel == "locks_lock_inode_wait":
+            return pid
+    return None
+
+
+def daemon_start(*, socket_path: str = DAEMON_SOCKET_PATH, pid_path: str = DAEMON_PID_PATH, workers: Optional[int] = None) -> bool:
+    """Ensure the compiler service running this module is available."""
+    if _daemon_alive(socket_path):
+        return True
+    Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(socket_path + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    owns_start_lock = False
+    try:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if _daemon_alive(socket_path):
+                return True
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                owns_start_lock = True
+                break
+            except BlockingIOError:
+                time.sleep(0.02)
+        if not owns_start_lock:
+            if _daemon_alive(socket_path):
+                return True
+            stale_pid = _daemon_stuck_on_start_lock(lock_fd, socket_path)
+            if stale_pid is None:
+                return False
+            try:
+                os.kill(stale_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if _daemon_alive(socket_path):
+                    return True
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    owns_start_lock = True
+                    break
+                except BlockingIOError:
+                    time.sleep(0.02)
+            if not owns_start_lock:
+                return _daemon_alive(socket_path)
+        if _daemon_alive(socket_path):
+            return True
+        try:
+            Path(socket_path).unlink()
+        except OSError:
+            pass
+        count = workers or max(2, min(os.cpu_count() or 2, 16))
+        env = os.environ.copy()
+        env["L2_DAEMON_LOCK_FD"] = str(lock_fd)
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--daemon-serve", "--socket", socket_path, "--pid", pid_path, "--workers", str(count)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(lock_fd,),
+            start_new_session=True,
+            env=env,
+        )
+        Path(pid_path).write_text(f"{proc.pid}\n", encoding="utf-8")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if _daemon_alive(socket_path):
+                return True
+            time.sleep(0.02)
+        return False
+    finally:
+        # The daemon inherits this open file description and keeps the lock
+        # after this client closes its copy.
+        os.close(lock_fd)
+
+
+def daemon_status(*, socket_path: str = DAEMON_SOCKET_PATH) -> Optional[Dict[str, Any]]:
+    try:
+        return _daemon_send({"cmd": "status"}, socket_path)
+    except Exception:
+        return None
+
+
+def daemon_request(argv: Sequence[str], *, wants_color: bool = False, stdin_data: Optional[str] = None, socket_path: str = DAEMON_SOCKET_PATH) -> Dict[str, Any]:
+    return _daemon_send({
+        "cmd": "run",
+        "argv": list(argv),
+        "wants_color": wants_color,
+        "stdin": stdin_data,
+        "tool_path": os.environ.get("PATH", ""),
+    }, socket_path)
+
+
+def daemon_stop(*, socket_path: str = DAEMON_SOCKET_PATH) -> bool:
+    try:
+        return bool(_daemon_send({"cmd": "shutdown"}, socket_path, 1.0).get("ok"))
+    except Exception:
+        return False
+
+
+def _proc_start_time_ns(pid: int) -> Optional[int]:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if ")" not in stat_text:
+        return None
+    rest = stat_text.rsplit(")", 1)[1].strip()
+    fields = rest.split()
+    if len(fields) < 20:
+        return None
+    try:
+        start_ticks = int(fields[19])
+    except ValueError:
+        return None
+    clk_tck = os.sysconf("SC_CLK_TCK")
+    if clk_tck <= 0:
+        clk_tck = 100
+    return int(start_ticks * (1_000_000_000 / clk_tck))
+
+
+def _write_daemon_lease(socket_path: str, pid: int) -> None:
+    """Publish the live daemon identity and heartbeat for stale-process detection.
+
+    The lease includes both the process PID and the process start time from
+    /proc/<pid>/stat. A client validates both fields before believing the daemon
+    is still the original instance.
+    """
+    lease_path = Path(socket_path + ".lease")
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text(
+        json.dumps({"pid": int(pid), "start_time_ns": _proc_start_time_ns(pid), "ts_ns": time.time_ns()}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _daemon_heartbeat_loop(socket_path: str, stop_event: threading.Event) -> None:
+    """Refresh the daemon lease while the daemon is live."""
+    while not stop_event.wait(0.5):
+        try:
+            _write_daemon_lease(socket_path, os.getpid())
+        except Exception:
+            pass
+
+
+_DAEMON_CLI_EXEC_LOCK = threading.RLock()
+
+
+def _run_cli_captured(
+    argv: Sequence[str],
+    *,
+    color: bool,
+    stdin_data: Optional[str],
+    event_observer: Optional[Callable[[Dict[str, Any]], None]],
+    output_files: Optional[Tuple[Any, Any]] = None,
+) -> Tuple[int, str, str]:
+    """Run the canonical CLI in-process, capturing Python and native stdio."""
+    import tempfile
+    import traceback
+
+    owned_output_files = output_files is None
+    if output_files is None:
+        stdout_file = tempfile.TemporaryFile()
+        stderr_file = tempfile.TemporaryFile()
+    else:
+        stdout_file, stderr_file = output_files
+
+    try:
+        with _DAEMON_CLI_EXEC_LOCK:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            saved_stdout_fd = os.dup(1)
+            saved_stderr_fd = os.dup(2)
+            saved_stdin = sys.stdin
+            old_force_color = os.environ.get("L2_FORCE_COLOR")
+            code = 1
+            stdout_text = ""
+            stderr_text = ""
+            input_stream = None
+            input_file = None
+            saved_stdin_fd = os.dup(0)
+
+            try:
+                if stdin_data is not None:
+                    input_file = tempfile.TemporaryFile()
+                    input_file.write(stdin_data.encode("utf-8"))
+                    input_file.seek(0)
+                    os.dup2(input_file.fileno(), 0)
+                else:
+                    null_stdin_fd = os.open(os.devnull, os.O_RDONLY)
+                    try:
+                        os.dup2(null_stdin_fd, 0)
+                    finally:
+                        os.close(null_stdin_fd)
+                input_stream = os.fdopen(os.dup(0), "r", encoding="utf-8")
+                sys.stdin = input_stream
+
+                os.dup2(stdout_file.fileno(), 1)
+                os.dup2(stderr_file.fileno(), 2)
+                os.environ["L2_FORCE_COLOR"] = "1" if color else "0"
+
+                try:
+                    code = int(cli(argv, event_observer=event_observer))
+                except SystemExit as exc:
+                    code = int(exc.code) if isinstance(exc.code, int) else 0
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                    code = 1
+                finally:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout_text = stdout_file.read().decode("utf-8", errors="replace")
+                stderr_text = stderr_file.read().decode("utf-8", errors="replace")
+            finally:
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                os.dup2(saved_stdout_fd, 1)
+                os.dup2(saved_stderr_fd, 2)
+                os.close(saved_stdout_fd)
+                os.close(saved_stderr_fd)
+                os.dup2(saved_stdin_fd, 0)
+                os.close(saved_stdin_fd)
+                sys.stdin = saved_stdin
+                if input_stream is not None:
+                    input_stream.close()
+                if input_file is not None:
+                    input_file.close()
+                if old_force_color is None:
+                    os.environ.pop("L2_FORCE_COLOR", None)
+                else:
+                    os.environ["L2_FORCE_COLOR"] = old_force_color
+
+        return code, stdout_text, stderr_text
+    finally:
+        if owned_output_files:
+            stdout_file.close()
+            stderr_file.close()
+
+
+def _run_cli_isolated(
+    argv: Sequence[str],
+    *,
+    color: bool,
+    stdin_data: Optional[str],
+    event_observer: Optional[Callable[[Dict[str, Any]], None]],
+    tool_path: Optional[str] = None,
+    child_started: Optional[Callable[[int], None]] = None,
+    child_finished: Optional[Callable[[], None]] = None,
+) -> Tuple[int, str, str]:
+    """Run the canonical CLI in a forked child so native execution is contained."""
+    import tempfile
+
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                if tool_path is not None:
+                    os.environ["PATH"] = tool_path
+                os.setpgid(0, 0)
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                code, _stdout_text, _stderr_text = _run_cli_captured(
+                    argv,
+                    color=color,
+                    stdin_data=stdin_data,
+                    event_observer=event_observer,
+                    output_files=(stdout_file, stderr_file),
+                )
+            except BaseException:
+                import traceback
+
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                os._exit(1)
+            os._exit(code)
+
+        try:
+            os.setpgid(child_pid, child_pid)
+        except OSError:
+            pass
+        if child_started is not None:
+            child_started(child_pid)
+        while True:
+            try:
+                _waited_pid, wait_status = os.waitpid(child_pid, 0)
+                break
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    raise
+        if child_finished is not None:
+            child_finished()
+
+        if os.WIFEXITED(wait_status):
+            code = os.WEXITSTATUS(wait_status)
+        elif os.WIFSIGNALED(wait_status):
+            code = 128 + os.WTERMSIG(wait_status)
+        else:
+            code = 1
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout_text = stdout_file.read().decode("utf-8", errors="replace")
+        stderr_text = stderr_file.read().decode("utf-8", errors="replace")
+        return code, stdout_text, stderr_text
+
+
+class _DaemonCompilerWorker:
+    def __init__(self) -> None:
+        env = os.environ.copy()
+        env["L2_DAEMON"] = "0"
+        self.busy = False
+        self.process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--daemon-worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        color: bool,
+        stdin_data: Optional[str],
+        event_observer: Optional[Callable[[Dict[str, Any]], None]],
+        tool_path: Optional[str] = None,
+    ) -> Tuple[int, str, str]:
+        if self.process.poll() is not None or self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("compiler worker is not running")
+        request = {
+            "cmd": "run",
+            "argv": list(argv),
+            "color": bool(color),
+            "stdin": stdin_data,
+            "stream_events": event_observer is not None,
+            "tool_path": tool_path,
+        }
+        self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError(f"compiler worker exited with status {self.process.poll()}")
+            message = json.loads(line)
+            kind = message.get("kind")
+            if kind == "event":
+                record = message.get("record")
+                if isinstance(record, dict):
+                    event_observer(record)
+                continue
+            if kind == "result":
+                return (
+                    int(message.get("code", 1)),
+                    str(message.get("stdout", "")),
+                    str(message.get("stderr", "")),
+                )
+            raise RuntimeError(f"invalid compiler worker response: {kind!r}")
+
+    def close(self) -> None:
+        if self.busy and self.process.poll() is None:
+            self.process.terminate()
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        try:
+            self.process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+
+
+def _daemon_worker_serve() -> int:
+    protocol_fd = os.dup(1)
+    protocol_stdin = os.fdopen(os.dup(0), "r", encoding="utf-8")
+    active_child_pid: Optional[int] = None
+    stopping = False
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        nonlocal stopping
+        stopping = True
+        if active_child_pid is not None:
+            try:
+                os.killpg(active_child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    def _send(message: Dict[str, Any]) -> None:
+        data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(protocol_fd, remaining)
+            remaining = remaining[written:]
+
+    try:
+        for line in protocol_stdin:
+            try:
+                request = json.loads(line)
+            except ValueError as exc:
+                _send({"kind": "result", "code": 2, "stdout": "", "stderr": f"invalid worker request: {exc}\n"})
+                continue
+            if request.get("cmd") == "shutdown":
+                break
+            if request.get("cmd") != "run" or not isinstance(request.get("argv"), list):
+                _send({"kind": "result", "code": 2, "stdout": "", "stderr": "invalid worker command\n"})
+                continue
+
+            def _forward_event(record: Dict[str, Any]) -> None:
+                _send({"kind": "event", "record": record})
+
+            def _child_started(pid: int) -> None:
+                nonlocal active_child_pid
+                active_child_pid = pid
+
+            def _child_finished() -> None:
+                nonlocal active_child_pid
+                active_child_pid = None
+
+            code, stdout_text, stderr_text = _run_cli_isolated(
+                [str(arg) for arg in request["argv"]],
+                color=bool(request.get("color")),
+                stdin_data=request.get("stdin") if isinstance(request.get("stdin"), str) else None,
+                event_observer=_forward_event if request.get("stream_events") else None,
+                tool_path=request.get("tool_path") if isinstance(request.get("tool_path"), str) else None,
+                child_started=_child_started,
+                child_finished=_child_finished,
+            )
+            _send({"kind": "result", "code": code, "stdout": stdout_text, "stderr": stderr_text})
+            if stopping:
+                break
+    finally:
+        protocol_stdin.close()
+        os.close(protocol_fd)
+    return 0
+
+
+class _IntegratedCompilerDaemon:
+    """Long-lived compiler coordinator; jobs execute in isolated workers."""
+    def __init__(self, socket_path: str, pid_path: str, workers: int, *, auto_reload: bool = True) -> None:
+        self.socket_path, self.pid_path, self.workers = socket_path, pid_path, max(1, workers)
+        self.state_path = Path(DAEMON_STATE_PATH)
+        self.auto_reload = auto_reload
+        self.code_hash = _daemon_code_hash()
+        self.started_at, self.bus = time.time(), EventBus(4096)
+        self._slots, self._active, self._queued, self._pending_requests, self._lock = (
+            threading.BoundedSemaphore(self.workers), 0, 0, 0, threading.Lock()
+        )
+        self._worker_condition = threading.Condition()
+        self._compiler_workers: List[_DaemonCompilerWorker] = []
+        self.total = self.success = self.failure = 0
+        self.history: Deque[Dict[str, Any]] = deque(maxlen=64)
+        self._source_cache: "OrderedDict[str, Tuple[int, int, str]]" = OrderedDict()
+        self._source_cache_limit = 128
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self.reload_requested = threading.Event()
+        self.stop_event = threading.Event()
+        self.server: Any = None
+        self._restore_state()
+        log_path = Path("build/logs/daemon.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = logging.getLogger(f"l2.integrated.daemon.{os.getpid()}")
+        level_name = os.environ.get("L2_DAEMON_LOG_LEVEL", "INFO").upper()
+        self.log.setLevel(getattr(logging, level_name, logging.INFO))
+        handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        self.log.addHandler(handler)
+
+    def _restore_state(self) -> None:
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            return
+        saved_hash = state.get("code_hash")
+        if saved_hash != self.code_hash and not state.get("reload_restore"):
+            return
+        self.started_at = float(state.get("started_at", self.started_at))
+        rows = state.get("recent_compilations", [])
+        if isinstance(rows, list):
+            self.history.extend(row for row in rows if isinstance(row, dict))
+        self.total = int(state.get("total_requests", 0))
+        self.success = int(state.get("success", 0))
+        self.failure = int(state.get("failure", 0))
+        self._cache_hits = int(state.get("cache_hits", 0))
+        self._cache_misses = int(state.get("cache_misses", 0))
+        rows = state.get("source_cache", [])
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                path_text, content = row.get("path"), row.get("content")
+                if not isinstance(path_text, str) or not isinstance(content, str):
+                    continue
+                path = Path(path_text)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime_ns != row.get("mtime_ns") or stat.st_size != row.get("size"):
+                    continue
+                self._source_cache[path_text] = (stat.st_mtime_ns, stat.st_size, content)
+            while len(self._source_cache) > self._source_cache_limit:
+                self._source_cache.popitem(last=False)
+
+    def _snapshot_state(self, *, reload_restore: bool = False) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "code_hash": self.code_hash,
+            "reload_restore": bool(reload_restore),
+            "started_at": self.started_at,
+            "recent_compilations": list(self.history),
+            "total_requests": self.total,
+            "success": self.success,
+            "failure": self.failure,
+            "source_cache_entries": len(self._source_cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "source_cache": [
+                {"path": path, "mtime_ns": mtime_ns, "size": size, "content": content}
+                for path, (mtime_ns, size, content) in self._source_cache.items()
+            ],
+        }
+        tmp_path = self.state_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self.state_path)
+
+    def _touch_source_cache(self, source: Path) -> str:
+        try:
+            stat = source.stat()
+            key = str(source.resolve())
+            cached = self._source_cache.get(key)
+            if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+                self._cache_hits += 1
+                self._source_cache.move_to_end(key)
+                return hashlib.sha256(cached[2].encode("utf-8")).hexdigest()
+            content = source.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        self._cache_misses += 1
+        self._source_cache[key] = (stat.st_mtime_ns, stat.st_size, content)
+        self._source_cache.move_to_end(key)
+        while len(self._source_cache) > self._source_cache_limit:
+            self._source_cache.popitem(last=False)
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _acquire_compiler_worker(self) -> _DaemonCompilerWorker:
+        with self._worker_condition:
+            while True:
+                for worker in list(self._compiler_workers):
+                    if worker.busy:
+                        continue
+                    if worker.process.poll() is not None:
+                        self._compiler_workers.remove(worker)
+                        worker.close()
+                        continue
+                    worker.busy = True
+                    return worker
+                if len(self._compiler_workers) < self.workers:
+                    worker = _DaemonCompilerWorker()
+                    worker.busy = True
+                    self._compiler_workers.append(worker)
+                    return worker
+                self._worker_condition.wait()
+
+    def _release_compiler_worker(self, worker: _DaemonCompilerWorker) -> None:
+        with self._worker_condition:
+            if worker.process.poll() is not None:
+                if worker in self._compiler_workers:
+                    self._compiler_workers.remove(worker)
+                worker.close()
+            else:
+                worker.busy = False
+            self._worker_condition.notify()
+
+    def _shutdown_compiler_workers(self) -> None:
+        with self._worker_condition:
+            workers = list(self._compiler_workers)
+            self._compiler_workers.clear()
+            self._worker_condition.notify_all()
+        for worker in workers:
+            if worker.process.poll() is None:
+                worker.process.terminate()
+        for worker in workers:
+            worker.close()
+
+    def _watch_code(self) -> None:
+        previous = self.code_hash
+        while not self.stop_event.wait(0.5):
+            current = _daemon_code_hash()
+            if current == previous:
+                continue
+            self.log.warning("compiler sources changed; scheduling daemon reload")
+            self.reload_requested.set()
+            self.stop_event.set()
+            if self.server is not None:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+
+    def _run(
+        self,
+        argv: List[str],
+        color: bool,
+        stdin_data: Optional[str],
+        tool_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        req_id, began = uuid.uuid4().hex[:12], time.perf_counter_ns()
+        for index, arg in enumerate(argv):
+            if arg == "--events-stream":
+                if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                    return {"ok": False, "error": "--events-stream requires a file path"}
+            elif arg.startswith("--events-stream="):
+                if not arg.split("=", 1)[1]:
+                    return {"ok": False, "error": "--events-stream requires a file path"}
+
+        source_path = next((Path(x) for x in argv if x.endswith(".sl")), None)
+        source_hash = self._touch_source_cache(source_path) if source_path is not None else ""
+        self.log.info("req_id=%s start source=%s argv=%r", req_id, source_path or "<command>", argv)
+        def forward_event(record: Dict[str, Any]) -> None:
+            self.bus.publish_record(record)
+
+        worker: Optional[_DaemonCompilerWorker] = None
+        try:
+            worker = self._acquire_compiler_worker()
+            return_code, stdout, stderr = worker.run(
+                argv,
+                color=color,
+                stdin_data=stdin_data,
+                event_observer=forward_event,
+                tool_path=tool_path,
+            )
+        except Exception as exc:
+            return_code, stdout, stderr = 1, "", f"[error] compiler worker failed: {exc}\n"
+        finally:
+            if worker is not None:
+                self._release_compiler_worker(worker)
+
+        result = {"ok": True, "code": return_code, "stdout": stdout, "stderr": stderr}
+        stdout_text, stderr_text = result["stdout"], result["stderr"]
+        cache_hit = "[v1] cache hit for " in stdout_text
+        record = {
+            "id": req_id,
+            "source": str(source_path or "<command>"),
+            "source_hash": source_hash,
+            "duration_ns": time.perf_counter_ns() - began,
+            "code": return_code,
+            "cache_hit": cache_hit,
+        }
+        self.history.append(record); self.success += return_code == 0; self.failure += return_code != 0
+        req_log = Path("build/logs/req") / f"{req_id}.log"
+        req_log.write_text(
+            f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} INFO req_id={req_id} result={record}\n"
+            f"--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}",
+            encoding="utf-8",
+        )
+        self.log.info("req_id=%s finish code=%s duration_ns=%s", req_id, return_code, record["duration_ns"])
+        return result
+
+    def handle(self, payload: Dict[str, Any], server: Any, *, queued_registered: bool = False) -> Dict[str, Any]:
+        cmd = str(payload.get("cmd", "")); self.total += 1
+        if cmd == "ping": return {"ok": True, "pong": True}
+        if cmd == "status":
+            with self._lock:
+                active, queued, pending = self._active, self._queued, self._pending_requests
+            cache_bytes = sum(len(row[2].encode("utf-8")) for row in self._source_cache.values())
+            return {
+                "ok": True,
+                "pid": os.getpid(),
+                "uptime_seconds": time.time() - self.started_at,
+                "workers": self.workers,
+                "active_jobs": active,
+                "queued_jobs": queued,
+                "pending_requests": pending,
+                "memory_rss_bytes": _daemon_memory_rss(),
+                "open_fds": _daemon_open_fds(),
+                "total_requests": self.total,
+                "success": self.success,
+                "failure": self.failure,
+                "stale": self.reload_requested.is_set(),
+                "code_hash": self.code_hash,
+                "recent_compilations": list(self.history),
+                "cache_stats": {"entries": len(self._source_cache), "hits": self._cache_hits, "misses": self._cache_misses, "bytes": cache_bytes},
+                "event_bus_stats": self.bus.stats(),
+            }
+        if cmd == "events": return {"ok": True, "events": self.bus.recent(str(payload.get("pattern", "*")), payload.get("limit"))}
+        if cmd == "logs":
+            requested = payload.get("req")
+            log_path = Path("build/logs/req") / f"{requested}.log" if requested else Path("build/logs/daemon.log")
+            try:
+                text = log_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            tail = payload.get("tail")
+            if tail is not None:
+                try:
+                    text = "\n".join(text.splitlines()[-max(0, int(tail)):]) + ("\n" if text else "")
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "logs tail must be an integer"}
+            return {"ok": True, "path": str(log_path), "text": text}
+        if cmd in {"session-clear", "reset"}:
+            self.history.clear()
+            self._source_cache.clear()
+            self._cache_hits = self._cache_misses = 0
+            if cmd == "reset":
+                try:
+                    self.state_path.unlink()
+                except OSError:
+                    pass
+            return {"ok": True}
+        if cmd == "shutdown":
+            self.stop_event.set()
+            threading.Thread(target=server.shutdown, daemon=True).start(); return {"ok": True}
+        if cmd != "run" or not isinstance(payload.get("argv"), list): return {"ok": False, "error": f"unknown or invalid daemon command: {cmd}"}
+        if not queued_registered:
+            with self._lock:
+                self._queued += 1
+        self._slots.acquire()
+        with self._lock:
+            self._queued -= 1
+            self._active += 1
+        try:
+            tool_path = payload.get("tool_path")
+            return self._run(
+                [str(x) for x in payload["argv"]],
+                bool(payload.get("wants_color")),
+                payload.get("stdin"),
+                tool_path if isinstance(tool_path, str) else None,
+            )
+        finally:
+            with self._lock: self._active -= 1
+            self._slots.release()
+
+
+def daemon_serve(argv: Sequence[str]) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--socket", default=DAEMON_SOCKET_PATH); parser.add_argument("--pid", default=DAEMON_PID_PATH); parser.add_argument("--workers", type=int, default=max(2, min(os.cpu_count() or 2, 16)))
+    parser.add_argument("--no-auto-reload", action="store_true")
+    args = parser.parse_args(list(argv))
+    inherited_lock_fd = os.environ.get("L2_DAEMON_LOCK_FD")
+    if inherited_lock_fd is not None:
+        lock_fd = int(inherited_lock_fd)
+        os.set_inheritable(lock_fd, True)
+    else:
+        lock_path = Path(str(args.socket) + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        os.set_inheritable(lock_fd, True)
+    os.environ["L2_DAEMON_LOCK_FD"] = str(lock_fd)
+    daemon = _IntegratedCompilerDaemon(
+        args.socket,
+        args.pid,
+        args.workers,
+        auto_reload=not args.no_auto_reload and os.environ.get("L2_DAEMON_NO_AUTO_RELOAD", "0").lower() not in {"1", "true", "yes"},
+    )
+
+    def _request_daemon_shutdown(_signum: int, _frame: Any) -> None:
+        daemon.stop_event.set()
+        if daemon.server is not None:
+            threading.Thread(target=daemon.server.shutdown, daemon=True).start()
+
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, _request_daemon_shutdown)
+    try: Path(args.socket).unlink()
+    except OSError: pass
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer): daemon_threads = True
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            subscription: Optional[int] = None
+            with daemon._lock:
+                daemon._pending_requests += 1
+            pending_registered = True
+            try:
+                payload = json.loads(self.rfile.readline(4 * 1024 * 1024).decode("utf-8"))
+                queued_registered = payload.get("cmd") == "run" and isinstance(payload.get("argv"), list)
+                with daemon._lock:
+                    daemon._pending_requests -= 1
+                    pending_registered = False
+                    if queued_registered:
+                        daemon._queued += 1
+                if payload.get("cmd") == "subscribe_events":
+                    write_lock = threading.Lock()
+                    def send_event(record: Dict[str, Any]) -> None:
+                        with write_lock:
+                            self.wfile.write((json.dumps({"ok": True, "event": record}, separators=(",", ":")) + "\n").encode("utf-8")); self.wfile.flush()
+                    subscription = daemon.bus.subscribe(str(payload.get("pattern", "*")), send_event, replay=bool(payload.get("replay")))
+                    send_event({"event": "subscription.ready", "timestamp_ns": time.time_ns(), "payload": {}})
+                    while True:
+                        try:
+                            if self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b"": break
+                        except BlockingIOError:
+                            time.sleep(0.1); continue
+                        except OSError: break
+                    return
+                response = daemon.handle(payload, self.server, queued_registered=queued_registered)
+            except Exception as exc:
+                if pending_registered:
+                    with daemon._lock:
+                        daemon._pending_requests -= 1
+                response = {"ok": False, "error": str(exc)}
+            finally:
+                if subscription is not None: daemon.bus.unsubscribe(subscription)
+            self.wfile.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")); self.wfile.flush()
+    Path(args.pid).parent.mkdir(parents=True, exist_ok=True); Path(args.pid).write_text(f"{os.getpid()}\n", encoding="utf-8")
+    _write_daemon_lease(args.socket, os.getpid())
+    lease_thread = threading.Thread(target=_daemon_heartbeat_loop, args=(args.socket, daemon.stop_event), name="l2-daemon-lease", daemon=True)
+    lease_thread.start()
+    with Server(args.socket, Handler) as server:
+        daemon.server = server
+        if daemon.auto_reload:
+            threading.Thread(target=daemon._watch_code, name="l2-daemon-reload", daemon=True).start()
+        try: server.serve_forever()
+        finally:
+            daemon.stop_event.set()
+            for path in (args.socket, args.pid, args.socket + ".lease"):
+                try: Path(path).unlink()
+                except OSError: pass
+    drain_deadline = time.monotonic() + 10.0
+    workers_stopped = False
+    while True:
+        with daemon._lock:
+            drained = daemon._active == 0 and daemon._queued == 0 and daemon._pending_requests == 0
+        if drained:
+            break
+        if not workers_stopped and time.monotonic() >= drain_deadline:
+            daemon.log.warning("daemon drain timed out; terminating active compiler workers")
+            daemon._shutdown_compiler_workers()
+            workers_stopped = True
+            drain_deadline = time.monotonic() + 5.0
+        elif workers_stopped and time.monotonic() >= drain_deadline:
+            daemon.log.error("daemon requests did not drain after worker termination")
+            break
+        time.sleep(0.01)
+    if not workers_stopped:
+        daemon._shutdown_compiler_workers()
+    daemon._snapshot_state(reload_restore=daemon.reload_requested.is_set())
+    if daemon.reload_requested.is_set() and daemon.auto_reload:
+        os.set_inheritable(lock_fd, True)
+        os.environ["L2_DAEMON_LOCK_FD"] = str(lock_fd)
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--daemon-serve",
+                "--socket",
+                str(args.socket),
+                "--pid",
+                str(args.pid),
+                "--workers",
+                str(args.workers),
+            ],
+        )
+    os.close(lock_fd)
+    signal.signal(signal.SIGTERM, previous_sigterm_handler)
+    return 0
+
+
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon-worker":
+        code = _daemon_worker_serve()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon-serve":
+        code = daemon_serve(sys.argv[2:])
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     code = cli(sys.argv[1:])
     # Flush all output then use os._exit to avoid SIGSEGV from ctypes/native
     # memory finalization during Python's shutdown sequence.

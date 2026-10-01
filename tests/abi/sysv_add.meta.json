@@ -1,0 +1,7 @@
+{
+  "binary": "libsysv_add.so",
+  "compile_args": ["--artifact", "shared", "--c-abi"],
+  "ct_run_main": false,
+  "external_caller": "sysv_add_caller.c",
+  "description": "Build automatic SysV variadic wrappers and verify them with a native C caller."
+}

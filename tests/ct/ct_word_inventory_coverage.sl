@@ -48,6 +48,7 @@ word verify_ct_word_inventory_coverage
   "ct-capture-normalize" meta-word-exists static_assert
   "ct-capture-origin" meta-word-exists static_assert
   "ct-capture-pretty" meta-word-exists static_assert
+  "ct-repr" meta-word-exists static_assert
   "ct-capture-replay-clear" meta-word-exists static_assert
   "ct-capture-replay-log" meta-word-exists static_assert
   "ct-capture-schema-get" meta-word-exists static_assert

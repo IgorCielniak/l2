@@ -1,0 +1,5 @@
+{
+  "description": "runtime Keystone JIT: assemble asm text, install, call via `call` word",
+  "use_l2": true,
+  "requires": ["keystone"]
+}

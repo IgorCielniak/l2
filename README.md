@@ -1,4 +1,5 @@
 # L2: A stack based, compiled, low level and untyped programming language
+
 > **Give the programmer raw power and get out of the way.**
 
 ## What Is L2?
@@ -16,7 +17,7 @@ If you've used **Forth** or **Factor**, L2 will feel familiar. If you've hand-wr
 
 ### You might choose L2 if you:
 
-- **Want transparency**: Every byte your program emits should be *your* choice, not the compiler's guess.
+- **Want transparency**: Every byte your program emits should be _your_ choice, not the compiler's guess.
 - **Need fine-grained control**: Direct memory access, inline assembly, and syscalls are first-class citizens.
 - **Like minimalism**: No stdlib bloat, no implicit behavior. You get allocation, I/O, arrays—the building blocks. Everything else is your design.
 - **Enjoy metaprogramming**: Generate repetitive code safely at compile time, define DSLs, or build code generators without external tools.
@@ -53,19 +54,21 @@ If you've used **Forth** or **Factor**, L2 will feel familiar. If you've hand-wr
 ### Prerequisites
 
 **Required:**
+
 - Python 3.7+
 - NASM (Netwide Assembler)
 - GNU binutils (`ld`)
 - Linux x86-64
 
 **Optional:**
-- `keystone-engine` (for compile-time JIT and `:asm` execution; otherwise compile-time words run interpreted)
+
+- `keystone-engine` is used by the runtime JIT path when available. The repo vendors a copy and the build script can fetch it automatically, so the JIT is available in typical local builds without a system-wide Keystone install.
 
 ### Your First L2 Program
 
 Create `hello.sl`:
 
-```
+```l2
 import stdlib.sl
 
 word main
@@ -109,7 +112,7 @@ python3 main.py examples/snake.sl -o snake
 
 L2 uses a data stack (like Forth) as its primary mechanism for passing values. Words pop arguments from the stack and push results back:
 
-```
+```l2
 import stdlib.sl
 
 word double
@@ -117,8 +120,8 @@ word double
 end
 
 word main
-  5 double      # → 10
-  puti          # print it
+  5 double
+  puti
   0
 end
 ```
@@ -178,7 +181,6 @@ In order to link with libc compile with `-lc` like this:
 python3 main.py file_name.sl -lc
 ```
 
-
 ### Memory & Arrays
 
 Allocate and manipulate memory:
@@ -190,10 +192,10 @@ word main
   1000 alloc dup         # allocate, keep a copy
   dup 0 + 42 !64         # store 42 at offset 0
   dup 8 + 99 !64         # store 99 at offset 8
-  
+
   dup 0 + @64 puti cr    # print 42
   dup 8 + @64 puti cr    # print 99
-  
+
   free
   0
 end
@@ -272,7 +274,7 @@ Mark a word `compile-time` to run while compiling instead of emitting runtime co
 word build-lookup-table
   # This runs at compile time
   0 100 for i
-    i i * ,    # emit i² into data section
+    i i * ,    # emit i*i into data section
   end
 end
 
@@ -325,6 +327,10 @@ L2 has extensive CT APIs for:
 python3 main.py source.sl [options] -o binary
 ```
 
+By default, `main.py` acts as a client and sends requests to a background
+compiler daemon. This keeps the compiler process warm and enables concurrent
+requests (for example, compile requests and future LSP/API requests).
+
 Common options:
 
 - `-o FILE`: Output executable name
@@ -335,6 +341,113 @@ Common options:
 - `--force`: Rebuild everything (ignore cache)
 - `--no-cache`: Skip compiler caches but allow tool-level incremental builds
 - `-v LEVEL`: Verbosity (1-3 for timing and diagnostics)
+- `--no-daemon`: Bypass the daemon for this invocation and run in-process
+
+Set `L2_DAEMON=0` to disable daemon mode globally.
+
+Every ordinary `main.py` invocation is a daemon client. It checks for the
+background compiler, starts it on demand when necessary, and forwards the
+complete compiler command. The daemon is hosted internally by
+`l2_main.py --daemon-serve`; users do not need a daemon lifecycle command.
+The daemon records bounded compilation history, per-request logs under
+`build/logs/req/`, and a rotating global log at `build/logs/daemon.log`.
+It watches the compiler sources and reloads itself after active requests drain,
+preserving recent history in `build/.l2_daemon_state.json`. Set
+`L2_DAEMON_NO_AUTO_RELOAD=1` for deterministic CI or daemon integration tests.
+Embedding/tooling clients can query the internal status API for uptime, memory,
+file descriptors, queue depth, cache counters, request history, and event-bus
+statistics. The daemon also exposes a live event stream over its Unix socket via
+`subscribe_events`, and can watch its own compiler sources for self-reload when
+`L2_DAEMON_NO_AUTO_RELOAD` is not set.
+
+### Compiler events
+
+L2 compile-time source is the primary event API. The compiler emits detailed
+event objects for parsing, imports, macro expansion, compile-time execution,
+word compilation, optimization, emission, diagnostics, and user events.
+`on-event` can register a compile-only word whose event object is pushed on the
+compile-time stack:
+
+```l2
+word inspect_compile_event
+  get-event-type "compile" string= static_assert
+  get-event-name string-length 0 > static_assert
+end on-event compile
+```
+
+Handlers are compile-time words, so event filtering and processing use the same
+stack operations as the rest of the language:
+
+```l2
+word inspect_word_compile_event
+  get-event-payload
+  "name" map-get static_assert
+  drop drop
+end on-event word.compile.begin
+```
+
+Patterns use glob matching (`word.compile.*`, `import.*`, `*`). Event objects
+expose `type`, `name`, `timestamp_ns`, `location`, and `payload`/`data`.
+Compile-time code can construct and emit its own objects:
+
+```l2
+word emit_build_event
+  "build.note" event-object-create
+  "message" "generated" event-object-prop-append
+  event-object-emit
+end on-event build.request
+
+emit-event build.request
+
+word main
+  0
+end
+```
+
+The event builtins are `get-event-type`, `get-event-name`,
+`get-event-timestamp`, `get-event-payload`, `event-object-create`,
+`event-object-prop-append`, `event-object-prop-get`, and
+`event-object-emit`. `ct-repr` consumes a compile-time value and pushes its
+normalized JSON representation as a string; use `puts` to print it while
+inspecting an event payload. Lower-level `event-subscribe`, `event-unsubscribe`, and
+`event-emit` remain available for compiler extensions. Python tooling can use
+`EventBus`, while external IDEs can subscribe to the daemon's Unix-socket
+`subscribe_events` request or consume `--events-stream` JSON Lines.
+
+Python exposes the same `EventBus` for IDEs and external tooling; compiler
+invocations can also write JSON Lines to a file path, including when routed
+through the daemon:
+
+```bash
+python3 main.py tests/general/hello.sl --no-artifact --events-stream build/events.jsonl
+python3 tools/event_tail.py --pattern 'word.compile.*' --replay
+```
+
+Events include compile/import boundaries, word emission, macro expansion,
+compile-time execution, diagnostics, and emitted sections. Daemon clients can
+subscribe with the `subscribe_events` JSON-socket request; `event_tail.py` is
+the supplied human-readable client.
+
+### C ABI library exports
+
+Build a shared/static/object library with SysV x86-64 C wrappers. With
+`--c-abi`, every runtime function receives a C wrapper; no per-word export
+marker or stack-effect comment is needed. Each wrapper accepts an argument
+count followed by that many `int64_t` variadic arguments and returns the top
+value left on the L2 data stack:
+
+```l2
+word add2 + end
+```
+
+```bash
+python3 main.py add2.sl --artifact shared --c-abi -o libadd2.so
+```
+
+This emits `libadd2.so` and `libadd2.h`; call the entry point as
+`l2_add2(2, a, b)`. Arguments are pushed onto the L2 data stack in order,
+including arguments passed on the native stack. This mode targets the System
+V AMD64 ABI.
 
 ### Caching & Optimization
 
@@ -385,22 +498,37 @@ python3 main.py --docs-serve --docs-port 8018
 
 ---
 
-## Runtime Eval Library
+## L2 Runtime Library
 
-You can call L2 from C (and vice versa) via the runtime evaluation library built from [main.c](main.c).
+You can call L2 from C (and vice versa) via the L2 runtime library built from [main.c](main.c). The library exposes `eval`, `eval_env`, and `compile()` (runtime code compilation) — everything needed to embed L2 in a host program.
+
+For scalar evaluation, prefer `l2_eval_ex()` from [libs/l2.h](libs/l2.h): it returns an explicit status and writes the full `int64_t` result through an output pointer. The legacy `l2_eval()` API returns `int` and can truncate results or make a valid `-1` indistinguishable from failure.
+
+> **Note:** The library was previously called `libl2eval`. It has been renamed to `libl2` to reflect its expanded scope. Backwards-compatible symlinks (`libl2eval.a`, `libl2eval.so`) and a forwarding header (`libs/l2eval.h`) are still generated so existing consumers keep working.
 
 ### Build the Library
 
 ```bash
-./tools/build_l2eval_lib.sh
+./tools/build_l2_lib.sh
 ```
 
-Produces `build/libl2eval.a` (static) and `build/libl2eval.so` (dynamic).
+Produces `build/libl2.a` (static) and `build/libl2.so` (dynamic).
+
+The build script also fetches a prebuilt `libkeystone.so` from PyPI's
+`keystone-engine` wheel into `tools/vendor/` (via
+[tools/fetch_keystone.sh](tools/fetch_keystone.sh)) and copies it to
+`build/libkeystone.so`. This means the runtime JIT (`l2_jit_from_asm`,
+etc.) works out of the box with **no system Keystone install required**
+— libl2 `dlopen`s the vendored copy at first use. Set
+`L2_KEYSTONE_PATH=/path/to/libkeystone.so` to override, or
+`L2_SKIP_KEYSTONE_FETCH=1` when running the build script to skip the
+download (JIT will then be disabled at runtime unless a system copy is
+already available).
 
 ### Example: Call L2 from C
 
 ```c
-#include "libs/l2eval.h"
+#include "libs/l2.h"
 #include <stdio.h>
 
 int main(void) {
@@ -413,7 +541,7 @@ int main(void) {
 Compile and link:
 
 ```bash
-cc -O2 program.c -I. -Lbuild -ll2eval -Wl,-rpath,build -o program
+cc -O2 program.c -I. -Lbuild -ll2 -Wl,-rpath,build -o program
 ./program
 ```
 
@@ -432,9 +560,42 @@ end
 ```
 
 ```bash
-python3 main.py program.sl -o program -lbuild/libl2eval.a -lc
+python3 main.py program.sl -o program -lbuild/libl2.a -lc
 ./program
 ```
+
+### Example: `compile()` — runtime code compilation
+
+`l2_compile(source, len)` returns a pointer to executable native code that
+runs the given L2 snippet against the current data stack. Invoke it via
+`call` (from `stdlib/core.sl`) and free it with `l2_release`.
+
+```
+import stdlib.sl
+
+extern l2_compile 2 1     # (ptr, len) -> fn_ptr
+extern l2_release 1 0
+
+word main
+  "3 4 +" l2_compile     # compile at runtime
+  dup                     # keep the pointer for l2_release
+  call                    # execute -> pushes 7
+  puti cr
+  l2_release              # free the executable page
+  0
+end
+```
+
+```bash
+python3 main.py program.sl -o program -lbuild/libl2.a -lc
+./program        # prints: 7
+```
+
+The runtime compile path is a hybrid implementation: it tries a native
+Keystone-backed JIT for JIT-safe snippets and falls back to the trampoline path
+for more complex cases. In other words, the current runtime already supports
+native code generation for compatible snippets, while still preserving the more
+general fallback path for cases that cannot be emitted safely.
 
 ---
 
@@ -498,6 +659,7 @@ Apache-2.0 — See [LICENSE](LICENSE)
 ## Acknowledgments
 
 L2 draws inspiration from:
+
 - **Forth**: Stack-based composition, minimalism
 - **Lisp**: Meta-programmability and compile-time power
 - **Assembly**: Transparency and direct control

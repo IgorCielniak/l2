@@ -26405,6 +26405,7 @@ class _IntegratedCompilerDaemon:
         }
         self.history.append(record); self.success += return_code == 0; self.failure += return_code != 0
         req_log = Path("build/logs/req") / f"{req_id}.log"
+        req_log.parent.mkdir(parents=True, exist_ok=True)
         req_log.write_text(
             f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} INFO req_id={req_id} result={record}\n"
             f"--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}",

@@ -14264,7 +14264,7 @@ class Assembler:
                         {"name": definition.name, "kind": "asm" if isinstance(definition, AsmDefinition) else "regular", "duration_ns": time.perf_counter_ns() - _event_start, "size_bytes": 0},
                     )
             if c_abi:
-                self._emit_sysv_wrappers(definitions, emission, module, module_name=module_name)
+                self._emit_sysv_wrappers(runtime_defs, emission, module, module_name=module_name)
             if _v >= 1:
                 print(f"[v1] code emission: {(_time_mod.perf_counter() - _t0)*1000:.2f}ms")
 

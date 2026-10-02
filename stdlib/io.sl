@@ -193,6 +193,10 @@
 #print [* | x] -> [*]
 :asm print (effects string-io) {
 	mov rax, [r12]      ; len or int value
+	lea r8, [rel dstack_top]
+	lea r9, [r12 + 16]
+	cmp r9, r8
+	ja .print_int
 	mov rbx, [r12 + 8]  ; possible address
 	cmp rax, 0
 	jl .print_int
@@ -230,6 +234,7 @@
 	mov r8, 1
 .abs:
 	lea rsi, [rel print_buf_end]
+	dec rsi
 	mov rcx, 0
 	mov r10, 10
 	cmp rbx, 0

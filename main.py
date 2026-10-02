@@ -71,6 +71,13 @@ def _read_stdin_for_daemon():
         return None
 
 
+def _daemon_default_enabled() -> bool:
+    raw = os.environ.get("L2_DAEMON")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def _daemon_send(payload, timeout: float = _DAEMON_TIMEOUT):
     import json
     import socket
@@ -344,9 +351,7 @@ if __name__ == "__main__":
         force_local = True
 
     if not force_local:
-        import os
-
-        daemon_enabled = os.environ.get("L2_DAEMON", "1").strip().lower() not in {"0", "false", "no", "off"}
+        daemon_enabled = _daemon_default_enabled()
         if daemon_enabled:
             result = _run_via_daemon(argv)
             if result is not None:

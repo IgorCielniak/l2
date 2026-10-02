@@ -11759,6 +11759,28 @@ class Emission:
         self.bss = bss if bss is not None else []
         self.c_header = c_header
 
+    def text_byte_length(self) -> int:
+        """Return UTF-8 byte length of the text section without building an intermediate string."""
+        total = 0
+        for index, line in enumerate(self.text):
+            total += len(line.encode("utf-8"))
+            if index:
+                total += 1
+        return total
+
+    def snapshot_byte_length(self) -> int:
+        """Return UTF-8 byte length of the full assembled output without joining the whole buffer."""
+        total = 0
+        for section in (self.text, self.data, self.bss):
+            for index, line in enumerate(section):
+                total += len(line.encode("utf-8"))
+                if index:
+                    total += 1
+            if section:
+                total += 1
+        total += len("section .note.GNU-stack noalloc noexec nowrite".encode("utf-8")) + 1
+        return total
+
     def snapshot(self) -> str:
         parts: List[str] = []
         if self.text:
@@ -11832,6 +11854,19 @@ def optimize_emitted_asm_text(
     collect_pass_logs: bool = False,
 ) -> Tuple[str, Dict[str, int], List[str]]:
     """Run an extensive but conservative post-emission optimization pass."""
+    if not asm_text or not any(ch in asm_text for ch in (":", "jmp", "jz", "jnz", "je", "jne", "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe")):
+        return asm_text, {
+            "removed_nops": 0,
+            "removed_self_moves": 0,
+            "removed_trivial_arith": 0,
+            "removed_jump_to_next_label": 0,
+            "threaded_jump_targets": 0,
+            "removed_unreachable_after_terminator": 0,
+            "inverted_conditional_branches": 0,
+            "collapsed_redundant_jumps": 0,
+            "removed_redundant_labels": 0,
+            "collapsed_blank_runs": 0,
+        }, []
     lines = asm_text.splitlines()
     _PARSE_SENTINEL = object()
     _parse_cache: Dict[str, object] = {}
@@ -11920,6 +11955,24 @@ def optimize_emitted_asm_text(
             if label is not None:
                 pos[label] = idx
         return pos
+
+    def _collect_referenced_labels(arr: Sequence[str]) -> Set[str]:
+        """Precompute every label referenced by jumps/branches in a single scan."""
+        refs: Set[str] = set()
+        for ln in arr:
+            parsed = _parse_cached(ln)
+            if parsed is None:
+                continue
+            _, ops = parsed
+            for op in ops:
+                if _ASM_LABEL_NAME_RE.match(op):
+                    refs.add(op)
+                else:
+                    for match in _ASM_REL_LABEL_REF_RE.finditer(op):
+                        label = match.group(1)
+                        if _ASM_LABEL_NAME_RE.match(label):
+                            refs.add(label)
+        return refs
 
     def _resolve_jmp_chain(target: str, arr: Sequence[str], lbl_pos: Dict[str, int]) -> str:
         seen: Set[str] = set()
@@ -12124,43 +12177,7 @@ def optimize_emitted_asm_text(
             _record_pass(round_idx + 1, "E/label-collapse", _before_e, stats)
         else:
             alias: Dict[str, str] = {}
-            _fast_ref_counts: Dict[str, int] = {}
-            for _ln in lines:
-                _parsed = _parse_cached(_ln)
-                if _parsed is None:
-                    continue
-                _mnem, _ops = _parsed
-                for _op in _ops:
-                    if _ASM_LABEL_NAME_RE.match(_op):
-                        _fast_ref_counts[_op] = _fast_ref_counts.get(_op, 0) + 1
-                    else:
-                        for _mref in _ASM_REL_LABEL_REF_RE.finditer(_op):
-                            _lbl = _mref.group(1)
-                            _fast_ref_counts[_lbl] = _fast_ref_counts.get(_lbl, 0) + 1
-            _ref_memo: Dict[str, bool] = {}
-            _label_ref_pat_cache: Dict[str, re.Pattern[str]] = {}
-
-            def _label_is_referenced(label: str, arr: Sequence[str], def_idx: int) -> bool:
-                cached = _ref_memo.get(label)
-                if cached is not None:
-                    return cached
-                if _fast_ref_counts.get(label, 0) > 0:
-                    _ref_memo[label] = True
-                    return True
-                pat = _label_ref_pat_cache.get(label)
-                if pat is None:
-                    pat = re.compile(rf"(?<![A-Za-z0-9_.$@]){re.escape(label)}(?![A-Za-z0-9_.$@])")
-                    _label_ref_pat_cache[label] = pat
-                for li, ltxt in enumerate(arr):
-                    if li == def_idx:
-                        continue
-                    if not ltxt.strip():
-                        continue
-                    if pat.search(ltxt):
-                        _ref_memo[label] = True
-                        return True
-                _ref_memo[label] = False
-                return False
+            referenced_labels = _collect_referenced_labels(lines)
 
             i = 0
             while i < len(lines):
@@ -12176,7 +12193,7 @@ def optimize_emitted_asm_text(
                         continue
                     dst_label = _label_only(lines[j])
                     if dst_label is not None:
-                        if not _label_is_referenced(src_label, lines, i):
+                        if src_label not in referenced_labels:
                             alias[src_label] = dst_label
                             lines[i] = ""
                             stats["removed_redundant_labels"] += 1
@@ -14223,6 +14240,7 @@ class Assembler:
                 print(f"[v1] emitting {len(runtime_defs)} runtime definitions")
 
             if _v >= 1: _t0 = _time_mod.perf_counter()
+            text_bytes_before = emission.text_byte_length()
             for definition in runtime_defs:
                 _event_start = time.perf_counter_ns()
                 if _v >= 3:
@@ -14235,10 +14253,12 @@ class Assembler:
                             print(f"[v3]   [{i}] {node.op}({node.data!r})")
                 self._emit_definition(definition, emission.text, debug=debug)
                 if self.event_bus is not None:
+                    text_bytes_after = emission.text_byte_length()
                     self.event_bus.publish(
                         "emit.section",
-                        {"section": "text", "word": definition.name, "bytes_appended": len("\n".join(emission.text).encode("utf-8"))},
+                        {"section": "text", "word": definition.name, "bytes_appended": max(0, text_bytes_after - text_bytes_before)},
                     )
+                    text_bytes_before = text_bytes_after
                     self.event_bus.publish(
                         "word.compile.end",
                         {"name": definition.name, "kind": "asm" if isinstance(definition, AsmDefinition) else "regular", "duration_ns": time.perf_counter_ns() - _event_start, "size_bytes": 0},
@@ -15358,6 +15378,16 @@ def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     return None
 
 
+def _ensure_parser_event_bus(parser: "Parser") -> EventBus:
+    if parser.event_bus is None:
+        parser.event_bus = EventBus()
+        compiler_ref = getattr(parser, "_compiler_ref", None)
+        if compiler_ref is not None:
+            compiler_ref.event_bus = parser.event_bus
+            compiler_ref.assembler.event_bus = parser.event_bus
+    return parser.event_bus
+
+
 def macro_on_event(ctx: MacroContext) -> Optional[List[Op]]:
     """Register the preceding compile-time word as a compiler event listener."""
     parser = ctx.parser
@@ -15384,9 +15414,8 @@ def macro_on_event(ctx: MacroContext) -> Optional[List[Op]]:
         finally:
             vm.stack[:] = saved_stack
 
-    if parser.event_bus is None:
-        raise ParseError("on-event requires the compiler event bus")
-    parser.event_bus.subscribe(
+    bus = _ensure_parser_event_bus(parser)
+    bus.subscribe(
         pattern_token.lexeme.strip('"'),
         _invoke_listener,
         propagate_errors=True,
@@ -15398,9 +15427,8 @@ def macro_emit_event(ctx: MacroContext) -> Optional[List[Op]]:
     """Publish an event from L2 compile-time source: ``emit-event name``."""
     parser = ctx.parser
     token = parser.next_token()
-    if parser.event_bus is None:
-        raise ParseError("emit-event requires the compiler event bus")
-    parser.event_bus.publish(token.lexeme.strip('"'), {"source_location": _event_location(token, parser)})
+    bus = _ensure_parser_event_bus(parser)
+    bus.publish(token.lexeme.strip('"'), {"source_location": _event_location(token, parser)})
     return None
 
 
@@ -20572,6 +20600,7 @@ class Compiler:
             macro_preview=macro_preview,
             event_bus=event_bus,
         )
+        self.parser._compiler_ref = self
         self.assembler = Assembler(self.dictionary, event_bus=event_bus)
         if include_paths is None:
             include_paths = [Path("."), Path("./stdlib")]
@@ -20783,6 +20812,7 @@ class Compiler:
         entry_mode: str = "program",
         c_abi: bool = False,
         module_name: str = "l2",
+        render_preview: bool = False,
     ) -> Emission:
         self.last_transformed_source = ""
         if self.event_bus is not None:
@@ -20790,18 +20820,19 @@ class Compiler:
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
-        self.last_transformed_source = _render_transformed_module_preview(
-            module,
-            focus_names=self._preview_focus_names,
-        )
+        if render_preview:
+            self.last_transformed_source = _render_transformed_module_preview(
+                module,
+                focus_names=self._preview_focus_names,
+            )
         emission = self.assembler.emit(
             module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
         )
         if self.event_bus is not None:
-            self.event_bus.publish("compile.end", {"source": str(self._last_loaded_path or "<memory>"), "output_artifact": module_name, "size_bytes": len(emission.snapshot().encode("utf-8"))})
+            self.event_bus.publish("compile.end", {"source": str(self._last_loaded_path or "<memory>"), "output_artifact": module_name, "size_bytes": emission.snapshot_byte_length()})
         return emission
 
-    def parse_file(self, path: Path) -> None:
+    def parse_file(self, path: Path, *, render_preview: bool = False) -> None:
         """Parse a source file to populate the dictionary without emitting assembly."""
         self._reset_source_flag_state()
         source, spans = self._load_source_graph(path)
@@ -20811,10 +20842,11 @@ class Compiler:
         self.parser.file_spans = spans or []
         tokens = self.reader.tokenize(source)
         module = self.parser.parse(tokens, source)
-        self.last_transformed_source = _render_transformed_module_preview(
-            module,
-            focus_names=self._preview_focus_names,
-        )
+        if render_preview:
+            self.last_transformed_source = _render_transformed_module_preview(
+                module,
+                focus_names=self._preview_focus_names,
+            )
         if self.event_bus is not None:
             self.event_bus.publish("compile.end", {"source": str(path), "output_artifact": None})
 
@@ -20826,12 +20858,19 @@ class Compiler:
         entry_mode: str = "program",
         c_abi: bool = False,
         module_name: Optional[str] = None,
+        render_preview: bool = False,
     ) -> Emission:
         self._reset_source_flag_state()
         source, spans = self._load_source_graph(path)
         mod_name = module_name or path.stem
         return self.compile_source(
-            source, spans=spans, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=mod_name
+            source,
+            spans=spans,
+            debug=debug,
+            entry_mode=entry_mode,
+            c_abi=c_abi,
+            module_name=mod_name,
+            render_preview=render_preview,
         )
 
     def collect_source_flags(self, path: Path) -> None:
@@ -20846,6 +20885,7 @@ class Compiler:
         entry_mode: str = "program",
         c_abi: bool = False,
         module_name: str = "l2",
+        render_preview: bool = False,
     ) -> Emission:
         if self._last_loaded_source is None or self._last_loaded_spans is None:
             raise CompileError("no preloaded source available")
@@ -20856,6 +20896,7 @@ class Compiler:
             entry_mode=entry_mode,
             c_abi=c_abi,
             module_name=module_name,
+            render_preview=render_preview,
         )
 
     def run_compile_time_word(
@@ -24793,9 +24834,12 @@ def cli(
     if not args.no_cache:
         source_graph_cache = SourceGraphCache(args.temp_dir / ".l2cache" / "graphs")
 
-    # The in-language event system is always present.  The JSON stream is an
-    # optional external observer layered on top of that same bus.
-    event_bus: Optional[EventBus] = EventBus()
+    # Only allocate the event bus when an observer or stream actually wants
+    # compiler events. The default CLI path is hot enough that this bookkeeping
+    # should be fully skipped unless tooling opted in.
+    event_bus: Optional[EventBus] = None
+    if event_observer is not None or args.events_stream is not None:
+        event_bus = EventBus()
     if event_observer is not None:
         event_bus.subscribe("*", event_observer)
     if args.events_stream is not None:
@@ -25240,7 +25284,7 @@ def cli(
                 _compile_t0 = _time_mod.perf_counter()
 
             if ct_only_parse:
-                compiler.parse_file(args.source)
+                compiler.parse_file(args.source, render_preview=args.preview)
                 asm_text = ""
                 if args.preview:
                     print("[preview] compile-time execution trace:")
@@ -25264,11 +25308,20 @@ def cli(
                 c_abi_flag = getattr(args, "c_abi", False)
                 if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
                     emission = compiler.compile_preloaded(
-                        debug=args.debug, entry_mode=entry_mode, c_abi=c_abi_flag, module_name=mod_name
+                        debug=args.debug,
+                        entry_mode=entry_mode,
+                        c_abi=c_abi_flag,
+                        module_name=mod_name,
+                        render_preview=args.preview,
                     )
                 else:
                     emission = compiler.compile_file(
-                        args.source, debug=args.debug, entry_mode=entry_mode, c_abi=c_abi_flag, module_name=mod_name
+                        args.source,
+                        debug=args.debug,
+                        entry_mode=entry_mode,
+                        c_abi=c_abi_flag,
+                        module_name=mod_name,
+                        render_preview=args.preview,
                     )
 
                 # Snapshot assembly text *before* ct-run-main JIT execution, which may

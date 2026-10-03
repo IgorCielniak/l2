@@ -25744,10 +25744,6 @@ def _daemon_open_fds() -> int:
         return 0
 
 
-def daemon_enabled_by_default() -> bool:
-    return os.environ.get("L2_DAEMON", "1").strip().lower() not in {"0", "false", "no", "off"}
-
-
 def _daemon_send(payload: Dict[str, Any], socket_path: str = DAEMON_SOCKET_PATH, timeout: float = DAEMON_TIMEOUT) -> Dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)

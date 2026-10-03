@@ -72,10 +72,7 @@ def _read_stdin_for_daemon():
 
 
 def _daemon_default_enabled() -> bool:
-    raw = os.environ.get("L2_DAEMON")
-    if raw is None:
-        return False
-    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+    return os.environ.get("L2_DAEMON", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _daemon_send(payload, timeout: float = _DAEMON_TIMEOUT):

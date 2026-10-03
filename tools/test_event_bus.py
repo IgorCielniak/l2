@@ -3,6 +3,7 @@
 
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -67,8 +68,17 @@ end:
         finally:
             l2_main._render_transformed_module_preview = original
 
-    def test_main_daemon_is_opt_in(self) -> None:
-        self.assertFalse(main._daemon_default_enabled())
+    def test_main_daemon_is_enabled_by_default(self) -> None:
+        with patch.dict("os.environ"):
+            import os
+
+            os.environ.pop("L2_DAEMON", None)
+            self.assertTrue(main._daemon_default_enabled())
+
+    def test_main_daemon_can_be_disabled_with_environment(self) -> None:
+        for value in ("0", "false", "no", "off"):
+            with self.subTest(value=value), patch.dict("os.environ", {"L2_DAEMON": value}):
+                self.assertFalse(main._daemon_default_enabled())
 
     def test_event_macros_work_without_explicit_event_bus(self) -> None:
         compiler = Compiler()

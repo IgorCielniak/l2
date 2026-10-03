@@ -152,10 +152,10 @@ end
 Drop into raw x86-64 when you need it:
 
 ```
-:asm fast-memcpy {
-    mov rax, [r12]       # load src
-    mov rbx, [r12 + 8]   # load dst
-    mov rcx, [r12 + 16]  # load size
+:asm fast_memcpy {
+    mov rsi, [r12]       # src
+    mov rdi, [r12 + 8]   # dst
+    mov rcx, [r12 + 16]  # size
     rep movsb
 };
 ```
@@ -273,8 +273,9 @@ Mark a word `compile-time` to run while compiling instead of emitting runtime co
 ```
 word build-lookup-table
   # This runs at compile time
+  "lookup_table:" data-append
   0 100 for i
-    i i * ,    # emit i*i into data section
+    i i * ct-repr "dq " swap string-append data-append
   end
 end
 
@@ -294,12 +295,61 @@ macro simplify
 ;
 ```
 
-And syntax rewrites for DSL customization:
+This token hook adds simple comma-separated function-call syntax. It rewrites
+`sum3(1, 2, 3)` to the stack-based call `1 2 3 sum3` (arguments here must not
+contain nested calls):
 
 ```
-# Custom parsing: transform [a, b, c] into a list
-ct-add-grammar-rewrite "[" "$*items ]" "(list-literal $*items)"
+import stdlib.sl
+
+word call-syntax-rewrite
+  dup token-lexeme identifier? 0 == if drop 0 exit end
+  peek-token dup nil? if drop drop 0 exit end
+  dup token-lexeme "(" string= 0 == if drop drop 0 exit end
+  swap >r
+  drop
+  next-token drop
+  list-new
+  list-new
+begin
+  next-token dup nil? if "unterminated call" parse-error end
+  dup token-lexeme ")" string= if
+    drop
+    list-extend
+    r> list-append
+    inject-tokens
+    1 exit
+  end
+  dup token-lexeme "," string= if
+    drop
+    list-extend
+    list-new
+    continue
+  end
+  list-append
+again
+end
+immediate
+compile-only
+
+word enable-call-syntax
+  "simple-calls" ct-lang-create drop
+  "simple-calls" ct-lang-activate drop
+  "simple-calls" "call-syntax-rewrite" ct-lang-set-token-hook drop
+end
+compile-time enable-call-syntax
+
+word sum3
+  + +
+end
+
+word main
+  sum3(1, 2, 3) puti cr  # prints: 6
+  0
+end
 ```
+
+This code might look scary and complicated but after reading the documentations it becomes pretty straight forward, the system is relatively complicated so it can support many usecases and provide a universal way of extending the language.
 
 ### More Metaprogramming
 
@@ -314,7 +364,7 @@ L2 has extensive CT APIs for:
 
 **For the complete API reference:**
 
-- Read the docstring: `python3 main.py --docs`
+- Read the docs: `python3 main.py --docs`
 - Serve in browser: `python3 main.py --docs-serve --docs-port 8018`
 
 ---
@@ -343,22 +393,23 @@ Common options:
 - `-v LEVEL`: Verbosity (1-3 for timing and diagnostics)
 - `--no-daemon`: Bypass the daemon for this invocation and run in-process
 
-Set `L2_DAEMON=0` to disable daemon mode globally.
+Daemon mode is enabled by default. Set `L2_DAEMON=0` to disable it, or
+`L2_DAEMON=1` to enable it explicitly.
 
-Every ordinary `main.py` invocation is a daemon client. It checks for the
-background compiler, starts it on demand when necessary, and forwards the
-complete compiler command. The daemon is hosted internally by
-`l2_main.py --daemon-serve`; users do not need a daemon lifecycle command.
-The daemon records bounded compilation history, per-request logs under
-`build/logs/req/`, and a rotating global log at `build/logs/daemon.log`.
-It watches the compiler sources and reloads itself after active requests drain,
-preserving recent history in `build/.l2_daemon_state.json`. Set
-`L2_DAEMON_NO_AUTO_RELOAD=1` for deterministic CI or daemon integration tests.
-Embedding/tooling clients can query the internal status API for uptime, memory,
-file descriptors, queue depth, cache counters, request history, and event-bus
-statistics. The daemon also exposes a live event stream over its Unix socket via
-`subscribe_events`, and can watch its own compiler sources for self-reload when
-`L2_DAEMON_NO_AUTO_RELOAD` is not set.
+With daemon mode enabled, eligible `main.py` compiler invocations check for the
+background compiler, start it on demand when necessary, and forward the
+compiler arguments. Local-only commands, such as `--docs`, `--repl`, and
+`--run`, stay in-process. The daemon is hosted internally by
+`l2_main.py --daemon-serve`; users do not need a daemon lifecycle command. It
+records bounded compilation history, per-request logs under `build/logs/req/`,
+and a rotating global log at `build/logs/daemon.log`. It watches `main.py`,
+`l2_main.py`, and `docs.py` for changes, then reloads after active requests drain
+while preserving recent history in `build/.l2_daemon_state.json`. Set
+`L2_DAEMON_NO_AUTO_RELOAD=1` to disable source-triggered reloads, for example in
+deterministic CI or daemon integration tests. Embedding and tooling clients can
+query the internal status API for uptime, memory, open file descriptors, queue
+depth, cache counters, request history, and event-bus statistics. The daemon
+also exposes a live event stream over its Unix socket via `subscribe_events`.
 
 ### Compiler events
 
@@ -605,7 +656,7 @@ general fallback path for cases that cannot be emitted safely.
 
 1. **Lexing** (Reader): Tokenize source → Token stream
 2. **Macro expansion**: Text macro and pattern rewrite passes
-3. **Parsing**: Build AST from transformed tokens
+3. **Parsing**: Build Modules and definitions
 4. **Compile-time execution**: Run `compile-time` words and `ct-*` directives
 5. **Code generation**: Emit x86-64 assembly
 6. **Assembly**: `nasm` → object files
@@ -618,7 +669,7 @@ Each step can be cached and profiled.
 L2 uses two runtime stacks:
 
 - **Data stack** (r12): Operand stack for computation
-- **Return stack** (r13): Call frames for word calls and `>r` / `r>` operations
+- **Return stack** (r13): Counters for loops and `>r` / `r>` operations
 
 Words interact via these stacks—no hidden state, no implicit contexts.
 

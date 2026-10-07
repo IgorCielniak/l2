@@ -20623,6 +20623,25 @@ class Compiler:
         self.source_include_paths.clear()
         self.source_cli_flags.clear()
 
+    def _publish_compile_error(self, exc: Exception, source: Optional[Path] = None) -> None:
+        if self.event_bus is None:
+            return
+        payload: Dict[str, Any] = {
+            "message": str(exc),
+            "exception": type(exc).__name__,
+            "source": str(source or self._last_loaded_path or "<memory>"),
+        }
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, Diagnostic):
+            payload.update({
+                "path": str(diagnostic.path),
+                "line": diagnostic.line,
+                "column": diagnostic.column,
+                "code": diagnostic.code,
+                "level": diagnostic.level,
+            })
+        self.event_bus.publish("compile.error", payload)
+
     def _collect_preview_focus_names(self, path: Path) -> Optional[Set[str]]:
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -20817,17 +20836,21 @@ class Compiler:
         self.last_transformed_source = ""
         if self.event_bus is not None:
             self.event_bus.publish("compile.begin", {"source": str(self._last_loaded_path or "<memory>"), "bytes": len(source.encode("utf-8"))})
-        self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(source)
-        module = self.parser.parse(tokens, source)
-        if render_preview:
-            self.last_transformed_source = _render_transformed_module_preview(
-                module,
-                focus_names=self._preview_focus_names,
+        try:
+            self.parser.file_spans = spans or []
+            tokens = self.reader.tokenize(source)
+            module = self.parser.parse(tokens, source)
+            if render_preview:
+                self.last_transformed_source = _render_transformed_module_preview(
+                    module,
+                    focus_names=self._preview_focus_names,
+                )
+            emission = self.assembler.emit(
+                module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
             )
-        emission = self.assembler.emit(
-            module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
-        )
+        except Exception as exc:
+            self._publish_compile_error(exc)
+            raise
         if self.event_bus is not None:
             self.event_bus.publish("compile.end", {"source": str(self._last_loaded_path or "<memory>"), "output_artifact": module_name, "size_bytes": emission.snapshot_byte_length()})
         return emission
@@ -20835,18 +20858,26 @@ class Compiler:
     def parse_file(self, path: Path, *, render_preview: bool = False) -> None:
         """Parse a source file to populate the dictionary without emitting assembly."""
         self._reset_source_flag_state()
-        source, spans = self._load_source_graph(path)
+        try:
+            source, spans = self._load_source_graph(path)
+        except Exception as exc:
+            self._publish_compile_error(exc, path)
+            raise
         if self.event_bus is not None:
             self.event_bus.publish("compile.begin", {"source": str(path), "bytes": len(source.encode("utf-8"))})
         self.last_transformed_source = ""
         self.parser.file_spans = spans or []
-        tokens = self.reader.tokenize(source)
-        module = self.parser.parse(tokens, source)
-        if render_preview:
-            self.last_transformed_source = _render_transformed_module_preview(
-                module,
-                focus_names=self._preview_focus_names,
-            )
+        try:
+            tokens = self.reader.tokenize(source)
+            module = self.parser.parse(tokens, source)
+            if render_preview:
+                self.last_transformed_source = _render_transformed_module_preview(
+                    module,
+                    focus_names=self._preview_focus_names,
+                )
+        except Exception as exc:
+            self._publish_compile_error(exc, path)
+            raise
         if self.event_bus is not None:
             self.event_bus.publish("compile.end", {"source": str(path), "output_artifact": None})
 
@@ -20861,7 +20892,11 @@ class Compiler:
         render_preview: bool = False,
     ) -> Emission:
         self._reset_source_flag_state()
-        source, spans = self._load_source_graph(path)
+        try:
+            source, spans = self._load_source_graph(path)
+        except Exception as exc:
+            self._publish_compile_error(exc, path)
+            raise
         mod_name = module_name or path.stem
         return self.compile_source(
             source,

@@ -6,12 +6,21 @@ word main
     "hello from write_file test\n" # buffer
     write_file
     dup 0 > if
-        "wrote bytes: " puts
+        "write_file bytes:" puts
         puti cr
-        0
-        exit
+        "/tmp/l2_write_file2_test.txt"
+        "hello from write_file test\n"
+        write_file2
+        dup 0 > if
+            "write_file2 bytes:" puts
+            puti cr
+            0 exit
+        end
+        "write_file2 failed errno=" puts
+        puti cr
+        1 exit
     end
-    "write failed errno=" puts
+    "write_file failed errno=" puts
     puti cr
-    exit
+    1
 end

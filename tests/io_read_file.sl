@@ -6,31 +6,56 @@ word main
     "read_file works\n"
     write_file drop
 
-    "/tmp/l2_read_file_test.txt" # (addr len)
-    read_file                 # (file_addr file_len)
-    dup 0 > if                # if file_len > 0, success
-        write_buf             # print file contents (file_len file_addr)
-        0
-        exit
+    "/tmp/l2_read_file_test.txt" with path path_len in
+        path path_len read_file_size
+        dup 0 < if
+            "read_file_size failed: " puts
+            puti
+            1 exit
+        end
+        with size in
+            size alloc with buffer in
+                path path_len buffer size read_file
+                dup 0 < if
+                    "read_file failed: " puts
+                    puti
+                    1 exit
+                end
+                buffer swap write_buf
+
+                path path_len buffer size read_file2
+                dup 0 < if
+                    "read_file2 failed: " puts
+                    puti
+                    1 exit
+                end
+                buffer swap write_buf
+
+                "/tmp/l2_missing_io_file_test.txt" with missing missing_len in
+                    missing missing_len read_file_size
+                    dup 0 < if
+                        drop
+                    else
+                        drop 1 exit
+                    end
+                    missing missing_len buffer size read_file
+                    dup 0 < if
+                        drop
+                    else
+                        drop 1 exit
+                    end
+                    missing missing_len buffer size read_file2
+                    dup 0 < if
+                        drop
+                    else
+                        drop 1 exit
+                    end
+                end
+
+                0
+                buffer size free
+                exit
+            end
+        end
     end
-    dup -2 == if              # open() failed
-        drop
-        "open() failed: errno=" puts
-        swap puti cr
-        exit
-    end
-    dup -1 == if              # fstat() failed
-        drop
-        "fstat() failed: errno=" puts
-        swap puti cr
-        exit
-    end
-    dup -3 == if              # mmap() failed
-        drop
-        "mmap() failed" puts
-        exit
-    end
-    "unknown read_file failure" puts
-    dup                       # file_len file_len file_addr
-    exit                       # Exit with returned file_len as the program exit code (debug)
 end

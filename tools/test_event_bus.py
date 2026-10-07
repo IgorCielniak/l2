@@ -30,6 +30,18 @@ class EventBusToolingTests(unittest.TestCase):
         bus.publish("two")
         self.assertEqual(bus.recent(limit=0), [])
 
+    def test_compilation_errors_are_published(self) -> None:
+        bus = EventBus()
+        compiler = Compiler(event_bus=bus)
+
+        with self.assertRaisesRegex(l2_main.CompileError, "unknown entry mode"):
+            compiler.compile_source("word main 0 end\n", entry_mode="invalid")
+
+        errors = bus.recent("compile.error")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["payload"]["exception"], "CompileError")
+        self.assertIn("unknown entry mode", errors[0]["payload"]["message"])
+
     def test_emit_section_reports_incremental_bytes(self) -> None:
         bus = EventBus(8)
         payloads = []

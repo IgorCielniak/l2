@@ -56,7 +56,7 @@ class DaemonTests(unittest.TestCase):
                     None,
                 )
                 self.assertEqual(eof_result.get("code"), 0, eof_result)
-                self.assertIn("read_stdin failed", eof_result.get("stdout", ""))
+                self.assertIn("input eof", eof_result.get("stdout", ""))
                 start_override = daemon._run(
                     ["tests/general/start_override.sl", "--no-artifact", "--ct-run-main"],
                     False,

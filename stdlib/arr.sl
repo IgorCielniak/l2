@@ -327,3 +327,17 @@ word foreachwith
 end
 immediate
 compile-only
+
+# map [*, list_ptr | callback] -> [*]
+# callback recieves one argument which is gonna
+# be the addr of the element so to get the
+# element value you need to do @ but this also
+# allows you to modify the original list
+# in place from within the callback
+word map
+    swap dup @
+    for
+        8 + dup
+        2 pick call
+    end 2drop
+end

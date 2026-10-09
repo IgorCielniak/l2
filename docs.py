@@ -473,14 +473,31 @@ def _run_docs_tui(
         {
             "name": "inline word ... end",
             "category": "Definitions",
-            "syntax": "inline word <name> <body...> end",
+            "syntax": "inline [preserve] word <name> <body...> end",
             "summary": "Define an inlined word (body is expanded at call sites).",
             "detail": (
                 "Marks the definition for inline expansion. "
                 "Every call site gets a copy of the body rather than a function call. "
+                "By default, the standalone definition is not emitted. Add `preserve` "
+                "immediately after `inline` to keep it in the output as well. "
                 "Recursive inline calls are rejected at compile time.\n\n"
                 "Example:\n"
                 "  inline word inc 1 + end"
+            ),
+        },
+        {
+            "name": "preserve",
+            "category": "Definitions",
+            "syntax": "inline preserve <definition>",
+            "summary": "Keep an inline definition emitted as a standalone word.",
+            "detail": (
+                "Use `preserve` immediately after `inline` and before a `word` or "
+                "`:asm` definition. Calls are still expanded inline, but the original "
+                "definition is also emitted, even when it has no runtime callers. "
+                "This is useful when taking its word pointer or exposing its symbol.\n\n"
+                "Examples:\n"
+                "  inline preserve word inc 1 + end\n"
+                "  inline preserve :asm fast_inc { inc qword [r12] } ;"
             ),
         },
         {
@@ -1455,6 +1472,10 @@ def _run_docs_tui(
         "  inline                                   [immediate]\n"
         "    Mark a word for inline expansion: its body\n"
         "    is expanded at each call site instead of emitting a call.\n"
+        "\n"
+        "  preserve                                 [immediate]\n"
+        "    Use immediately after inline to also emit the original\n"
+        "    standalone definition. Calls are still expanded inline.\n"
         "\n"
         "  CT                                       [runtime + compile-time]\n"
         "    Pushes 1 when running in compile-time execution and 0 in\n"
@@ -6483,6 +6504,7 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "runtime": "word runtime_word 7 end runtime",
     "runtime-only": "word runtime_word 7 end runtime-only",
     "inline": "inline word inc 1 + end",
+    "preserve": "inline preserve word retained 1 + end",
     "use-l2-ct": "word dup2 dup dup end use-l2-ct",
     "set-token-hook": '"trace_hook" set-token-hook',
     "clear-token-hook": '"trace_hook" set-token-hook clear-token-hook',

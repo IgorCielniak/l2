@@ -865,7 +865,7 @@ _PEEPHOLE_CANCEL_PAIRS = frozenset({
 _PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
 _DEFAULT_CONTROL_WORDS = frozenset({"if", "else", "for", "while", "do"})
 
-_PARSE_PRIORITY_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "inline", "priority"})
+_PARSE_PRIORITY_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "inline", "preserve", "priority"})
 
 _PARSE_KW_LIST_BEGIN = 1
 _PARSE_KW_LIST_END = 2
@@ -946,13 +946,13 @@ _PARSE_LITERAL_CACHE: Dict[str, Any] = {}
 
 class Definition:
     __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'terminator', 'inline',
-                 'stack_inputs', 'stack_outputs', '_label_positions',
+                 'preserve', 'stack_inputs', 'stack_outputs', '_label_positions',
                  '_for_pairs', '_begin_pairs', '_words_resolved', '_merged_runs')
 
     def __init__(self, name: str, body: List[Op], immediate: bool = False,
                  compile_only: bool = False, runtime_only: bool = False, terminator: str = "end", inline: bool = False,
                  stack_inputs: Optional[int] = None,
-                 stack_outputs: Optional[int] = None) -> None:
+                 stack_outputs: Optional[int] = None, preserve: bool = False) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
@@ -960,6 +960,7 @@ class Definition:
         self.runtime_only = runtime_only
         self.terminator = terminator
         self.inline = inline
+        self.preserve = preserve
         self.stack_inputs = stack_inputs
         self.stack_outputs = stack_outputs
         self._label_positions = None
@@ -970,18 +971,20 @@ class Definition:
 
 
 class AsmDefinition:
-    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'inline', 'effects', '_inline_lines', 'stack_inputs', 'stack_outputs')
+    __slots__ = ('name', 'body', 'immediate', 'compile_only', 'runtime_only', 'inline', 'preserve', 'effects', '_inline_lines', 'stack_inputs', 'stack_outputs')
 
     def __init__(self, name: str, body: str, immediate: bool = False,
                  compile_only: bool = False, runtime_only: bool = False, inline: bool = False,
                  effects: Set[str] = None, _inline_lines: Optional[List[str]] = None,
-                 stack_inputs: Optional[int] = None, stack_outputs: Optional[int] = None) -> None:
+                 stack_inputs: Optional[int] = None, stack_outputs: Optional[int] = None,
+                 preserve: bool = False) -> None:
         self.name = name
         self.body = body
         self.immediate = immediate
         self.compile_only = compile_only
         self.runtime_only = runtime_only
         self.inline = inline
+        self.preserve = preserve
         self.effects = effects if effects is not None else set()
         self._inline_lines = _inline_lines
         self.stack_inputs = stack_inputs
@@ -4538,6 +4541,7 @@ class Parser:
         self.custom_bss: Optional[List[str]] = None
         self.cstruct_layouts: Dict[str, CStructLayout] = {}
         self._pending_inline_definition: bool = False
+        self._pending_preserve_definition: bool = False
         self._pending_priority: Optional[int] = None
         self.generated_source_map: Dict[int, Tuple[str, int, int, int]] = {}
         self.capture_globals: Dict[str, Any] = {}
@@ -7142,6 +7146,7 @@ class Parser:
         self.custom_data = None
         self.custom_bss = None
         self._pending_inline_definition = False
+        self._pending_preserve_definition = False
         self._pending_priority = None
         self._rewrite_step_count = 0
         self._rewrite_seen_state.clear()
@@ -7218,7 +7223,8 @@ class Parser:
                         _handle_list_end(token)
                     elif kw == _PARSE_KW_WORD:
                         inline_def = _consume_pending_inline()
-                        _begin_definition(token, terminator="end", inline=inline_def)
+                        preserve_def = self._consume_pending_preserve()
+                        _begin_definition(token, terminator="end", inline=inline_def, preserve=preserve_def)
                     elif kw == _PARSE_KW_END:
                         if self.control_stack:
                             _handle_flexible_end(token)
@@ -7982,7 +7988,13 @@ class Parser:
         self._pending_inline_definition = False
         return pending
 
-    def _begin_definition(self, token: Token, terminator: str = "end", inline: bool = False) -> None:
+    def _consume_pending_preserve(self) -> bool:
+        pending = self._pending_preserve_definition
+        self._pending_preserve_definition = False
+        return pending
+
+    def _begin_definition(self, token: Token, terminator: str = "end", inline: bool = False,
+                          preserve: bool = False) -> None:
         if self._eof():
             raise ParseError(
                 f"definition name missing after '{token.lexeme}' at {token.line}:{token.column}"
@@ -7997,6 +8009,7 @@ class Parser:
             body=[],
             terminator=terminator,
             inline=inline,
+            preserve=preserve,
             stack_inputs=stack_inputs,
             stack_outputs=stack_outputs,
         )
@@ -8084,6 +8097,7 @@ class Parser:
         if self._eof():
             raise ParseError(f"definition name missing after ':asm' at {token.line}:{token.column}")
         inline_def = self._consume_pending_inline()
+        preserve_def = self._consume_pending_preserve()
         name_token = self._consume()
         effect_names: Optional[List[str]] = None
         if not self._eof():
@@ -8124,6 +8138,7 @@ class Parser:
             name=name_token.lexeme,
             body=asm_body,
             inline=inline_def,
+            preserve=preserve_def,
             stack_inputs=stack_inputs,
             stack_outputs=stack_outputs,
         )
@@ -14180,6 +14195,9 @@ class Assembler:
                 # Look for an asm `_start` among parsed definitions (not just runtime_defs)
                 asm_start = next((d for d in definitions if isinstance(d, AsmDefinition) and d.name == "_start"), None)
                 extra_roots: List[str] = []
+                extra_roots.extend(
+                    defn.name for defn in runtime_defs if getattr(defn, "preserve", False)
+                )
                 if asm_start is not None:
                     called = self._extract_called_symbols_from_asm(asm_start.body)
                     # Resolve called symbols to definition names using both
@@ -14220,8 +14238,10 @@ class Assembler:
                 for label in exported:
                     emission.text.append(f"global {label}")
 
-            # Inline-only definitions are expanded at call sites; skip emitting standalone labels.
-            runtime_defs = [defn for defn in runtime_defs if not getattr(defn, "inline", False)]
+            runtime_defs = [
+                defn for defn in runtime_defs
+                if not getattr(defn, "inline", False) or getattr(defn, "preserve", False)
+            ]
 
             if self._need_cfg:
                 self._last_cfg_definitions = [
@@ -15370,11 +15390,24 @@ def macro_runtime(ctx: MacroContext) -> Optional[List[Op]]:
 def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
     next_tok = parser.peek_token()
-    if next_tok is None or next_tok.lexeme not in ("word", ":asm"):
-        raise ParseError("'inline' must be followed by 'word' or ':asm'")
+    if next_tok is None or next_tok.lexeme not in ("word", ":asm", "preserve"):
+        raise ParseError("'inline' must be followed by 'word', ':asm', or 'preserve'")
     if parser._pending_inline_definition:
         raise ParseError("duplicate 'inline' before definition")
     parser._pending_inline_definition = True
+    return None
+
+
+def macro_preserve(ctx: MacroContext) -> Optional[List[Op]]:
+    parser = ctx.parser
+    next_tok = parser.peek_token()
+    if not parser._pending_inline_definition:
+        raise ParseError("'preserve' must follow 'inline'")
+    if parser._pending_preserve_definition:
+        raise ParseError("duplicate 'preserve' before definition")
+    if next_tok is None or next_tok.lexeme not in ("word", ":asm"):
+        raise ParseError("'preserve' must be followed by 'word' or ':asm'")
+    parser._pending_preserve_definition = True
     return None
 
 
@@ -20374,6 +20407,7 @@ def bootstrap_dictionary() -> Dictionary:
     dictionary.register(Word(name="runtime", immediate=True, macro=macro_runtime))
     dictionary.register(Word(name="runtime-only", immediate=True, macro=macro_runtime))
     dictionary.register(Word(name="inline", immediate=True, macro=macro_inline))
+    dictionary.register(Word(name="preserve", immediate=True, macro=macro_preserve))
     dictionary.register(Word(name="on-event", immediate=True, macro=macro_on_event))
     dictionary.register(Word(name="emit-event", immediate=True, macro=macro_emit_event))
     dictionary.register(Word(name="label", immediate=True, macro=macro_label))

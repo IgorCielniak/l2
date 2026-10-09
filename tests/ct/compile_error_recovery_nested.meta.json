@@ -1,0 +1,4 @@
+{
+  "description": "A parser error inside a word body can be repaired at module scope and resumed.",
+  "compile_args": ["--no-cache"]
+}

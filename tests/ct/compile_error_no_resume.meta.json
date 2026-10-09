@@ -1,0 +1,5 @@
+{
+  "description": "A compile.error listener that does not request resume leaves the compile error fatal.",
+  "expect_compile_error": true,
+  "compile_args": ["--no-cache"]
+}

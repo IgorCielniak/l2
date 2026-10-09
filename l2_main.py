@@ -4570,6 +4570,14 @@ class Parser:
         self._ct_language_extensions: Dict[str, Dict[str, Any]] = {}
         self._ct_language_active: Set[str] = set()
         self._ct_language_token_hook_owner: Optional[str] = None
+        self._error_restore_points: List[Dict[str, Any]] = []
+        self._error_restore_point_counter = 0
+        self._current_error_restore_point: Optional[int] = None
+        self._active_error_recovery: Optional[Dict[str, Any]] = None
+        self._active_module: Optional[Module] = None
+        self._compile_error_notified = False
+        self._error_recovery_attempts: Dict[Tuple[str, int, int, str], int] = {}
+        self._error_recovery_retry_limit = 8
         self.diagnostics: List[Diagnostic] = []
         self._max_errors: int = 20
         self._warnings_enabled: Set[str] = set()
@@ -4618,6 +4626,102 @@ class Parser:
             )
         if diag.level == "error" and sum(1 for d in self.diagnostics if d.level == "error") >= self._max_errors:
             raise ParseError(f"too many errors ({self._max_errors}), aborting", diagnostic=diag)
+
+    def _add_error_restore_point(
+        self,
+        stage: str,
+        pos: int,
+        token: Optional[Token],
+        last_token: Optional[Token],
+    ) -> int:
+        self._error_restore_point_counter += 1
+        point_id = self._error_restore_point_counter
+        point: Dict[str, Any] = {
+            "id": point_id,
+            "stage": stage,
+            "pos": int(pos),
+            "token": token,
+            "last_token": last_token,
+            "lexeme": token.lexeme if token is not None else "",
+            "line": int(token.line) if token is not None else 0,
+            "column": int(token.column) if token is not None else 0,
+        }
+        self._error_restore_points.append(point)
+        if len(self._error_restore_points) > 512:
+            del self._error_restore_points[0]
+        self._current_error_restore_point = point_id
+        return point_id
+
+    def _find_error_restore_point(self, point_id: int) -> Optional[Dict[str, Any]]:
+        for point in reversed(self._error_restore_points):
+            if point.get("id") == point_id:
+                return point
+        return None
+
+    def _dispatch_recoverable_compile_error(
+        self,
+        exc: Exception,
+        *,
+        stage: str,
+        restore_point_id: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        if self.event_bus is None or restore_point_id is None:
+            return None
+        point = self._find_error_restore_point(restore_point_id)
+        if point is None:
+            return None
+        diagnostic = getattr(exc, "diagnostic", None)
+        error_line = int(diagnostic.line) if isinstance(diagnostic, Diagnostic) else int(point["line"])
+        error_column = int(diagnostic.column) if isinstance(diagnostic, Diagnostic) else int(point["column"])
+        key = (stage, error_line, error_column, str(exc))
+        attempts = self._error_recovery_attempts.get(key, 0) + 1
+        self._error_recovery_attempts[key] = attempts
+        if attempts > self._error_recovery_retry_limit:
+            raise CompileTimeError(
+                f"compile error recovery retry limit ({self._error_recovery_retry_limit}) "
+                f"exceeded after {attempts - 1} attempts at restore point {restore_point_id}"
+            )
+
+        payload: Dict[str, Any] = {
+            "message": str(exc),
+            "exception": type(exc).__name__,
+            "phase": stage,
+            "recoverable": True,
+            "attempt": attempts,
+            "attempt_limit": self._error_recovery_retry_limit,
+            "restore_point_id": restore_point_id,
+            "restore_point": {
+                key: value for key, value in point.items()
+                if key not in ("token", "last_token")
+            },
+        }
+        if isinstance(diagnostic, Diagnostic):
+            payload.update({
+                "path": str(diagnostic.path) if diagnostic.path is not None else "",
+                "line": int(diagnostic.line),
+                "column": int(diagnostic.column),
+                "code": diagnostic.code,
+                "level": diagnostic.level,
+            })
+        recovery = {
+            "payload": payload,
+            "phase": stage,
+            "restore_point_id": restore_point_id,
+            "resume": False,
+        }
+        self._active_error_recovery = recovery
+        self._compile_error_notified = True
+        try:
+            self.event_bus.publish("compile.error", payload)
+        finally:
+            self._active_error_recovery = None
+        if not recovery["resume"]:
+            return None
+        selected_id = int(recovery["restore_point_id"])
+        selected = self._find_error_restore_point(selected_id)
+        if selected is None or selected.get("stage") != stage:
+            raise CompileTimeError("compile error handler selected an invalid restore point")
+        return selected
 
     def _record_diagnostic(
         self,
@@ -7126,6 +7230,14 @@ class Parser:
         self._token_iter_exhausted = True
         self.source = source
         self.pos = 0
+        self._error_restore_points = []
+        self._error_restore_point_counter = 0
+        self._current_error_restore_point = None
+        self._active_error_recovery = None
+        self._compile_error_notified = False
+        self._error_recovery_attempts.clear()
+        self._error_recovery_retry_limit = 8
+        self.diagnostics.clear()
         self.variable_labels = {}
         self.variable_words = {}
         self.cstruct_layouts = {}
@@ -7136,6 +7248,7 @@ class Parser:
                 cstruct_layouts=self.cstruct_layouts,
             )
         ]
+        self._active_module = self.context_stack[0]
         self.definition_stack.clear()
         self.last_defined = None
         self.control_stack = []
@@ -7197,7 +7310,11 @@ class Parser:
         try:
             while self.pos < len(_tokens):
               try:
-                token = _tokens[self.pos]
+                token_pos = self.pos
+                token = _tokens[token_pos]
+                restore_point_id = self._add_error_restore_point(
+                    "parse", token_pos, token, self._last_token
+                )
                 self.pos += 1
                 self._last_token = token
                 if _reader_rewrite_rules and _try_apply_rewrite_rules("reader", token):
@@ -7251,9 +7368,29 @@ class Parser:
                     continue
                 if _handle_token(token):
                     _tokens = self.tokens
-              except CompileTimeError:
-                raise
+              except CompileTimeError as _recov_exc:
+                restore_point = self._dispatch_recoverable_compile_error(
+                    _recov_exc,
+                    stage="parse",
+                    restore_point_id=restore_point_id,
+                )
+                if restore_point is None:
+                    raise
+                self.pos = int(restore_point["pos"])
+                self._last_token = restore_point.get("last_token")
+                _tokens = self.tokens
+                continue
               except ParseError as _recov_exc:
+                restore_point = self._dispatch_recoverable_compile_error(
+                    _recov_exc,
+                    stage="parse",
+                    restore_point_id=restore_point_id,
+                )
+                if restore_point is not None:
+                    self.pos = int(restore_point["pos"])
+                    self._last_token = restore_point.get("last_token")
+                    _tokens = self.tokens
+                    continue
                 self._record_diagnostic_obj(
                     self._diagnostic_from_parse_error(
                         _recov_exc,
@@ -18581,6 +18718,79 @@ def _ct_parser_checkpoint(vm: CompileTimeVM) -> None:
     )
 
 
+def _ct_error_restore_points(vm: CompileTimeVM) -> None:
+    vm.push([
+        {key: value for key, value in point.items() if key not in ("token", "last_token")}
+        for point in vm.parser._error_restore_points
+    ])
+
+
+def _ct_error_restore_point(vm: CompileTimeVM) -> None:
+    point_id = vm.pop_int()
+    point = vm.parser._find_error_restore_point(point_id)
+    if point is None:
+        raise ParseError(f"unknown compile-error restore point {point_id}")
+    vm.push({key: value for key, value in point.items() if key not in ("token", "last_token")})
+
+
+def _ct_error_jump(vm: CompileTimeVM) -> None:
+    point_id = vm.pop_int()
+    recovery = vm.parser._active_error_recovery
+    if recovery is None:
+        raise ParseError("ct-error-jump can only be used by a compile.error handler")
+    point = vm.parser._find_error_restore_point(point_id)
+    if point is None or point.get("stage") != recovery.get("phase"):
+        raise ParseError(f"restore point {point_id} is not valid for this compile error")
+    recovery["restore_point_id"] = point_id
+
+
+def _ct_error_resume(vm: CompileTimeVM) -> None:
+    recovery = vm.parser._active_error_recovery
+    if recovery is None:
+        raise ParseError("ct-error-resume can only be used by a compile.error handler")
+    recovery["resume"] = True
+    vm.push(1)
+
+
+def _ct_error_get_retry_limit(vm: CompileTimeVM) -> None:
+    vm.push(vm.parser._error_recovery_retry_limit)
+
+
+def _ct_error_set_retry_limit(vm: CompileTimeVM) -> None:
+    limit = vm.pop_int()
+    if limit < 1 or limit > 1024:
+        raise ParseError("ct-error-set-retry-limit expects a value from 1 through 1024")
+    previous = vm.parser._error_recovery_retry_limit
+    vm.parser._error_recovery_retry_limit = limit
+    vm.push(previous)
+
+
+def _ct_error_define(vm: CompileTimeVM) -> None:
+    source = vm.pop_str()
+    parser = vm.parser
+    recovery = parser._active_error_recovery
+    module = parser._active_module
+    if recovery is None or module is None:
+        raise ParseError("ct-error-define can only run during recoverable compilation")
+
+    fragment_parser = Parser(parser.dictionary, parser.reader)
+    fragment_parser._restore_rewrite_state(parser._snapshot_rewrite_state())
+    fragment_parser.token_hook = parser.token_hook
+    fragment_parser._macro_signatures = parser._macro_signatures
+    fragment_parser._macro_attrs = parser._macro_attrs
+    fragment_parser._macro_docs = parser._macro_docs
+    fragment_tokens = parser.reader.tokenize(source)
+    fragment = fragment_parser.parse(fragment_tokens, source)
+    if not all(isinstance(form, (Definition, AsmDefinition)) for form in fragment.forms):
+        raise ParseError("ct-error-define source must contain only word or :asm definitions")
+    parser._restore_rewrite_state(fragment_parser._snapshot_rewrite_state())
+    parser.token_hook = fragment_parser.token_hook
+    module.forms.extend(fragment.forms)
+    module.variables.update(fragment.variables)
+    module.cstruct_layouts.update(fragment.cstruct_layouts)
+    vm.push(len(fragment.forms))
+
+
 def _ct_parser_restore(vm: CompileTimeVM) -> None:
     checkpoint = vm._resolve_handle(vm.pop())
     restore_last_token = False
@@ -19977,6 +20187,13 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("ct-parser-set-pos", _ct_parser_set_pos, compile_only=True)
     register("ct-parser-checkpoint", _ct_parser_checkpoint, compile_only=True)
     register("ct-parser-restore", _ct_parser_restore, compile_only=True)
+    register("ct-error-restore-points", _ct_error_restore_points, compile_only=True)
+    register("ct-error-restore-point", _ct_error_restore_point, compile_only=True)
+    register("ct-error-jump", _ct_error_jump, compile_only=True)
+    register("ct-error-resume", _ct_error_resume, compile_only=True)
+    register("ct-error-get-retry-limit", _ct_error_get_retry_limit, compile_only=True)
+    register("ct-error-set-retry-limit", _ct_error_set_retry_limit, compile_only=True)
+    register("ct-error-define", _ct_error_define, compile_only=True)
     register("ct-parser-tail", _ct_parser_tail, compile_only=True)
     register("ct-parser-session-begin", _ct_parser_session_begin, compile_only=True)
     register("ct-parser-session-commit", _ct_parser_session_commit, compile_only=True)
@@ -20664,6 +20881,7 @@ class Compiler:
             "message": str(exc),
             "exception": type(exc).__name__,
             "source": str(source or self._last_loaded_path or "<memory>"),
+            "recoverable": False,
         }
         diagnostic = getattr(exc, "diagnostic", None)
         if isinstance(diagnostic, Diagnostic):
@@ -20675,6 +20893,7 @@ class Compiler:
                 "level": diagnostic.level,
             })
         self.event_bus.publish("compile.error", payload)
+        self.parser._compile_error_notified = True
 
     def _collect_preview_focus_names(self, path: Path) -> Optional[Set[str]]:
         try:
@@ -20874,17 +21093,41 @@ class Compiler:
             self.parser.file_spans = spans or []
             tokens = self.reader.tokenize(source)
             module = self.parser.parse(tokens, source)
+            self.parser._active_module = module
+            self.parser._compile_error_notified = False
             if render_preview:
                 self.last_transformed_source = _render_transformed_module_preview(
                     module,
                     focus_names=self._preview_focus_names,
                 )
-            emission = self.assembler.emit(
-                module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
+            emit_restore_point_id = self.parser._add_error_restore_point(
+                "emit", len(self.parser.tokens), None, self.parser._last_token
             )
+            while True:
+                try:
+                    emission = self.assembler.emit(
+                        module, debug=debug, entry_mode=entry_mode, c_abi=c_abi, module_name=module_name
+                    )
+                    break
+                except Exception as emit_exc:
+                    restore_point = self.parser._dispatch_recoverable_compile_error(
+                        emit_exc,
+                        stage="emit",
+                        restore_point_id=emit_restore_point_id,
+                    )
+                    if restore_point is None:
+                        raise
+                    if self.parser._active_module is None:
+                        raise CompileTimeError("compile error handler removed the active module")
+                    module = self.parser._active_module
         except Exception as exc:
-            self._publish_compile_error(exc)
+            if not self.parser._compile_error_notified:
+                self._publish_compile_error(exc)
+            self.parser._compile_error_notified = False
+            self.parser._active_module = None
             raise
+        self.parser._compile_error_notified = False
+        self.parser._active_module = None
         if self.event_bus is not None:
             self.event_bus.publish("compile.end", {"source": str(self._last_loaded_path or "<memory>"), "output_artifact": module_name, "size_bytes": emission.snapshot_byte_length()})
         return emission
@@ -25319,12 +25562,6 @@ def cli(
         asm_text: Optional[str] = None
         fhash = ""
         cache_asm_hit = False
-        ct_only_parse = bool(
-            args.ct_run_main
-            and args.no_artifact
-            and args.dump_cfg is None
-            and not args.emit_asm
-        )
         # An event consumer must observe the compiler pipeline even when the
         # artifact cache is warm; otherwise an IDE sees an empty stream.
         if cache and event_observer is None and args.events_stream is None and not args.ct_run_main and args.dump_cfg is None and not args.preview:
@@ -25352,141 +25589,120 @@ def cli(
                 import time as _time_mod
                 _compile_t0 = _time_mod.perf_counter()
 
-            if ct_only_parse:
-                compiler.parse_file(args.source, render_preview=args.preview)
-                asm_text = ""
-                if args.preview:
-                    print("[preview] compile-time execution trace:")
-                    trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
-                    if trace_text:
-                        print(trace_text)
-                    else:
-                        print("# (no compile-time execution events)")
-                    print("[preview] transformed source (post-macro + post-compile-time):")
-                    preview_text = compiler.last_transformed_source.rstrip()
-                    if preview_text:
-                        print(preview_text)
-                    else:
-                        print("# (no transformed forms)")
-                    print("[preview] end")
-                if verbosity >= 1:
-                    _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
-                    print(f"[v1] parse-only compile-time prep: {_compile_dt:.1f}ms")
+            mod_name = args.source.stem if args.source else "l2"
+            c_abi_flag = getattr(args, "c_abi", False)
+            if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
+                emission = compiler.compile_preloaded(
+                    debug=args.debug,
+                    entry_mode=entry_mode,
+                    c_abi=c_abi_flag,
+                    module_name=mod_name,
+                    render_preview=args.preview,
+                )
             else:
-                mod_name = args.source.stem if args.source else "l2"
-                c_abi_flag = getattr(args, "c_abi", False)
-                if compiler._last_loaded_path == args.source.resolve() and compiler._last_loaded_source is not None:
-                    emission = compiler.compile_preloaded(
-                        debug=args.debug,
-                        entry_mode=entry_mode,
-                        c_abi=c_abi_flag,
-                        module_name=mod_name,
-                        render_preview=args.preview,
-                    )
+                emission = compiler.compile_file(
+                    args.source,
+                    debug=args.debug,
+                    entry_mode=entry_mode,
+                    c_abi=c_abi_flag,
+                    module_name=mod_name,
+                    render_preview=args.preview,
+                )
+
+            # Snapshot assembly text *before* ct-run-main JIT execution, which may
+            # corrupt Python heap objects depending on memory layout.
+            asm_text = emission.snapshot()
+            if args.preview:
+                print("[preview] compile-time execution trace:")
+                trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
+                if trace_text:
+                    print(trace_text)
                 else:
-                    emission = compiler.compile_file(
-                        args.source,
-                        debug=args.debug,
-                        entry_mode=entry_mode,
-                        c_abi=c_abi_flag,
-                        module_name=mod_name,
-                        render_preview=args.preview,
-                    )
+                    print("# (no compile-time execution events)")
+                print("[preview] transformed source (post-macro + post-compile-time):")
+                preview_text = compiler.last_transformed_source.rstrip()
+                if preview_text:
+                    print(preview_text)
+                else:
+                    print("# (no transformed forms)")
+                print("[preview] end")
+            if verbosity >= 1:
+                _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
+                print(f"[v1] compilation: {_compile_dt:.1f}ms")
+                print(f"[v1] assembly size: {len(asm_text)} bytes")
 
-                # Snapshot assembly text *before* ct-run-main JIT execution, which may
-                # corrupt Python heap objects depending on memory layout.
-                asm_text = emission.snapshot()
-                if args.preview:
-                    print("[preview] compile-time execution trace:")
-                    trace_text = _render_preview_trace_events(compiler.parser.preview_trace_events).rstrip()
-                    if trace_text:
-                        print(trace_text)
-                    else:
-                        print("# (no compile-time execution events)")
-                    print("[preview] transformed source (post-macro + post-compile-time):")
-                    preview_text = compiler.last_transformed_source.rstrip()
-                    if preview_text:
-                        print(preview_text)
-                    else:
-                        print("# (no transformed forms)")
-                    print("[preview] end")
-                if verbosity >= 1:
-                    _compile_dt = (_time_mod.perf_counter() - _compile_t0) * 1000
-                    print(f"[v1] compilation: {_compile_dt:.1f}ms")
-                    print(f"[v1] assembly size: {len(asm_text)} bytes")
+            has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
 
-                has_ct = bool(compiler.parser.compile_time_vm._ct_executed)
+            if asm_post_opt_enabled:
+                use_asm_opt_cache = cache_enabled
+                asm_opt_key_path = args.temp_dir / f"{args.source.stem}.asmopt.key"
+                asm_opt_cache_path = args.temp_dir / f"{args.source.stem}.asmopt.asm"
+                asm_opt_cache_version = "v1"
 
-                if asm_post_opt_enabled:
-                    use_asm_opt_cache = cache_enabled
-                    asm_opt_key_path = args.temp_dir / f"{args.source.stem}.asmopt.key"
-                    asm_opt_cache_path = args.temp_dir / f"{args.source.stem}.asmopt.asm"
-                    asm_opt_cache_version = "v1"
+                asm_digest: Optional[str] = None
+                try:
+                    import hashlib
+                    asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
+                except Exception:
+                    asm_digest = None
 
-                    asm_digest: Optional[str] = None
+                optimized_from_cache = False
+                asm_opt_stats: Dict[str, int] = {}
+                asm_opt_pass_logs: List[str] = []
+                if use_asm_opt_cache and asm_digest is not None:
                     try:
-                        import hashlib
-                        asm_digest = hashlib.blake2b(asm_text.encode("utf-8"), digest_size=16).hexdigest()
-                    except Exception:
-                        asm_digest = None
+                        cached_key = asm_opt_key_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        cached_key = ""
+                    expected_key = f"{asm_opt_cache_version}:{asm_digest}"
+                    if cached_key == expected_key:
+                        try:
+                            asm_text = asm_opt_cache_path.read_text(encoding="utf-8")
+                            optimized_from_cache = True
+                        except OSError:
+                            optimized_from_cache = False
 
-                    optimized_from_cache = False
-                    asm_opt_stats: Dict[str, int] = {}
-                    asm_opt_pass_logs: List[str] = []
+                if not optimized_from_cache:
+                    optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
+                        asm_text,
+                        collect_pass_logs=(verbosity >= 4),
+                    )
+                    if optimized_asm != asm_text:
+                        asm_text = optimized_asm
                     if use_asm_opt_cache and asm_digest is not None:
                         try:
-                            cached_key = asm_opt_key_path.read_text(encoding="utf-8").strip()
+                            asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
+                            asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
+                            asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
                         except OSError:
-                            cached_key = ""
-                        expected_key = f"{asm_opt_cache_version}:{asm_digest}"
-                        if cached_key == expected_key:
-                            try:
-                                asm_text = asm_opt_cache_path.read_text(encoding="utf-8")
-                                optimized_from_cache = True
-                            except OSError:
-                                optimized_from_cache = False
+                            pass
 
-                    if not optimized_from_cache:
-                        optimized_asm, asm_opt_stats, asm_opt_pass_logs = optimize_emitted_asm_text(
-                            asm_text,
-                            collect_pass_logs=(verbosity >= 4),
-                        )
-                        if optimized_asm != asm_text:
-                            asm_text = optimized_asm
-                        if use_asm_opt_cache and asm_digest is not None:
-                            try:
-                                asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
-                                asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
-                                asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
-                            except OSError:
-                                pass
+                if verbosity >= 1:
+                    if optimized_from_cache:
+                        print("[v1] asm post-opt: cache hit")
+                    else:
+                        changed = sum(asm_opt_stats.values())
+                        print(f"[v1] asm post-opt: {changed} rewrite(s)")
+                if verbosity >= 2 and not optimized_from_cache:
+                    for key in sorted(asm_opt_stats):
+                        if asm_opt_stats[key]:
+                            print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
+                if verbosity >= 4 and not optimized_from_cache:
+                    for msg in asm_opt_pass_logs:
+                        print(f"[v4] asm post-opt {msg}")
 
-                    if verbosity >= 1:
-                        if optimized_from_cache:
-                            print("[v1] asm post-opt: cache hit")
-                        else:
-                            changed = sum(asm_opt_stats.values())
-                            print(f"[v1] asm post-opt: {changed} rewrite(s)")
-                    if verbosity >= 2 and not optimized_from_cache:
-                        for key in sorted(asm_opt_stats):
-                            if asm_opt_stats[key]:
-                                print(f"[v2] asm post-opt {key}: {asm_opt_stats[key]}")
-                    if verbosity >= 4 and not optimized_from_cache:
-                        for msg in asm_opt_pass_logs:
-                            print(f"[v4] asm post-opt {msg}")
-
-                if cache and not args.ct_run_main:
-                    if not fhash:
-                        fhash = cache.flags_hash(
-                            args.debug,
-                            folding_enabled,
-                            peephole_enabled,
-                            auto_inline_enabled,
-                            asm_post_opt_enabled,
-                            string_deduplication_enabled,
-                            entry_mode,
-                        )
-                    cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
+            if cache and not args.ct_run_main:
+                if not fhash:
+                    fhash = cache.flags_hash(
+                        args.debug,
+                        folding_enabled,
+                        peephole_enabled,
+                        auto_inline_enabled,
+                        asm_post_opt_enabled,
+                        string_deduplication_enabled,
+                        entry_mode,
+                    )
+                cache.save(args.source, compiler._loaded_files, fhash, asm_text, has_ct_effects=has_ct)
 
         # Merge source-level `flags ...` pragmas into effective linker flags.
         if compiler.source_link_flags:
@@ -25589,7 +25805,7 @@ def cli(
                     return 1
                 print(summary)
 
-        if args.source_embed and not ct_only_parse:
+        if args.source_embed:
             asm_text = _append_source_embed_to_asm(asm_text, compiler._last_loaded_source)
     except (ParseError, CompileError, CompileTimeError) as exc:
         # Print all collected diagnostics in Rust-style format
@@ -25639,10 +25855,6 @@ def cli(
 
     if args.macro_profile is not None:
         _emit_macro_profile_report(compiler.parser, args.macro_profile)
-
-    if ct_only_parse and args.no_artifact:
-        print("[info] skipped artifact generation (--no-artifact)")
-        return ct_run_exit_code if args.ct_run_main else 0
 
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     asm_path = args.temp_dir / (args.source.stem + ".asm")

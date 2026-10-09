@@ -1,0 +1,4 @@
+{
+  "description": "A compile.error handler defines a missing CT word and resumes at the failing parser restore point.",
+  "compile_args": ["--no-cache"]
+}

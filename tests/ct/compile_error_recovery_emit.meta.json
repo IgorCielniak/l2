@@ -1,0 +1,4 @@
+{
+  "description": "An on-event compile.error handler defines an unresolved runtime word and resumes emission.",
+  "compile_args": ["--no-cache"]
+}

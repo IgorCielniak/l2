@@ -1,0 +1,12 @@
+error[E2001]: unknown word 'missing_without_repair'
+  --> compile_error_no_resume.sl:5:4
+    |
+  5 |     missing_without_repair
+    |    ^
+    | = note: runtime emission could not resolve the referenced word
+    | = note: while emitting 'main'
+    |
+    = help: check spelling and ensure the word is defined/imported before use
+    = help: if this word is compile-time only, avoid calling it from runtime code
+
+1 error(s) emitted

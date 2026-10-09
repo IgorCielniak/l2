@@ -1,0 +1,5 @@
+{
+  "description": "Repeatedly resuming an unchanged compile error is bounded and eventually fails.",
+  "expect_compile_error": true,
+  "compile_args": ["--no-cache"]
+}

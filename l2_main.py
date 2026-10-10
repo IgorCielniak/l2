@@ -4575,6 +4575,7 @@ class Parser:
         self._current_error_restore_point: Optional[int] = None
         self._active_error_recovery: Optional[Dict[str, Any]] = None
         self._active_module: Optional[Module] = None
+        self._ct_predefined_names: Set[str] = set()
         self._compile_error_notified = False
         self._error_recovery_attempts: Dict[Tuple[str, int, int, str], int] = {}
         self._error_recovery_retry_limit = 8
@@ -7249,6 +7250,7 @@ class Parser:
             )
         ]
         self._active_module = self.context_stack[0]
+        self._ct_predefined_names.clear()
         self.definition_stack.clear()
         self.last_defined = None
         self.control_stack = []
@@ -8158,7 +8160,16 @@ class Parser:
         candidate = Word(name=definition.name, priority=priority)
         candidate.definition = definition
         candidate.inline = inline
-        active_word = self.dictionary.register(candidate)
+        if name_token.lexeme in self._ct_predefined_names:
+            was_suppressed = _suppress_redefine_warnings
+            _suppress_redefine_warnings_set(True)
+            try:
+                active_word = self.dictionary.register(candidate)
+            finally:
+                _suppress_redefine_warnings_set(was_suppressed)
+            self._ct_predefined_names.discard(name_token.lexeme)
+        else:
+            active_word = self.dictionary.register(candidate)
         is_active = active_word is candidate
         self.definition_stack.append((candidate, is_active))
 
@@ -12472,7 +12483,8 @@ class FunctionEmitter:
         _a = self.text.append
         _a(f"    ; push {label}")
         _a("    sub r12, 8")
-        _a(f"    mov qword [r12], {label}")
+        _a(f"    lea rax, [rel {label}]")
+        _a("    mov [r12], rax")
 
     def push_from(self, register: str) -> None:
         _a = self.text.append
@@ -18687,6 +18699,58 @@ def _ct_parser_eof(vm: CompileTimeVM) -> None:
     vm.push(1 if vm.parser.pos >= len(vm.parser.tokens) else 0)
 
 
+def _ct_predef_all(vm: CompileTimeVM) -> None:
+    parser = vm.parser
+    tokens = parser.tokens
+    scan_pos = parser.pos
+
+    if parser.context_stack and isinstance(parser.context_stack[-1], Definition):
+        depth = 1 + len(parser.control_stack)
+        while scan_pos < len(tokens) and depth:
+            lexeme = tokens[scan_pos].lexeme
+            if lexeme == "end":
+                depth -= 1
+            elif lexeme == "if" or lexeme in parser.block_openers - {"word"}:
+                depth += 1
+            scan_pos += 1
+        if depth:
+            raise ParseError("ct-predef-all could not find the end of the current word")
+
+    while scan_pos + 1 < len(tokens):
+        if tokens[scan_pos].lexeme != "word":
+            scan_pos += 1
+            continue
+
+        name = tokens[scan_pos + 1].lexeme
+        end_pos = scan_pos + 2
+        depth = 0
+        while end_pos < len(tokens):
+            lexeme = tokens[end_pos].lexeme
+            if lexeme == "end":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif lexeme == "if" or lexeme in parser.block_openers - {"word"}:
+                depth += 1
+            end_pos += 1
+        if end_pos >= len(tokens):
+            raise ParseError(f"ct-predef-all could not find the end of word '{name}'")
+
+        fragment_parser = Parser(parser.dictionary, parser.reader)
+        fragment_parser._restore_rewrite_state(parser._snapshot_rewrite_state())
+        fragment_parser.token_hook = parser.token_hook
+        fragment_parser._macro_signatures = parser._macro_signatures
+        fragment_parser._macro_attrs = parser._macro_attrs
+        fragment_parser._macro_docs = parser._macro_docs
+        fragment_parser.block_openers = set(parser.block_openers)
+        fragment_parser.control_overrides = set(parser.control_overrides)
+        fragment = fragment_parser.parse(tokens[scan_pos : end_pos + 1], parser.source)
+        if len(fragment.forms) != 1 or not isinstance(fragment.forms[0], Definition):
+            raise ParseError(f"ct-predef-all expected a regular word definition for '{name}'")
+        parser._ct_predefined_names.add(name)
+        scan_pos = end_pos + 1
+
+
 def _ct_parser_peek(vm: CompileTimeVM) -> None:
     offset = vm.pop_int()
     if offset < 0:
@@ -20181,6 +20245,10 @@ def _register_compile_time_primitives(dictionary: Dictionary) -> None:
     register("peek-token", _ct_peek_token, compile_only=True)
     register("ct-current-token", _ct_current_token, compile_only=True)
     register("ct-parser-pos", _ct_parser_pos, compile_only=True)
+    register("ct-predef-all", _ct_predef_all, compile_only=True)
+    ct_predef_all_word = dictionary.lookup("ct-predef-all")
+    if ct_predef_all_word is not None:
+        ct_predef_all_word.immediate = True
     register("ct-parser-remaining", _ct_parser_remaining, compile_only=True)
     register("ct-parser-eof?", _ct_parser_eof, compile_only=True)
     register("ct-parser-peek", _ct_parser_peek, compile_only=True)
@@ -23718,7 +23786,16 @@ def _run_integrity_assembler_semantic_checks(errors: List[str]) -> None:
         {
             "name": "word_ptr",
             "nodes": [_make_op("word_ptr", probe_target)],
-            "required": [f"mov qword [r12], {sanitize_label(probe_target)}"],
+            "required": [
+                f"lea rax, [rel {sanitize_label(probe_target)}]",
+                "mov [r12], rax",
+            ],
+            "check": lambda text_blob: None
+            if (
+                f"lea rax, [rel {sanitize_label(probe_target)}]" in text_blob
+                or f"mov qword [r12], {sanitize_label(probe_target)}" in text_blob
+            )
+            else f"expected word_ptr to push a symbol address for {sanitize_label(probe_target)}",
         },
         {
             "name": "branch_zero",

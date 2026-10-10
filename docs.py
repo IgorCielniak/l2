@@ -1907,6 +1907,14 @@ def _run_docs_tui(
         "    Return absolute parser cursor index within current token\n"
         "    stream (0-based, inclusive start position).\n"
         "\n"
+        "  ct-predef-all        [*] -> [*]\n"
+        "    Predeclare all later top-level word definitions in the current\n"
+        "    parse stream so compile-time code can call them before they are\n"
+        "    defined. This is useful for forward compile-time references\n"
+        "    without an explicit earlier stub: the parser marks each later\n"
+        "    word name as available immediately for the rest of the compile\n"
+        "    phase.\n"
+        "\n"
         "  ct-parser-remaining   [*] -> [* | n]\n"
         "    Return remaining token count from current cursor to stream\n"
         "    end (never negative).\n"
@@ -6465,6 +6473,7 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-parser-eof?": "Returns 1 when parser cursor is at or beyond end-of-stream and 0 otherwise, enabling safe loop termination in custom parser macros.",
     "ct-parser-peek": "Performs non-consuming lookahead by offset from current parser cursor; out-of-range reads return nil instead of raising.",
     "ct-parser-set-pos": "Repositions parser cursor to an absolute token index, returns previous position, and keeps ct-current-token state consistent.",
+    "ct-predef-all": "Predeclares all following top-level word definitions in the current compile-time parse stream so forward compile-time calls resolve before later definitions appear.",
     "ct-parser-checkpoint": "Captures parser cursor snapshot map (pos, last_token, remaining) for speculative parsing and branch rollback.",
     "ct-parser-restore": "Restores parser cursor from checkpoint map or raw position with bounds/type validation and returns success flag.",
     "ct-parser-tail": "Returns a copy of remaining token objects from current parser cursor for diagnostics, lookahead, or external analyzers.",

@@ -145,6 +145,7 @@ word verify_ct_word_inventory_coverage
   "ct-new-label" meta-word-exists static_assert
   "ct-parser-pos" meta-word-exists static_assert
   "ct-parser-remaining" meta-word-exists static_assert
+  "ct-predef-all" meta-word-exists static_assert
   "ct-rebuild-rewrite-index" meta-word-exists static_assert
   "ct-register-block-opener" meta-word-exists static_assert
   "ct-register-control-override" meta-word-exists static_assert

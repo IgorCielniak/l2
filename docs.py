@@ -1545,30 +1545,30 @@ def _run_docs_tui(
         "  recovery retries from the selected token position. Emission recovery\n"
         "  retries code generation after repair definitions are added.\n"
         "\n"
-        "  `ct-error-restore-points`           [*] -> [* | points]\n"
+        "  ct-error-restore-points           [*] -> [* | points]\n"
         "    List the most recent parser/emission restore-point records.\n"
         "    Records expose `id`, `stage`, `pos`, `lexeme`, `line`, and `column`.\n"
         "\n"
-        "  `ct-error-restore-point`            [* | id] -> [* | point]\n"
+        "  ct-error-restore-point            [* | id] -> [* | point]\n"
         "    Get one restore-point record by id; errors if the id is unavailable.\n"
         "\n"
-        "  `ct-error-jump`                     [* | id] -> [*]\n"
+        "  ct-error-jump                     [* | id] -> [*]\n"
         "    Select a restore point from the current error's phase. For parser\n"
         "    errors this selects where parsing resumes.\n"
         "\n"
-        "  `ct-error-resume`                   [*] -> [* | 1]\n"
+        "  ct-error-resume                   [*] -> [* | 1]\n"
         "    Explicitly request recovery from the active `compile.error` handler.\n"
         "\n"
-        "  `ct-error-define`                   [* | source] -> [* | count]\n"
+        "  ct-error-define                   [* | source] -> [* | count]\n"
         "    Parse source as a top-level fragment containing only `word` or\n"
         "    `:asm` definitions, then add those definitions to the active module.\n"
         "    It uses the current dictionary, macro signatures, token hook, and\n"
         "    rewrite configuration. It is valid only during error recovery.\n"
         "\n"
-        "  `ct-error-get-retry-limit`          [*] -> [* | limit]\n"
+        "  ct-error-get-retry-limit          [*] -> [* | limit]\n"
         "    Read the active compile's retry limit (default 8).\n"
         "\n"
-        "  `ct-error-set-retry-limit`          [* | limit] -> [* | previous]\n"
+        "  ct-error-set-retry-limit          [* | limit] -> [* | previous]\n"
         "    Set the active limit from 1 through 1024 and return the old value.\n"
         "    The limit applies to retries of the same error at the same location.\n"
         "\n"
@@ -2740,6 +2740,138 @@ def _run_docs_tui(
         "      10 20 with x y in\n"
         "        x y +   # reads x (10) and y (20), adds -> 30\n"
         "      end\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 17  ADDITIONAL CT STACK EFFECTS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  These signatures make callback, stateful, and dual-mode CT APIs\n"
+        "  explicit. `*` denotes an unchanged deeper stack. Values marked\n"
+        "  `found` are returned as a flag after the associated value.\n"
+        "\n"
+        "  CT  [*] -> [* | flag]\n"
+        "    Push 1 in CT execution and 0 in emitted runtime code.\n"
+        "\n"
+        "  use-l2-ct  [* | name] -> [*] || [*] -> [*]\n"
+        "    The named form consumes a word name; the empty-stack form\n"
+        "    targets the most recently defined word. Neither form pushes.\n"
+        "\n"
+        "  set-token-hook  [* | name] -> [*]\n"
+        "    Install the named token hook; compilation fails if the hook\n"
+        "    cannot be used when a token is processed.\n"
+        "\n"
+        "  clear-token-hook  [*] -> [*]\n"
+        "    Clear the parser's current token hook.\n"
+        "\n"
+        "  ct-lang-create  [* | name] -> [* | created]\n"
+        "    Create a pack record if absent; return 1 only when newly created.\n"
+        "\n"
+        "  ct-lang-exists?  [* | name] -> [* | exists]\n"
+        "    Test whether the named pack record exists.\n"
+        "\n"
+        "  ct-lang-list  [*] -> [* | names]\n"
+        "    Return all registered pack names in sorted order.\n"
+        "\n"
+        "  ct-lang-activate  [* | name] -> [* | ok]\n"
+        "    Add an existing pack to the active-pack selection; this does\n"
+        "    not enable its hooks, rewrites, or macros.\n"
+        "\n"
+        "  ct-lang-deactivate  [* | name] -> [* | ok]\n"
+        "    Remove an existing pack from active-pack selection only.\n"
+        "\n"
+        "  ct-lang-active?  [* | name] -> [* | active]\n"
+        "    Test active-pack selection, not resource enablement.\n"
+        "\n"
+        "  ct-lang-active-list  [*] -> [* | names]\n"
+        "    Return active pack names in sorted order.\n"
+        "\n"
+        "  ct-lang-meta-set  [*, name | metadata] -> [* | ok]\n"
+        "    Store a copied metadata map, or clear metadata with nil.\n"
+        "\n"
+        "  ct-lang-meta-get  [* | name] -> [*, metadata | found]\n"
+        "    Return the copied metadata map and whether the pack exists.\n"
+        "\n"
+        "  ct-lang-set-auto-validate  [*, name | enabled] -> [* | ok]\n"
+        "    Set automatic validator policy for an existing pack.\n"
+        "\n"
+        "  ct-lang-get-auto-validate  [* | name] -> [*, enabled | found]\n"
+        "    Return the policy flag and whether the pack exists.\n"
+        "\n"
+        "  ct-lang-add-validator  [*, name | validator] -> [* | count]\n"
+        "    Associate a validator word name with a pack; duplicate names\n"
+        "    are not added twice.\n"
+        "\n"
+        "  ct-lang-run-validators  [* | name] -> [* | count]\n"
+        "    Run the named pack's validators and return the executed count.\n"
+        "\n"
+        "  ct-lang-run-active-validators  [*] -> [* | count]\n"
+        "    Run validators selected by the active-pack set.\n"
+        "\n"
+        "  ct-lang-set-token-hook  [*, name | hook-or-nil] -> [*, previous]\n"
+        "    Set or clear the parser hook and return the previously installed\n"
+        "    hook name (or nil). Registration takes effect immediately.\n"
+        "\n"
+        "  ct-lang-add-reader-rewrite-named  [* | pack, name, pattern, replacement] -> [* | rule-name]\n"
+        "    Register a reader-stage rewrite immediately and return its name.\n"
+        "\n"
+        "  ct-lang-add-grammar-rewrite-named  [* | pack, name, pattern, replacement] -> [* | rule-name]\n"
+        "    Register a grammar-stage rewrite immediately and return its name.\n"
+        "\n"
+        "  ct-lang-register-text-macro-signature  [* | pack, name, params, expansion] -> [* | macro-name]\n"
+        "    Register a text macro immediately and return its macro name.\n"
+        "\n"
+        "  ct-lang-register-pattern-macro  [* | pack, name, clauses] -> [* | macro-name]\n"
+        "    Register pattern-macro clauses immediately and return the name.\n"
+        "\n"
+        "  ct-lang-status  [* | name] -> [*, status | found]\n"
+        "    Return the pack status map and whether the pack exists.\n"
+        "\n"
+        "  ct-lang-remove  [* | name] -> [* | removed]\n"
+        "    Remove the pack record and, by default, clean its owned resources.\n"
+        "\n"
+        "  ct-list-words-prefix  [* | prefix] -> [* | names]\n"
+        "    Return sorted registered word names beginning with the prefix.\n"
+        "\n"
+        "  ct-repr  [* | value] -> [* | representation]\n"
+        "    Return a readable serialization for diagnostics and metadata.\n"
+        "\n"
+        "  ct-runtime-get-source  [* | name] -> [*, source | source_len]\n"
+        "    Return a definition's source text and its length; unavailable\n"
+        "    source is represented by an empty result.\n"
+        "\n"
+        "  event-emit  [*, event | payload] -> [* | emitted]\n"
+        "    Synchronously publish a CT map or nil payload; return 0 if no\n"
+        "    event bus is attached, otherwise 1.\n"
+        "\n"
+        "  event-object-create  [* | type] -> [* | event]\n"
+        "    Create an event record with an empty payload map.\n"
+        "\n"
+        "  event-object-prop-append  [*, event, key | value] -> [* | event]\n"
+        "    Store a payload property and return the same event record.\n"
+        "\n"
+        "  event-object-prop-get  [*, event | key] -> [*, event, value | found]\n"
+        "    Return the event, property value (or nil), and a found flag.\n"
+        "\n"
+        "  event-subscribe  [*, pattern | callback] -> [* | handle]\n"
+        "    Subscribe a callback word to a pattern; no bus returns handle 0.\n"
+        "\n"
+        "  event-unsubscribe  [* | handle] -> [* | removed]\n"
+        "    Remove a subscription by handle and report whether it existed.\n"
+        "\n"
+        "  event-object-emit  [* | event] -> [* | emitted]\n"
+        "    Synchronously dispatch an event record; no bus returns 0.\n"
+        "\n"
+        "  get-event-type  [* | event] -> [*, event | type]\n"
+        "    Return the event record and its type string.\n"
+        "\n"
+        "  get-event-name  [* | event] -> [*, event | name]\n"
+        "    Return the event record and its name string.\n"
+        "\n"
+        "  get-event-timestamp  [* | event] -> [*, event | timestamp]\n"
+        "    Return the event record and its timestamp_ns integer.\n"
+        "\n"
+        "  get-event-payload  [* | event] -> [*, event | payload]\n"
+        "    Return the event record and its payload map.\n"
         "\n"
     )
 
@@ -6328,6 +6460,70 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
     return None
 
 
+def _usage_guidance_for_word(word_name: str, category: str) -> str:
+    if word_name == "ct-emit-op":
+        return "Supply the internal operation name followed by its data; this appends directly to the active compiled body instead of parsing tokens."
+    if word_name == "ct-get-word-asm":
+        return "Pass the name of an existing :asm definition; a high-level word or unknown name returns nil."
+    if word_name == "ct-new-label":
+        return "Pass a readable prefix and use the returned unique label in emitted branch/label operations."
+    if word_name in {"ct-register-block-opener", "ct-unregister-block-opener", "ct-register-control-override", "ct-unregister-control-override"}:
+        return "Use the exact control word lexeme that the parser should recognize; registrations affect later parsing in the current compilation."
+    if word_name == "i":
+        return "Call it only inside an active compile-time for loop; the index is zero-based and belongs to the innermost loop."
+    if category == "Capture":
+        if word_name.startswith("ct-capture-global-"):
+            return "Use these operations for compile-local state shared across macro expansions; values are copied at the API boundary."
+        if "schema" in word_name or "taint" in word_name or word_name in {"ct-capture-freeze", "ct-capture-thaw", "ct-capture-mutable?"}:
+            return "Pass the macro name and capture name in that order; check the returned status before relying on the metadata change."
+        if word_name in {"ct-capture-args", "ct-capture-locals", "ct-capture-globals", "ct-capture-origin", "ct-capture-lifetime", "ct-capture-lifetime-live?", "ct-capture-lifetime-assert", "ct-capture-lint"}:
+            return "Call it with the active macro context (`ctx`); cloned results are safe to inspect without mutating the original capture."
+        return "Pass the capture value explicitly and consume the returned value; these helpers do not implicitly read a macro's capture context."
+    if category in {"List", "Map", "String", "Nil"}:
+        if word_name.startswith(("list-set", "list-insert", "list-remove", "list-pop", "list-clear", "list-reverse", "map-set", "map-delete", "map-update", "map-clear")):
+            return "These operations mutate the supplied collection; retain the returned collection when chaining further work."
+        if word_name.startswith(("list-get", "list-find", "list-peek", "list-last", "map-get", "map-has", "map-keys", "map-values")):
+            return "Inspect the documented result order carefully; lookup operations may return the original collection together with a value and found flag."
+        return "Build inputs with the matching list/map/string constructors, then pass arguments in the order shown by the stack effect."
+    if category in {"Token", "Lexer"}:
+        if word_name in {"next-token", "peek-token", "ct-current-token", "inject-tokens", "inject-lexemes", "add-token", "add-token-chars"}:
+            return "Use it while the parser is processing source; consumption or injection affects the live token cursor, while reader separators affect future tokenization only."
+        return "Pass the lexer or token object returned by the matching constructor/read operation; token metadata retains its source coordinates unless explicitly changed."
+    if category == "Control":
+        return "Use control frames within the active parser flow; push/pop operations mutate the parser's control stack, while frame key operations act on the supplied map."
+    if category == "Rewrite":
+        if word_name.startswith(("ct-get-", "ct-list-", "ct-export-", "ct-rewrite-dry-run", "ct-rewrite-run-on-list", "ct-rewrite-compatibility")):
+            return "Use the returned snapshot for inspection before changing live rewrite state; dry-run/list operations do not register rules."
+        return "Choose the reader or grammar stage explicitly and keep rule names stable so you can inspect, disable, and remove the registration later."
+    if category == "Pattern":
+        return "Use the pattern macro's registered name consistently; group/scope activation and enabled state jointly determine whether its clauses can match."
+    if category == "Language":
+        return "Most operations take the pack name first; resources registered through the pack APIs are owned by that pack and are cleaned up when it is removed."
+    if category == "CT-Call":
+        return "Configure this before the relevant ct-call expansion; getter results describe the current CT VM policy, not runtime execution."
+    if category == "Macro":
+        return "Use the registered macro name; query functions return presence/status separately so missing macros can be handled without guessing."
+    if category == "Assembly":
+        return "Call it during compilation before final assembly emission; these lines are added to compiler output and are not ordinary runtime instructions."
+    if category == "Assert":
+        return "Use it to stop compilation at the point a compile-time invariant fails rather than allowing invalid generated code to proceed."
+    if category == "Template":
+        return "Use it inside a macro template; it controls template expansion and does not emit a runtime instruction by itself."
+    if category in {"Event", "Events"} or word_name.startswith(("event-", "get-event-")):
+        return "Event helpers operate on the current compile-time event bus; dispatch is synchronous and subscribers receive the event record."
+    if word_name.startswith("ct-error-"):
+        return "Call recovery helpers only from a recoverable compile.error handler; use restore-point IDs from that error and explicitly request retry."
+    if word_name.startswith(("ct-parser-", "ct-predef-")):
+        return "Use it during parsing against the live token stream; checkpoints restore parser position, not arbitrary compiler or external state."
+    if word_name.startswith(("ct-get-", "ct-list-")):
+        return "Use the returned value to make a compile-time decision; where the stack effect includes a found flag, test it before using the associated value."
+    if word_name.startswith(("ct-set-", "ct-add-", "ct-register-")):
+        return "Call it before the source construct that should observe the change; registration and configuration are order-dependent within a compilation."
+    if word_name.startswith("ct-clear-"):
+        return "Use it at a deliberate phase boundary when subsequent compilation should start without the accumulated state."
+    return "Push its inputs in stack order, call it during the phase where its effect is needed, and consume the result before continuing."
+
+
 def category_for_word(word_name: str) -> str:
     if word_name in _CT_TEMPLATE_DIRECTIVE_NAMES:
         return "Template"
@@ -6494,8 +6690,8 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-lang-create": "Creates or updates a named language-extension pack record and returns whether it was newly created.",
     "ct-lang-exists?": "Returns 1 when a named language-extension pack exists.",
     "ct-lang-list": "Returns sorted list of registered language-extension pack names.",
-    "ct-lang-activate": "Activates a named language-extension pack.",
-    "ct-lang-deactivate": "Deactivates a named language-extension pack.",
+    "ct-lang-activate": "Marks a named language pack active. This controls active-pack queries and active-validator selection; it does not automatically enable or disable the pack's registered macros, rewrites, or token hook.",
+    "ct-lang-deactivate": "Marks a language pack inactive without removing or disabling its registered macros, rewrites, or token hook. Use the explicit rule/hook controls when those resources themselves must stop affecting parsing.",
     "ct-lang-active?": "Returns 1 when a named language-extension pack is active.",
     "ct-lang-active-list": "Returns sorted list of currently active language-extension pack names.",
     "ct-lang-meta-set": "Stores metadata map for a language-extension pack; nil clears metadata.",
@@ -6514,6 +6710,89 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-lang-remove": "Removes a language-extension pack and cleans owned rewrites/macros/hooks.",
 }
 
+_OVERVIEW_OVERRIDES.update({
+    "clear-token-hook": "Clears the active compile-time token hook. Use it when a hook should only transform a bounded part of a source file; it has no effect on separators or tokens that were already produced.",
+    "ct-add-reader-rewrite-named": "Registers a named rewrite in the reader stage, before grammar parsing. Supply the rule name, a list of input lexemes, and a list of replacement lexemes; use the name later to inspect, reprioritize, disable, or remove this rule.",
+    "ct-add-reader-rewrite-priority": "Registers a reader-stage rewrite with an explicit priority. Higher-priority rules are considered before lower-priority rules; use a stable priority when several rules can match the same token sequence.",
+    "ct-error-define": "Parses a source string during a recoverable compile.error callback and appends its word or assembly definitions to the active module. The fragment must contain definitions only; it is not a rollback mechanism, so use it to supply missing definitions before requesting a retry.",
+    "ct-error-get-retry-limit": "Returns the maximum number of attempts allowed for a recoverable compile error. Read this when a handler needs to report or preserve the compiler's current retry policy.",
+    "ct-error-jump": "Selects a restore-point ID for the current compile.error callback. Use an ID from that error's payload; only a point from the same parser or emission phase is accepted, and the callback must also request resumption.",
+    "ct-error-restore-point": "Looks up one restore-point snapshot by ID and returns its public fields without the internal token objects. Call it from a recovery handler with an ID taken from the current error payload.",
+    "ct-error-restore-points": "Returns the compiler's available error restore points as a list of public metadata maps. Recovery handlers use these records to choose a compatible parser or emission restart location; they are metadata, not transactional snapshots.",
+    "ct-error-resume": "Marks the active compile.error callback as willing to retry and returns 1. A retry occurs only when the handler also selects a valid restore point with ct-error-jump.",
+    "ct-error-set-retry-limit": "Sets the recoverable-error retry budget to an integer from 1 through 1024 and returns the previous value. Configure it before triggering errors; increasing the limit does not make non-recoverable errors recoverable.",
+    "ct-get-reader-rewrite-enabled": "Returns whether the named reader rewrite is enabled. Pair it with ct-set-reader-rewrite-enabled when temporarily changing a rule, and check whether the rule exists before relying on its state.",
+    "ct-get-reader-rewrite-priority": "Returns the priority of a named reader-stage rewrite. Use it to inspect the ordering that resolves overlapping rules before changing that order.",
+    "ct-lang-active-list": "Returns the names of all currently active language-extension packs in sorted order. Use this snapshot for diagnostics or to restore the caller's intended active-pack set.",
+    "ct-lang-add-grammar-rewrite-named": "Immediately registers a named grammar-stage rewrite and records it as owned by a language pack. Pass the pack name, rule name, input-pattern list, and replacement list; pack activation does not gate the rule, while removing the pack cleans it up.",
+    "ct-lang-add-reader-rewrite-named": "Immediately registers a named reader-stage rewrite and records it as owned by a language pack. Pass the pack name, rule name, input-pattern list, and replacement list; pack activation does not gate the rule, while removing the pack cleans it up.",
+    "ct-lang-add-validator": "Associates a named CT validator word with a language pack and returns the resulting validator count. Validators run only when requested or when that pack's auto-validation policy invokes them.",
+    "ct-lang-create": "Creates an inactive language-extension pack record when the name is new; an existing record is left in place. Returns 1 only for a newly created pack. Create it before setting metadata or activating it.",
+    "ct-lang-exists?": "Tests whether a language-extension pack record exists and returns 1 or 0. This does not tell you whether the pack is active; use ct-lang-active? for that.",
+    "ct-lang-get-auto-validate": "Returns the pack's auto-validation setting and a found flag. A missing pack is distinct from an existing pack whose setting is disabled.",
+    "ct-lang-list": "Returns all registered language-extension pack names in sorted order, including inactive packs. Use ct-lang-active-list when you only need currently enabled extensions.",
+    "ct-lang-meta-get": "Looks up a pack's metadata map and returns the map plus a found flag. The flag distinguishes a missing pack from an existing pack whose metadata is empty or nil.",
+    "ct-lang-meta-set": "Stores a copied metadata map on a language pack; passing nil clears its metadata. Use this for extension-owned descriptive/configuration data rather than registering executable hooks.",
+    "ct-lang-register-pattern-macro": "Immediately registers pattern-macro clauses and records ownership under a language pack so removal can clean up generated rewrite rules. The macro name and clauses use the same shapes as ct-register-pattern-macro; activation does not gate matching.",
+    "ct-lang-register-text-macro-signature": "Immediately registers a text macro with an explicit parameter specification and expansion, then tracks it under the language pack for cleanup. Activation does not gate macro expansion.",
+    "ct-lang-run-active-validators": "Runs validators for active packs and returns the total number executed. Unlike automatic validation, this explicit call includes active packs regardless of their auto-validation setting.",
+    "ct-lang-run-validators": "Runs the registered validators for one named pack immediately and returns the number executed. Use this after changing pack metadata or rules when validation should happen now.",
+    "ct-lang-set-auto-validate": "Enables or disables automatic validator execution for a named pack and returns success. This affects automatic validation policy, not explicit calls to ct-lang-run-validators.",
+    "ct-lang-set-token-hook": "Sets the parser's active token-hook word immediately and records its owning language pack for status and cleanup; passing nil clears the association. Pack activation does not defer or gate the hook.",
+    "ct-lang-status": "Returns a status map and found flag for a pack. Inspect it to report activation, owned resources, and metadata without separately querying each resource list.",
+    "ct-list-words-prefix": "Returns the sorted names of currently registered words that begin with the supplied prefix. Use it to discover a family of compiler words without copying or filtering the full dictionary yourself.",
+    "ct-repr": "Serializes a CT value to a readable representation string. Use it for diagnostics or generated metadata; it is a representation, not a promise that every host object can be reconstructed from the text.",
+    "ct-runtime-get-source": "Looks up the source fragment for a named definition and returns the source text with its length. Use it for CT introspection or runtime metadata; an unknown or source-less word yields no source.",
+    "ct-set-grammar-rewrite-enabled": "Enables or disables a named grammar-stage rewrite. Use this to scope a rule to a particular compilation context, and re-enable it when that context ends.",
+    "ct-set-grammar-rewrite-priority": "Sets the priority for a named grammar-stage rewrite. Higher priorities are considered first; use ct-list-grammar-rewrites to inspect the resulting evaluation order.",
+    "ct-set-macro-expansion-limit": "Sets the maximum expansion-work budget used to stop runaway macro and rewrite expansion. Choose a finite limit appropriate to the source; this is a safety bound, not a per-macro iteration count.",
+    "ct-set-macro-preview": "Enables or disables macro-expansion preview recording. Turn it on before an expansion you want to inspect, then read the preview with ct-get-macro-preview.",
+    "ct-set-reader-rewrite-enabled": "Enables or disables a named reader-stage rewrite without removing its registration. Use this for temporary language modes where the rule should remain available for later reuse.",
+    "ct-set-reader-rewrite-priority": "Sets the priority of a named reader-stage rewrite. Use explicit priorities to make overlapping reader rules deterministic and inspect the final order with ct-list-reader-rewrites.",
+    "event-emit": "Publishes an event name and a CT map (or nil payload) to the current synchronous compile-time event bus. Subscribers run during this call, so handler side effects and exceptions occur before event-emit returns.",
+    "event-object-create": "Creates a mutable event record with its event/type/name fields, timestamp, and an initially empty payload map. Add fields with event-object-prop-append, then dispatch the record with event-object-emit.",
+    "event-object-emit": "Publishes an event record created or modified with the event-object helpers. Subscribers receive that record synchronously; if no event bus is attached the operation reports failure.",
+    "event-object-prop-append": "Stores a value in an event record's payload and returns the same record for chaining. Reserved keys such as type, event, name, timestamp_ns, and location also update the corresponding top-level event field.",
+    "event-object-prop-get": "Looks up a property on an event record, returning the record, value (or nil), and a found flag. The event record remains on the stack so successive property reads can be chained.",
+    "event-subscribe": "Registers a callback word for an event-name pattern and returns a subscription handle. A named CT word receives the event map on its stack; dispatch is synchronous and handler errors propagate to the publisher.",
+    "event-unsubscribe": "Removes an event subscription by the handle returned from event-subscribe and returns whether it was removed. Keep the handle if a subscription should be temporary.",
+    "get-event-name": "Reads the event's name field and returns the event record followed by that name. Use it inside a named event callback, where the event map is supplied on the stack.",
+    "get-event-payload": "Reads the payload map from an event record and returns the record plus that map. Use it in a subscribed CT callback to inspect event-specific fields.",
+    "get-event-timestamp": "Reads the event's timestamp_ns field and returns the event record plus the integer timestamp. The timestamp is metadata for ordering/diagnostics, not a source location.",
+    "get-event-type": "Reads the type field from an event record and returns the record plus the type string. Use it in a shared callback that handles more than one event pattern.",
+    "set-token-hook": "Sets the active compile-time token-hook word by name. The hook is consulted as tokens are processed; define the hook before installing it and use clear-token-hook to stop applying it.",
+    "use-l2-ct": "Marks the following definition for execution by the L2 CT VM rather than the alternate CT implementation. Use it when a metaprogram depends on L2 stack semantics or compiler CT built-ins.",
+    "ct-call": "Calls a named CT word from a macro template with the current capture context and splices the returned token sequence into the expansion. Define the CT word before the macro is expanded and return tokens/lexemes in the form expected by the template.",
+    "ct-if": "Evaluates a template condition and expands only the selected then/else branch. Use it when a macro's emitted token structure depends on a capture or compile-time predicate.",
+    "ct-when": "Expands its body only when its template condition is true. It is the single-branch form of ct-if; use ct-if when a false branch must emit alternate tokens.",
+    "ct-unless": "Expands its body only when its template condition is false. Use it for an optional clause that should be omitted when its capture/condition is present.",
+    "ct-for": "Iterates the named capture's values and expands the body once per item, substituting the loop variable each time. Use it for explicit capture traversal when separators or per-item logic are needed.",
+    "ct-each": "Iterates a capture with the template's compact each binding, including index/value mode where requested. Use it for straightforward repeated expansion; choose ct-for when the body needs more control.",
+    "ct-let": "Evaluates a template expression and binds its result to a local template name for the nested body. Use it to avoid repeating a computed capture or token sequence.",
+    "ct-fn": "Defines a helper local to a macro template; invoke it with ct-call from that template. Use it to share template logic without registering a global CT word.",
+    "ct-switch": "Starts a multi-branch template selector over a compile-time expression. Pair it with ct-case and optionally ct-default; use ct-match for the compact expression-style form.",
+    "ct-case": "Declares one matching branch inside ct-switch or ct-match. Its body is expanded only when the selector matches the case value.",
+    "ct-default": "Declares the fallback branch of ct-switch or ct-match. It runs only when no earlier case matches and should appear at most once per selector.",
+    "ct-match": "Selects a template branch from an expression using ct-case/ct-default clauses. Use it when the choice is a direct match rather than a sequence of independent conditions.",
+    "ct-fold": "Reduces a capture sequence by carrying an accumulator through each item and the fold body. Supply an initial accumulator and use the bound accumulator/item names to compute the next value.",
+    "ct-break": "Stops the innermost active ct-for/ct-each iteration immediately. Use it after a match when later captured items must not contribute.",
+    "ct-continue": "Skips the remainder of the current ct-for/ct-each iteration and advances to the next item. Put it inside a conditional when some captures should be ignored.",
+    "ct-include": "Loads another template fragment from the named file during macro expansion. Use it to share template text; the path is resolved by the compiler's include rules.",
+    "ct-import": "Imports a macro/template pack during template expansion so its definitions are available to the current expansion. Use ordinary source imports when definitions must also participate in the surrounding compilation.",
+    "ct-comment": "Begins a template comment region whose contents are discarded from expansion. Close it with ct-endcomment; nested comment regions are supported.",
+    "ct-endcomment": "Closes the current ct-comment region. It is a structural delimiter, not an emitted token or a standalone comment.",
+    "ct-strict": "Switches the current template to strict expansion checks. Use it when unknown or invalid template constructs should fail rather than be silently passed through.",
+    "ct-permissive": "Switches the current template to permissive expansion behavior. Use it for deliberate token passthrough; strict mode is safer when template typos must be caught.",
+    "ct-version": "Attaches a version marker to a macro template for introspection and tooling. Read it later with ct-get-macro-template-version; it does not select a compiler version.",
+    "ct-error": "Aborts the current macro expansion with the supplied diagnostic message. Use it when a compile-time precondition fails and continuing would emit invalid tokens.",
+    "ct-warning": "Emits a non-fatal diagnostic from a macro template and continues expansion. Use it to flag suspicious usage while preserving compilation.",
+    "ct-note": "Emits an informational diagnostic from a macro template without stopping expansion. Use it for actionable compile-time notices rather than errors.",
+    "emit-list": "Emits a captured list of tokens from a template into the expansion. Use it to splice an already-built token list without treating it as a single value.",
+    "ct-emit-list": "Emits a captured list explicitly through the CT template path. Use it when the list was produced by compile-time logic and must be expanded as a sequence of tokens.",
+    "emit-block": "Emits the enclosed template block as a token sequence. Use it when a macro needs to capture a syntactic block and output that block later.",
+    "ct-emit-block": "Emits the enclosed block after CT template processing. Use it for blocks assembled or selected by compile-time logic rather than literal passthrough.",
+})
+
 
 def _compose_overview(
     word_name: str,
@@ -6524,24 +6803,15 @@ def _compose_overview(
 ) -> str:
     override = _OVERVIEW_OVERRIDES.get(word_name)
     if override is not None:
+        if len(override) < 105:
+            return f"{override} {_usage_guidance_for_word(word_name, category)}"
         return override
     semantic = _semantic_overview_from_name(word_name, category, stack_effect)
     text = raw_description.strip()
     if text:
         rendered = text if text.endswith(".") else text + "."
-        if len(rendered) < 40:
-            if semantic:
-                rendered += f" {semantic}"
-            elif stack_effect:
-                rendered += (
-                    f" In typical {category.lower()} workflows it is used with the "
-                    f"stack contract {stack_effect}."
-                )
-            else:
-                rendered += (
-                    f" It is commonly used in {category.lower()} compile-time flows "
-                    "for explicit parser/VM state transitions."
-                )
+        if len(rendered) < 105:
+            rendered += f" {_usage_guidance_for_word(word_name, category)}"
         return rendered
     if semantic:
         return semantic
@@ -6716,254 +6986,299 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "ct-lang-remove": '"demo.lang" ct-lang-remove drop',
 }
 
+_EXAMPLE_OVERRIDES.update({
+    "ct-capture-clone": 'list-new "node" list-append ct-capture-clone list-length puti cr',
+    "ct-capture-equal?": 'list-new "x" list-append list-new "x" list-append ct-capture-equal? static_assert',
+    "ct-capture-freeze": '"sum" "left" ct-capture-freeze',
+    "ct-capture-join": 'list-new "red" list-append "blue" list-append ", " ct-capture-join puts',
+    "ct-capture-lifetime-assert": 'ctx ct-capture-lifetime-assert',
+    "ct-capture-mutable?": '"sum" "left" ct-capture-mutable? static_assert',
+    "ct-capture-normalize": 'list-new "x" list-append ct-capture-normalize list-length puti cr',
+    "ct-capture-pretty": 'map-new "count" 2 map-set ct-capture-pretty puts',
+    "ct-capture-replay-log": "ct-capture-replay-log list-length puti cr",
+    "ct-capture-schema-put": '"sum" "left" "single" "int" 1 ct-capture-schema-put',
+    "ct-capture-taint-set": '"sum" "left" 1 ct-capture-taint-set',
+    "ct-capture-thaw": '"sum" "left" ct-capture-thaw static_assert',
+    "ct-clear-grammar-rewrites": "ct-clear-grammar-rewrites puti cr",
+    "ct-clear-reader-rewrites": "ct-clear-reader-rewrites puti cr",
+    "ct-clone-macro": '"sum" "sum_copy" ct-clone-macro static_assert',
+    "ct-control-depth": "ct-control-depth puti cr",
+    "ct-control-get": '"if" ct-control-frame-new dup "false" "L_false" ct-control-set drop "false" ct-control-get puts',
+    "ct-control-peek": '"if" ct-control-frame-new ct-control-push ct-control-peek ct-control-pop drop',
+    "ct-control-pop": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
+    "ct-control-push": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
+    "ct-control-set": '"if" ct-control-frame-new "false" "L_false" ct-control-set drop',
+    "ct-current-token": "ct-current-token token-lexeme puts",
+    "ct-error-define": '"word recovered 42 end" ct-error-define drop',
+    "ct-error-get-retry-limit": "ct-error-get-retry-limit puti cr",
+    "ct-error-jump": "1 ct-error-jump",
+    "ct-error-restore-point": "1 ct-error-restore-point map-length puti cr",
+    "ct-error-restore-points": "ct-error-restore-points list-length puti cr",
+    "ct-error-resume": "ct-error-resume drop",
+    "ct-error-set-retry-limit": "3 ct-error-set-retry-limit drop",
+    "ct-get-ct-call-memo-size": "ct-get-ct-call-memo-size puti cr",
+    "ct-get-ct-call-recursion-limit": "ct-get-ct-call-recursion-limit puti cr",
+    "ct-get-ct-call-side-effect-log": "ct-get-ct-call-side-effect-log list-length puti cr",
+    "ct-get-macro-expansion": '"twice" ct-get-macro-expansion drop drop',
+    "ct-get-macro-signature": '"twice" ct-get-macro-signature drop drop drop',
+    "ct-get-macro-template-mode": '"twice" ct-get-macro-template-mode swap drop puts',
+    "ct-get-macro-template-program-size": '"twice" ct-get-macro-template-program-size swap drop puti cr',
+    "ct-get-macro-template-version": '"twice" ct-get-macro-template-version swap drop puts',
+    "ct-get-rewrite-max-steps": "ct-get-rewrite-max-steps puti cr",
+    "ct-get-rewrite-profile": "ct-get-rewrite-profile map-length puti cr",
+    "ct-get-rewrite-saturation": "ct-get-rewrite-saturation puts",
+    "ct-get-rewrite-trace-log": "ct-get-rewrite-trace-log list-length puti cr",
+    "ct-get-word-asm": '"puti" ct-get-word-asm puts',
+    "ct-get-word-body": '"puti" ct-get-word-body list-length puti cr',
+    "ct-last-token-line": "ct-last-token-line puti cr",
+    "ct-list-active-pattern-groups": "ct-list-active-pattern-groups list-length puti cr",
+    "ct-list-grammar-rewrites": "ct-list-grammar-rewrites list-length puti cr",
+    "ct-list-reader-rewrites": "ct-list-reader-rewrites list-length puti cr",
+    "ct-list-words": "ct-list-words list-length puti cr",
+    "ct-list-words-prefix": '"ct-" ct-list-words-prefix list-length puti cr',
+    "ct-new-label": '"loop_done" ct-new-label puts',
+    "ct-parser-checkpoint": "ct-parser-checkpoint map-length puti cr",
+    "ct-parser-pos": "ct-parser-pos puti cr",
+    "ct-parser-remaining": "ct-parser-remaining puti cr",
+    "ct-parser-tail": "ct-parser-tail list-length puti cr",
+    "ct-predef-all": "ct-predef-all",
+    "ct-rename-macro": '"sum" "sum_v2" ct-rename-macro static_assert',
+    "ct-repr": 'list-new "token" list-append ct-repr puts',
+    "ct-rewrite-txn-begin": "ct-rewrite-txn-begin puti cr",
+    "ct-runtime-get-source": '"main" ct-runtime-get-source swap drop puts',
+    "ct-set-ct-call-memo": "1 ct-set-ct-call-memo",
+    "ct-set-ct-call-side-effects": "1 ct-set-ct-call-side-effects",
+    "ct-set-macro-expansion": '"sum" list-new "42" list-append ct-set-macro-expansion static_assert',
+    "ct-set-macro-preview": "1 ct-set-macro-preview",
+    "ct-unregister-pattern-macro": '"old_rule" ct-unregister-pattern-macro static_assert',
+    "ct-unregister-word": '"temporary_word" ct-unregister-word static_assert',
+    "ct-word-exists?": '"main" ct-word-exists? static_assert',
+    "ct-word-is-pattern-macro": '"sum" ct-word-is-pattern-macro static_assert',
+    "ct-word-is-text-macro": '"sum" ct-word-is-text-macro static_assert',
+    "event-emit": '"build.note" map-new event-emit static_assert',
+    "event-object-create": '"build.note" event-object-create get-event-type puts drop',
+    "event-object-emit": '"build.note" event-object-create event-object-emit static_assert',
+    "event-object-prop-append": '"build.note" event-object-create "source" "generator" event-object-prop-append drop',
+    "event-object-prop-get": '"build.note" event-object-create "source" "generator" event-object-prop-append "source" event-object-prop-get drop swap drop puts',
+    "event-subscribe": 'word on_build get-event-type puts end "build.begin" "on_build" event-subscribe drop',
+    "event-unsubscribe": 'word on_build get-event-type puts end "build.begin" "on_build" event-subscribe event-unsubscribe static_assert',
+    "get-event-name": '"build.note" event-object-create get-event-name puts drop',
+    "get-event-payload": '"build.note" event-object-create get-event-payload map-length puti cr drop',
+    "get-event-timestamp": '"build.note" event-object-create get-event-timestamp puti cr drop',
+    "get-event-type": '"build.note" event-object-create get-event-type puts drop',
+    "identifier?": '"valid_name2" identifier? static_assert',
+    "inject-tokens": 'list-new "temporary_word" list-append inject-tokens',
+    "int>string": "42 int>string puts",
+    "list-append": 'list-new "first" list-append "second" list-append list-length puti cr',
+    "list-clear": 'list-new "temporary" list-append list-clear list-empty? static_assert',
+    "list-clone": 'list-new "kept" list-append list-clone list-length puti cr',
+    "list-contains?": 'list-new "red" list-append "red" list-contains? static_assert',
+    "list-empty?": "list-new list-empty? static_assert",
+    "list-extend": 'list-new "left" list-append list-new "right" list-append list-extend list-length puti cr',
+    "list-find": 'list-new "red" list-append "blue" list-append "blue" list-find dup static_assert drop puti cr',
+    "list-get": 'list-new "first" list-append "second" list-append 1 list-get puts',
+    "list-insert": 'list-new "a" list-append "c" list-append 1 "b" list-insert list-length puti cr',
+    "list-join": 'list-new "red" list-append "blue" list-append ", " list-join puts',
+    "list-last": 'list-new "first" list-append "last" list-append list-last puts',
+    "list-peek-front": 'list-new "first" list-append "last" list-append list-peek-front swap drop puts',
+    "list-pop": 'list-new "first" list-append "last" list-append list-pop swap drop puts',
+    "list-pop-front": 'list-new "first" list-append "last" list-append list-pop-front swap drop puts',
+    "list-push-front": 'list-new "last" list-append "first" list-push-front list-length puti cr',
+    "list-remove": 'list-new "keep" list-append "remove" list-append 1 list-remove swap drop puts',
+    "list-reverse": 'list-new "first" list-append "last" list-append list-reverse list-get 0 puts',
+    "list-set": 'list-new "old" list-append 0 "new" list-set 0 list-get puts',
+    "list-slice": 'list-new "a" list-append "b" list-append "c" list-append 1 3 list-slice list-length puti cr',
+    "map-clear": 'map-new "temporary" 1 map-set map-clear map-empty? static_assert',
+    "map-clone": 'map-new "name" "L2" map-set map-clone map-length puti cr',
+    "map-delete": 'map-new "temporary" 1 map-set "temporary" map-delete swap drop static_assert',
+    "map-empty?": "map-new map-empty? static_assert",
+    "map-get": 'map-new "name" "L2" map-set "name" map-get drop swap drop puts',
+    "map-has?": 'map-new "name" "L2" map-set "name" map-has? swap drop static_assert',
+    "map-keys": 'map-new "name" "L2" map-set map-keys list-length puti cr',
+    "map-length": 'map-new "name" "L2" map-set map-length puti cr',
+    "map-set": 'map-new "name" "L2" map-set "name" map-get drop swap drop puts',
+    "map-update": 'map-new "left" 1 map-set map-new "right" 2 map-set map-update map-length puti cr',
+    "map-values": 'map-new "name" "L2" map-set map-values list-length puti cr',
+    "nil": "nil nil? static_assert",
+    "nil?": "nil nil? static_assert",
+    "string-append": '"compile" "-" string-append puts',
+    "string-contains?": '"compile-time" "time" string-contains? static_assert',
+    "string-ends-with?": '"compile-time" "time" string-ends-with? static_assert',
+    "string-join": 'list-new "reader" list-append "parser" list-append " -> " string-join puts',
+    "string-length": '"compile-time" string-length puti cr',
+    "string-lower": '"CT-VM" string-lower puts',
+    "string-replace": '"red,red" "," ";" string-replace puts',
+    "string-split": '"reader,parser,emitter" "," string-split list-length puti cr',
+    "string-starts-with?": '"compile-time" "compile" string-starts-with? static_assert',
+    "string-upper": '"compile-time" string-upper puts',
+    "string=": '"same" "same" string= static_assert',
+    "string>number": '"0x2a" string>number drop 42 == static_assert',
+    "token-from-lexeme": 'peek-token "generated_name" token-from-lexeme token-lexeme puts',
+    "token-lexeme": "peek-token token-lexeme puts",
+})
 
-_EXAMPLE_VARIANT_OVERRIDES: Dict[str, List[str]] = {
-    "add-token": ['"@" add-token'],
-    "add-token-chars": ['",;" add-token-chars'],
-    "ct-capture-args": ["ctx ct-capture-args map-length 0 >= static_assert"],
-    "ct-capture-locals": ["ctx ct-capture-locals map-length 0 >= static_assert"],
-    "ct-capture-globals": ["ctx ct-capture-globals map-length 0 >= static_assert"],
-    "ct-capture-origin": ["ctx ct-capture-origin map-length 0 >= static_assert"],
-    "ct-capture-get": ['ctx "x" ct-capture-get swap drop drop'],
-    "ct-capture-has?": ['ctx "x" ct-capture-has? static_assert'],
-    "ct-capture-lifetime": ["ctx ct-capture-lifetime 0 >= static_assert"],
-    "ct-capture-lifetime-live?": ["ctx ct-capture-lifetime-live? static_assert"],
-    "ct-capture-lifetime-assert": ["ctx ct-capture-lifetime-assert"],
-    "ct-capture-lint": ["ctx ct-capture-lint list-length 0 >= static_assert"],
-    "ct-capture-schema-validate": ["ctx ct-capture-schema-validate static_assert"],
-    "ct-capture-tainted?": ['ctx "x" ct-capture-tainted?'],
-    "ct-control-push": ['"if" ct-control-frame-new dup ct-control-push ct-control-pop drop'],
-    "ct-control-set": ['"if" ct-control-frame-new "end" "if_end" ct-new-label ct-control-set drop'],
-    "ct-emit-op": ['"jump" "L1" ct-emit-op'],
-    "ct-ctrand-seed": ["12345 ct-ctrand-seed 10 ct-ctrand-int drop"],
-    "ct-import-rewrite-pack": ["ct-export-rewrite-pack ct-import-rewrite-pack drop"],
-    "ct-import-rewrite-pack-replace": ["ct-export-rewrite-pack ct-import-rewrite-pack-replace drop"],
-}
+_EXAMPLE_OVERRIDES.update({
+    "ct-capture-lifetime-assert": "ctx ct-capture-lifetime-assert",
+    "ct-clear-grammar-rewrites": "ct-clear-grammar-rewrites puti cr",
+    "ct-clear-reader-rewrites": "ct-clear-reader-rewrites puti cr",
+    "ct-control-depth": "ct-control-depth puti cr",
+    "ct-emit-op": '"literal" 42 ct-emit-op',
+    "ct-get-ct-call-memo-size": "ct-get-ct-call-memo-size puti cr",
+    "ct-get-ct-call-recursion-limit": "ct-get-ct-call-recursion-limit puti cr",
+    "ct-get-macro-expansion-limit": "ct-get-macro-expansion-limit puti cr",
+    "ct-get-rewrite-max-steps": "ct-get-rewrite-max-steps puti cr",
+    "ct-get-rewrite-saturation": "ct-get-rewrite-saturation puts",
+    "ct-last-token-line": "ct-last-token-line puti cr",
+    "ct-parser-pos": "ct-parser-pos puti cr",
+    "ct-parser-remaining": "ct-parser-remaining puti cr",
+    "ct-predef-all": "ct-predef-all",
+    "ct-set-ct-call-memo": "1 ct-set-ct-call-memo",
+    "ct-set-ct-call-side-effects": "1 ct-set-ct-call-side-effects",
+    "ct-set-macro-preview": "1 ct-set-macro-preview",
+    "list-length": 'list-new "first" list-append "second" list-append list-length puti cr',
+    "next-token": "next-token token-lexeme puts",
+    "peek-token": "peek-token token-lexeme puts",
+    "string-strip": '"  compile-time  " string-strip puts',
+    "token-column": "peek-token token-column puti cr",
+    "token-line": "peek-token token-line puti cr",
+})
 
+_EXAMPLE_OVERRIDES.update({
+    "ct-capture-mutable?": '"sum" "left" ct-capture-freeze "sum" "left" ct-capture-mutable? 0 == static_assert',
+    "ct-capture-thaw": '"sum" "left" ct-capture-freeze "sum" "left" ct-capture-thaw static_assert',
+    "ct-error-define": '"word recovered 42 end" ct-error-define drop get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
+    "ct-error-jump": 'get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
+    "ct-error-restore-point": 'get-event-payload "restore_point_id" map-get drop ct-error-restore-point map-length puti cr',
+    "ct-error-resume": 'get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
+    "ct-get-macro-expansion": 'macro twice (x) $x $x ; "twice" ct-get-macro-expansion drop list-length puti cr',
+    "ct-get-macro-signature": 'macro twice (x) $x $x ; "twice" ct-get-macro-signature drop drop list-length puti cr',
+    "ct-get-macro-template-mode": 'macro twice (x) $x $x ; "twice" ct-get-macro-template-mode drop puts',
+    "ct-get-macro-template-program-size": 'macro twice (x) $x $x ; "twice" ct-get-macro-template-program-size drop puti cr',
+    "ct-get-macro-template-version": 'macro versioned (x) ct-version "1.0" $x ; "versioned" ct-get-macro-template-version drop puts',
+    "ct-get-word-asm": ':asm example_asm { nop }; "example_asm" ct-get-word-asm puts',
+    "ct-get-word-body": 'word example_word 1 2 + end "example_word" ct-get-word-body list-length puti cr',
+    "ct-runtime-get-source": 'word source_demo 42 end "source_demo" ct-runtime-get-source drop puts',
+    "ct-word-exists?": '"puti" ct-word-exists? static_assert',
+    "ct-word-is-pattern-macro": '"not_a_pattern_macro" ct-word-is-pattern-macro 0 == static_assert',
+    "ct-word-is-text-macro": '"not_a_text_macro" ct-word-is-text-macro 0 == static_assert',
+    "ct-unregister-pattern-macro": '"old_rule" ct-unregister-pattern-macro drop',
+    "ct-unregister-word": '"temporary_word" ct-unregister-word drop',
+    "ct-control-peek": '"if" ct-control-frame-new ct-control-push ct-control-peek drop ct-control-pop drop',
+    "ct-control-pop": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
+    "event-object-prop-get": '"build.note" event-object-create "source" "generator" event-object-prop-append "source" event-object-prop-get drop swap drop puts',
+    "list-reverse": 'list-new "first" list-append "last" list-append list-reverse 0 list-get puts',
+})
 
-_STACK_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_?.:+\-*/<>=!&]*")
+_EXAMPLE_OVERRIDES.update({
+    "ct-lang-create": '"demo.lang" ct-lang-create static_assert',
+    "ct-lang-list": '"demo.lang" ct-lang-create drop ct-lang-list list-length puti cr',
+    "ct-lang-active-list": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop ct-lang-active-list list-length puti cr',
+    "ct-lang-run-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-run-validators puti cr',
+    "ct-lang-run-active-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-activate drop ct-lang-run-active-validators puti cr',
+    "ct-lang-set-token-hook": 'word demo_hook end "demo.lang" ct-lang-create drop "demo.lang" "demo_hook" ct-lang-set-token-hook drop',
+    "ct-get-reader-rewrite-enabled": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" ct-get-reader-rewrite-enabled drop static_assert',
+    "ct-get-reader-rewrite-priority": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" ct-get-reader-rewrite-priority drop puti cr',
+    "ct-set-reader-rewrite-enabled": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" 0 ct-set-reader-rewrite-enabled static_assert',
+    "ct-set-reader-rewrite-priority": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" 50 ct-set-reader-rewrite-priority static_assert',
+    "ct-lang-activate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate static_assert',
+    "ct-lang-active?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-active? static_assert',
+    "ct-lang-add-grammar-rewrite-named": '"demo.lang" ct-lang-create drop "demo.lang" "g" list-new "kw" list-append list-new "42" list-append ct-lang-add-grammar-rewrite-named drop',
+    "ct-lang-add-reader-rewrite-named": '"demo.lang" ct-lang-create drop "demo.lang" "r" list-new "kw" list-append list-new "42" list-append ct-lang-add-reader-rewrite-named drop',
+    "ct-lang-add-validator": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator puti cr',
+    "ct-lang-deactivate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-deactivate static_assert',
+    "ct-lang-exists?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-exists? static_assert',
+    "ct-lang-get-auto-validate": '"demo.lang" ct-lang-create drop "demo.lang" 1 ct-lang-set-auto-validate drop "demo.lang" ct-lang-get-auto-validate drop static_assert',
+    "ct-lang-meta-get": '"demo.lang" ct-lang-create drop "demo.lang" map-new "version" "1" map-set ct-lang-meta-set drop "demo.lang" ct-lang-meta-get drop "version" map-get drop swap drop puts',
+    "ct-lang-meta-set": '"demo.lang" ct-lang-create drop "demo.lang" map-new "version" "1" map-set ct-lang-meta-set static_assert',
+    "ct-lang-register-pattern-macro": '"demo.lang" ct-lang-create drop "demo.lang" "pm" list-new list-new list-new "kw" list-append list-append list-new "42" list-append list-append list-append ct-lang-register-pattern-macro drop',
+    "ct-lang-register-text-macro-signature": '"demo.lang" ct-lang-create drop "demo.lang" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
+    "ct-lang-remove": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-remove static_assert',
+    "ct-lang-run-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-run-validators puti cr',
+    "ct-lang-set-auto-validate": '"demo.lang" ct-lang-create drop "demo.lang" 1 ct-lang-set-auto-validate static_assert',
+    "ct-lang-set-token-hook": 'word demo_hook end "demo.lang" ct-lang-create drop "demo.lang" "demo_hook" ct-lang-set-token-hook drop',
+    "ct-lang-status": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-status drop map-length puti cr',
+})
 
+_PATTERN_MACRO_EXAMPLE_SETUP = (
+    '"pm_rule" list-new list-new list-new "x" list-append list-append '
+    'list-new "1" list-append list-append list-append ct-register-pattern-macro'
+)
+_READER_REWRITE_EXAMPLE_SETUP = (
+    '"rule_kw" list-new "kw" list-append list-new "42" list-append '
+    'ct-add-reader-rewrite-named drop'
+)
+_GRAMMAR_REWRITE_EXAMPLE_SETUP = (
+    '"rule_kw" list-new "kw" list-append list-new "42" list-append '
+    'ct-add-grammar-rewrite-named drop'
+)
+_TEXT_MACRO_EXAMPLE_SETUP = "macro twice (x) $x $x ;"
 
-def _stack_input_items(stack_effect: str) -> List[str]:
-    effect = stack_effect.strip()
-    if not effect:
-        return []
-    left = effect.split("->", 1)[0].strip()
-    match = re.search(r"\[(.*?)\]", left)
-    if match is None:
-        return []
-    inner = match.group(1).strip()
-    if "|" in inner:
-        left_part, right_part = inner.split("|", 1)
-        tokens = [
-            tok
-            for tok in (_STACK_TOKEN_RE.findall(left_part) + _STACK_TOKEN_RE.findall(right_part))
-            if tok != "*"
-        ]
-    else:
-        tokens = [tok for tok in _STACK_TOKEN_RE.findall(inner) if tok != "*"]
-    normalized = [tok.lower() for tok in tokens]
-    if normalized and all(tok in {"immediate", "runtime", "compile", "time"} for tok in normalized):
-        return []
-    return tokens
+_EXAMPLE_OVERRIDES.update({
+    "ct-get-grammar-rewrite-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-get-grammar-rewrite-enabled drop static_assert',
+    "ct-get-grammar-rewrite-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-get-grammar-rewrite-priority drop puti cr',
+    "ct-set-grammar-rewrite-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" 0 ct-set-grammar-rewrite-enabled static_assert',
+    "ct-set-grammar-rewrite-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" 50 ct-set-grammar-rewrite-priority static_assert',
+    "ct-get-pattern-macro-clause-details": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-clause-details drop list-length puti cr',
+    "ct-get-pattern-macro-clauses": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-clauses drop list-length puti cr',
+    "ct-get-pattern-macro-enabled": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-enabled drop static_assert',
+    "ct-get-pattern-macro-group": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group drop "pm_rule" ct-get-pattern-macro-group drop puts',
+    "ct-get-pattern-macro-priority": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 10 ct-set-pattern-macro-priority drop "pm_rule" ct-get-pattern-macro-priority drop puti cr',
+    "ct-get-pattern-macro-scope": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope drop "pm_rule" ct-get-pattern-macro-scope drop puts',
+    "ct-set-pattern-group-active": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group drop "arith" 1 ct-set-pattern-group-active static_assert',
+    "ct-set-pattern-macro-clause-guard": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 0 "guard_nonzero" ct-set-pattern-macro-clause-guard static_assert',
+    "ct-set-pattern-macro-enabled": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 0 ct-set-pattern-macro-enabled static_assert',
+    "ct-set-pattern-macro-group": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group static_assert',
+    "ct-set-pattern-macro-priority": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 10 ct-set-pattern-macro-priority static_assert',
+    "ct-set-pattern-macro-scope": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope static_assert',
+    "ct-set-pattern-scope-active": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope drop "expressions" 1 ct-set-pattern-scope-active static_assert',
+    "ct-detect-pattern-conflicts-named": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-detect-pattern-conflicts-named list-length puti cr',
+    "ct-detect-pattern-conflicts": f'{_PATTERN_MACRO_EXAMPLE_SETUP} ct-detect-pattern-conflicts list-length puti cr',
+    "ct-list-pattern-macros": f'{_PATTERN_MACRO_EXAMPLE_SETUP} ct-list-pattern-macros list-length puti cr',
+    "ct-register-pattern-macro": _PATTERN_MACRO_EXAMPLE_SETUP,
+    "ct-unregister-pattern-macro": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-unregister-pattern-macro static_assert',
+    "ct-get-rewrite-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" "optimized" ct-set-rewrite-pipeline drop "grammar" "rule_kw" ct-get-rewrite-pipeline drop puts',
+    "ct-get-rewrite-provenance": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" ct-get-rewrite-provenance drop map-length puti cr',
+    "ct-get-rewrite-specificity": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" ct-get-rewrite-specificity drop puti cr',
+    "ct-list-rewrite-active-pipelines": '"grammar" "default" 1 ct-set-rewrite-pipeline-active ct-list-rewrite-active-pipelines list-length puti cr',
+    "ct-set-rewrite-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" "optimized" ct-set-rewrite-pipeline static_assert',
+    "ct-set-rewrite-pipeline-active": '"grammar" "default" 1 ct-set-rewrite-pipeline-active ct-list-rewrite-active-pipelines list-length puti cr',
+})
 
+_EXAMPLE_OVERRIDES.update({
+    "ct-capture-global-clear": '"scratch" list-new "x" list-append ct-capture-global-set ct-capture-global-clear 0 > static_assert',
+    "ct-capture-global-delete": '"scratch" list-new "x" list-append ct-capture-global-set "scratch" ct-capture-global-delete static_assert',
+    "ct-capture-global-get": '"scratch" list-new "x" list-append ct-capture-global-set "scratch" ct-capture-global-get drop list-length puti cr',
+    "ct-capture-schema-get": '"sum" "left" "single" "int" 1 ct-capture-schema-put "sum" ct-capture-schema-get drop map-length puti cr',
+    "ct-capture-taint-get": '"sum" "left" 1 ct-capture-taint-set "sum" "left" ct-capture-taint-get drop static_assert',
+    "ct-clone-macro": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "twice_copy" ct-clone-macro static_assert',
+    "ct-rename-macro": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "twice_v2" ct-rename-macro static_assert',
+    "ct-set-macro-expansion": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" list-new "42" list-append ct-set-macro-expansion static_assert',
+    "ct-macro-doc-get": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "Duplicates its argument." ct-macro-doc-set drop "twice" ct-macro-doc-get drop puts',
+    "ct-macro-doc-set": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "Duplicates its argument." ct-macro-doc-set static_assert',
+    "ct-macro-attrs-get": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" map-new "category" "arithmetic" map-set ct-macro-attrs-set drop "twice" ct-macro-attrs-get drop map-length puti cr',
+    "ct-macro-attrs-set": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" map-new "category" "arithmetic" map-set ct-macro-attrs-set static_assert',
+    "ct-register-text-macro": '"m" 1 list-new "42" list-append ct-register-text-macro',
+    "ct-register-text-macro-signature": '"identity" list-new "x" list-append list-new "$x" list-append ct-register-text-macro-signature',
+    "ct-set-ct-call-contract": 'word my_ct_word 42 end "my_ct_word" map-new "arg_kind" "map" map-set "result_kind" "scalar" map-set ct-set-ct-call-contract static_assert',
+    "ct-get-ct-call-contract": 'word my_ct_word 42 end "my_ct_word" map-new "arg_kind" "map" map-set ct-set-ct-call-contract drop "my_ct_word" ct-get-ct-call-contract drop map-length puti cr',
+})
 
-def _stack_output_items(stack_effect: str) -> List[str]:
-    effect = stack_effect.strip()
-    if not effect or "->" not in effect:
-        return []
-    right = effect.split("->", 1)[1].strip()
-    match = re.search(r"\[(.*?)\]", right)
-    if match is None:
-        return []
-    inner = match.group(1).strip()
-    if "|" in inner:
-        inner = inner.split("|", 1)[1].strip()
-    tokens = [tok for tok in _STACK_TOKEN_RE.findall(inner) if tok != "*"]
-    normalized = [tok.lower() for tok in tokens]
-    if normalized and all(tok in {"immediate", "runtime", "compile", "time"} for tok in normalized):
-        return []
-    return tokens
-
-
-def _placeholder_for_stack_item(item: str) -> str:
-    token = item.strip().lower()
-    if not token:
-        return "0"
-    if token in {"ctx", "context"}:
-        return "ctx"
-    if token in {"frame"}:
-        return '"if" ct-control-frame-new'
-    if token in {"op"}:
-        return '"jump"'
-    if token in {"data"}:
-        return '"L1"'
-    if token in {"macro", "macro_name"}:
-        return '"my_macro"'
-    if token in {"shape"}:
-        return '"single"'
-    if token in {"type", "ctype"}:
-        return '"int"'
-    if token in {"required"}:
-        return "1"
-    if token in {"key"}:
-        return '"key"'
-    if token in {"value"}:
-        return '"value"'
-    if token in {"list", "lists", "tokens", "words", "clauses", "groups", "scopes", "pipelines", "reports", "patches", "details", "allowlist", "expansion", "body"}:
-        return "list-new"
-    if "list" in token or "tokens" in token or "clauses" in token or token.endswith("s") and token not in {"ms"}:
-        return "list-new"
-    if token in {"map", "ctx", "frame", "pack", "schema", "attrs", "metadata", "provenance", "fixture", "contract"} or "map" in token:
-        return "map-new"
-    if token in {"name", "word", "stage", "pipeline", "group", "scope", "policy", "mode", "strategy", "prefix", "suffix", "key", "guard", "path", "json", "blob", "text", "str", "string", "label", "id"}:
-        return '"x"'
-    if "name" in token or "word" in token or "stage" in token or "scope" in token or "group" in token:
-        return '"x"'
-    if token in {"token", "tok", "template"} or "token" in token:
-        return "next-token"
-    if token in {"flag", "ok", "found", "enabled", "required"}:
-        return "1"
-    if "flag" in token or "enabled" in token:
-        return "1"
-    if token in {"n", "count", "idx", "index", "start", "end", "priority", "bound", "lo", "hi", "ms", "seed", "depth", "line", "column", "timeout"}:
-        return "1"
-    if token in {"left", "right", "a", "b", "x", "y", "item"}:
-        return "1"
-    return "0"
-
-
-def _alternate_placeholder_for_stack_item(item: str) -> str:
-    token = item.strip().lower()
-    if not token:
-        return "0"
-    if token in {"ctx", "context"}:
-        return "ctx"
-    if token in {"frame"}:
-        return '"while" ct-control-frame-new'
-    if token in {"op"}:
-        return '"label"'
-    if token in {"data"}:
-        return '"L2"'
-    if token in {"macro", "macro_name"}:
-        return '"other_macro"'
-    if token in {"shape"}:
-        return '"tokens"'
-    if token in {"type", "ctype"}:
-        return '"identifier"'
-    if token in {"required"}:
-        return "0"
-    if token in {"key"}:
-        return '"name"'
-    if token in {"value"}:
-        return '"other"'
-    if token in {"list", "lists", "tokens", "words", "clauses", "groups", "scopes", "pipelines", "reports", "details", "allowlist", "expansion", "body"}:
-        return 'list-new "alt" list-append'
-    if "list" in token or "tokens" in token or "clauses" in token or token.endswith("s") and token not in {"ms"}:
-        return 'list-new "alt" list-append'
-    if token in {"map", "ctx", "frame", "pack", "schema", "attrs", "metadata", "provenance", "fixture", "contract"} or "map" in token:
-        return 'map-new "k" 2 map-set'
-    if token in {"name", "word", "stage", "pipeline", "group", "scope", "policy", "mode", "strategy", "prefix", "suffix", "key", "guard", "path", "json", "blob", "text", "str", "string", "label", "id"}:
-        return '"alt"'
-    if "name" in token or "word" in token or "stage" in token or "scope" in token or "group" in token:
-        return '"alt"'
-    if token in {"token", "tok", "template"} or "token" in token:
-        return "peek-token"
-    if token in {"flag", "ok", "found", "enabled", "required"}:
-        return "0"
-    if "flag" in token or "enabled" in token:
-        return "0"
-    if token in {"n", "count", "idx", "index", "start", "end", "priority", "bound", "lo", "hi", "ms", "seed", "depth", "line", "column", "timeout"}:
-        return "2"
-    if token in {"left", "right", "a", "b", "x", "y", "item"}:
-        return "2"
-    return "1"
-
-
-def _consumer_for_stack_outputs(outputs: Sequence[str]) -> str:
-    lowered = [item.strip().lower() for item in outputs]
-    if any(tok in {"list", "lists", "tokens", "clauses", "groups"} or "list" in tok for tok in lowered):
-        return "list-length"
-    if any(tok in {"map", "maps", "attrs", "schema", "metadata"} or "map" in tok for tok in lowered):
-        return "map-length"
-    if any(tok in {"token", "tok", "lexeme"} or "token" in tok for tok in lowered):
-        return "token-lexeme"
-    if any(tok in {"flag", "ok", "found", "enabled", "required", "match", "hit"} or "flag" in tok for tok in lowered):
-        return 'if "ok" puts end'
-    if any(tok in {"name", "word", "label", "path", "text", "string", "json", "blob"} or "str" in tok for tok in lowered):
-        return "puts"
-    if any(tok in {"n", "count", "idx", "index", "start", "end", "line", "column", "priority"} for tok in lowered):
-        return "puti cr"
-    return "drop" if lowered else ""
-
-
-def _build_invocation_example(word_name: str, args: Sequence[str], consume: str) -> str:
-    if args:
-        base = f"{' '.join(args)} {word_name}"
-    else:
-        base = word_name
-    return f"{base} {consume}".strip()
-
-
-def _example_from_stack_signature(word_name: str, stack_effect: str) -> str:
-    args = [_placeholder_for_stack_item(item) for item in _stack_input_items(stack_effect)]
-    outputs = _stack_output_items(stack_effect)
-    consume = _consumer_for_stack_outputs(outputs)
-    return _build_invocation_example(word_name, args, consume)
-
-
-def _example_from_stack_signature_alt(word_name: str, stack_effect: str) -> str:
-    args = [_alternate_placeholder_for_stack_item(item) for item in _stack_input_items(stack_effect)]
-    outputs = _stack_output_items(stack_effect)
-    consume = _consumer_for_stack_outputs(outputs)
-    return _build_invocation_example(word_name, args, consume)
-
-
-def _example_has_flag_output(stack_effect: str) -> bool:
-    lowered = [item.strip().lower() for item in _stack_output_items(stack_effect)]
-    return any(
-        tok in {"flag", "ok", "found", "enabled", "required", "match", "hit"}
-        or "flag" in tok
-        for tok in lowered
-    )
-
-
-def _sanitize_demo_name(word_name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_]", "_", word_name)
-    safe = safe.strip("_")
-    if not safe:
-        safe = "word"
-    if safe[0].isdigit():
-        safe = f"w_{safe}"
-    return safe.lower()
+_EXAMPLE_OVERRIDES.update({
+    "ct-remove-reader-rewrite": f'{_READER_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-remove-reader-rewrite static_assert',
+    "ct-remove-grammar-rewrite": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-remove-grammar-rewrite static_assert',
+    "ct-list-reader-rewrites": f'{_READER_REWRITE_EXAMPLE_SETUP} ct-list-reader-rewrites list-length puti cr',
+    "ct-list-grammar-rewrites": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-list-grammar-rewrites list-length puti cr',
+    "ct-rewrite-dry-run": '"grammar" list-new "kw" list-append 64 ct-rewrite-dry-run swap drop list-length puti cr',
+    "ct-rewrite-generate-fixture": '"grammar" list-new "kw" list-append 64 ct-rewrite-generate-fixture map-length puti cr',
+    "ct-rewrite-run-on-list": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop list-length puti cr',
+})
 
 
 def _normalize_example_line(text: str) -> str:
     return " ".join(part.strip() for part in str(text).splitlines() if part.strip())
 
 
-def _compile_time_wrapped_example(word_name: str, invocation: str, suffix: str) -> str:
-    body = _normalize_example_line(invocation)
-    if "#" in body:
-        body = body.split("#", 1)[0].rstrip()
-    if not body:
-        body = word_name
-    demo_name = f"demo_{_sanitize_demo_name(word_name)}_{suffix}"
-    return f"word {demo_name} {body} end compile-time {demo_name}"
-
-
-def _append_unique_example(examples: List[str], seen: Set[str], candidate: str) -> None:
-    line = _normalize_example_line(candidate)
-    if not line:
-        return
-    key = line.lower()
-    if key in seen:
-        return
-    seen.add(key)
-    examples.append(line)
-
-
-def _example_for_word(word_name: str, stack_effect: str, category: str) -> str:
+def _curated_example_for_word(word_name: str) -> str:
     override = _EXAMPLE_OVERRIDES.get(word_name)
     if override is not None:
         return override
@@ -7155,87 +7470,14 @@ def _example_for_word(word_name: str, stack_effect: str, category: str) -> str:
             return "here"
         return "10 for i puti cr end"
 
-    # Final fallback still shows a concrete call with stack-shaped dummy values.
-    del category
-    return _example_from_stack_signature(word_name, stack_effect)
+    raise KeyError(f"no curated CT reference example for {word_name!r}")
 
 
-def _examples_for_word(word_name: str, stack_effect: str, category: str) -> List[str]:
-    if "..." in stack_effect:
-        override = _EXAMPLE_OVERRIDES.get(word_name)
-        return [override] if override is not None else []
-
-    primary = _example_for_word(word_name, stack_effect, category)
-    signature = _example_from_stack_signature(word_name, stack_effect)
-    signature_alt = _example_from_stack_signature_alt(word_name, stack_effect)
-    stack_inputs = _stack_input_items(stack_effect)
-    raw_signature = _build_invocation_example(
-        word_name,
-        [_placeholder_for_stack_item(item) for item in stack_inputs],
-        "",
-    )
-    raw_signature_alt = _build_invocation_example(
-        word_name,
-        [_alternate_placeholder_for_stack_item(item) for item in stack_inputs],
-        "",
-    )
-
-    primary_norm = _normalize_example_line(primary).lower()
-    signature_norm = _normalize_example_line(signature).lower()
-    signature_alt_norm = _normalize_example_line(signature_alt).lower()
-    raw_signature_norm = _normalize_example_line(raw_signature).lower()
-    raw_signature_alt_norm = _normalize_example_line(raw_signature_alt).lower()
-    has_curated_primary = bool(primary_norm) and primary_norm != signature_norm
-
-    out: List[str] = []
-    seen: Set[str] = set()
-    _append_unique_example(out, seen, primary)
-
-    for extra in _EXAMPLE_VARIANT_OVERRIDES.get(word_name, []):
-        _append_unique_example(out, seen, extra)
-
-    if has_curated_primary:
-        if len(stack_inputs) == 0:
-            _append_unique_example(out, seen, signature)
-            if signature_alt_norm != signature_norm:
-                _append_unique_example(out, seen, signature_alt)
-        if len(stack_inputs) >= 1:
-            _append_unique_example(out, seen, raw_signature)
-            if raw_signature_alt_norm != raw_signature_norm:
-                _append_unique_example(out, seen, raw_signature_alt)
-        if len(stack_inputs) >= 2:
-            _append_unique_example(out, seen, signature)
-            if signature_alt_norm != signature_norm:
-                _append_unique_example(out, seen, signature_alt)
-        _append_unique_example(out, seen, _compile_time_wrapped_example(word_name, primary, "ct"))
-    else:
-        if raw_signature_alt_norm != raw_signature_norm:
-            _append_unique_example(out, seen, raw_signature_alt)
-        if signature_alt_norm != signature_norm:
-            _append_unique_example(out, seen, signature_alt)
-        _append_unique_example(out, seen, _compile_time_wrapped_example(word_name, signature, "ct"))
-
-    if _example_has_flag_output(stack_effect):
-        existing_blob = " ".join(out).lower()
-        if "static_assert" not in existing_blob:
-            assert_example = _build_invocation_example(
-                word_name,
-                [_placeholder_for_stack_item(item) for item in stack_inputs],
-                "static_assert",
-            )
-            _append_unique_example(out, seen, assert_example)
-
-            assert_example_alt = _build_invocation_example(
-                word_name,
-                [_alternate_placeholder_for_stack_item(item) for item in stack_inputs],
-                "static_assert",
-            )
-            if _normalize_example_line(assert_example_alt).lower() != _normalize_example_line(assert_example).lower():
-                _append_unique_example(out, seen, assert_example_alt)
-
-    if not out:
-        out.append(word_name)
-    return out
+def _examples_for_word(word_name: str) -> List[str]:
+    example = _normalize_example_line(_curated_example_for_word(word_name))
+    if not example:
+        raise ValueError(f"curated CT reference example for {word_name!r} is empty")
+    return [example]
 
 
 def _format_examples_block(examples: Sequence[str]) -> str:
@@ -7320,7 +7562,7 @@ def build_ct_reference_entries(base_doc_text: str, ct_words: Sequence[Dict[str, 
             stack_effect=stack_effect,
             category=category,
         )
-        example_lines = _examples_for_word(name, stack_effect, category)
+        example_lines = _examples_for_word(name)
         example = _format_examples_block(example_lines)
         scope = _scope_for_word(meta)
         search_text = " ".join(

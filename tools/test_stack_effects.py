@@ -76,10 +76,15 @@ class StackEffectTests(unittest.TestCase):
         self.assertEqual(entries[0].name, "is-ready?")
         self.assertEqual(entries[0].stack_effect, "[* | value] -> [* | flag]")
 
-    def test_docs_does_not_count_variadic_arities_or_generate_fixed_example(self) -> None:
+    def test_docs_does_not_count_variadic_arities(self) -> None:
         effect = "[*, item0 ... itemN | count] -> [* | result]"
         self.assertEqual(docs._parse_stack_effect_counts(effect), (-1, 1))
-        self.assertEqual(docs._examples_for_word("map", effect, "word"), [])
+
+    def test_ct_reference_uses_curated_example_by_word_name(self) -> None:
+        self.assertEqual(
+            docs._examples_for_word("map-new"),
+            ['map-new "key" 42 map-set'],
+        )
 
     def test_fn_library_uses_only_documented_comment_format(self) -> None:
         source = (ROOT / "libs/fn.sl").read_text(encoding="utf-8")

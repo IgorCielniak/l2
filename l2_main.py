@@ -22133,11 +22133,6 @@ class BuildCache:
             shutil.rmtree(self.cache_dir)
 
 
-_nasm_path: str = ""
-_linker_path: str = ""
-_linker_is_lld: bool = False
-
-
 def _which_exec(name: str) -> Optional[str]:
     """Lightweight executable lookup without importing shutil."""
     if not name:
@@ -22152,28 +22147,17 @@ def _which_exec(name: str) -> Optional[str]:
     return None
 
 def _find_nasm() -> str:
-    global _nasm_path
-    if _nasm_path:
-        return _nasm_path
     p = _which_exec("nasm")
     if not p:
         raise RuntimeError("nasm not found")
-    _nasm_path = p
     return p
 
 def _find_linker() -> tuple:
-    global _linker_path, _linker_is_lld
-    if _linker_path:
-        return _linker_path, _linker_is_lld
     lld = _which_exec("ld.lld")
     if lld:
-        _linker_path = lld
-        _linker_is_lld = True
         return lld, True
     ld = _which_exec("ld")
     if ld:
-        _linker_path = ld
-        _linker_is_lld = False
         return ld, False
     raise RuntimeError("No linker found")
 
@@ -23392,11 +23376,17 @@ def _run_integrity_compile_time_docs_checks(errors: List[str]) -> None:
                 continue
             overview = str(item.get("overview", "")).strip()
             example = str(item.get("example", "")).strip()
+            stack_effect = str(item.get("stack_effect", "")).strip()
+            examples = item.get("examples")
             category = str(item.get("category", "")).strip()
             if not overview:
                 errors.append(f"compile-time entry '{name}' is missing overview text")
+            if not stack_effect:
+                errors.append(f"compile-time entry '{name}' is missing stack effect")
             if not example:
                 errors.append(f"compile-time entry '{name}' is missing example text")
+            if not isinstance(examples, list) or len(examples) != 1:
+                errors.append(f"compile-time entry '{name}' must have exactly one curated example")
             if not category:
                 errors.append(f"compile-time entry '{name}' is missing category")
 
@@ -23404,10 +23394,12 @@ def _run_integrity_compile_time_docs_checks(errors: List[str]) -> None:
                 errors.append(f"compile-time entry '{name}' example still uses placeholder ellipsis")
             if example == name:
                 errors.append(f"compile-time entry '{name}' example should include an explicit usage context")
-            if len(overview) < 40:
+            if len(overview) < 100:
                 errors.append(f"compile-time entry '{name}' overview is too short for useful guidance")
             if overview.lower().startswith("compile-time operation for "):
                 errors.append(f"compile-time entry '{name}' overview is still generic boilerplate")
+            if re.search(r"\bword demo_[A-Za-z0-9_]+_(?:ct|runtime)\b", example):
+                errors.append(f"compile-time entry '{name}' example uses a generated placeholder wrapper")
             if not re.search(rf"(?<![A-Za-z0-9_?.:+\-*/<>=!&]){re.escape(name)}(?![A-Za-z0-9_?.:+\-*/<>=!&])", example):
                 errors.append(f"compile-time entry '{name}' example should explicitly show the word invocation")
 
@@ -26603,6 +26595,8 @@ class _IntegratedCompilerDaemon:
         self.state_path = Path(DAEMON_STATE_PATH)
         self.auto_reload = auto_reload
         self.code_hash = _daemon_code_hash()
+        self.startup_path = os.environ.get("PATH", "")
+        self.instance_id = uuid.uuid4().hex[:12]
         self.started_at, self.bus = time.time(), EventBus(4096)
         self._slots, self._active, self._queued, self._pending_requests, self._lock = (
             threading.BoundedSemaphore(self.workers), 0, 0, 0, threading.Lock()
@@ -26750,16 +26744,31 @@ class _IntegratedCompilerDaemon:
 
     def _watch_code(self) -> None:
         previous = self.code_hash
+        previous_path = self.startup_path
         while not self.stop_event.wait(0.5):
             current = _daemon_code_hash()
-            if current == previous:
+            current_path = os.environ.get("PATH", "")
+            if current == previous and current_path == previous_path:
                 continue
-            self.log.warning("compiler sources changed; scheduling daemon reload")
+            reasons = []
+            if current != previous:
+                reasons.append("compiler sources changed")
+            if current_path != previous_path:
+                reasons.append("PATH changed")
+            self._schedule_reload(" and ".join(reasons))
+            return
+
+    def _schedule_reload(self, reason: str) -> None:
+        if not self.auto_reload:
+            return
+        with self._lock:
+            if self.reload_requested.is_set():
+                return
             self.reload_requested.set()
             self.stop_event.set()
-            if self.server is not None:
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
-            return
+        self.log.warning("%s; scheduling daemon reload", reason)
+        if self.server is not None:
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _run(
         self,
@@ -26843,6 +26852,7 @@ class _IntegratedCompilerDaemon:
                 "failure": self.failure,
                 "stale": self.reload_requested.is_set(),
                 "code_hash": self.code_hash,
+                "instance_id": self.instance_id,
                 "recent_compilations": list(self.history),
                 "cache_stats": {"entries": len(self._source_cache), "hits": self._cache_hits, "misses": self._cache_misses, "bytes": cache_bytes},
                 "event_bus_stats": self.bus.stats(),
@@ -26876,6 +26886,12 @@ class _IntegratedCompilerDaemon:
             self.stop_event.set()
             threading.Thread(target=server.shutdown, daemon=True).start(); return {"ok": True}
         if cmd != "run" or not isinstance(payload.get("argv"), list): return {"ok": False, "error": f"unknown or invalid daemon command: {cmd}"}
+        tool_path = payload.get("tool_path")
+        if not isinstance(tool_path, str) or "\x00" in tool_path:
+            tool_path = os.environ.get("PATH", "")
+        if tool_path != os.environ.get("PATH", ""):
+            os.environ["PATH"] = tool_path
+            self._schedule_reload("PATH changed")
         if not queued_registered:
             with self._lock:
                 self._queued += 1
@@ -26884,12 +26900,11 @@ class _IntegratedCompilerDaemon:
             self._queued -= 1
             self._active += 1
         try:
-            tool_path = payload.get("tool_path")
             return self._run(
                 [str(x) for x in payload["argv"]],
                 bool(payload.get("wants_color")),
                 payload.get("stdin"),
-                tool_path if isinstance(tool_path, str) else None,
+                tool_path,
             )
         finally:
             with self._lock: self._active -= 1
@@ -26935,15 +26950,17 @@ def daemon_serve(argv: Sequence[str]) -> int:
             with daemon._lock:
                 daemon._pending_requests += 1
             pending_registered = True
+            response: Optional[Dict[str, Any]] = None
             try:
                 payload = json.loads(self.rfile.readline(4 * 1024 * 1024).decode("utf-8"))
                 queued_registered = payload.get("cmd") == "run" and isinstance(payload.get("argv"), list)
                 with daemon._lock:
-                    daemon._pending_requests -= 1
-                    pending_registered = False
                     if queued_registered:
                         daemon._queued += 1
                 if payload.get("cmd") == "subscribe_events":
+                    with daemon._lock:
+                        daemon._pending_requests -= 1
+                        pending_registered = False
                     write_lock = threading.Lock()
                     def send_event(record: Dict[str, Any]) -> None:
                         with write_lock:
@@ -26959,13 +26976,17 @@ def daemon_serve(argv: Sequence[str]) -> int:
                     return
                 response = daemon.handle(payload, self.server, queued_registered=queued_registered)
             except Exception as exc:
-                if pending_registered:
-                    with daemon._lock:
-                        daemon._pending_requests -= 1
                 response = {"ok": False, "error": str(exc)}
             finally:
                 if subscription is not None: daemon.bus.unsubscribe(subscription)
-            self.wfile.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")); self.wfile.flush()
+                try:
+                    if response is not None:
+                        self.wfile.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+                        self.wfile.flush()
+                finally:
+                    if pending_registered:
+                        with daemon._lock:
+                            daemon._pending_requests -= 1
     Path(args.pid).parent.mkdir(parents=True, exist_ok=True); Path(args.pid).write_text(f"{os.getpid()}\n", encoding="utf-8")
     _write_daemon_lease(args.socket, os.getpid())
     lease_thread = threading.Thread(target=_daemon_heartbeat_loop, args=(args.socket, daemon.stop_event), name="l2-daemon-lease", daemon=True)

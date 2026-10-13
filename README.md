@@ -295,9 +295,11 @@ macro simplify
 ;
 ```
 
-This token hook adds simple comma-separated function-call syntax. It rewrites
-`sum3(1, 2, 3)` to the stack-based call `1 2 3 sum3` (arguments here must not
-contain nested calls):
+This token hook adds simple comma-separated function-call syntax. Installing
+it on the language pack takes effect immediately; pack activation only affects
+active-pack queries and validator selection, not hook or rewrite enablement.
+It rewrites `sum3(1, 2, 3)` to the stack-based call `1 2 3 sum3` (arguments
+here must not contain nested calls):
 
 ```
 import stdlib.sl
@@ -332,12 +334,11 @@ end
 immediate
 compile-only
 
-word enable-call-syntax
+word install-call-syntax
   "simple-calls" ct-lang-create drop
-  "simple-calls" ct-lang-activate drop
   "simple-calls" "call-syntax-rewrite" ct-lang-set-token-hook drop
 end
-compile-time enable-call-syntax
+compile-time install-call-syntax
 
 word sum3
   + +
@@ -358,8 +359,8 @@ L2 has extensive CT APIs for:
 - Template control flow: `ct-if`, `ct-for`, `ct-each`, `ct-fold`, `ct-let`, `ct-switch`
 - Capture/scope management for hygienic macros
 - Pattern matching with guards
-- Language extension packs and DSL lifecycle
-- Memoization, sandboxing, and recursion limits
+- Language extension packs and owned-resource cleanup
+- CT-call policies: memoization, allowlists, exception handling, and recursion/time limits
 - Rewrite rule priority, pipelines, and analysis
 
 **For the complete API reference:**
@@ -405,11 +406,15 @@ records bounded compilation history, per-request logs under `build/logs/req/`,
 and a rotating global log at `build/logs/daemon.log`. It watches `main.py`,
 `l2_main.py`, and `docs.py` for changes, then reloads after active requests drain
 while preserving recent history in `build/.l2_daemon_state.json`. Set
-`L2_DAEMON_NO_AUTO_RELOAD=1` to disable source-triggered reloads, for example in
-deterministic CI or daemon integration tests. Embedding and tooling clients can
-query the internal status API for uptime, memory, open file descriptors, queue
-depth, cache counters, request history, and event-bus statistics. The daemon
-also exposes a live event stream over its Unix socket via `subscribe_events`.
+`L2_DAEMON_NO_AUTO_RELOAD=1` to disable automatic reloads, for example in
+deterministic CI or daemon integration tests. Each compiler request also carries
+the client's current `PATH`; when it differs from the daemon's, the daemon uses
+it for the request and reloads so newly started workers inherit the updated
+toolchain environment. Embedding and tooling clients can query the internal
+status API for uptime, memory, open file descriptors, queue depth, cache
+counters, request history, its instance ID, and event-bus statistics. The
+daemon also exposes a live event stream over its Unix socket via
+`subscribe_events`.
 
 ### Compiler events
 

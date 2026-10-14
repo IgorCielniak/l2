@@ -4577,7 +4577,7 @@ class Parser:
         self._active_module: Optional[Module] = None
         self._ct_predefined_names: Set[str] = set()
         self._compile_error_notified = False
-        self._error_recovery_attempts: Dict[Tuple[str, int, int, str], int] = {}
+        self._error_recovery_attempts: Dict[Tuple[str, str, int, int, str], int] = {}
         self._error_recovery_retry_limit = 8
         self.diagnostics: List[Diagnostic] = []
         self._max_errors: int = 20
@@ -4672,9 +4672,26 @@ class Parser:
         if point is None:
             return None
         diagnostic = getattr(exc, "diagnostic", None)
-        error_line = int(diagnostic.line) if isinstance(diagnostic, Diagnostic) else int(point["line"])
-        error_column = int(diagnostic.column) if isinstance(diagnostic, Diagnostic) else int(point["column"])
-        key = (stage, error_line, error_column, str(exc))
+        point_token = point.get("token") or point.get("last_token")
+        point_location = self.location_for_token(point_token) if isinstance(point_token, Token) else None
+        if isinstance(diagnostic, Diagnostic):
+            if diagnostic.path is not None:
+                error_path = str(diagnostic.path)
+            elif point_location is not None:
+                error_path = str(point_location.path)
+            else:
+                error_path = ""
+            error_line = int(diagnostic.line)
+            error_column = int(diagnostic.column)
+        elif point_location is not None:
+            error_path = str(point_location.path)
+            error_line = int(point_location.line)
+            error_column = int(point_location.column)
+        else:
+            error_path = ""
+            error_line = int(point["line"])
+            error_column = int(point["column"])
+        key = (stage, error_path, error_line, error_column, str(exc))
         attempts = self._error_recovery_attempts.get(key, 0) + 1
         self._error_recovery_attempts[key] = attempts
         if attempts > self._error_recovery_retry_limit:
@@ -4695,10 +4712,12 @@ class Parser:
                 key: value for key, value in point.items()
                 if key not in ("token", "last_token")
             },
+            "path": error_path,
+            "line": error_line,
+            "column": error_column,
         }
         if isinstance(diagnostic, Diagnostic):
             payload.update({
-                "path": str(diagnostic.path) if diagnostic.path is not None else "",
                 "line": int(diagnostic.line),
                 "column": int(diagnostic.column),
                 "code": diagnostic.code,
@@ -5879,6 +5898,11 @@ class Parser:
             "grammar_rewrites": set(),
             "text_macros": set(),
             "pattern_macros": set(),
+            "reader_rewrite_refs": {},
+            "grammar_rewrite_refs": {},
+            "text_macro_refs": {},
+            "pattern_macro_refs": {},
+            "pattern_macro_rule_refs": {},
             "validators": [],
             "token_hook": None,
             "auto_validate": False,
@@ -6066,6 +6090,14 @@ class Parser:
             bucket = set()
             record[field] = bucket
         bucket.add(created_name)
+        refs_field = "reader_rewrite_refs" if stage == "reader" else "grammar_rewrite_refs"
+        refs = record.get(refs_field)
+        if not isinstance(refs, dict):
+            refs = {}
+            record[refs_field] = refs
+        refs[created_name] = next(
+            rule for rule in self._rewrite_bucket(stage) if rule.name == created_name
+        )
         return created_name
 
     def ct_lang_register_text_macro_signature(
@@ -6076,6 +6108,7 @@ class Parser:
         expansion: Sequence[Any],
     ) -> None:
         key = self._ct_lang_key(name)
+        previous_word = self.dictionary.lookup(macro_name)
         self.register_text_macro_signature(macro_name, param_spec, expansion)
         record = self._ct_lang_record(key, create=True)
         if record is None:  # pragma: no cover - defensive
@@ -6085,6 +6118,24 @@ class Parser:
             text_macros = set()
             record["text_macros"] = text_macros
         text_macros.add(str(macro_name))
+        current_word = self.dictionary.lookup(macro_name)
+        refs = record.get("text_macro_refs")
+        if not isinstance(refs, dict):
+            refs = {}
+            record["text_macro_refs"] = refs
+        owned_before = refs.get(str(macro_name))
+        if (
+            current_word is not None
+            and current_word is not previous_word
+            and current_word.macro_expansion is not None
+        ):
+            refs[str(macro_name)] = current_word
+            text_macros.add(str(macro_name))
+        elif current_word is not None and current_word is owned_before:
+            text_macros.add(str(macro_name))
+        else:
+            refs.pop(str(macro_name), None)
+            text_macros.discard(str(macro_name))
 
     def ct_lang_register_pattern_macro(
         self,
@@ -6102,6 +6153,20 @@ class Parser:
             pattern_macros = set()
             record["pattern_macros"] = pattern_macros
         pattern_macros.add(str(macro_name))
+        refs = record.get("pattern_macro_refs")
+        if not isinstance(refs, dict):
+            refs = {}
+            record["pattern_macro_refs"] = refs
+        rule_refs = record.get("pattern_macro_rule_refs")
+        if not isinstance(rule_refs, dict):
+            rule_refs = {}
+            record["pattern_macro_rule_refs"] = rule_refs
+        refs[str(macro_name)] = self._pattern_macro_rules.get(str(macro_name))
+        rule_refs[str(macro_name)] = {
+            rule.name: rule
+            for rule in self.grammar_rewrite_rules
+            if rule.name in self._pattern_macro_rule_names(str(macro_name))
+        }
 
     def ct_lang_run_validators(self, name: Any, *, phase: str = "manual") -> int:
         key = self._ct_lang_key(name)
@@ -6221,24 +6286,45 @@ class Parser:
         if not cleanup:
             return True
 
-        for rule_name in list(record.get("reader_rewrites", set())):
-            if isinstance(rule_name, str):
-                self.remove_rewrite_rule("reader", rule_name)
-        for rule_name in list(record.get("grammar_rewrites", set())):
-            if isinstance(rule_name, str):
-                self.remove_rewrite_rule("grammar", rule_name)
+        for stage, refs_field in (
+            ("reader", "reader_rewrite_refs"),
+            ("grammar", "grammar_rewrite_refs"),
+        ):
+            refs = record.get(refs_field, {})
+            if not isinstance(refs, dict):
+                continue
+            bucket = self._rewrite_bucket(stage)
+            for rule_name, owned_rule in refs.items():
+                if any(rule.name == rule_name and rule is owned_rule for rule in bucket):
+                    self.remove_rewrite_rule(stage, rule_name)
 
+        text_macro_refs = record.get("text_macro_refs", {})
         for macro_name in list(record.get("text_macros", set())):
-            if not isinstance(macro_name, str):
+            if not isinstance(macro_name, str) or not isinstance(text_macro_refs, dict):
                 continue
             word = self.dictionary.lookup(macro_name)
-            if word is None or word.macro_expansion is None:
+            if word is None or word is not text_macro_refs.get(macro_name):
                 continue
-            self.unregister_word(macro_name)
+            self.unregister_word(macro_name, remove_pattern_macro=False)
 
+        pattern_refs = record.get("pattern_macro_refs", {})
+        pattern_rule_refs = record.get("pattern_macro_rule_refs", {})
         for macro_name in list(record.get("pattern_macros", set())):
-            if isinstance(macro_name, str):
-                self.unregister_pattern_macro(macro_name)
+            if not isinstance(macro_name, str) or not isinstance(pattern_refs, dict):
+                continue
+            owned_rule_list = pattern_refs.get(macro_name)
+            if not isinstance(pattern_rule_refs, dict):
+                continue
+            owned_rules = pattern_rule_refs.get(macro_name, {})
+            if not isinstance(owned_rules, dict):
+                continue
+            for rule_name, owned_rule in owned_rules.items():
+                if any(rule.name == rule_name and rule is owned_rule for rule in self.grammar_rewrite_rules):
+                    self.remove_rewrite_rule("grammar", rule_name)
+            if self._pattern_macro_rules.get(macro_name) is owned_rule_list:
+                self._pattern_macro_rules.pop(macro_name, None)
+                self._pattern_macro_groups.pop(macro_name, None)
+                self._pattern_macro_scopes.pop(macro_name, None)
 
         return True
 
@@ -6966,7 +7052,7 @@ class Parser:
         self._macro_profile.pop(source, None)
         return True
 
-    def unregister_word(self, name: str) -> bool:
+    def unregister_word(self, name: str, *, remove_pattern_macro: bool = True) -> bool:
         if name not in self.dictionary.words:
             return False
         del self.dictionary.words[name]
@@ -6978,7 +7064,8 @@ class Parser:
         self._ct_call_abi_contracts.pop(name, None)
         self._macro_hotness.pop(name, None)
         self._macro_profile.pop(name, None)
-        self.unregister_pattern_macro(name)
+        if remove_pattern_macro:
+            self.unregister_pattern_macro(name)
         if self.token_hook == name:
             self.token_hook = None
         return True
@@ -9997,7 +10084,7 @@ class CompileTimeVM:
         if self.parser.event_bus is not None:
             self.parser.event_bus.publish("ct.execute.begin", {"word": word.name, "runtime_mode": self.runtime_mode})
         try:
-            if word.runtime_only:
+            if word.runtime_only and not self.runtime_mode:
                 raise ParseError(
                     f"word '{word.name}' is runtime-only and cannot be executed at compile time"
                 )
@@ -18837,16 +18924,28 @@ def _ct_error_define(vm: CompileTimeVM) -> None:
     if recovery is None or module is None:
         raise ParseError("ct-error-define can only run during recoverable compilation")
 
-    fragment_parser = Parser(parser.dictionary, parser.reader)
+    original_words = dict(parser.dictionary.words)
+    staged_dictionary = Dictionary(words=dict(original_words))
+    staged_dictionary.warn_callback = parser.dictionary.warn_callback
+    fragment_parser = Parser(staged_dictionary, parser.reader)
     fragment_parser._restore_rewrite_state(parser._snapshot_rewrite_state())
     fragment_parser.token_hook = parser.token_hook
-    fragment_parser._macro_signatures = parser._macro_signatures
-    fragment_parser._macro_attrs = parser._macro_attrs
-    fragment_parser._macro_docs = parser._macro_docs
+    fragment_parser._macro_signatures = dict(parser._macro_signatures)
+    fragment_parser._macro_attrs = dict(parser._macro_attrs)
+    fragment_parser._macro_docs = dict(parser._macro_docs)
     fragment_tokens = parser.reader.tokenize(source)
     fragment = fragment_parser.parse(fragment_tokens, source)
     if not all(isinstance(form, (Definition, AsmDefinition)) for form in fragment.forms):
         raise ParseError("ct-error-define source must contain only word or :asm definitions")
+    for name, word in staged_dictionary.words.items():
+        if original_words.get(name) is not word:
+            parser.dictionary.words[name] = word
+    parser._macro_signatures.clear()
+    parser._macro_signatures.update(fragment_parser._macro_signatures)
+    parser._macro_attrs.clear()
+    parser._macro_attrs.update(fragment_parser._macro_attrs)
+    parser._macro_docs.clear()
+    parser._macro_docs.update(fragment_parser._macro_docs)
     parser._restore_rewrite_state(fragment_parser._snapshot_rewrite_state())
     parser.token_hook = fragment_parser.token_hook
     module.forms.extend(fragment.forms)
@@ -20924,6 +21023,7 @@ class Compiler:
         if include_paths is None:
             include_paths = [Path("."), Path("./stdlib")]
         self.include_paths: List[Path] = [p.expanduser().resolve() for p in include_paths]
+        self._import_resolve_cache: Dict[Tuple[Path, str, Tuple[Path, ...]], Path] = {}
         self._loaded_files: Set[Path] = set()
         self.defines: Set[str] = set(defines or [])
         self._last_loaded_path: Optional[Path] = None
@@ -21308,8 +21408,6 @@ class Compiler:
             raise CompileTimeError(f"word '{name}' not defined; cannot run at compile time")
         self.parser.compile_time_vm.invoke_repl(word, libs=libs)
 
-    _import_resolve_cache: Dict[Tuple[Path, str], Path] = {}
-
     @staticmethod
     def _parse_directive_target_and_rest(
         line: str,
@@ -21370,10 +21468,13 @@ class Compiler:
         return raw_text
 
     def _resolve_import_target(self, importing_file: Path, target: str) -> Path:
-        cache_key = (importing_file.parent, target)
+        include_paths = tuple(path.expanduser().resolve() for path in self.include_paths)
+        cache_key = (importing_file.parent.resolve(), target, include_paths)
         cached = self._import_resolve_cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and cached.exists():
             return cached
+        if cached is not None:
+            self._import_resolve_cache.pop(cache_key, None)
         raw = Path(target)
         tried: List[Path] = []
 
@@ -21392,7 +21493,7 @@ class Compiler:
             self._import_resolve_cache[cache_key] = result
             return result
 
-        for base in self.include_paths:
+        for base in include_paths:
             candidate = base / raw
             tried.append(candidate)
             if candidate.exists():
@@ -21516,7 +21617,7 @@ class Compiler:
             seen = set()
         out_lines: List[str] = []
         spans: List[FileSpan] = []
-        self._append_file_with_imports(path.resolve(), out_lines, spans, seen)
+        self._append_file_with_imports(path.resolve(), out_lines, spans, seen, depth=0)
         self._loaded_files = set(seen)
         return "\n".join(out_lines) + "\n", spans
 
@@ -21526,6 +21627,8 @@ class Compiler:
         out_lines: List[str],
         spans: List[FileSpan],
         seen: Set[Path],
+        *,
+        depth: int,
     ) -> None:
         # path is expected to be already resolved by callers
         if path in seen:
@@ -21533,7 +21636,7 @@ class Compiler:
         seen.add(path)
 
         if self.event_bus is not None:
-            self.event_bus.publish("import.begin", {"path": str(path), "depth": len(seen) - 1})
+            self.event_bus.publish("import.begin", {"path": str(path), "depth": depth})
 
         try:
             contents = path.read_text()
@@ -21565,7 +21668,7 @@ class Compiler:
                     )
                 )
             if self.event_bus is not None:
-                self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": len(seen) - 1})
+                self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": depth})
             return
 
         in_py_block = False
@@ -21763,7 +21866,7 @@ class Compiler:
                     segment_start_global = None
 
                 target_path = self._resolve_import_target(path, target)
-                self._append_file_with_imports(target_path, out_lines, spans, seen)
+                self._append_file_with_imports(target_path, out_lines, spans, seen, depth=depth + 1)
 
                 # Allow `import <path> <statements...>`; keep trailing statements.
                 if remainder:
@@ -21837,7 +21940,7 @@ class Compiler:
                 )
             )
         if self.event_bus is not None:
-            self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": len(seen) - 1})
+            self.event_bus.publish("import.end", {"path": str(path), "resolved_path": str(path), "depth": depth})
 
         if _ifdef_stack:
             raise ParseError(f"unterminated ifdef/ifndef ({len(_ifdef_stack)} level(s) deep) in {path}")

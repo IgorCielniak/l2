@@ -877,10 +877,15 @@ def _run_docs_tui(
             "name": "compile-time",
             "category": "Modifiers",
             "syntax": "compile-time <word>",
-            "summary": "Execute a word at compile time but still emit it.",
+            "summary": "Execute the named word immediately during compilation.",
             "detail": (
-                "Runs the named word immediately during compilation, "
-                "but its definition is also emitted for runtime use."
+                "Invokes the named word immediately in the CT VM. If used inside "
+                "another word definition, the compiler also emits a call to the "
+                "named word in that definition's body; the enclosing definition's "
+                "flags determine whether its body is emitted for runtime. At top "
+                "level, only the compile-time invocation occurs. "
+                "The target must already be defined and cannot be runtime-only or "
+                "compile-only."
             ),
         },
         {
@@ -1300,7 +1305,7 @@ def _run_docs_tui(
         "═══════════════════════════════════════════════════════════════\n"
         "\n"
         "  L2 runs a compile-time virtual machine (the CT VM) during\n"
-        "  parsing. Code marked `compile-time`, immediate words, and\n"
+        "  parsing. The `compile-time <word>` directive, immediate words, and\n"
         "  :py blocks execute inside this VM. They can inspect and\n"
         "  transform the token stream, emit definitions, manipulate\n"
         "  lists and maps, and control the generated assembly output.\n"
@@ -1444,10 +1449,11 @@ def _run_docs_tui(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "  compile-time                             [immediate]\n"
-        "    Marks a word definition so that its body\n"
-        "    runs in the CT VM. The word's definition\n"
-        "    is interpreted by the VM when the\n"
-        "    word is referenced during compilation.\n"
+        "    Immediately invokes the following, already-defined word\n"
+        "    in the CT VM. When used inside another definition, also\n"
+        "    adds a call to that word to the enclosing body; its flags\n"
+        "    determine whether that body is emitted for runtime.\n"
+        "    At top level it only performs the CT invocation.\n"
         "\n"
         "      word double-ct dup + end\n"
         "      compile-time double-ct\n"
@@ -3009,7 +3015,8 @@ def _run_docs_tui(
         "    Use --leak-check to run in CTVM with mmap/munmap\n"
         "    interception and leak reporting (non-zero exit on leaks).\n"
         "\n"
-        "    You can also mark words as compile-time:\n"
+        "    You can also invoke an already-defined word during\n"
+        "    compilation with the compile-time directive:\n"
         "\n"
         "      word generate-table\n"
         "        # ... runs during compilation\n"

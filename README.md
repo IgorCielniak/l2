@@ -266,9 +266,12 @@ word main
 end
 ```
 
-### Compile-Time Words
+### Running Words at Compile Time
 
-Mark a word `compile-time` to run while compiling instead of emitting runtime code:
+The `compile-time <word>` directive immediately invokes an already-defined word
+in the CT VM. At top level it runs only during compilation; inside another word
+definition it also adds a call to that definition's body (whether the body is
+emitted for runtime depends on the enclosing definition's flags):
 
 ```
 word build-lookup-table

@@ -155,6 +155,49 @@ static uint64_t hash_str(const char *text) {
 VEC_DECL(StrVec, char *);
 VEC_DECL(IntVec, int);
 
+/* Concatenate strings in linear time.  NULL items are skipped; `sep` (may be
+ * NULL) is written between consecutive items and `suffix` (may be NULL)
+ * after every item.  Repeated strcat() would rescan the growing buffer on
+ * every append, which is quadratic in the output size. */
+static char *str_join_parts(char *const *items, size_t count, const char *sep, const char *suffix) {
+    size_t sep_len = sep ? strlen(sep) : 0;
+    size_t suffix_len = suffix ? strlen(suffix) : 0;
+    size_t total = 0;
+    size_t present = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!items[i]) {
+            continue;
+        }
+        total += strlen(items[i]) + suffix_len;
+        present++;
+    }
+    if (present > 1) {
+        total += sep_len * (present - 1);
+    }
+    char *out = (char *)xmalloc(total + 1);
+    char *cursor = out;
+    bool first = true;
+    for (size_t i = 0; i < count; i++) {
+        if (!items[i]) {
+            continue;
+        }
+        if (!first && sep_len) {
+            memcpy(cursor, sep, sep_len);
+            cursor += sep_len;
+        }
+        first = false;
+        size_t len = strlen(items[i]);
+        memcpy(cursor, items[i], len);
+        cursor += len;
+        if (suffix_len) {
+            memcpy(cursor, suffix, suffix_len);
+            cursor += suffix_len;
+        }
+    }
+    *cursor = '\0';
+    return out;
+}
+
 static bool strvec_contains(StrVec *vec, const char *value) {
     if (!vec || !value) {
         return false;
@@ -2856,19 +2899,9 @@ static const char *emit_string_literal(EmitContext *ctx, const char *value) {
         VEC_PUSH(&bytes, str_printf("%u", (unsigned int)*p));
     }
     VEC_PUSH(&bytes, str_dup("0"));
-    size_t total = 0;
-    for (size_t i = 0; i < bytes.len; i++) {
-        total += strlen(bytes.data[i]) + 2;
-    }
-    char *line = (char *)xmalloc(total + strlen(label) + 6);
-    strcpy(line, label);
-    strcat(line, ": db ");
-    for (size_t i = 0; i < bytes.len; i++) {
-        strcat(line, bytes.data[i]);
-        if (i + 1 < bytes.len) {
-            strcat(line, ", ");
-        }
-    }
+    char *joined_bytes = str_join_parts(bytes.data, bytes.len, ", ", NULL);
+    char *line = str_printf("%s: db %s", label, joined_bytes);
+    free(joined_bytes);
     VEC_PUSH(&ctx->emission->data, line);
     return label;
 }
@@ -3311,18 +3344,7 @@ static char *emission_snapshot(Emission *emission) {
         }
     }
     VEC_PUSH(&parts, str_dup("section .note.GNU-stack noalloc noexec nowrite"));
-    size_t total = 0;
-    for (size_t i = 0; i < parts.len; i++) {
-        if (parts.data[i]) {
-            total += strlen(parts.data[i]) + 1;
-        }
-    }
-    char *buf = (char *)xmalloc(total + 1);
-    buf[0] = '\0';
-    for (size_t i = 0; i < parts.len; i++) {
-        strcat(buf, parts.data[i]);
-        strcat(buf, "\n");
-    }
+    char *buf = str_join_parts(parts.data, parts.len, NULL, "\n");
     return buf;
 }
 
@@ -4329,15 +4351,11 @@ static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visi
         span.local_start_line = span_local_start;
         VEC_PUSH(spans, span);
     }
-    size_t total = 0;
+    char *out = str_join_parts(parts.data, parts.len, NULL, NULL);
     for (size_t i = 0; i < parts.len; i++) {
-        total += strlen(parts.data[i]);
+        free(parts.data[i]);
     }
-    char *out = (char *)xmalloc(total + 1);
-    out[0] = '\0';
-    for (size_t i = 0; i < parts.len; i++) {
-        strcat(out, parts.data[i]);
-    }
+    VEC_FREE(&parts);
     free(content);
     free(base_dir);
     return out;
@@ -4448,15 +4466,11 @@ static char *expand_imports_from_source(const char *content, const char *base_di
         span.local_start_line = span_local_start;
         VEC_PUSH(spans, span);
     }
-    size_t total = 0;
+    char *out = str_join_parts(parts.data, parts.len, NULL, NULL);
     for (size_t i = 0; i < parts.len; i++) {
-        total += strlen(parts.data[i]);
+        free(parts.data[i]);
     }
-    char *out = (char *)xmalloc(total + 1);
-    out[0] = '\0';
-    for (size_t i = 0; i < parts.len; i++) {
-        strcat(out, parts.data[i]);
-    }
+    VEC_FREE(&parts);
     return out;
 }
 
@@ -4809,18 +4823,7 @@ static void parse_tokens(Parser *parser, const char *source) {
                 body[body_len] = '\0';
             } else if (asm_body_toks.len > 0) {
                 /* Reconstruct body from tokens (injected via inject-lexemes). */
-                size_t total = 0;
-                for (size_t i = 0; i < asm_body_toks.len; i++) {
-                    total += strlen(asm_body_toks.data[i]) + 1;
-                }
-                body = (char *)xmalloc(total + 1);
-                body[0] = '\0';
-                for (size_t i = 0; i < asm_body_toks.len; i++) {
-                    if (i > 0) {
-                        strcat(body, " ");
-                    }
-                    strcat(body, asm_body_toks.data[i]);
-                }
+                body = str_join_parts(asm_body_toks.data, asm_body_toks.len, " ", NULL);
             } else {
                 fprintf(stderr, "[error] missing '}' to terminate asm body\n");
                 exit(1);
@@ -5641,15 +5644,7 @@ int l2_cli(int argc, char **argv) {
         char *expanded = expand_imports(inputs.data[i], &include_dirs, &visited, &file_spans, &line_counter);
         VEC_PUSH(&sources, expanded);
     }
-    size_t total = 0;
-    for (size_t i = 0; i < sources.len; i++) {
-        total += strlen(sources.data[i]);
-    }
-    char *combined = (char *)xmalloc(total + 1);
-    combined[0] = '\0';
-    for (size_t i = 0; i < sources.len; i++) {
-        strcat(combined, sources.data[i]);
-    }
+    char *combined = str_join_parts(sources.data, sources.len, NULL, NULL);
 
     Dictionary dict;
     dictionary_init(&dict);
@@ -6335,18 +6330,7 @@ static char *l2_ct_render_snippet_asm(const char *source, long source_len) {
     }
 
     // Keystone consumes flat instruction text, not section directives.
-    size_t total = 0;
-    for (size_t i = 0; i < emission.text.len; i++) {
-        if (emission.text.data[i]) total += strlen(emission.text.data[i]) + 1;
-    }
-    char *asm_text = (char *)xmalloc(total + 1);
-    asm_text[0] = '\0';
-    for (size_t i = 0; i < emission.text.len; i++) {
-        if (emission.text.data[i]) {
-            strcat(asm_text, emission.text.data[i]);
-            strcat(asm_text, "\n");
-        }
-    }
+    char *asm_text = str_join_parts(emission.text.data, emission.text.len, NULL, "\n");
 
     for (size_t i = 0; i < emission.text.len; i++) free(emission.text.data[i]);
     for (size_t i = 0; i < emission.data.len; i++) free(emission.data.data[i]);

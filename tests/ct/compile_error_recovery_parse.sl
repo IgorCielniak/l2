@@ -1,14 +1,14 @@
 import stdlib/stdlib.sl
 
 word repair_compile_error
-    ct-error-restore-points list-length 1 >= static_assert
-    get-event-payload
-    "restore_point_id" map-get drop dup
-    ct-error-restore-point drop
-    ct-error-jump
-    "word missing_ct_word 42 end" ct-error-define drop
-    ct-error-resume
-end on-event compile.error
+    ct-recovery-list-restore-points list-length 1 >= static-assert
+    event-payload
+    "restore-point-id" map-get drop dup
+    ct-recovery-get-restore-point drop
+    ct-recovery-jump
+    "word missing_ct_word 42 end" ct-definition-register-source drop
+    ct-recovery-resume drop
+end on-event compiler.error
 
 word trigger_ct
     missing_ct_word

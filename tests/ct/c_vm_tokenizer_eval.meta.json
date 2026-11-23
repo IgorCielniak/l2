@@ -1,0 +1,4 @@
+{
+  "description": "Default tokenizer rules in the C compile-time VM (eval_program): the fixed backtick and escaped-backtick tokens, ; before letters, the retired add-token words, and the unsupported frontend header",
+  "use_l2": true
+}

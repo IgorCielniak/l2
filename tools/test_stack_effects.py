@@ -95,5 +95,39 @@ class StackEffectTests(unittest.TestCase):
             self.assertIsNotNone(effect, source[match.start():source.find("\n", match.start())])
 
 
+class DeclaredEffectTests(unittest.TestCase):
+    """Effects declared in cells (stack-effect, ct-definition-set-effect)
+    are checked; fn declares its functions' effects."""
+
+    def compile_output(self, source: str) -> str:
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="l2-effects-") as tmp:
+            path = Path(tmp) / "e.sl"
+            path.write_text(source, encoding="utf-8")
+            result = subprocess.run([sys.executable, str(ROOT / "main.py"), "--no-daemon", str(path),
+                                     "--no-artifact", "-I", str(ROOT)], capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_fn_effects_and_declared_outputs(self) -> None:
+        out = self.compile_output(
+            "import stdlib/stdlib.sl\nimport libs/fn.sl\nuse-fn-dsl\n"
+            "fn add(int a, int b){\n    return a+b;\n}\n"
+            "word two 1 2 end\nstack-effect two 0 1\n"
+            "word check \"add\" ct-definition-effect static-assert 1 == static-assert 2 == static-assert end\n"
+            "compile-time check\n"
+            "word main 1 add puti cr two drop end\n")
+        self.assertIn("'two' declares 1 output but leaves 2", out)
+        self.assertIn("in 'main': 'add' needs 2 values, but only 1 on the stack", out)
+
+    def test_effect_comments_alone_do_not_warn(self) -> None:
+        # Comments count items (a string is one), so they are not used to
+        # check calls: this string-taking word must not be reported.
+        out = self.compile_output(
+            "import stdlib/stdlib.sl\nimport stdlib/debug.sl\n"
+            "word main \"x\" abort_msg end\n")
+        self.assertNotIn("[stack-check]", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

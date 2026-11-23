@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import main
+import l2_client as main
 import l2_main
 from l2_main import Compiler, EventBus, optimize_emitted_asm_text
 
@@ -37,10 +37,15 @@ class EventBusToolingTests(unittest.TestCase):
         with self.assertRaisesRegex(l2_main.CompileError, "unknown entry mode"):
             compiler.compile_source("word main 0 end\n", entry_mode="invalid")
 
-        errors = bus.recent("compile.error")
+        errors = bus.recent("compiler.error")
         self.assertEqual(len(errors), 1)
-        self.assertEqual(errors[0]["payload"]["exception"], "CompileError")
-        self.assertIn("unknown entry mode", errors[0]["payload"]["message"])
+        diagnostic = errors[0]["payload"]["diagnostic"]
+        self.assertEqual((diagnostic.code, diagnostic.category), ("emission-entry-mode-invalid", "emission_error"))
+        self.assertIn("unknown entry mode", diagnostic.message)
+        # Emission errors have a restore point, so handlers could resume them.
+        self.assertTrue(errors[0]["payload"]["recoverable"])
+        self.assertEqual(errors[0]["payload"]["recovery"], {"attempt": 1, "limit": 8})
+        self.assertEqual(len(bus.recent("compiler.error.emission_error")), 1)
 
     def test_emit_section_reports_incremental_bytes(self) -> None:
         bus = EventBus(8)
@@ -97,9 +102,9 @@ end:
         compiler.compile_source(
             """
 word inspect_build_event
-  get-event-name
-  "build.request" string=
-  static_assert
+  event-name
+  "build.request" string-equal?
+  static-assert
 end on-event build.request
 
 emit-event build.request

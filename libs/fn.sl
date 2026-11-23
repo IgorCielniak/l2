@@ -1,40 +1,120 @@
+import ct_store.sl
+
+# fn-error [* | message] -> (raises)
+# While a statement is being compiled, errors point at its first token
+#; otherwise at the parser's current input.
+word fn-error
+	"fn.statement" ct-store-get if
+		dup token-line swap token-column ct-parser-error-at
+	else
+		drop ct-parser-error
+	end
+end
+compile-only
+
+# fn-is? [*, element | text] -> [* | flag]
+# Body elements are tokens (or, for generated code, strings).
+word fn-is?
+	swap lexeme string-equal?
+end
+compile-only
+
+# fn-contains? [*, list | text] -> [* | flag]
+word fn-contains?
+	>r list-clone                     # list'     (r: text)
+begin
+	dup list-empty? if drop rdrop 0 exit end
+	list-pop-front drop               # list' element
+	r@ fn-is? if drop rdrop 1 exit end
+again
+end
+compile-only
+
+# fn-mark-statement [*, ctx | stmt] -> [*, ctx | stmt]
+# The statement's first token becomes the position fn-error reports at.
+word fn-mark-statement
+	dup list-empty? if exit end
+	dup 0 list-get "fn.statement" swap ct-store-set
+end
+compile-only
+
+# Emit a parsed call: a macro becomes `name arg1 arg2 ...` (an argument of
+# several tokens is wrapped in a quotation so it stays one value); any other
+# word becomes postfix `args... name`.
+#call-syntax-emit [*, fnameTok | groups] -> [*]
+word call-syntax-emit
+	over token-lexeme ct-macro-get-by-name swap drop if
+		list-new 2 pick list-append       # fname groups out
+		swap                              # fname out groups
+		begin
+			dup list-empty? if drop break end
+			list-pop-front drop           # fname out groups' group
+			dup list-length 1 == if
+				0 list-get rot swap list-append swap
+			else
+				>r >r                     # fname out (r: group groups')
+				over "`" token-with-lexeme list-append
+				r> r> swap >r             # fname out group (r: groups')
+				list-extend
+				over "`" token-with-lexeme list-append
+				r>                        # fname out' groups'
+			end
+		again
+		swap drop                         # out
+	else
+		list-new swap                     # fname out groups
+		begin
+			dup list-empty? if drop break end
+			list-pop-front drop           # fname out groups' group
+			rot swap list-extend swap     # fname out' groups'
+		again
+		swap list-append                  # out
+	end
+	ct-parser-inject
+end
+compile-only
+
 #call-syntax-rewrite [* | fnameToken] -> [* | handled]
 word call-syntax-rewrite
 	dup token-lexeme identifier? 0 == if drop 0 exit end
-	peek-token dup nil? if drop drop 0 exit end
-	dup token-lexeme "(" string= 0 == if drop drop 0 exit end
-	swap >r                 # stash fnameTok
+	0 ct-parser-peek dup nil? if drop drop 0 exit end
+	dup token-lexeme "(" string-equal? 0 == if drop drop 0 exit end
 	drop                    # discard peeked '('
-	next-token drop         # consume '('
-	list-new                # out
-	list-new                # out cur
-begin
-	next-token dup nil? if "unterminated call expression" parse-error end
-	dup token-lexeme ")" string= if
-		drop
-		# flush current arg
-		list-extend           # out'
-		r> list-append        # out''
-		inject-tokens
-		1 exit
+	ct-parser-consume drop  # consume '('
+	list-new list-new       # fnameTok groups cur
+	begin
+		ct-parser-eof? if "unterminated call expression" fn-error end
+		ct-parser-consume
+		dup token-lexeme ")" string-equal? if
+			drop list-append break
 		end
-	dup token-lexeme "," string= if
-		drop
-		list-extend            # out'
-		list-new               # out' cur
-		continue
-	end
-	# default: append tok to cur
-	list-append
-again
+		dup token-lexeme "," string-equal? if
+			drop list-append list-new continue
+		end
+		list-append
+	again
+	call-syntax-emit
+	1
 end
 immediate
+compile-only
+
+# Remove the fn.dsl pack's token hooks (through their handles).
+word fn-dsl-drop-token-hooks       # fn-dsl-drop-token-hooks [*] -> [*]
+	fn-dsl-lang-name ct-lang-status drop "token_hooks" map-get drop
+	begin
+		dup list-empty? if drop exit end
+		list-pop-front drop
+		"handle" map-get drop ct-lang-remove-token-hook drop
+	again
+end
 compile-only
 
 #extend-syntax [*] -> [*]
 word extend-syntax
 	fn-dsl-lang-ensure
-	fn-dsl-lang-name "call-syntax-rewrite" ct-lang-set-token-hook drop
+	fn-dsl-drop-token-hooks
+	fn-dsl-lang-name "call-syntax-rewrite" ct-lang-add-token-hook drop
 end
 immediate
 compile-only
@@ -58,12 +138,61 @@ compile-only
 
 
 word fn-op-prec
-	dup "+" string= if drop 1 exit end
-	dup "-" string= if drop 1 exit end
-	dup "*" string= if drop 2 exit end
-	dup "/" string= if drop 2 exit end
-	dup "%" string= if drop 2 exit end
+	lexeme
+	dup "+" string-equal? if drop 1 exit end
+	dup "-" string-equal? if drop 1 exit end
+	dup "*" string-equal? if drop 2 exit end
+	dup "/" string-equal? if drop 2 exit end
+	dup "%" string-equal? if drop 2 exit end
 	drop 0
+end
+compile-only
+
+# Infix to postfix over a list of token lexemes (shunting-yard). + and -
+# bind looser than *, /, and %; all are left-associative; ( and ) group and
+# are dropped. Only string elements and balanced parentheses are checked:
+# operand/operator placement is left to the caller. (Was the `shunt`
+# compiler built-in.)
+word fn-infix>postfix              # fn-infix>postfix [* | tokens] -> [* | postfix]
+	list-new list-new rot          # out ops tokens
+	begin
+		dup list-empty? if drop break end
+		list-pop-front drop            # out ops tokens' tok
+		dup lexeme drop                # elements must be tokens or strings
+		swap >r                        # out ops tok          (r: tokens')
+		dup "(" fn-is? if
+			list-append r> continue
+		end
+		dup ")" fn-is? if
+			drop                           # out ops
+			begin
+				dup list-empty? if "fn-infix>postfix: unmatched ')'" fn-error end
+				list-pop drop                  # out ops' top
+				dup "(" fn-is? if drop break end
+				rot swap list-append swap      # out' ops'
+			again
+			r> continue
+		end
+		dup fn-op-prec 0 == if             # an operand
+			rot swap list-append swap      # out' ops
+			r> continue
+		end
+		begin                              # move operators of >= precedence
+			over list-empty? if break end
+			over list-last                 # out ops tok top
+			dup "(" fn-is? if drop break end
+			fn-op-prec over fn-op-prec < if break end
+			>r list-pop drop rot swap list-append swap r>
+		again
+		list-append                        # out ops'
+		r>
+	again
+	begin                                  # out ops
+		dup list-empty? if drop break end
+		list-pop drop
+		dup "(" fn-is? if "fn-infix>postfix: unmatched '('" fn-error end
+		rot swap list-append swap
+	again
 end
 compile-only
 
@@ -72,66 +201,109 @@ word fn-operator?
 end
 compile-only
 
+# fn-check-dup [*, params | name] -> [*, params | name]
+# Raises if `name` is already in `params`.
 word fn-check-dup
 	>r                              # params          (r: name)
 	0                               # params idx
 begin
-	over list-length swap >= if     # params flag
-		r> exit
+	over list-length over <= if     # params idx      (every element checked)
+		drop r> exit
 	end
-	dup >r                          # params idx   (r: idx name)
-	over swap list-get              # params elem
-	1 rpick string= if "duplicate parameter names in fn definition" parse-error end
-	drop                            # drop comparison flag when no error
-	r> 1 +                          # params idx+1
+	2dup list-get                   # params idx elem
+	r@ string-equal? if "duplicate parameter names in fn definition" fn-error end
+	1 +                             # params idx+1
 again
 end
 compile-only
 
+# fn-next-lexeme [*] -> [* | lexeme]
+word fn-next-lexeme
+	ct-parser-eof? if "unexpected end of input in fn definition" fn-error end
+	ct-parser-consume token-lexeme
+end
+compile-only
+
+# fn-params [*] -> [* | params]
+# Reads `type name, ...)` after the opening '(' of a parameter list.
 word fn-params
-	list-new             # lexer params
-	swap                 # params lexer
-	>r                   # params            (r: lexer)
+	list-new                          # params
 begin
-	0 rpick lexer-pop token-lexeme   # params lex
-	swap drop                        # params lex   (drop returned lexer)
-	dup ")" string= if drop r> exit end
-	dup identifier? 0 == if "invalid parameter type in fn definition" parse-error end
+	fn-next-lexeme                    # params lex
+	dup ")" string-equal? if drop exit end
+	dup identifier? 0 == if "invalid parameter type in fn definition" fn-error end
 	drop                              # params
-	0 rpick lexer-pop token-lexeme    # params lexer pname
-	swap drop                         # params pname
-	dup identifier? 0 == if "invalid parameter name in fn definition" parse-error end
+	fn-next-lexeme                    # params pname
+	dup identifier? 0 == if "invalid parameter name in fn definition" fn-error end
 	fn-check-dup                      # params pname
 	list-append                       # params
-	0 rpick lexer-pop token-lexeme    # params lexer sep
-	swap drop                         # params sep
-	dup "," string= if drop continue end
-	dup ")" string= if drop r> exit end
-	"expected ',' or ')' in parameter list" parse-error
+	fn-next-lexeme                    # params sep
+	dup "," string-equal? if drop continue end
+	dup ")" string-equal? if drop exit end
+	"expected ',' or ')' in parameter list" fn-error
 again
 end
 compile-only
 
-word fn-collect-body
-	"{" lexer-expect drop          # consume opening brace, keep lexer
-	lexer-collect-brace             # lexer bodyTokens
-	swap drop                       # bodyTokens
+# fn-expect [* | lexeme] -> [*]
+# Consumes the next token, which must be `lexeme`.
+word fn-expect
+	dup ct-parser-expected if
+		drop drop
+		ct-parser-consume drop
+		exit
+	end
+	drop
+	"expected '" swap string-append "' in fn definition" string-append fn-error
 end
 compile-only
 
-word fn-lexemes-from-tokens
-	>r                   # (r: tokens)
-	list-new             # acc
+# fn-collect-body [*] -> [* | bodyTokens]
+# Consumes `{ ... }` and returns the tokens between the braces.
+word fn-collect-body
+	"{" fn-expect
+	"{" "}" ct-parser-collect-balanced
+	0 == if "unterminated fn body: missing '}'" fn-error end
+end
+compile-only
+
+# fn-literal-lexeme? [* | lexeme] -> [* | flag]
+word fn-literal-lexeme?
+	dup "\"" string-starts-with? if drop 1 exit end
+	"'" string-starts-with?
+end
+compile-only
+
+# fn-split-tokens [* | tokens] -> [* | pieces]
+# The default reader keeps operators such as `a+b` in one token; fn bodies
+# split them.  Each token's text is re-tokenized with the fn operators and
+# punctuation as separators, and every piece is cut from its token with
+# token-slice, so it keeps its exact source position.  String and character
+# literals stay whole.
+word fn-split-tokens
+	ct-tokenizer-get-config >r                     # tokens     (r: saved config)
+	map-new "separators" list-new
+		"+" list-append "-" list-append "*" list-append "/" list-append "%" list-append
+		";" list-append "," list-append "(" list-append ")" list-append
+		"{" list-append "}" list-append
+	map-set ct-tokenizer-set-config
+	list-new swap list-clone                       # out tokens
 begin
-	0 rpick list-empty? if
-		rdrop exit
+	dup list-empty? if drop r> ct-tokenizer-set-config exit end
+	list-pop-front drop                            # out tokens' tok
+	dup token-lexeme fn-literal-lexeme? if
+		rot swap list-append swap                  # out' tokens'
+		continue
 	end
-	0 rpick list-pop-front     # acc tokens' first
-	rdrop                      # acc tokens'
-	swap                       # acc first tokens'
-	>r                         # acc first   (r: tokens')
-	token-lexeme          # acc lex
-	list-append           # acc'
+	dup token-lexeme "<fn>" ct-tokenizer-run       # out tokens' tok pieces
+	begin
+		dup list-empty? if drop drop break end
+		list-pop-front drop                        # out tokens' tok pieces' piece
+		dup token-origin source-origin-start
+		swap token-origin source-origin-end        # out tokens' tok pieces' start end
+		3 pick rot rot token-slice                 # out tokens' tok pieces' pieceTok
+		4 pick swap list-append drop               # out tokens' tok pieces'
+	again
 again
 end
 compile-only
@@ -142,34 +314,34 @@ begin
 	dup list-empty? if
 		drop                          # out cur
 		dup list-length 0 > if
-			shunt                     # out postfix
+			fn-infix>postfix                     # out postfix
 			list-extend              # out'
 			exit
 		end
 		drop                          # out
-		dup list-length 0 == if "empty function body" parse-error end
-		list-pop                      # out' tok
-		dup "drop" string= 0 == if "invalid trailing function statement" parse-error end
+		dup list-length 0 == if "empty function body" fn-error end
+		list-pop drop                 # out' tok
+		dup "drop" fn-is? 0 == if "invalid trailing function statement" fn-error end
 		drop                          # out'
 		exit
 	end
 
-	list-pop-front                   # out cur body' tok
+	list-pop-front drop              # out cur body' tok
 	swap >r                          # out cur tok      (r: body')
 
-	dup "return" string= if
+	dup "return" fn-is? if
 		drop
 		r>
 		continue
 	end
 
-	dup ";" string= if
+	dup ";" fn-is? if
 		drop
 		dup list-length 0 == if
 			r>
 			continue
 		end
-		shunt                          # out postfix
+		fn-infix>postfix                          # out postfix
 		list-extend                    # out'
 		"drop" list-append             # out''
 		list-new                       # out'' cur'
@@ -252,7 +424,7 @@ begin
 		-1 0 exit                 # params -1 0
 	end                        # params idx
 	over over list-get            # params idx elem
-	0 rpick string=               # params idx flag
+	0 rpick string-equal?               # params idx flag
 	if
 		r> drop                   # drop name
 		1 exit                    # params idx 1
@@ -314,12 +486,11 @@ begin
 		swap drop
 		exit
 	end
-	dup list-pop-front              # map original clone keys keys' key
+	dup list-pop-front drop         # map original clone keys keys' key
 	rot drop                        # map original clone keys' key
 	dup                             # map original clone keys' key key
-	4 pick swap map-get             # map original clone keys' key original value ok
-	rot drop                        # map original clone keys' key value ok
-	0 == if "internal fn variable map corruption" parse-error end
+	4 pick swap map-get             # map original clone keys' key value ok
+	0 == if "internal fn variable map corruption" fn-error end
 	1 +                             # map original clone keys' key value+1
 	3 pick                          # map original clone keys' key value+1 clone
 	rot                             # map original clone keys' value+1 clone key
@@ -366,14 +537,14 @@ begin
 	over over list-get               # expr idx tok
 	r>                               # expr idx tok depth
 	swap                             # expr idx depth tok
-	dup "(" string= if
+	dup "(" fn-is? if
 		drop
 		1 +                            # expr idx depth+1
 		swap 1 + swap                  # expr idx+1 depth+1
 		continue
 	end
 
-	dup ")" string= if
+	dup ")" fn-is? if
 		drop
 		dup 0 == if
 			drop
@@ -395,7 +566,7 @@ compile-only
 word fn-call-syntax-expr?          # fn-call-syntax-expr? [* | expr] -> [* | flag]
 	dup list-length 3 < if drop 0 exit end
 	dup 0 list-get identifier? 0 == if drop 0 exit end
-	dup 1 list-get "(" string= 0 == if drop 0 exit end
+	dup 1 list-get "(" fn-is? 0 == if drop 0 exit end
 
 	dup fn-call-close-index
 	if
@@ -426,10 +597,10 @@ begin
 		exit
 	end
 
-	list-pop-front                    # args cur depth inner' tok
+	list-pop-front drop               # args cur depth inner' tok
 	swap >r                           # args cur depth tok   (r: inner')
 
-	dup "(" string= if
+	dup "(" fn-is? if
 		swap >r                          # args cur tok         (r: depth inner')
 		list-append                      # args cur'
 		r> 1 +                           # args cur' depth+1
@@ -437,7 +608,7 @@ begin
 		continue
 	end
 
-	dup ")" string= if
+	dup ")" fn-is? if
 		swap                             # args cur tok depth
 		dup 0 > if
 			1 - >r                         # args cur tok         (r: depth-1 inner')
@@ -453,7 +624,7 @@ begin
 		continue
 	end
 
-	dup "," string= if
+	dup "," fn-is? if
 		swap                             # args cur tok depth
 		dup 0 == if
 			drop                            # args cur tok
@@ -485,14 +656,14 @@ compile-only
 word fn-rewrite-call-expr          # fn-rewrite-call-expr [* | expr] -> [*, expr | postfix_flag]
 	dup list-length 3 < if 0 exit end
 	dup 0 list-get identifier? 0 == if 0 exit end
-	dup 1 list-get "(" string= 0 == if 0 exit end
-	dup "," list-contains? if 0 exit end
-	dup "+" list-contains? if 0 exit end
-	dup "-" list-contains? if 0 exit end
-	dup "*" list-contains? if 0 exit end
-	dup "/" list-contains? if 0 exit end
-	dup "%" list-contains? if 0 exit end
-	shunt
+	dup 1 list-get "(" fn-is? 0 == if 0 exit end
+	dup "," fn-contains? if 0 exit end
+	dup "+" fn-contains? if 0 exit end
+	dup "-" fn-contains? if 0 exit end
+	dup "*" fn-contains? if 0 exit end
+	dup "/" fn-contains? if 0 exit end
+	dup "%" fn-contains? if 0 exit end
+	fn-infix>postfix
 	list-reverse
 	1
 end
@@ -504,8 +675,8 @@ word fn-list-drop-front-n          # fn-list-drop-front-n [*, list | n] -> [* | 
 begin
 	r> dup 0 > if                     # list n
 		1 - >r                          # list      (r: n-1)
-		dup list-empty? if "invalid fn statement shape" parse-error end
-		list-pop-front drop             # list'
+		dup list-empty? if "invalid fn statement shape" fn-error end
+		list-pop-front drop drop        # list'
 		continue
 	end
 	drop                              # list
@@ -525,9 +696,9 @@ compile-only
 
 
 word fn-valid-type?
-	dup "int" string= if drop 1 exit end
-	dup "number" string= if drop 1 exit end
-	dup "float" string= if drop 1 exit end
+	dup "int" string-equal? if drop 1 exit end
+	dup "number" string-equal? if drop 1 exit end
+	dup "float" string-equal? if drop 1 exit end
 	drop 0
 end
 compile-only
@@ -535,10 +706,10 @@ compile-only
 
 word fn-stmt-decl?
 	dup list-length 5 < if drop 0 exit end
-	dup 0 list-get "let" string= 0 == if drop 0 exit end
+	dup 0 list-get "let" fn-is? 0 == if drop 0 exit end
 	dup 1 list-get identifier? 0 == if drop 0 exit end
 	dup 2 list-get identifier? 0 == if drop 0 exit end
-	dup 3 list-get "=" string= 0 == if drop 0 exit end
+	dup 3 list-get "=" fn-is? 0 == if drop 0 exit end
 	drop 1
 end
 compile-only
@@ -547,7 +718,7 @@ compile-only
 word fn-stmt-assign?
 	dup list-length 3 < if drop 0 exit end
 	dup 0 list-get identifier? 0 == if drop 0 exit end
-	dup 1 list-get "=" string= 0 == if drop 0 exit end
+	dup 1 list-get "=" fn-is? 0 == if drop 0 exit end
 	drop 1
 end
 compile-only
@@ -560,7 +731,7 @@ word fn-expr-has-operator?         # fn-expr-has-operator? [* | expr] -> [* | fl
 			drop
 			0 exit
 		end
-		list-pop-front                # expr' tok
+		list-pop-front drop           # expr' tok
 		swap >r                       # tok      (r: expr')
 		fn-operator? if
 			rdrop
@@ -574,7 +745,8 @@ compile-only
 
 
 word fn-token-type                 # fn-token-type [*, typeMap | tok] -> [* | type]
-	dup string>number
+	lexeme
+	dup try-string>int
 	if
 		drop
 		drop
@@ -582,12 +754,10 @@ word fn-token-type                 # fn-token-type [*, typeMap | tok] -> [* | ty
 		"int" exit
 	end
 	drop
-	map-get
+	map-get                           # type ok
 	if
-		swap drop
 		exit
 	end
-	drop
 	drop
 	"number"
 end
@@ -617,15 +787,15 @@ compile-only
 
 
 word fn-type-compatible?           # fn-type-compatible? [*, targetType | exprType] -> [* | flag]
-	2dup string= if
+	2dup string-equal? if
 		drop
 		drop
 		1 exit
 	end
 	swap
-	dup "number" string= if
+	dup "number" string-equal? if
 		drop
-		"int" string=
+		"int" string-equal?
 		exit
 	end
 	drop
@@ -636,17 +806,17 @@ compile-only
 
 
 word fn-parse-let-stmt             # fn-parse-let-stmt [* | stmt] -> [*, type, name | expr]
-	dup fn-stmt-decl? 0 == if "invalid let statement in fn body" parse-error end
-	dup 1 list-get
-	over 2 list-get
+	dup fn-stmt-decl? 0 == if "invalid let statement in fn body" fn-error end
+	dup 1 list-get lexeme
+	over 2 list-get lexeme
 	rot 4 fn-stmt-expr-from
 end
 compile-only
 
 
 word fn-parse-assign-stmt          # fn-parse-assign-stmt [* | stmt] -> [*, name | expr]
-	dup fn-stmt-assign? 0 == if "invalid assignment statement in fn body" parse-error end
-	dup 0 list-get
+	dup fn-stmt-assign? 0 == if "invalid assignment statement in fn body" fn-error end
+	dup 0 list-get lexeme
 	swap 2 fn-stmt-expr-from
 end
 compile-only
@@ -663,20 +833,20 @@ begin
 		else
 			drop
 		end
-		dup list-empty? if "empty function body" parse-error end
+		dup list-empty? if "empty function body" fn-error end
 		exit
 	end
 
-	list-pop-front                   # statements cur body' tok
+	list-pop-front drop              # statements cur body' tok
 	swap >r                          # statements cur tok   (r: body')
 
-	dup "return" string= if
+	dup "return" fn-is? if
 		drop
 		r>
 		continue
 	end
 
-	dup ";" string= if
+	dup ";" fn-is? if
 		drop
 		dup list-length 0 == if
 			r>
@@ -716,48 +886,40 @@ compile-only
 word fn-ctx-get                    # fn-ctx-get [*, ctx | key] -> [* | value]
 	map-get
 	if
-		swap drop
 		exit
 	end
 	drop
-	drop
-	"internal fn compiler context key is missing" parse-error
-end
-compile-only
-
-
-word fn-ctx-set                    # fn-ctx-set [*, ctx, key | value] -> [* | ctx]
-	map-set
+	"internal fn compiler context key is missing" fn-error
 end
 compile-only
 
 
 word fn-ctx-set-out                # fn-ctx-set-out [*, ctx | out] -> [* | ctx]
-	swap "out" rot fn-ctx-set
+	swap "out" rot map-set
 end
 compile-only
 
 
 word fn-ctx-set-vars               # fn-ctx-set-vars [*, ctx | vars] -> [* | ctx]
-	swap "vars" rot fn-ctx-set
+	swap "vars" rot map-set
 end
 compile-only
 
 
 word fn-ctx-set-types              # fn-ctx-set-types [*, ctx | types] -> [* | ctx]
-	swap "types" rot fn-ctx-set
+	swap "types" rot map-set
 end
 compile-only
 
 
 word fn-ctx-set-locals             # fn-ctx-set-locals [*, ctx | n] -> [* | ctx]
-	swap "locals" rot fn-ctx-set
+	swap "locals" rot map-set
 end
 compile-only
 
 
 word fn-ctx-set-params-count       # fn-ctx-set-params-count [*, ctx | n] -> [* | ctx]
-	swap "params_count" rot fn-ctx-set
+	swap "params_count" rot map-set
 end
 compile-only
 
@@ -790,7 +952,7 @@ word fn-append-expression          # fn-append-expression [*, out, vars | expr] 
 	fn-rewrite-call-expr
 	if
 	else
-		shunt
+		fn-infix>postfix
 	end
 	rot
 	swap
@@ -802,7 +964,7 @@ compile-only
 
 word fn-compile-expr-stmt          # fn-compile-expr-stmt [*, ctx, stmt | isLast] -> [* | ctx]
 	>r                                # ctx stmt    (r: isLast)
-	dup list-empty? if "empty function statement in fn body" parse-error end
+	dup list-empty? if "empty function statement in fn body" fn-error end
 	over fn-ctx-out-vars              # ctx stmt ctx out vars
 	3 pick                            # ctx stmt ctx out vars stmt
 	fn-append-expression              # ctx stmt ctx out' vars'
@@ -822,19 +984,18 @@ compile-only
 
 
 word fn-compile-let-stmt           # fn-compile-let-stmt [*, ctx, stmt | isLast] -> [* | ctx]
-	if "invalid trailing function statement in fn body" parse-error end
+	if "invalid trailing function statement in fn body" fn-error end
 	fn-parse-let-stmt                 # ctx type name expr
 
-	dup list-empty? if "missing initializer expression in let statement" parse-error end
-	2 pick fn-valid-type? 0 == if "unsupported fn variable type in let statement" parse-error end
+	dup list-empty? if "missing initializer expression in let statement" fn-error end
+	2 pick fn-valid-type? 0 == if "unsupported fn variable type in let statement" fn-error end
 
 	3 pick "types" fn-ctx-get
-	2 pick map-get if "duplicate variable in let statement" parse-error end
-	drop
+	2 pick map-get if "duplicate variable in let statement" fn-error end
 	drop
 
 	dup 4 pick "types" fn-ctx-get fn-expr-type   # ctx type name expr exprType
-	3 pick swap fn-type-compatible? 0 == if "fn type error: incompatible let initializer" parse-error end
+	3 pick swap fn-type-compatible? 0 == if "fn type error: incompatible let initializer" fn-error end
 
 	swap >r swap >r                  # ctx expr      (r: type name)
 
@@ -870,18 +1031,17 @@ compile-only
 
 
 word fn-compile-assign-stmt        # fn-compile-assign-stmt [*, ctx, stmt | isLast] -> [* | ctx]
-	if "invalid trailing function statement in fn body" parse-error end
+	if "invalid trailing function statement in fn body" fn-error end
 	fn-parse-assign-stmt              # ctx name expr
 
-	dup list-empty? if "missing expression in assignment statement" parse-error end
+	dup list-empty? if "missing expression in assignment statement" fn-error end
 
 	2 pick "types" fn-ctx-get
 	2 pick map-get
-	0 == if "assignment to undeclared variable in fn body" parse-error end
-	swap drop
+	0 == if "assignment to undeclared variable in fn body" fn-error end
 
 	1 pick 4 pick "types" fn-ctx-get fn-expr-type   # ctx name expr targetType exprType
-	1 pick swap fn-type-compatible? 0 == if "fn type error: incompatible assignment expression" parse-error end
+	1 pick swap fn-type-compatible? 0 == if "fn type error: incompatible assignment expression" fn-error end
 	drop
 
 	swap >r                           # ctx expr      (r: name)
@@ -927,8 +1087,9 @@ begin
 		drop
 		exit
 	end
-	list-pop-front                    # ctx statements' stmt
+	list-pop-front drop               # ctx statements' stmt
 	swap >r                           # ctx stmt    (r: statements')
+	fn-mark-statement
 	0 rpick list-empty? if
 		1
 	else
@@ -942,43 +1103,21 @@ end
 compile-only
 
 
-word fn-translate-token            # fn-translate-token [*, out, map | tok] -> [*, out | map]
-	# number?
-	dup string>number              # out map tok num ok
-	if
-		# (out map tok num) -> (out' map)
-		>r                           # out map tok        (r: num)
-		drop                         # out map
-		r>                           # out map num
-		swap >r                      # out num            (r: map)
-		list-append                  # out'
-		r>                           # out' map
+# fn-translate-token [*, out, map | tok] -> [*, out | map]
+# A number keeps its token; a variable becomes `N rpick`, both tokens
+# anchored at the variable itself; anything else keeps its token.
+word fn-translate-token
+	dup lexeme try-string>int nip if   # out map tok
+		swap >r list-append r> exit
+	end
+	over over lexeme map-get if        # out map tok idx
+		over swap int>string token-with-lexeme   # out map tok idxTok
+		swap "rpick" token-with-lexeme           # out map idxTok rpickTok
+		>r >r swap r> list-append r> list-append swap
 		exit
 	end
-	drop                           # out map tok
-
-	# param?
-	dup >r                         # out map tok        (r: tok)
-	map-get                        # out map idx|nil ok
-	if
-		# append idx
-		swap >r                      # out idx            (r: map tok)
-		list-append                  # out'
-		r>                           # out' map
-		# append "rpick"
-		"rpick" swap >r             # out' "rpick"      (r: map tok)
-		list-append                  # out''
-		r>                           # out'' map
-		# drop saved tok
-		r> drop                      # out'' map
-		exit
-	end
-	# not a param: drop idx|nil, append original tok
-	drop                           # out map
-	r>                             # out map tok
-	swap >r                        # out tok            (r: map)
-	list-append                    # out'
-	r>                             # out' map
+	drop                               # out map tok
+	swap >r list-append r>
 end
 compile-only
 
@@ -989,7 +1128,7 @@ word fn-translate-postfix-loop     # fn-translate-postfix-loop [*, map, out | po
 			drop
 			exit
 		end
-		list-pop-front               # map out postfix' tok
+		list-pop-front drop          # map out postfix' tok
 		swap >r                      # map out tok   (r: postfix')
 		>r swap r>                   # out map tok   (r: postfix')
 		fn-translate-token           # out map
@@ -1059,139 +1198,102 @@ word fn-build-body                # fn-build-body [*, bodyLexemes | params] -> [
 end
 compile-only
 
+# fn-emit-definition [*, body, nameTok | paramCount] -> [*]
+# Emit `word <name> <body...> end stack-effect <name> <params> 1`.  Body
+# elements are tokens, which keep their exact source origins, or generated
+# lexeme strings (`>r`, `rdrop`, `drop`), anchored at the token before them
+# (the name at the start).  The declared effect (the parameters in, one value
+# out) lets the stack checker verify the function and its callers.
+word fn-emit-definition
+	>r dup >r                                                 # body nameTok   (r: count nameTok)
+	dup "word" token-with-lexeme list-new swap list-append   # body nameTok out
+	over list-append                                          # body nameTok out
+	rot list-clone rot                                        # out body anchor
+begin
+	over list-empty? if break end
+	over list-pop-front drop nip                              # out body anchor elem
+	dup token? 0 == if over swap token-with-lexeme end        # out body anchor tok
+	nip                                                       # out body tok
+	2 pick over list-append drop
+again
+	"end" token-with-lexeme                                   # out body endTok
+	rot swap list-append nip                                  # out
+	r> r> >r                                                  # out nameTok   (r: count)
+	dup "stack-effect" token-with-lexeme                      # out nameTok effectTok
+	rot swap list-append                                      # nameTok out
+	over list-append                                          # nameTok out
+	over r> int>string token-with-lexeme list-append          # nameTok out
+	swap "1" token-with-lexeme list-append                    # out
+	list>syntax emit
+end
+compile-only
+
 word fn
-	"(),{};+-*/%," lexer-new         # lexer
-	dup lexer-pop                     # lexer nameTok
-	dup >r                            # save nameTok
-	token-lexeme                      # lexer name
-	dup identifier? 0 == if "invalid function name for 'fn'" parse-error end
-	>r                                # save name string
-	drop                              # leave lexer only for params
-	"(" lexer-expect drop            # consume '(' keep lexer
-	fn-params                         # params lexer
+	ct-parser-eof? if "missing function name after 'fn'" fn-error end
+	ct-parser-consume                 # nameTok
+	dup token-lexeme identifier? 0 == if "invalid function name for 'fn'" fn-error end
+	>r                                # (r: nameTok)
+	"(" fn-expect                     # consume '('
+	fn-params                         # params
+	dup list-length >r                # (r: nameTok paramCount)
 	fn-collect-body                   # params bodyTokens
-	swap >r                           # bodyTokens (r: params)
-	fn-lexemes-from-tokens            # lexemes
-	r>                                # bodyLexemes params
+	fn-split-tokens                   # params pieces
+	"fn.statement" ct-store-delete
+	swap                              # pieces params
 	fn-build-body                     # body
-	r> drop                           # drop name string
-	r>                                # name token
-	swap emit-definition
+	"fn.statement" ct-store-delete
+	r> r> swap fn-emit-definition     # body nameTok paramCount
 end
 immediate
 compile-only
 
 
 # High-level DSL convenience aliases.
-macro defn 0
-	fn
-;
+macro defn `fn` emit ;
 
-macro function 0
-	fn
-;
+macro function `fn` emit ;
+
+# The macro's metadata map (empty when it has none or is not a macro).
+word fn-dsl-macro-metadata         # fn-dsl-macro-metadata [* | name] -> [* | metadata]
+	ct-macro-get-by-name if "metadata" map-get drop else drop map-new end
+end
+compile-only
+
+# Store one key in a macro's metadata.
+word fn-dsl-set-metadata           # fn-dsl-set-metadata [*, name, key | value] -> [*]
+	>r >r dup fn-dsl-macro-metadata     # name metadata (r: value key)
+	r> r> map-set                       # name metadata'
+	>r map-new "metadata" r> map-set    # name patch
+	ct-macro-set-by-name drop
+end
+compile-only
 
 word fn-dsl-set-doc                # fn-dsl-set-doc [*, name | doc] -> [*]
-	ct-macro-doc-set drop
+	"doc" swap fn-dsl-set-metadata
 end
 compile-only
 
 word fn-dsl-set-attrs              # fn-dsl-set-attrs [*, name | kind] -> [*]
-	map-new
-	"category" "fn.dsl" map-set
-	swap
-	"kind" swap map-set
-	"source" "ct-register-text-macro-signature" map-set
-	ct-macro-attrs-set drop
-end
-compile-only
-
-word fn-dsl-parser-session-begin
-	ct-parser-session-begin
-end
-compile-only
-
-word fn-dsl-parser-session-commit
-	ct-parser-session-commit
-end
-compile-only
-
-word fn-dsl-parser-session-rollback
-	ct-parser-session-rollback
-end
-compile-only
-
-word fn-dsl-parser-collect-until   # fn-dsl-parser-collect-until [* | delimiter] -> [*, tokens | found]
-	ct-parser-collect-until
-end
-compile-only
-
-word fn-dsl-parser-collect-balanced   # fn-dsl-parser-collect-balanced [*, open | close] -> [*, tokens | found]
-	ct-parser-collect-balanced
-end
-compile-only
-
-word fn-dsl-parser-mark
-	ct-parser-mark
-end
-compile-only
-
-word fn-dsl-parser-diff
-	ct-parser-diff
-end
-compile-only
-
-word fn-dsl-parser-expected
-	ct-parser-expected
-end
-compile-only
-
-word fn-dsl-token-clone
-	token-clone
-end
-compile-only
-
-word fn-dsl-token-rename          # fn-dsl-token-rename [*, token | lexeme] -> [* | token]
-	token-with-lexeme
-end
-compile-only
-
-word fn-dsl-token-shift-column    # fn-dsl-token-shift-column [*, token | delta] -> [* | token]
-	token-shift-column
-end
-compile-only
-
-word fn-dsl-rewrite-scope-push
-	ct-rewrite-scope-push
-end
-compile-only
-
-word fn-dsl-rewrite-scope-pop
-	ct-rewrite-scope-pop
-end
-compile-only
-
-word fn-dsl-rewrite-run           # fn-dsl-rewrite-run [*, stage | token-list] -> [*, token-list | patches]
-	ct-rewrite-run-on-list
+	over "category" "fn.dsl" fn-dsl-set-metadata
+	"kind" swap fn-dsl-set-metadata
 end
 compile-only
 
 word fn-dsl-rewrite-run-scoped    # fn-dsl-rewrite-run-scoped [*, stage | token-list] -> [*, token-list | patches]
-	fn-dsl-rewrite-scope-push drop
-	fn-dsl-rewrite-run
-	fn-dsl-rewrite-scope-pop static_assert
+	ct-rewrite-scope-push drop
+	ct-rewrite-run-on-list
+	ct-rewrite-scope-pop static-assert
 end
 compile-only
 
-word fn-dsl-parser-tail-lexemes   # fn-dsl-parser-tail-lexemes [*] -> [* | list]
-	ct-parser-tail
+word fn-dsl-token-lexemes         # fn-dsl-token-lexemes [* | tokens] -> [* | lexemes]
 	list-new swap
 begin
 	dup list-empty? if
 		drop
 		exit
 	end
-	list-pop-front
+	list-pop-front drop
 	swap >r
 	token-lexeme
 	list-append
@@ -1201,533 +1303,334 @@ again
 end
 compile-only
 
-word fn-dsl-parser-diff-lexemes   # fn-dsl-parser-diff-lexemes [*, start | end] -> [* | list]
-	fn-dsl-parser-diff
-	"lexemes" map-get
+word fn-dsl-parser-tail-lexemes   # fn-dsl-parser-tail-lexemes [*] -> [* | list]
+	ct-parser-tail fn-dsl-token-lexemes
 end
 compile-only
 
+word fn-dsl-parser-diff-lexemes   # fn-dsl-parser-diff-lexemes [*, start | end] -> [* | list]
+	ct-parser-slice fn-dsl-token-lexemes
+end
+compile-only
+
+# Library macros.  fn-dsl-register-macros adopts them into the fn.dsl
+# language pack and records their documentation as macro metadata.
+# thread-first: pipe(value, func) => value func
+macro pipe (value func) `$value $func` emit ;
+# alias of pipe
+macro thread (value func) `$value $func` emit ;
+# thread-first with one extra argument
+macro pipe2 (value arg func) `$value $arg $func` emit ;
+# thread-first with two extra arguments
+macro pipe3 (value arg1 arg2 func) `$value $arg1 $arg2 $func` emit ;
+# invoke side-effect function and keep value
+macro tap (value func) `$value dup $func` emit ;
+# expression-level conditional
+macro when (cond expr) `$cond if $expr else 0 end` emit ;
+# inverse expression-level conditional
+macro unless (cond expr) `$cond if 0 else $expr end` emit ;
+# expression-level if/else
+macro ifelse (cond on_true on_false) `$cond if $on_true else $on_false end` emit ;
+# compose two unary functions
+macro compose2 (f g x) `$x $g $f` emit ;
+# compose three unary functions
+macro compose3 (f g h x) `$x $h $g $f` emit ;
+# variadic thread-first pipeline
+macro chain (value funcs) `$value $funcs` emit ;
+# apply function to variadic args
+macro invoke (func args) `$args $func` emit ;
+# tap with one function argument
+macro tapn (value func args) `$value dup $args $func drop` emit ;
+# apply binary function
+macro apply2 (func a b) `$a $b $func` emit ;
+# apply ternary function
+macro apply3 (func a b c) `$a $b $c $func` emit ;
+# thread-first with three extra arguments
+macro pipe4 (value arg1 arg2 arg3 func) `$value $arg1 $arg2 $arg3 $func` emit ;
+# thread-first with four extra arguments
+macro pipe5 (value arg1 arg2 arg3 arg4 func) `$value $arg1 $arg2 $arg3 $arg4 $func` emit ;
+# apply quaternary function
+macro apply4 (func a b c d) `$a $b $c $d $func` emit ;
+# apply 5-arity function
+macro apply5 (func a b c d e) `$a $b $c $d $e $func` emit ;
+# compose four unary functions
+macro compose4 (f g h k x) `$x $k $h $g $f` emit ;
+# compose five unary functions
+macro compose5 (f g h k m x) `$x $m $k $h $g $f` emit ;
+# apply two unary functions to same input
+macro juxt2 (f g x) `$x $f $x $g` emit ;
+# apply three unary functions to same input
+macro juxt3 (f g h x) `$x $f $x $g $x $h` emit ;
+# reverse first two arguments before call
+macro flip2 (func a b) `$b $a $func` emit ;
+# expression guard with explicit fallback
+macro guard (cond on_true on_false) `$cond if $on_true else $on_false end` emit ;
+# evaluate expression when condition is false
+macro when-not (cond expr) `$cond if 0 else $expr end` emit ;
+# alias of pipe/thread-first
+macro thrush (value func) `$value $func` emit ;
+# return value unchanged
+macro identity (value) `$value` emit ;
+# always return first argument
+macro const (value _ignored) `$value` emit ;
+# return fallback only when value is falsey
+macro default (value fallback) `$value dup if else drop $fallback end` emit ;
+# branch on value presence while preserving happy-path value
+macro maybe (value on_some on_none) `$value dup if $on_some else drop $on_none end` emit ;
+# alias of tap
+macro keep (value func) `$value dup $func` emit ;
+# conditionally apply function and keep original value otherwise
+macro pipe-if (value cond func) `$cond if $value $func else $value end` emit ;
+# inverse conditional pipeline
+macro pipe-unless (value cond func) `$cond if $value else $value $func end` emit ;
+# thread-last with one fixed argument
+macro pipe-last2 (value arg func) `$arg $value $func` emit ;
+# thread-last with two fixed arguments
+macro pipe-last3 (value arg1 arg2 func) `$arg1 $arg2 $value $func` emit ;
+# thread-last with three fixed arguments
+macro pipe-last4 (value arg1 arg2 arg3 func) `$arg1 $arg2 $arg3 $value $func` emit ;
+# thread-first with five extra arguments
+macro pipe6 (value arg1 arg2 arg3 arg4 arg5 func) `$value $arg1 $arg2 $arg3 $arg4 $arg5 $func` emit ;
+# apply 6-arity function
+macro apply6 (func a b c d e f) `$a $b $c $d $e $f $func` emit ;
+# compose six unary functions
+macro compose6 (f g h k m n x) `$x $n $m $k $h $g $f` emit ;
+# apply four unary functions to the same input
+macro juxt4 (f g h k x) `$x $f $x $g $x $h $x $k` emit ;
+# apply five unary functions to the same input
+macro juxt5 (f g h k m x) `$x $f $x $g $x $h $x $k $x $m` emit ;
+# apply six unary functions to the same input
+macro juxt6 (f g h k m n x) `$x $f $x $g $x $h $x $k $x $m $x $n` emit ;
+# tap through two side-effect functions while preserving value
+macro tap2 (value f g) `$value dup $f dup $g` emit ;
+# tap through three side-effect functions while preserving value
+macro tap3 (value f g h) `$value dup $f dup $g dup $h` emit ;
+# statement-oriented conditional block
+macro when-do (cond body) `$cond if $body end` emit ;
+# inverse statement-oriented conditional block
+macro unless-do (cond body) `$cond if else $body end` emit ;
+
 word fn-dsl-register-macros
-	"pipe"
-	list-new "value" list-append "func" list-append
-	list-new "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe" ct-lang-register-macro drop
 	"pipe" "thread-first: pipe(value, func) => value func" fn-dsl-set-doc
 	"pipe" "pipeline" fn-dsl-set-attrs
-
-	"thread"
-	list-new "value" list-append "func" list-append
-	list-new "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "thread" ct-lang-register-macro drop
 	"thread" "alias of pipe" fn-dsl-set-doc
 	"thread" "pipeline" fn-dsl-set-attrs
-
-	"pipe2"
-	list-new "value" list-append "arg" list-append "func" list-append
-	list-new "$value" list-append "$arg" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe2" ct-lang-register-macro drop
 	"pipe2" "thread-first with one extra argument" fn-dsl-set-doc
 	"pipe2" "pipeline" fn-dsl-set-attrs
-
-	"pipe3"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "func" list-append
-	list-new "$value" list-append "$arg1" list-append "$arg2" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe3" ct-lang-register-macro drop
 	"pipe3" "thread-first with two extra arguments" fn-dsl-set-doc
 	"pipe3" "pipeline" fn-dsl-set-attrs
-
-	"tap"
-	list-new "value" list-append "func" list-append
-	list-new "$value" list-append "dup" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "tap" ct-lang-register-macro drop
 	"tap" "invoke side-effect function and keep value" fn-dsl-set-doc
 	"tap" "pipeline" fn-dsl-set-attrs
-
-	"when"
-	list-new "cond" list-append "expr" list-append
-	list-new "$cond" list-append "if" list-append "$expr" list-append "else" list-append "0" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "when" ct-lang-register-macro drop
 	"when" "expression-level conditional" fn-dsl-set-doc
 	"when" "control" fn-dsl-set-attrs
-
-	"unless"
-	list-new "cond" list-append "expr" list-append
-	list-new "$cond" list-append "if" list-append "0" list-append "else" list-append "$expr" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "unless" ct-lang-register-macro drop
 	"unless" "inverse expression-level conditional" fn-dsl-set-doc
 	"unless" "control" fn-dsl-set-attrs
-
-	"ifelse"
-	list-new "cond" list-append "on_true" list-append "on_false" list-append
-	list-new "$cond" list-append "if" list-append "$on_true" list-append "else" list-append "$on_false" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "ifelse" ct-lang-register-macro drop
 	"ifelse" "expression-level if/else" fn-dsl-set-doc
 	"ifelse" "control" fn-dsl-set-attrs
-
-	"compose2"
-	list-new "f" list-append "g" list-append "x" list-append
-	list-new "$x" list-append "$g" list-append "$f" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "compose2" ct-lang-register-macro drop
 	"compose2" "compose two unary functions" fn-dsl-set-doc
 	"compose2" "functional" fn-dsl-set-attrs
-
-	"compose3"
-	list-new "f" list-append "g" list-append "h" list-append "x" list-append
-	list-new "$x" list-append "$h" list-append "$g" list-append "$f" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "compose3" ct-lang-register-macro drop
 	"compose3" "compose three unary functions" fn-dsl-set-doc
 	"compose3" "functional" fn-dsl-set-attrs
-
-	"chain"
-	list-new "value" list-append "*funcs" list-append
-	list-new "$value" list-append "$*funcs" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "chain" ct-lang-register-macro drop
 	"chain" "variadic thread-first pipeline" fn-dsl-set-doc
 	"chain" "pipeline" fn-dsl-set-attrs
-
-	"invoke"
-	list-new "func" list-append "*args" list-append
-	list-new "$*args" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "invoke" ct-lang-register-macro drop
 	"invoke" "apply function to variadic args" fn-dsl-set-doc
 	"invoke" "functional" fn-dsl-set-attrs
-
-	"tapn"
-	list-new "value" list-append "func" list-append "*args" list-append
-	list-new "$value" list-append "dup" list-append "$*args" list-append "$func" list-append "drop" list-append
-	ct-register-text-macro-signature
-	"tapn" "tap with variadic function arguments" fn-dsl-set-doc
+	fn-dsl-lang-name "tapn" ct-lang-register-macro drop
+	"tapn" "tap with one function argument" fn-dsl-set-doc
 	"tapn" "pipeline" fn-dsl-set-attrs
-
-	"apply2"
-	list-new "func" list-append "a" list-append "b" list-append
-	list-new "$a" list-append "$b" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "apply2" ct-lang-register-macro drop
 	"apply2" "apply binary function" fn-dsl-set-doc
 	"apply2" "functional" fn-dsl-set-attrs
-
-	"apply3"
-	list-new "func" list-append "a" list-append "b" list-append "c" list-append
-	list-new "$a" list-append "$b" list-append "$c" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "apply3" ct-lang-register-macro drop
 	"apply3" "apply ternary function" fn-dsl-set-doc
 	"apply3" "functional" fn-dsl-set-attrs
-
-	"pipe4"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "func" list-append
-	list-new "$value" list-append "$arg1" list-append "$arg2" list-append "$arg3" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe4" ct-lang-register-macro drop
 	"pipe4" "thread-first with three extra arguments" fn-dsl-set-doc
 	"pipe4" "pipeline" fn-dsl-set-attrs
-
-	"pipe5"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "arg4" list-append "func" list-append
-	list-new "$value" list-append "$arg1" list-append "$arg2" list-append "$arg3" list-append "$arg4" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe5" ct-lang-register-macro drop
 	"pipe5" "thread-first with four extra arguments" fn-dsl-set-doc
 	"pipe5" "pipeline" fn-dsl-set-attrs
-
-	"apply4"
-	list-new "func" list-append "a" list-append "b" list-append "c" list-append "d" list-append
-	list-new "$a" list-append "$b" list-append "$c" list-append "$d" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "apply4" ct-lang-register-macro drop
 	"apply4" "apply quaternary function" fn-dsl-set-doc
 	"apply4" "functional" fn-dsl-set-attrs
-
-	"apply5"
-	list-new "func" list-append "a" list-append "b" list-append "c" list-append "d" list-append "e" list-append
-	list-new "$a" list-append "$b" list-append "$c" list-append "$d" list-append "$e" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "apply5" ct-lang-register-macro drop
 	"apply5" "apply 5-arity function" fn-dsl-set-doc
 	"apply5" "functional" fn-dsl-set-attrs
-
-	"compose4"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "x" list-append
-	list-new "$x" list-append "$k" list-append "$h" list-append "$g" list-append "$f" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "compose4" ct-lang-register-macro drop
 	"compose4" "compose four unary functions" fn-dsl-set-doc
 	"compose4" "functional" fn-dsl-set-attrs
-
-	"compose5"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "x" list-append
-	list-new "$x" list-append "$m" list-append "$k" list-append "$h" list-append "$g" list-append "$f" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "compose5" ct-lang-register-macro drop
 	"compose5" "compose five unary functions" fn-dsl-set-doc
 	"compose5" "functional" fn-dsl-set-attrs
-
-	"juxt2"
-	list-new "f" list-append "g" list-append "x" list-append
-	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "juxt2" ct-lang-register-macro drop
 	"juxt2" "apply two unary functions to same input" fn-dsl-set-doc
 	"juxt2" "functional" fn-dsl-set-attrs
-
-	"juxt3"
-	list-new "f" list-append "g" list-append "h" list-append "x" list-append
-	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "juxt3" ct-lang-register-macro drop
 	"juxt3" "apply three unary functions to same input" fn-dsl-set-doc
 	"juxt3" "functional" fn-dsl-set-attrs
-
-	"flip2"
-	list-new "func" list-append "a" list-append "b" list-append
-	list-new "$b" list-append "$a" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "flip2" ct-lang-register-macro drop
 	"flip2" "reverse first two arguments before call" fn-dsl-set-doc
 	"flip2" "functional" fn-dsl-set-attrs
-
-	"guard"
-	list-new "cond" list-append "on_true" list-append "on_false" list-append
-	list-new "$cond" list-append "if" list-append "$on_true" list-append "else" list-append "$on_false" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "guard" ct-lang-register-macro drop
 	"guard" "expression guard with explicit fallback" fn-dsl-set-doc
 	"guard" "control" fn-dsl-set-attrs
-
-	"when-not"
-	list-new "cond" list-append "expr" list-append
-	list-new "$cond" list-append "if" list-append "0" list-append "else" list-append "$expr" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "when-not" ct-lang-register-macro drop
 	"when-not" "evaluate expression when condition is false" fn-dsl-set-doc
 	"when-not" "control" fn-dsl-set-attrs
-
-	"thrush"
-	list-new "value" list-append "func" list-append
-	list-new "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "thrush" ct-lang-register-macro drop
 	"thrush" "alias of pipe/thread-first" fn-dsl-set-doc
 	"thrush" "pipeline" fn-dsl-set-attrs
-
-	"identity"
-	list-new "value" list-append
-	list-new "$value" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "identity" ct-lang-register-macro drop
 	"identity" "return value unchanged" fn-dsl-set-doc
 	"identity" "functional" fn-dsl-set-attrs
-
-	"const"
-	list-new "value" list-append "_ignored" list-append
-	list-new "$value" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "const" ct-lang-register-macro drop
 	"const" "always return first argument" fn-dsl-set-doc
 	"const" "functional" fn-dsl-set-attrs
-
-	"default"
-	list-new "value" list-append "fallback" list-append
-	list-new "$value" list-append "dup" list-append "if" list-append "else" list-append "drop" list-append "$fallback" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "default" ct-lang-register-macro drop
 	"default" "return fallback only when value is falsey" fn-dsl-set-doc
 	"default" "control" fn-dsl-set-attrs
-
-	"maybe"
-	list-new "value" list-append "on_some" list-append "on_none" list-append
-	list-new "$value" list-append "dup" list-append "if" list-append "$on_some" list-append "else" list-append "drop" list-append "$on_none" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "maybe" ct-lang-register-macro drop
 	"maybe" "branch on value presence while preserving happy-path value" fn-dsl-set-doc
 	"maybe" "control" fn-dsl-set-attrs
-
-	"keep"
-	list-new "value" list-append "func" list-append
-	list-new "$value" list-append "dup" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "keep" ct-lang-register-macro drop
 	"keep" "alias of tap" fn-dsl-set-doc
 	"keep" "pipeline" fn-dsl-set-attrs
-
-	"pipe-if"
-	list-new "value" list-append "cond" list-append "func" list-append
-	list-new "$cond" list-append "if" list-append "$value" list-append "$func" list-append "else" list-append "$value" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe-if" ct-lang-register-macro drop
 	"pipe-if" "conditionally apply function and keep original value otherwise" fn-dsl-set-doc
 	"pipe-if" "pipeline" fn-dsl-set-attrs
-
-	"pipe-unless"
-	list-new "value" list-append "cond" list-append "func" list-append
-	list-new "$cond" list-append "if" list-append "$value" list-append "else" list-append "$value" list-append "$func" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe-unless" ct-lang-register-macro drop
 	"pipe-unless" "inverse conditional pipeline" fn-dsl-set-doc
 	"pipe-unless" "pipeline" fn-dsl-set-attrs
-
-	"pipe-last2"
-	list-new "value" list-append "arg" list-append "func" list-append
-	list-new "$arg" list-append "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe-last2" ct-lang-register-macro drop
 	"pipe-last2" "thread-last with one fixed argument" fn-dsl-set-doc
 	"pipe-last2" "pipeline" fn-dsl-set-attrs
-
-	"pipe-last3"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "func" list-append
-	list-new "$arg1" list-append "$arg2" list-append "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe-last3" ct-lang-register-macro drop
 	"pipe-last3" "thread-last with two fixed arguments" fn-dsl-set-doc
 	"pipe-last3" "pipeline" fn-dsl-set-attrs
-
-	"pipe-last4"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "func" list-append
-	list-new "$arg1" list-append "$arg2" list-append "$arg3" list-append "$value" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe-last4" ct-lang-register-macro drop
 	"pipe-last4" "thread-last with three fixed arguments" fn-dsl-set-doc
 	"pipe-last4" "pipeline" fn-dsl-set-attrs
-
-	"pipe6"
-	list-new "value" list-append "arg1" list-append "arg2" list-append "arg3" list-append "arg4" list-append "arg5" list-append "func" list-append
-	list-new "$value" list-append "$arg1" list-append "$arg2" list-append "$arg3" list-append "$arg4" list-append "$arg5" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "pipe6" ct-lang-register-macro drop
 	"pipe6" "thread-first with five extra arguments" fn-dsl-set-doc
 	"pipe6" "pipeline" fn-dsl-set-attrs
-
-	"apply6"
-	list-new "func" list-append "a" list-append "b" list-append "c" list-append "d" list-append "e" list-append "f" list-append
-	list-new "$a" list-append "$b" list-append "$c" list-append "$d" list-append "$e" list-append "$f" list-append "$func" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "apply6" ct-lang-register-macro drop
 	"apply6" "apply 6-arity function" fn-dsl-set-doc
 	"apply6" "functional" fn-dsl-set-attrs
-
-	"compose6"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "n" list-append "x" list-append
-	list-new "$x" list-append "$n" list-append "$m" list-append "$k" list-append "$h" list-append "$g" list-append "$f" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "compose6" ct-lang-register-macro drop
 	"compose6" "compose six unary functions" fn-dsl-set-doc
 	"compose6" "functional" fn-dsl-set-attrs
-
-	"juxt4"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "x" list-append
-	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "juxt4" ct-lang-register-macro drop
 	"juxt4" "apply four unary functions to the same input" fn-dsl-set-doc
 	"juxt4" "functional" fn-dsl-set-attrs
-
-	"juxt5"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "x" list-append
-	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append "$x" list-append "$m" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "juxt5" ct-lang-register-macro drop
 	"juxt5" "apply five unary functions to the same input" fn-dsl-set-doc
 	"juxt5" "functional" fn-dsl-set-attrs
-
-	"juxt6"
-	list-new "f" list-append "g" list-append "h" list-append "k" list-append "m" list-append "n" list-append "x" list-append
-	list-new "$x" list-append "$f" list-append "$x" list-append "$g" list-append "$x" list-append "$h" list-append "$x" list-append "$k" list-append "$x" list-append "$m" list-append "$x" list-append "$n" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "juxt6" ct-lang-register-macro drop
 	"juxt6" "apply six unary functions to the same input" fn-dsl-set-doc
 	"juxt6" "functional" fn-dsl-set-attrs
-
-	"tap2"
-	list-new "value" list-append "f" list-append "g" list-append
-	list-new "$value" list-append "dup" list-append "$f" list-append "dup" list-append "$g" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "tap2" ct-lang-register-macro drop
 	"tap2" "tap through two side-effect functions while preserving value" fn-dsl-set-doc
 	"tap2" "pipeline" fn-dsl-set-attrs
-
-	"tap3"
-	list-new "value" list-append "f" list-append "g" list-append "h" list-append
-	list-new "$value" list-append "dup" list-append "$f" list-append "dup" list-append "$g" list-append "dup" list-append "$h" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "tap3" ct-lang-register-macro drop
 	"tap3" "tap through three side-effect functions while preserving value" fn-dsl-set-doc
 	"tap3" "pipeline" fn-dsl-set-attrs
-
-	"when-do"
-	list-new "cond" list-append "*body" list-append
-	list-new "$cond" list-append "if" list-append "$*body" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "when-do" ct-lang-register-macro drop
 	"when-do" "statement-oriented conditional block" fn-dsl-set-doc
 	"when-do" "control" fn-dsl-set-attrs
-
-	"unless-do"
-	list-new "cond" list-append "*body" list-append
-	list-new "$cond" list-append "if" list-append "else" list-append "$*body" list-append "end" list-append
-	ct-register-text-macro-signature
+	fn-dsl-lang-name "unless-do" ct-lang-register-macro drop
 	"unless-do" "inverse statement-oriented conditional block" fn-dsl-set-doc
 	"unless-do" "control" fn-dsl-set-attrs
 end
 compile-only
 
-word fn-dsl-pattern-append-clause   # fn-dsl-pattern-append-clause [*, clauses, pattern | replacement] -> [* | clauses']
-	>r
-	list-new
-	swap
-	list-append
-	r>
-	list-append
-	list-append
-end
-compile-only
+# Arithmetic simplification: fn_simplify followed by one of these shapes
+# is replaced by its simplified value; anything else passes through.
+macro fn_simplify
+	match
+		[$x:int, +, 0] => `$x` emit
+		[0, +, $x:int] => `$x` emit
+		[$x:int, -, 0] => `$x` emit
+		[$x:int, \*, 1] => `$x` emit
+		[1, \*, $x:int] => `$x` emit
+		[$x:int, /, 1] => `$x` emit
+		[$x:int, \*, 0] => `0` emit
+		[0, \*, $x:int] => `0` emit
+		[_] =>
+	end
+;
 
 word fn-dsl-install-pattern-macros
-	"fn_simplify"
-	list-new
-
-	list-new "$x:int" list-append "+" list-append "0" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "0" list-append "+" list-append "$x:int" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "$x:int" list-append "-" list-append "0" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "$x:int" list-append "*" list-append "1" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "1" list-append "*" list-append "$x:int" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "$x:int" list-append "/" list-append "1" list-append
-	list-new "$x" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "$x:int" list-append "*" list-append "0" list-append
-	list-new "0" list-append
-	fn-dsl-pattern-append-clause
-
-	list-new "0" list-append "*" list-append "$x:int" list-append
-	list-new "0" list-append
-	fn-dsl-pattern-append-clause
-
-	ct-register-pattern-macro
-
-	"fn_simplify" "fn.dsl.optim" ct-set-pattern-macro-group static_assert
-	"fn_simplify" "fn.dsl.scope" ct-set-pattern-macro-scope static_assert
-	"fn_simplify" 20 ct-set-pattern-macro-priority static_assert
-	"fn.dsl.optim" 1 ct-set-pattern-group-active static_assert
-	"fn.dsl.scope" 1 ct-set-pattern-scope-active static_assert
-end
-compile-only
-
-word fn-dsl-pattern-enable
-	"fn_simplify" 1 ct-set-pattern-macro-enabled
-end
-compile-only
-
-word fn-dsl-pattern-disable
-	"fn_simplify" 0 ct-set-pattern-macro-enabled
-end
-compile-only
-
-word fn-dsl-pattern-enabled
-	"fn_simplify" ct-get-pattern-macro-enabled
-end
-compile-only
-
-word fn-dsl-pattern-clauses
-	"fn_simplify" ct-get-pattern-macro-clauses
-end
-compile-only
-
-word fn-dsl-pattern-conflicts
-	"fn_simplify" ct-detect-pattern-conflicts-named
-end
-compile-only
-
-word fn-dsl-ct-call-policy-open
-	"off" ct-set-ct-call-sandbox-mode
-	"raise" ct-set-ct-call-exception-policy
-	1 ct-set-ct-call-memo
-	0 ct-set-ct-call-side-effects
-	64 ct-set-ct-call-recursion-limit
-	0 ct-set-ct-call-timeout-ms
-end
-compile-only
-
-word fn-dsl-ct-call-policy-safe
-	"compile-only" ct-set-ct-call-sandbox-mode
-	list-new
-	"ct-capture-args" list-append
-	"ct-capture-get" list-append
-	"ct-capture-has?" list-append
-	"ct-capture-shape" list-append
-	"ct-capture-coerce-tokens" list-append
-	"ct-capture-coerce-string" list-append
-	"ct-capture-coerce-number" list-append
-	"ct-capture-normalize" list-append
-	"ct-capture-pretty" list-append
-	"ct-capture-clone" list-append
-	ct-set-ct-call-sandbox-allowlist drop
-	"raise" ct-set-ct-call-exception-policy
-	1 ct-set-ct-call-memo
-	1 ct-set-ct-call-side-effects
-	64 ct-set-ct-call-recursion-limit
-	250 ct-set-ct-call-timeout-ms
-	1337 ct-ctrand-seed
-end
-compile-only
-
-word fn-dsl-ct-call-status
-	map-new
-	"sandbox_mode" ct-get-ct-call-sandbox-mode map-set
-	"exception_policy" ct-get-ct-call-exception-policy map-set
-	"memo_enabled" ct-get-ct-call-memo map-set
-	"memo_size" ct-get-ct-call-memo-size map-set
-	"side_effects_enabled" ct-get-ct-call-side-effects map-set
-	"side_effect_log" ct-get-ct-call-side-effect-log map-set
-	"recursion_limit" ct-get-ct-call-recursion-limit map-set
-	"timeout_ms" ct-get-ct-call-timeout-ms map-set
-	"sandbox_allowlist" ct-get-ct-call-sandbox-allowlist map-set
-	"sandbox_allowlist_size" ct-get-ct-call-sandbox-allowlist list-length map-set
-end
-compile-only
-
-word fn-dsl-ct-call-reset
-	ct-clear-ct-call-memo drop
-	ct-clear-ct-call-side-effect-log drop
-end
-compile-only
-
-word fn-dsl-words-prefix
-	ct-list-words-prefix
+	fn-dsl-lang-name "fn_simplify" ct-lang-register-macro drop
 end
 compile-only
 
 word fn-dsl-ct-capabilities
 	map-new
-	"ct_total" "ct-" fn-dsl-words-prefix list-length map-set
-	"ct_capture" "ct-capture-" fn-dsl-words-prefix list-length map-set
-	"ct_parser" "ct-parser-" fn-dsl-words-prefix list-length map-set
-	"ct_rewrite" "ct-rewrite-" fn-dsl-words-prefix list-length map-set
-	"ct_reader" "ct-add-reader-" fn-dsl-words-prefix list-length map-set
-	"ct_grammar" "ct-add-grammar-" fn-dsl-words-prefix list-length map-set
-	"ct_macro" "ct-macro-" fn-dsl-words-prefix list-length map-set
-	"ct_pattern_set" "ct-set-pattern-" fn-dsl-words-prefix list-length map-set
-	"ct_pattern_get" "ct-get-pattern-" fn-dsl-words-prefix list-length map-set
-	"ct_call_get" "ct-get-ct-call-" fn-dsl-words-prefix list-length map-set
-	"ct_call_set" "ct-set-ct-call-" fn-dsl-words-prefix list-length map-set
-	"ct_word_introspection" "ct-get-word-" fn-dsl-words-prefix list-length map-set
+	"ct_total" "ct-" ct-definition-list-names-prefix list-length map-set
+	"ct_parser" "ct-parser-" ct-definition-list-names-prefix list-length map-set
+	"ct_rewrite" "ct-rewrite-" ct-definition-list-names-prefix list-length map-set
+	"ct_reader" "ct-rewrite-add-reader" ct-definition-list-names-prefix list-length map-set
+	"ct_grammar" "ct-rewrite-add-grammar" ct-definition-list-names-prefix list-length map-set
+	"ct_macro" "ct-macro-" ct-definition-list-names-prefix list-length map-set
+	"ct_rng" "ct-rng-" ct-definition-list-names-prefix list-length map-set
+	"ct_word_introspection" "ct-definition-" ct-definition-list-names-prefix list-length map-set
 end
 compile-only
 
 word fn-dsl-assert-ct-surface
 	fn-dsl-ct-capabilities
-	dup "ct_total" map-get 120 >= static_assert
-	dup "ct_capture" map-get 20 >= static_assert
-	dup "ct_parser" map-get 8 >= static_assert
-	dup "ct_rewrite" map-get 8 >= static_assert
-	dup "ct_call_get" map-get 5 >= static_assert
-	dup "ct_call_set" map-get 5 >= static_assert
+	dup "ct_total" map-get drop 120 >= static-assert
+	dup "ct_parser" map-get drop 8 >= static-assert
+	dup "ct_rewrite" map-get drop 8 >= static-assert
+	dup "ct_rng" map-get drop 3 >= static-assert
 	drop
+end
+compile-only
+
+# Remove the fn.dsl pack's own grammar rewrite registrations named `name`
+# (through their handles, never by global name).
+word fn-dsl-drop-owned-rule        # fn-dsl-drop-owned-rule [* | name] -> [*]
+	>r
+	fn-dsl-lang-name ct-lang-status drop "grammar_rewrites" map-get drop
+	begin
+		dup list-empty? if drop rdrop exit end
+		list-pop-front drop
+		dup "name" map-get drop r@ string-equal? if
+			"handle" map-get drop ct-rewrite-remove drop
+		else
+			drop
+		end
+	again
+end
+compile-only
+
+# Install (or reinstall) a pack-owned grammar rule on the fn.dsl pipeline.
+word fn-dsl-upsert-grammar-rule    # fn-dsl-upsert-grammar-rule [*, name, pattern | replacement] -> [*]
+	>r >r
+	dup fn-dsl-drop-owned-rule
+	fn-dsl-lang-name swap r> r>
+	ct-lang-add-grammar-rewrite-named
+	"fn.dsl" ct-rewrite-rule-set-pipeline drop
 end
 compile-only
 
 word fn-dsl-upsert-grammar-alias   # fn-dsl-upsert-grammar-alias [*, name, alias | target] -> [*]
 	>r >r
-	dup ct-remove-grammar-rewrite drop
 	list-new r> list-append
 	list-new r> list-append
-	ct-add-grammar-rewrite-named drop
-end
-compile-only
-
-word fn-dsl-bind-rewrite-pipeline  # fn-dsl-bind-rewrite-pipeline [* | name] -> [*]
-	"grammar" swap "fn.dsl" ct-set-rewrite-pipeline drop
-end
-compile-only
-
-word fn-dsl-upsert-grammar-rule    # fn-dsl-upsert-grammar-rule [*, name, pattern | replacement] -> [*]
-	>r >r
-	dup ct-remove-grammar-rewrite drop
-	r> r>
-	ct-add-grammar-rewrite-named drop
+	fn-dsl-upsert-grammar-rule
 end
 compile-only
 
@@ -1761,83 +1664,24 @@ word fn-dsl-install-operators
 	list-new "$f" list-append "<-" list-append "$x" list-append
 	list-new "$x" list-append "$f" list-append
 	fn-dsl-upsert-grammar-rule
-
-	"fn.dsl.pipeop" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.rpipeop" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.andand" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.oror" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.arrow" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.larrow" fn-dsl-bind-rewrite-pipeline
-end
-compile-only
-
-word fn-dsl-sync-rewrite-index
-	"grammar" ct-rebuild-rewrite-index drop
 end
 compile-only
 
 word fn-dsl-active?
-	"grammar" ct-list-rewrite-active-pipelines
+	"grammar" ct-rewrite-list-active-pipelines
 	"fn.dsl" list-contains?
 end
 compile-only
 
-word fn-dsl-stats
-	"grammar" ct-get-rewrite-index-stats
-end
-compile-only
-
-word fn-dsl-compat
-	"grammar" ct-rewrite-compatibility-matrix
-end
-compile-only
-
-word fn-dsl-trace-on
-	1 ct-set-rewrite-trace
-end
-compile-only
-
-word fn-dsl-trace-off
-	0 ct-set-rewrite-trace
-end
-compile-only
-
-word fn-dsl-trace-log
-	ct-get-rewrite-trace-log
-end
-compile-only
-
-word fn-dsl-trace-clear
-	ct-clear-rewrite-trace-log
-end
-compile-only
-
 word fn-dsl-mode-fast
-	"first" ct-set-rewrite-saturation
-	4096 ct-set-rewrite-max-steps
-	0 ct-set-rewrite-loop-detection
+	4096 ct-rewrite-set-max-steps
+	0 ct-rewrite-set-loop-detection
 end
 compile-only
 
 word fn-dsl-mode-safe
-	"specificity" ct-set-rewrite-saturation
-	100000 ct-set-rewrite-max-steps
-	1 ct-set-rewrite-loop-detection
-end
-compile-only
-
-word fn-dsl-pack-export
-	ct-export-rewrite-pack
-end
-compile-only
-
-word fn-dsl-pack-import
-	ct-import-rewrite-pack
-end
-compile-only
-
-word fn-dsl-pack-replace
-	ct-import-rewrite-pack-replace
+	100000 ct-rewrite-set-max-steps
+	1 ct-rewrite-set-loop-detection
 end
 compile-only
 
@@ -1850,16 +1694,7 @@ word fn-dsl-install-rewrites
 	"fn.dsl.method" "method" "fn" fn-dsl-upsert-grammar-alias
 	"fn.dsl.defun" "defun" "fn" fn-dsl-upsert-grammar-alias
 
-	"fn.dsl.fun" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.def" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.fnc" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.func" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.fnx" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.method" fn-dsl-bind-rewrite-pipeline
-	"fn.dsl.defun" fn-dsl-bind-rewrite-pipeline
-
-	"grammar" "fn.dsl" 1 ct-set-rewrite-pipeline-active
-	fn-dsl-sync-rewrite-index
+	"grammar" "fn.dsl" 1 ct-rewrite-set-pipeline-active
 end
 compile-only
 
@@ -1880,26 +1715,16 @@ immediate
 compile-only
 
 word fn-dsl-disable
-	"grammar" "fn.dsl" 0 ct-set-rewrite-pipeline-active
+	"grammar" "fn.dsl" 0 ct-rewrite-set-pipeline-active
 	fn-dsl-lang-name ct-lang-deactivate drop
 end
 immediate
 compile-only
 
-macro use-fn-dsl 0
-	fn-dsl-enable
-;
+macro use-fn-dsl `fn-dsl-enable` emit ;
 
-macro use-fn-calls 0
-	fn-dsl-enable-calls
-;
+macro use-fn-calls `fn-dsl-enable-calls` emit ;
 
-macro use-fn-superlang 0
-	fn-dsl-enable
-	fn-dsl-enable-calls
-	fn-dsl-ct-call-policy-safe
-;
+macro use-fn-superlang `fn-dsl-enable fn-dsl-enable-calls` emit ;
 
-macro use-fn-full 0
-	use-fn-superlang
-;
+macro use-fn-full `use-fn-superlang` emit ;

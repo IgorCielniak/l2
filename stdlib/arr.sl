@@ -224,13 +224,13 @@ word arr_find
 end
 
 word fw-opener-lex?
-    dup "if" string= if drop 1 exit end
-    dup "for" string= if drop 1 exit end
-    dup "while" string= if drop 1 exit end
-    dup "begin" string= if drop 1 exit end
-    dup "with" string= if drop 1 exit end
-    dup "foreach" string= if drop 1 exit end
-    dup "foreachwith" string= if drop 1 exit end
+    dup "if" string-equal? if drop 1 exit end
+    dup "for" string-equal? if drop 1 exit end
+    dup "while" string-equal? if drop 1 exit end
+    dup "begin" string-equal? if drop 1 exit end
+    dup "with" string-equal? if drop 1 exit end
+    dup "foreach" string-equal? if drop 1 exit end
+    dup "foreachwith" string-equal? if drop 1 exit end
     drop 0
 end
 compile-only
@@ -239,11 +239,11 @@ word fw-collect-body
     list-new 0
     with body depth in
     begin
-        next-token dup nil? if
-            drop
-            "unterminated 'foreachwith' block (missing 'end')" parse-error
+        ct-parser-eof? if
+            "unterminated 'foreachwith' block (missing 'end')" ct-parser-error
         end
-        dup token-lexeme "end" string= if
+        ct-parser-consume
+        dup token-lexeme "end" string-equal? if
             depth 0 == if
                 drop
                 body exit
@@ -261,36 +261,41 @@ word fw-collect-body
 end
 compile-only
 
-word fw-append-lex
-    swap token-from-lexeme
+# fw-append-lex-at [*, out, template | lexeme] -> [* | out]
+# The new token keeps the template token's origin.
+word fw-append-lex-at
+    token-with-lexeme
     list-append
 end
 compile-only
 
 word foreach
+    # Capture the 'foreach' token before the body is consumed; it anchors
+    # the generated tokens.
+    ct-parser-current
     fw-collect-body
-    with body in
+    with tpl body in
         list-new with out in
-            out nil "dup" fw-append-lex out !
-            out nil "@" fw-append-lex out !
-            out nil "swap" fw-append-lex out !
-            out nil "8" fw-append-lex out !
-            out nil "+" fw-append-lex out !
-            out nil "swap" fw-append-lex out !
-            out nil "0" fw-append-lex out !
-            out nil "swap" fw-append-lex out !
-            out nil "for" fw-append-lex out !
-            out nil "2dup" fw-append-lex out !
-            out nil "8" fw-append-lex out !
-            out nil "*" fw-append-lex out !
-            out nil "+" fw-append-lex out !
-            out nil "@" fw-append-lex out !
+            out tpl "dup" fw-append-lex-at out !
+            out tpl "@" fw-append-lex-at out !
+            out tpl "swap" fw-append-lex-at out !
+            out tpl "8" fw-append-lex-at out !
+            out tpl "+" fw-append-lex-at out !
+            out tpl "swap" fw-append-lex-at out !
+            out tpl "0" fw-append-lex-at out !
+            out tpl "swap" fw-append-lex-at out !
+            out tpl "for" fw-append-lex-at out !
+            out tpl "2dup" fw-append-lex-at out !
+            out tpl "8" fw-append-lex-at out !
+            out tpl "*" fw-append-lex-at out !
+            out tpl "+" fw-append-lex-at out !
+            out tpl "@" fw-append-lex-at out !
             out body list-extend out !
-            out nil "1" fw-append-lex out !
-            out nil "+" fw-append-lex out !
-            out nil "end" fw-append-lex out !
-            out nil "2drop" fw-append-lex out !
-            out inject-tokens
+            out tpl "1" fw-append-lex-at out !
+            out tpl "+" fw-append-lex-at out !
+            out tpl "end" fw-append-lex-at out !
+            out tpl "2drop" fw-append-lex-at out !
+            out ct-parser-inject
         end
     end
 end
@@ -298,13 +303,13 @@ immediate
 compile-only
 
 word foreachwith
-    next-token dup nil? if
-        drop
-        "missing variable name after 'foreachwith'" parse-error
+    ct-parser-eof? if
+        "missing variable name after 'foreachwith'" ct-parser-error
     end
+    ct-parser-consume
     dup token-lexeme dup identifier? 0 == if
         drop drop
-        "invalid variable name in 'foreachwith'" parse-error
+        "invalid variable name in 'foreachwith'" ct-parser-error
     end
     drop
     >r
@@ -313,15 +318,15 @@ word foreachwith
     r>
     with body name_tok in
         list-new with out in
-            out name_tok "foreach" fw-append-lex out !
-            out name_tok "with" fw-append-lex out !
+            out name_tok "foreach" fw-append-lex-at out !
+            out name_tok "with" fw-append-lex-at out !
             out name_tok list-append out !
-            out name_tok "in" fw-append-lex out !
+            out name_tok "in" fw-append-lex-at out !
             out body list-extend out !
-            out name_tok "end" fw-append-lex out !
-            out name_tok "end" fw-append-lex out !
-            out name_tok "drop" fw-append-lex out !
-            out inject-tokens
+            out name_tok "end" fw-append-lex-at out !
+            out name_tok "end" fw-append-lex-at out !
+            out name_tok "drop" fw-append-lex-at out !
+            out ct-parser-inject
         end
     end
 end

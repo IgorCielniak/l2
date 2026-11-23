@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "a begin loop closed by end instead of again is a control mismatch"
+}

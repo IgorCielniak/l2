@@ -1,3 +1,7 @@
 word source_probe
     1 2 +
 end
+29
+word shadowed "é" drop 2 end
+0
+0

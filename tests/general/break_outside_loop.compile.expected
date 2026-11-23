@@ -1,0 +1,18 @@
+error[parser-loop-control-outside-loop]: 'break' outside a loop at 5:7
+  --> break_outside_loop.sl:5:8
+    |
+  5 |   1 if break end
+    |        ^^^^^
+    | = note: while parsing definition 'main'
+    | = note: inside 'if' block opened at 5:4
+error[parser-unexpected-end]: unexpected 'end' at 7:0
+  --> break_outside_loop.sl:7:1
+    |
+  7 | end
+    | ^^^
+    | = note: `end` must close an active definition or control block
+    |
+    = help: remove this `end` or add its matching opener earlier
+    = help: check nesting around `if`/`else`/`for`/`while`/`begin`/`word`
+
+2 error(s) emitted

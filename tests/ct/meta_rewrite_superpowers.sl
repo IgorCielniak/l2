@@ -1,57 +1,63 @@
 import stdlib.sl
 
+# The handle of the only grammar rule with this name, found through the
+# rule listing.
+word grammar-handle   # [* | name] -> [* | handle]
+  >r ct-rewrite-list-grammar
+  begin
+    list-pop-front drop
+    dup "name" map-get drop r@ string-equal? if
+      "handle" map-get drop nip rdrop exit
+    end
+    drop
+  again
+end
+
 word setup-meta
   # Grammar rewrites with named rules and explicit priorities.
   "tw-low"
   list-new "tw" list-append
   list-new "2" list-append
-  ct-add-grammar-rewrite-named drop
+  ct-rewrite-add-grammar-named drop
 
   "tw-high"
   list-new "tw" list-append
   list-new "3" list-append
-  ct-add-grammar-rewrite-named drop
-  "tw-high" 10 ct-set-grammar-rewrite-priority static_assert
+  ct-rewrite-add-grammar-named
+  10 ct-rewrite-rule-set-priority static-assert
 
   # Reader rewrite rule and rule controls.
   "coldup"
   list-new "::" list-append
   list-new "dup" list-append
-  ct-add-reader-rewrite-named drop
-  "coldup" 7 ct-set-reader-rewrite-priority static_assert
+  ct-rewrite-add-reader-named
+  7 ct-rewrite-rule-set-priority static-assert
 
-  # Programmatic text macro registration.
-  "twice" 1
-  list-new
-  "$0" list-append
-  "$0" list-append
-  "+" list-append
-  ct-register-text-macro
+  # A macro generated with ordinary macro syntax.
+  `macro twice (x) \` \$x \$x + \` emit ;` emit
 
-  # Introspection checks.
-  "tw-high" ct-get-grammar-rewrite-enabled static_assert static_assert
-  "tw-high" ct-get-grammar-rewrite-priority static_assert 10 == static_assert
-  "coldup" ct-get-reader-rewrite-enabled static_assert static_assert
-  "coldup" ct-get-reader-rewrite-priority static_assert 7 == static_assert
+  # Introspection checks, by handle and by unique name.
+  "tw-high" grammar-handle ct-rewrite-rule-get-enabled static-assert static-assert
+  "grammar" "tw-high" ct-rewrite-rule-get-priority static-assert 10 == static-assert
+  "reader" "coldup" ct-rewrite-rule-get-enabled static-assert static-assert
+  "reader" "coldup" ct-rewrite-rule-get-priority static-assert 7 == static-assert
+  "reader" "missing" ct-rewrite-rule-get-priority 0 == static-assert nil? static-assert
 
-  ct-get-macro-expansion-limit dup 1 >= static_assert ct-set-macro-expansion-limit
-  1 ct-set-macro-preview
-  ct-get-macro-preview static_assert
-  0 ct-set-macro-preview
+  ct-expansion-get-depth-limit dup 1 >= static-assert ct-expansion-set-depth-limit
 end
 compile-time setup-meta
 
 word val_a tw end
 
 word disable-high
-  "tw-high" 0 ct-set-grammar-rewrite-enabled static_assert
+  "tw-high" grammar-handle 0 ct-rewrite-rule-set-enabled static-assert
 end
 compile-time disable-high
 
 word val_b tw end
 
 word enable-high
-  "tw-high" 1 ct-set-grammar-rewrite-enabled static_assert
+  "tw-high" grammar-handle 1 ct-rewrite-rule-set-enabled static-assert
 end
 compile-time enable-high
 

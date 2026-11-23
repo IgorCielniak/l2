@@ -4,11 +4,11 @@ import stdlib/stdlib.sl
 import stdlib/io.sl
 import stdlib/mem.sl
 
-macro WIDTH 0 40 ;
-macro HEIGHT 0 24 ;
-macro GENERATIONS 0 80 ;
-macro CELLS 0 WIDTH HEIGHT * ;
-macro FRAME_DELAY 0 35000000;
+macro WIDTH `40` emit ;
+macro HEIGHT `24` emit ;
+macro GENERATIONS `80` emit ;
+macro CELLS `WIDTH HEIGHT *` emit ;
+macro FRAME_DELAY `35000000` emit ;
 
 #cell_addr [*, grid, x | y] -> [* | addr]
 word cell_addr

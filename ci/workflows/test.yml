@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -75,16 +75,39 @@ jobs:
           name: l2-dynamic
           path: build
 
-      - name: Run tests
-        run: python3 test.py -v && python3 test.py --ct-run-main -v && python3 tools/test_stack_effects.py && python3 tools/test_l2_api.py && python3 tools/test_event_bus.py && python3 tools/test_daemon.py
-        timeout-minutes: 30
+      - name: Run the full test matrix
+        # All suites: runtime, compile-time main, script, leak-check, integrity,
+        # the runtime library build, and every Python test file.
+        run: python3 run_test_matrix.py
+        timeout-minutes: 45
 
-      - name: Run leak checks
-        run: python3 test.py --leak-check
-        timeout-minutes: 20
+  perf-gate:
+    # Compile-time performance against the pull request's base commit
+    # (interleaved A/B runs, so machine noise affects both sides alike).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
 
-      - name: Run integrity checks
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
         run: |
-          python3 main.py --check-integrity
-          python3 main.py tests/general/hello.sl --check-integrity
-        timeout-minutes: 20
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils unzip
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          bash tools/fetch_keystone.sh
+
+      - name: Check out the base commit
+        run: git worktree add ../l2-base ${{ github.event.pull_request.base.sha }}
+
+      - name: Compare compile time with the base
+        run: python3 tools/bench_compile.py --ab ../l2-base --runs 9 --max-file-regression 5 --max-geomean 0
+        timeout-minutes: 30

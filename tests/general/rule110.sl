@@ -6,8 +6,8 @@ import stdlib/io.sl
 import stdlib/mem.sl
 
 # Configuration
-macro WIDTH 0 80 ;
-macro GENERATIONS 0 40 ;
+macro WIDTH `80` emit ;
+macro GENERATIONS `40` emit ;
 
 # rule110 [*, left, center | right] -> [* | new_state]
 word rule110

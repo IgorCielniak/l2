@@ -7,16 +7,16 @@ end
 compile-only
 
 word emit-overridden
-    "dup" use-l2-ct
+    "dup" ct-definition-prefer-l2-by-name drop
     42
     dup
     int>string
-    nil
-    token-from-lexeme
+    ct-parser-current swap
+    token-with-lexeme
     list-new
     swap
     list-append
-    inject-tokens
+    ct-parser-inject
 end
 immediate
 compile-only

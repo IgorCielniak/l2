@@ -1,0 +1,4 @@
+{
+  "description": "ct-definition-prefer-l2-by-name in the C compile-time VM (eval_program): marking an existing definition, a missing name, and the retired use-l2-ct",
+  "use_l2": true
+}

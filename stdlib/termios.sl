@@ -1,8 +1,8 @@
 import stdlib.sl
 
-macro TCGETS 0 0x5401 ;
-macro ENOTTY 0 25 ;
-macro EBADF 0 9 ;
+const TCGETS 0x5401
+const ENOTTY 25
+const EBADF 9
 
 # isatty [* | fd] -> [* | flag]
 word isatty

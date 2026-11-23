@@ -1,5 +1,5 @@
 word reject_compile_event
-  "intentional listener failure" parse-error
+  "intentional listener failure" ct-parser-error
 end on-event compile
 
 word main

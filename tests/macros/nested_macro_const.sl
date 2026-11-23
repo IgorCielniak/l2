@@ -1,7 +1,7 @@
 import stdlib.sl
 
-macro const 2
-    macro $0 $1 ;
+macro const (name value)
+    `macro $name \` $value \` emit ;` emit
 ;
 
 const a 4

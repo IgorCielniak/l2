@@ -3,46 +3,45 @@
 # Linux syscall constants + convenience wrappers for L2
 
 # File descriptor constants
-macro FD_STDIN 0 0 ;
-macro FD_STDOUT 0 1 ;
-macro FD_STDERR 0 2 ;
+const FD_STDIN 0
+const FD_STDOUT 1
+const FD_STDERR 2
 
 # Common open(2) flags
-macro O_RDONLY 0 0 ;
-macro O_WRONLY 0 1 ;
-macro O_RDWR 0 2 ;
-macro O_CREAT 0 64 ;
-macro O_EXCL 0 128 ;
-macro O_NOCTTY 0 256 ;
-macro O_TRUNC 0 512 ;
-macro O_APPEND 0 1024 ;
-macro O_NONBLOCK 0 2048 ;
-macro O_CLOEXEC 0 524288 ;
+const O_RDONLY 0
+const O_WRONLY 1
+const O_RDWR 2
+const O_CREAT 64
+const O_EXCL 128
+const O_NOCTTY 256
+const O_TRUNC 512
+const O_APPEND 1024
+const O_NONBLOCK 2048
+const O_CLOEXEC 524288
 
 # lseek(2)
-macro SEEK_SET 0 0 ;
-macro SEEK_CUR 0 1 ;
-macro SEEK_END 0 2 ;
+const SEEK_SET 0
+const SEEK_CUR 1
+const SEEK_END 2
 
 # mmap(2)
-macro PROT_NONE 0 0 ;
-macro PROT_READ 0 1 ;
-macro PROT_WRITE 0 2 ;
-macro PROT_EXEC 0 4 ;
-macro MAP_PRIVATE 0 2 ;
-macro MAP_ANONYMOUS 0 32 ;
-macro MAP_SHARED 0 1 ;
+const PROT_NONE 0
+const PROT_READ 1
+const PROT_WRITE 2
+const PROT_EXEC 4
+const MAP_PRIVATE 2
+const MAP_ANONYMOUS 32
+const MAP_SHARED 1
 
 # Socket constants
-macro AF_UNIX 0 1 ;
-macro AF_INET 0 2 ;
-macro AF_INET6 0 10 ;
-macro SOCK_STREAM 0 1 ;
-macro SOCK_DGRAM 0 2 ;
-macro SOCK_NONBLOCK 0 2048 ;
-macro SOCK_CLOEXEC 0 524288 ;
-
-macro INADDR_ANY 0 0 ;
+const AF_UNIX 1
+const AF_INET 2
+const AF_INET6 10
+const SOCK_STREAM 1
+const SOCK_DGRAM 2
+const SOCK_NONBLOCK 2048
+const SOCK_CLOEXEC 524288
+const INADDR_ANY 0
 
 # Generic syscall helpers with explicit argument count
 # Stack form:
@@ -59,5491 +58,3396 @@ macro INADDR_ANY 0 0 ;
 }
 ;
 
-macro syscall0 0
+macro syscall0 `
     0
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall1 0
+macro syscall1 `
     1
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall2 0
+macro syscall2 `
     2
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall3 0
+macro syscall3 `
     3
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall4 0
+macro syscall4 `
     4
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall5 0
+macro syscall5 `
     5
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall6 0
+macro syscall6 `
     6
     ___linux_swap
     syscall
-;
+` emit ;
 
-macro syscall.read 0
+macro syscall.read `
     0
     syscall3
-;
+` emit ;
 
-macro syscall.read.num 0
-    0
-;
+const syscall.read.num 0
+const syscall.read.argc 3
 
-macro syscall.read.argc 0
-    3
-;
-
-macro syscall.write 0
+macro syscall.write `
     1
     syscall3
-;
+` emit ;
 
-macro syscall.write.num 0
-    1
-;
+const syscall.write.num 1
+const syscall.write.argc 3
 
-macro syscall.write.argc 0
-    3
-;
-
-macro syscall.open 0
+macro syscall.open `
     2
     syscall3
-;
+` emit ;
 
-macro syscall.open.num 0
-    2
-;
+const syscall.open.num 2
+const syscall.open.argc 3
 
-macro syscall.open.argc 0
-    3
-;
-
-macro syscall.close 0
+macro syscall.close `
     3
     syscall1
-;
+` emit ;
 
-macro syscall.close.num 0
-    3
-;
+const syscall.close.num 3
+const syscall.close.argc 1
 
-macro syscall.close.argc 0
-    1
-;
-
-macro syscall.stat 0
+macro syscall.stat `
     4
     syscall2
-;
+` emit ;
 
-macro syscall.stat.num 0
-    4
-;
+const syscall.stat.num 4
+const syscall.stat.argc 2
 
-macro syscall.stat.argc 0
-    2
-;
-
-macro syscall.newstat 0
+macro syscall.newstat `
     4
     syscall2
-;
+` emit ;
 
-macro syscall.newstat.num 0
-    4
-;
+const syscall.newstat.num 4
+const syscall.newstat.argc 2
 
-macro syscall.newstat.argc 0
-    2
-;
-
-macro syscall.fstat 0
+macro syscall.fstat `
     5
     syscall2
-;
+` emit ;
 
-macro syscall.fstat.num 0
-    5
-;
+const syscall.fstat.num 5
+const syscall.fstat.argc 2
 
-macro syscall.fstat.argc 0
-    2
-;
-
-macro syscall.newfstat 0
+macro syscall.newfstat `
     5
     syscall2
-;
+` emit ;
 
-macro syscall.newfstat.num 0
-    5
-;
+const syscall.newfstat.num 5
+const syscall.newfstat.argc 2
 
-macro syscall.newfstat.argc 0
-    2
-;
-
-macro syscall.lstat 0
+macro syscall.lstat `
     6
     syscall2
-;
+` emit ;
 
-macro syscall.lstat.num 0
-    6
-;
+const syscall.lstat.num 6
+const syscall.lstat.argc 2
 
-macro syscall.lstat.argc 0
-    2
-;
-
-macro syscall.newlstat 0
+macro syscall.newlstat `
     6
     syscall2
-;
+` emit ;
 
-macro syscall.newlstat.num 0
-    6
-;
+const syscall.newlstat.num 6
+const syscall.newlstat.argc 2
 
-macro syscall.newlstat.argc 0
-    2
-;
-
-macro syscall.poll 0
+macro syscall.poll `
     7
     syscall3
-;
+` emit ;
 
-macro syscall.poll.num 0
-    7
-;
+const syscall.poll.num 7
+const syscall.poll.argc 3
 
-macro syscall.poll.argc 0
-    3
-;
-
-macro syscall.lseek 0
+macro syscall.lseek `
     8
     syscall3
-;
+` emit ;
 
-macro syscall.lseek.num 0
-    8
-;
+const syscall.lseek.num 8
+const syscall.lseek.argc 3
 
-macro syscall.lseek.argc 0
-    3
-;
-
-macro syscall.mmap 0
+macro syscall.mmap `
     9
     syscall6
-;
+` emit ;
 
-macro syscall.mmap.num 0
-    9
-;
+const syscall.mmap.num 9
+const syscall.mmap.argc 6
 
-macro syscall.mmap.argc 0
-    6
-;
-
-macro syscall.mprotect 0
+macro syscall.mprotect `
     10
     syscall3
-;
+` emit ;
 
-macro syscall.mprotect.num 0
-    10
-;
+const syscall.mprotect.num 10
+const syscall.mprotect.argc 3
 
-macro syscall.mprotect.argc 0
-    3
-;
-
-macro syscall.munmap 0
+macro syscall.munmap `
     11
     syscall2
-;
+` emit ;
 
-macro syscall.munmap.num 0
-    11
-;
+const syscall.munmap.num 11
+const syscall.munmap.argc 2
 
-macro syscall.munmap.argc 0
-    2
-;
-
-macro syscall.brk 0
+macro syscall.brk `
     12
     syscall1
-;
+` emit ;
 
-macro syscall.brk.num 0
-    12
-;
+const syscall.brk.num 12
+const syscall.brk.argc 1
 
-macro syscall.brk.argc 0
-    1
-;
-
-macro syscall.rt_sigaction 0
+macro syscall.rt_sigaction `
     13
     syscall4
-;
+` emit ;
 
-macro syscall.rt_sigaction.num 0
-    13
-;
+const syscall.rt_sigaction.num 13
+const syscall.rt_sigaction.argc 4
 
-macro syscall.rt_sigaction.argc 0
-    4
-;
-
-macro syscall.rt_sigprocmask 0
+macro syscall.rt_sigprocmask `
     14
     syscall4
-;
+` emit ;
 
-macro syscall.rt_sigprocmask.num 0
-    14
-;
+const syscall.rt_sigprocmask.num 14
+const syscall.rt_sigprocmask.argc 4
 
-macro syscall.rt_sigprocmask.argc 0
-    4
-;
-
-macro syscall.rt_sigreturn 0
+macro syscall.rt_sigreturn `
     15
     syscall0
-;
+` emit ;
 
-macro syscall.rt_sigreturn.num 0
-    15
-;
+const syscall.rt_sigreturn.num 15
+const syscall.rt_sigreturn.argc 0
 
-macro syscall.rt_sigreturn.argc 0
-    0
-;
-
-macro syscall.ioctl 0
+macro syscall.ioctl `
     16
     syscall3
-;
+` emit ;
 
-macro syscall.ioctl.num 0
-    16
-;
+const syscall.ioctl.num 16
+const syscall.ioctl.argc 3
 
-macro syscall.ioctl.argc 0
-    3
-;
-
-macro syscall.pread64 0
+macro syscall.pread64 `
     17
     syscall4
-;
+` emit ;
 
-macro syscall.pread64.num 0
-    17
-;
+const syscall.pread64.num 17
+const syscall.pread64.argc 4
 
-macro syscall.pread64.argc 0
-    4
-;
-
-macro syscall.pwrite64 0
+macro syscall.pwrite64 `
     18
     syscall4
-;
+` emit ;
 
-macro syscall.pwrite64.num 0
-    18
-;
+const syscall.pwrite64.num 18
+const syscall.pwrite64.argc 4
 
-macro syscall.pwrite64.argc 0
-    4
-;
-
-macro syscall.readv 0
+macro syscall.readv `
     19
     syscall3
-;
+` emit ;
 
-macro syscall.readv.num 0
-    19
-;
+const syscall.readv.num 19
+const syscall.readv.argc 3
 
-macro syscall.readv.argc 0
-    3
-;
-
-macro syscall.writev 0
+macro syscall.writev `
     20
     syscall3
-;
+` emit ;
 
-macro syscall.writev.num 0
-    20
-;
+const syscall.writev.num 20
+const syscall.writev.argc 3
 
-macro syscall.writev.argc 0
-    3
-;
-
-macro syscall.access 0
+macro syscall.access `
     21
     syscall2
-;
+` emit ;
 
-macro syscall.access.num 0
-    21
-;
+const syscall.access.num 21
+const syscall.access.argc 2
 
-macro syscall.access.argc 0
-    2
-;
-
-macro syscall.pipe 0
+macro syscall.pipe `
     22
     syscall1
-;
+` emit ;
 
-macro syscall.pipe.num 0
-    22
-;
+const syscall.pipe.num 22
+const syscall.pipe.argc 1
 
-macro syscall.pipe.argc 0
-    1
-;
-
-macro syscall.select 0
+macro syscall.select `
     23
     syscall5
-;
+` emit ;
 
-macro syscall.select.num 0
-    23
-;
+const syscall.select.num 23
+const syscall.select.argc 5
 
-macro syscall.select.argc 0
-    5
-;
-
-macro syscall.sched_yield 0
+macro syscall.sched_yield `
     24
     syscall0
-;
+` emit ;
 
-macro syscall.sched_yield.num 0
-    24
-;
+const syscall.sched_yield.num 24
+const syscall.sched_yield.argc 0
 
-macro syscall.sched_yield.argc 0
-    0
-;
-
-macro syscall.mremap 0
+macro syscall.mremap `
     25
     syscall5
-;
+` emit ;
 
-macro syscall.mremap.num 0
-    25
-;
+const syscall.mremap.num 25
+const syscall.mremap.argc 5
 
-macro syscall.mremap.argc 0
-    5
-;
-
-macro syscall.msync 0
+macro syscall.msync `
     26
     syscall3
-;
+` emit ;
 
-macro syscall.msync.num 0
-    26
-;
+const syscall.msync.num 26
+const syscall.msync.argc 3
 
-macro syscall.msync.argc 0
-    3
-;
-
-macro syscall.mincore 0
+macro syscall.mincore `
     27
     syscall3
-;
+` emit ;
 
-macro syscall.mincore.num 0
-    27
-;
+const syscall.mincore.num 27
+const syscall.mincore.argc 3
 
-macro syscall.mincore.argc 0
-    3
-;
-
-macro syscall.madvise 0
+macro syscall.madvise `
     28
     syscall3
-;
+` emit ;
 
-macro syscall.madvise.num 0
-    28
-;
+const syscall.madvise.num 28
+const syscall.madvise.argc 3
 
-macro syscall.madvise.argc 0
-    3
-;
-
-macro syscall.shmget 0
+macro syscall.shmget `
     29
     syscall3
-;
+` emit ;
 
-macro syscall.shmget.num 0
-    29
-;
+const syscall.shmget.num 29
+const syscall.shmget.argc 3
 
-macro syscall.shmget.argc 0
-    3
-;
-
-macro syscall.shmat 0
+macro syscall.shmat `
     30
     syscall3
-;
+` emit ;
 
-macro syscall.shmat.num 0
-    30
-;
+const syscall.shmat.num 30
+const syscall.shmat.argc 3
 
-macro syscall.shmat.argc 0
-    3
-;
-
-macro syscall.shmctl 0
+macro syscall.shmctl `
     31
     syscall3
-;
+` emit ;
 
-macro syscall.shmctl.num 0
-    31
-;
+const syscall.shmctl.num 31
+const syscall.shmctl.argc 3
 
-macro syscall.shmctl.argc 0
-    3
-;
-
-macro syscall.dup 0
+macro syscall.dup `
     32
     syscall1
-;
+` emit ;
 
-macro syscall.dup.num 0
-    32
-;
+const syscall.dup.num 32
+const syscall.dup.argc 1
 
-macro syscall.dup.argc 0
-    1
-;
-
-macro syscall.dup2 0
+macro syscall.dup2 `
     33
     syscall2
-;
+` emit ;
 
-macro syscall.dup2.num 0
-    33
-;
+const syscall.dup2.num 33
+const syscall.dup2.argc 2
 
-macro syscall.dup2.argc 0
-    2
-;
-
-macro syscall.pause 0
+macro syscall.pause `
     34
     syscall0
-;
+` emit ;
 
-macro syscall.pause.num 0
-    34
-;
+const syscall.pause.num 34
+const syscall.pause.argc 0
 
-macro syscall.pause.argc 0
-    0
-;
-
-macro syscall.nanosleep 0
+macro syscall.nanosleep `
     35
     syscall2
-;
+` emit ;
 
-macro syscall.nanosleep.num 0
-    35
-;
+const syscall.nanosleep.num 35
+const syscall.nanosleep.argc 2
 
-macro syscall.nanosleep.argc 0
-    2
-;
-
-macro syscall.getitimer 0
+macro syscall.getitimer `
     36
     syscall2
-;
+` emit ;
 
-macro syscall.getitimer.num 0
-    36
-;
+const syscall.getitimer.num 36
+const syscall.getitimer.argc 2
 
-macro syscall.getitimer.argc 0
-    2
-;
-
-macro syscall.alarm 0
+macro syscall.alarm `
     37
     syscall1
-;
+` emit ;
 
-macro syscall.alarm.num 0
-    37
-;
+const syscall.alarm.num 37
+const syscall.alarm.argc 1
 
-macro syscall.alarm.argc 0
-    1
-;
-
-macro syscall.setitimer 0
+macro syscall.setitimer `
     38
     syscall3
-;
+` emit ;
 
-macro syscall.setitimer.num 0
-    38
-;
+const syscall.setitimer.num 38
+const syscall.setitimer.argc 3
 
-macro syscall.setitimer.argc 0
-    3
-;
-
-macro syscall.getpid 0
+macro syscall.getpid `
     39
     syscall0
-;
+` emit ;
 
-macro syscall.getpid.num 0
-    39
-;
+const syscall.getpid.num 39
+const syscall.getpid.argc 0
 
-macro syscall.getpid.argc 0
-    0
-;
-
-macro syscall.sendfile 0
+macro syscall.sendfile `
     40
     syscall4
-;
+` emit ;
 
-macro syscall.sendfile.num 0
-    40
-;
+const syscall.sendfile.num 40
+const syscall.sendfile.argc 4
 
-macro syscall.sendfile.argc 0
-    4
-;
-
-macro syscall.sendfile64 0
+macro syscall.sendfile64 `
     40
     syscall4
-;
+` emit ;
 
-macro syscall.sendfile64.num 0
-    40
-;
+const syscall.sendfile64.num 40
+const syscall.sendfile64.argc 4
 
-macro syscall.sendfile64.argc 0
-    4
-;
-
-macro syscall.socket 0
+macro syscall.socket `
     41
     syscall3
-;
+` emit ;
 
-macro syscall.socket.num 0
-    41
-;
+const syscall.socket.num 41
+const syscall.socket.argc 3
 
-macro syscall.socket.argc 0
-    3
-;
-
-macro syscall.connect 0
+macro syscall.connect `
     42
     syscall3
-;
+` emit ;
 
-macro syscall.connect.num 0
-    42
-;
+const syscall.connect.num 42
+const syscall.connect.argc 3
 
-macro syscall.connect.argc 0
-    3
-;
-
-macro syscall.accept 0
+macro syscall.accept `
     43
     syscall3
-;
+` emit ;
 
-macro syscall.accept.num 0
-    43
-;
+const syscall.accept.num 43
+const syscall.accept.argc 3
 
-macro syscall.accept.argc 0
-    3
-;
-
-macro syscall.sendto 0
+macro syscall.sendto `
     44
     syscall6
-;
+` emit ;
 
-macro syscall.sendto.num 0
-    44
-;
+const syscall.sendto.num 44
+const syscall.sendto.argc 6
 
-macro syscall.sendto.argc 0
-    6
-;
-
-macro syscall.recvfrom 0
+macro syscall.recvfrom `
     45
     syscall6
-;
+` emit ;
 
-macro syscall.recvfrom.num 0
-    45
-;
+const syscall.recvfrom.num 45
+const syscall.recvfrom.argc 6
 
-macro syscall.recvfrom.argc 0
-    6
-;
-
-macro syscall.sendmsg 0
+macro syscall.sendmsg `
     46
     syscall3
-;
+` emit ;
 
-macro syscall.sendmsg.num 0
-    46
-;
+const syscall.sendmsg.num 46
+const syscall.sendmsg.argc 3
 
-macro syscall.sendmsg.argc 0
-    3
-;
-
-macro syscall.recvmsg 0
+macro syscall.recvmsg `
     47
     syscall3
-;
+` emit ;
 
-macro syscall.recvmsg.num 0
-    47
-;
+const syscall.recvmsg.num 47
+const syscall.recvmsg.argc 3
 
-macro syscall.recvmsg.argc 0
-    3
-;
-
-macro syscall.shutdown 0
+macro syscall.shutdown `
     48
     syscall2
-;
+` emit ;
 
-macro syscall.shutdown.num 0
-    48
-;
+const syscall.shutdown.num 48
+const syscall.shutdown.argc 2
 
-macro syscall.shutdown.argc 0
-    2
-;
-
-macro syscall.bind 0
+macro syscall.bind `
     49
     syscall3
-;
+` emit ;
 
-macro syscall.bind.num 0
-    49
-;
+const syscall.bind.num 49
+const syscall.bind.argc 3
 
-macro syscall.bind.argc 0
-    3
-;
-
-macro syscall.listen 0
+macro syscall.listen `
     50
     syscall2
-;
+` emit ;
 
-macro syscall.listen.num 0
-    50
-;
+const syscall.listen.num 50
+const syscall.listen.argc 2
 
-macro syscall.listen.argc 0
-    2
-;
-
-macro syscall.getsockname 0
+macro syscall.getsockname `
     51
     syscall3
-;
+` emit ;
 
-macro syscall.getsockname.num 0
-    51
-;
+const syscall.getsockname.num 51
+const syscall.getsockname.argc 3
 
-macro syscall.getsockname.argc 0
-    3
-;
-
-macro syscall.getpeername 0
+macro syscall.getpeername `
     52
     syscall3
-;
+` emit ;
 
-macro syscall.getpeername.num 0
-    52
-;
+const syscall.getpeername.num 52
+const syscall.getpeername.argc 3
 
-macro syscall.getpeername.argc 0
-    3
-;
-
-macro syscall.socketpair 0
+macro syscall.socketpair `
     53
     syscall4
-;
+` emit ;
 
-macro syscall.socketpair.num 0
-    53
-;
+const syscall.socketpair.num 53
+const syscall.socketpair.argc 4
 
-macro syscall.socketpair.argc 0
-    4
-;
-
-macro syscall.setsockopt 0
+macro syscall.setsockopt `
     54
     syscall5
-;
+` emit ;
 
-macro syscall.setsockopt.num 0
-    54
-;
+const syscall.setsockopt.num 54
+const syscall.setsockopt.argc 5
 
-macro syscall.setsockopt.argc 0
-    5
-;
-
-macro syscall.getsockopt 0
+macro syscall.getsockopt `
     55
     syscall5
-;
+` emit ;
 
-macro syscall.getsockopt.num 0
-    55
-;
+const syscall.getsockopt.num 55
+const syscall.getsockopt.argc 5
 
-macro syscall.getsockopt.argc 0
-    5
-;
-
-macro syscall.clone 0
+macro syscall.clone `
     56
     syscall5
-;
+` emit ;
 
-macro syscall.clone.num 0
-    56
-;
+const syscall.clone.num 56
+const syscall.clone.argc 5
 
-macro syscall.clone.argc 0
-    5
-;
-
-macro syscall.fork 0
+macro syscall.fork `
     57
     syscall0
-;
+` emit ;
 
-macro syscall.fork.num 0
-    57
-;
+const syscall.fork.num 57
+const syscall.fork.argc 0
 
-macro syscall.fork.argc 0
-    0
-;
-
-macro syscall.vfork 0
+macro syscall.vfork `
     58
     syscall0
-;
+` emit ;
 
-macro syscall.vfork.num 0
-    58
-;
+const syscall.vfork.num 58
+const syscall.vfork.argc 0
 
-macro syscall.vfork.argc 0
-    0
-;
-
-macro syscall.execve 0
+macro syscall.execve `
     59
     syscall3
-;
+` emit ;
 
-macro syscall.execve.num 0
-    59
-;
+const syscall.execve.num 59
+const syscall.execve.argc 3
 
-macro syscall.execve.argc 0
-    3
-;
-
-macro syscall.exit 0
+macro syscall.exit `
     60
     syscall1
-;
+` emit ;
 
-macro syscall.exit.num 0
-    60
-;
+const syscall.exit.num 60
+const syscall.exit.argc 1
 
-macro syscall.exit.argc 0
-    1
-;
-
-macro syscall.wait4 0
+macro syscall.wait4 `
     61
     syscall4
-;
+` emit ;
 
-macro syscall.wait4.num 0
-    61
-;
+const syscall.wait4.num 61
+const syscall.wait4.argc 4
 
-macro syscall.wait4.argc 0
-    4
-;
-
-macro syscall.kill 0
+macro syscall.kill `
     62
     syscall2
-;
+` emit ;
 
-macro syscall.kill.num 0
-    62
-;
+const syscall.kill.num 62
+const syscall.kill.argc 2
 
-macro syscall.kill.argc 0
-    2
-;
-
-macro syscall.uname 0
+macro syscall.uname `
     63
     syscall1
-;
+` emit ;
 
-macro syscall.uname.num 0
-    63
-;
+const syscall.uname.num 63
+const syscall.uname.argc 1
 
-macro syscall.uname.argc 0
-    1
-;
-
-macro syscall.newuname 0
+macro syscall.newuname `
     63
     syscall1
-;
+` emit ;
 
-macro syscall.newuname.num 0
-    63
-;
+const syscall.newuname.num 63
+const syscall.newuname.argc 1
 
-macro syscall.newuname.argc 0
-    1
-;
-
-macro syscall.semget 0
+macro syscall.semget `
     64
     syscall3
-;
+` emit ;
 
-macro syscall.semget.num 0
-    64
-;
+const syscall.semget.num 64
+const syscall.semget.argc 3
 
-macro syscall.semget.argc 0
-    3
-;
-
-macro syscall.semop 0
+macro syscall.semop `
     65
     syscall3
-;
+` emit ;
 
-macro syscall.semop.num 0
-    65
-;
+const syscall.semop.num 65
+const syscall.semop.argc 3
 
-macro syscall.semop.argc 0
-    3
-;
-
-macro syscall.semctl 0
+macro syscall.semctl `
     66
     syscall4
-;
+` emit ;
 
-macro syscall.semctl.num 0
-    66
-;
+const syscall.semctl.num 66
+const syscall.semctl.argc 4
 
-macro syscall.semctl.argc 0
-    4
-;
-
-macro syscall.shmdt 0
+macro syscall.shmdt `
     67
     syscall1
-;
+` emit ;
 
-macro syscall.shmdt.num 0
-    67
-;
+const syscall.shmdt.num 67
+const syscall.shmdt.argc 1
 
-macro syscall.shmdt.argc 0
-    1
-;
-
-macro syscall.msgget 0
+macro syscall.msgget `
     68
     syscall2
-;
+` emit ;
 
-macro syscall.msgget.num 0
-    68
-;
+const syscall.msgget.num 68
+const syscall.msgget.argc 2
 
-macro syscall.msgget.argc 0
-    2
-;
-
-macro syscall.msgsnd 0
+macro syscall.msgsnd `
     69
     syscall4
-;
+` emit ;
 
-macro syscall.msgsnd.num 0
-    69
-;
+const syscall.msgsnd.num 69
+const syscall.msgsnd.argc 4
 
-macro syscall.msgsnd.argc 0
-    4
-;
-
-macro syscall.msgrcv 0
+macro syscall.msgrcv `
     70
     syscall5
-;
+` emit ;
 
-macro syscall.msgrcv.num 0
-    70
-;
+const syscall.msgrcv.num 70
+const syscall.msgrcv.argc 5
 
-macro syscall.msgrcv.argc 0
-    5
-;
-
-macro syscall.msgctl 0
+macro syscall.msgctl `
     71
     syscall3
-;
+` emit ;
 
-macro syscall.msgctl.num 0
-    71
-;
+const syscall.msgctl.num 71
+const syscall.msgctl.argc 3
 
-macro syscall.msgctl.argc 0
-    3
-;
-
-macro syscall.fcntl 0
+macro syscall.fcntl `
     72
     syscall3
-;
+` emit ;
 
-macro syscall.fcntl.num 0
-    72
-;
+const syscall.fcntl.num 72
+const syscall.fcntl.argc 3
 
-macro syscall.fcntl.argc 0
-    3
-;
-
-macro syscall.flock 0
+macro syscall.flock `
     73
     syscall2
-;
+` emit ;
 
-macro syscall.flock.num 0
-    73
-;
+const syscall.flock.num 73
+const syscall.flock.argc 2
 
-macro syscall.flock.argc 0
-    2
-;
-
-macro syscall.fsync 0
+macro syscall.fsync `
     74
     syscall1
-;
+` emit ;
 
-macro syscall.fsync.num 0
-    74
-;
+const syscall.fsync.num 74
+const syscall.fsync.argc 1
 
-macro syscall.fsync.argc 0
-    1
-;
-
-macro syscall.fdatasync 0
+macro syscall.fdatasync `
     75
     syscall1
-;
+` emit ;
 
-macro syscall.fdatasync.num 0
-    75
-;
+const syscall.fdatasync.num 75
+const syscall.fdatasync.argc 1
 
-macro syscall.fdatasync.argc 0
-    1
-;
-
-macro syscall.truncate 0
+macro syscall.truncate `
     76
     syscall2
-;
+` emit ;
 
-macro syscall.truncate.num 0
-    76
-;
+const syscall.truncate.num 76
+const syscall.truncate.argc 2
 
-macro syscall.truncate.argc 0
-    2
-;
-
-macro syscall.ftruncate 0
+macro syscall.ftruncate `
     77
     syscall2
-;
+` emit ;
 
-macro syscall.ftruncate.num 0
-    77
-;
+const syscall.ftruncate.num 77
+const syscall.ftruncate.argc 2
 
-macro syscall.ftruncate.argc 0
-    2
-;
-
-macro syscall.getdents 0
+macro syscall.getdents `
     78
     syscall3
-;
+` emit ;
 
-macro syscall.getdents.num 0
-    78
-;
+const syscall.getdents.num 78
+const syscall.getdents.argc 3
 
-macro syscall.getdents.argc 0
-    3
-;
-
-macro syscall.getcwd 0
+macro syscall.getcwd `
     79
     syscall2
-;
+` emit ;
 
-macro syscall.getcwd.num 0
-    79
-;
+const syscall.getcwd.num 79
+const syscall.getcwd.argc 2
 
-macro syscall.getcwd.argc 0
-    2
-;
-
-macro syscall.chdir 0
+macro syscall.chdir `
     80
     syscall1
-;
+` emit ;
 
-macro syscall.chdir.num 0
-    80
-;
+const syscall.chdir.num 80
+const syscall.chdir.argc 1
 
-macro syscall.chdir.argc 0
-    1
-;
-
-macro syscall.fchdir 0
+macro syscall.fchdir `
     81
     syscall1
-;
+` emit ;
 
-macro syscall.fchdir.num 0
-    81
-;
+const syscall.fchdir.num 81
+const syscall.fchdir.argc 1
 
-macro syscall.fchdir.argc 0
-    1
-;
-
-macro syscall.rename 0
+macro syscall.rename `
     82
     syscall2
-;
+` emit ;
 
-macro syscall.rename.num 0
-    82
-;
+const syscall.rename.num 82
+const syscall.rename.argc 2
 
-macro syscall.rename.argc 0
-    2
-;
-
-macro syscall.mkdir 0
+macro syscall.mkdir `
     83
     syscall2
-;
+` emit ;
 
-macro syscall.mkdir.num 0
-    83
-;
+const syscall.mkdir.num 83
+const syscall.mkdir.argc 2
 
-macro syscall.mkdir.argc 0
-    2
-;
-
-macro syscall.rmdir 0
+macro syscall.rmdir `
     84
     syscall1
-;
+` emit ;
 
-macro syscall.rmdir.num 0
-    84
-;
+const syscall.rmdir.num 84
+const syscall.rmdir.argc 1
 
-macro syscall.rmdir.argc 0
-    1
-;
-
-macro syscall.creat 0
+macro syscall.creat `
     85
     syscall2
-;
+` emit ;
 
-macro syscall.creat.num 0
-    85
-;
+const syscall.creat.num 85
+const syscall.creat.argc 2
 
-macro syscall.creat.argc 0
-    2
-;
-
-macro syscall.link 0
+macro syscall.link `
     86
     syscall2
-;
+` emit ;
 
-macro syscall.link.num 0
-    86
-;
+const syscall.link.num 86
+const syscall.link.argc 2
 
-macro syscall.link.argc 0
-    2
-;
-
-macro syscall.unlink 0
+macro syscall.unlink `
     87
     syscall1
-;
+` emit ;
 
-macro syscall.unlink.num 0
-    87
-;
+const syscall.unlink.num 87
+const syscall.unlink.argc 1
 
-macro syscall.unlink.argc 0
-    1
-;
-
-macro syscall.symlink 0
+macro syscall.symlink `
     88
     syscall2
-;
+` emit ;
 
-macro syscall.symlink.num 0
-    88
-;
+const syscall.symlink.num 88
+const syscall.symlink.argc 2
 
-macro syscall.symlink.argc 0
-    2
-;
-
-macro syscall.readlink 0
+macro syscall.readlink `
     89
     syscall3
-;
+` emit ;
 
-macro syscall.readlink.num 0
-    89
-;
+const syscall.readlink.num 89
+const syscall.readlink.argc 3
 
-macro syscall.readlink.argc 0
-    3
-;
-
-macro syscall.chmod 0
+macro syscall.chmod `
     90
     syscall2
-;
+` emit ;
 
-macro syscall.chmod.num 0
-    90
-;
+const syscall.chmod.num 90
+const syscall.chmod.argc 2
 
-macro syscall.chmod.argc 0
-    2
-;
-
-macro syscall.fchmod 0
+macro syscall.fchmod `
     91
     syscall2
-;
+` emit ;
 
-macro syscall.fchmod.num 0
-    91
-;
+const syscall.fchmod.num 91
+const syscall.fchmod.argc 2
 
-macro syscall.fchmod.argc 0
-    2
-;
-
-macro syscall.chown 0
+macro syscall.chown `
     92
     syscall3
-;
+` emit ;
 
-macro syscall.chown.num 0
-    92
-;
+const syscall.chown.num 92
+const syscall.chown.argc 3
 
-macro syscall.chown.argc 0
-    3
-;
-
-macro syscall.fchown 0
+macro syscall.fchown `
     93
     syscall3
-;
+` emit ;
 
-macro syscall.fchown.num 0
-    93
-;
+const syscall.fchown.num 93
+const syscall.fchown.argc 3
 
-macro syscall.fchown.argc 0
-    3
-;
-
-macro syscall.lchown 0
+macro syscall.lchown `
     94
     syscall3
-;
+` emit ;
 
-macro syscall.lchown.num 0
-    94
-;
+const syscall.lchown.num 94
+const syscall.lchown.argc 3
 
-macro syscall.lchown.argc 0
-    3
-;
-
-macro syscall.umask 0
+macro syscall.umask `
     95
     syscall1
-;
+` emit ;
 
-macro syscall.umask.num 0
-    95
-;
+const syscall.umask.num 95
+const syscall.umask.argc 1
 
-macro syscall.umask.argc 0
-    1
-;
-
-macro syscall.gettimeofday 0
+macro syscall.gettimeofday `
     96
     syscall2
-;
+` emit ;
 
-macro syscall.gettimeofday.num 0
-    96
-;
+const syscall.gettimeofday.num 96
+const syscall.gettimeofday.argc 2
 
-macro syscall.gettimeofday.argc 0
-    2
-;
-
-macro syscall.getrlimit 0
+macro syscall.getrlimit `
     97
     syscall2
-;
+` emit ;
 
-macro syscall.getrlimit.num 0
-    97
-;
+const syscall.getrlimit.num 97
+const syscall.getrlimit.argc 2
 
-macro syscall.getrlimit.argc 0
-    2
-;
-
-macro syscall.getrusage 0
+macro syscall.getrusage `
     98
     syscall2
-;
+` emit ;
 
-macro syscall.getrusage.num 0
-    98
-;
+const syscall.getrusage.num 98
+const syscall.getrusage.argc 2
 
-macro syscall.getrusage.argc 0
-    2
-;
-
-macro syscall.sysinfo 0
+macro syscall.sysinfo `
     99
     syscall1
-;
+` emit ;
 
-macro syscall.sysinfo.num 0
-    99
-;
+const syscall.sysinfo.num 99
+const syscall.sysinfo.argc 1
 
-macro syscall.sysinfo.argc 0
-    1
-;
-
-macro syscall.times 0
+macro syscall.times `
     100
     syscall1
-;
+` emit ;
 
-macro syscall.times.num 0
-    100
-;
+const syscall.times.num 100
+const syscall.times.argc 1
 
-macro syscall.times.argc 0
-    1
-;
-
-macro syscall.ptrace 0
+macro syscall.ptrace `
     101
     syscall4
-;
+` emit ;
 
-macro syscall.ptrace.num 0
-    101
-;
+const syscall.ptrace.num 101
+const syscall.ptrace.argc 4
 
-macro syscall.ptrace.argc 0
-    4
-;
-
-macro syscall.getuid 0
+macro syscall.getuid `
     102
     syscall0
-;
+` emit ;
 
-macro syscall.getuid.num 0
-    102
-;
+const syscall.getuid.num 102
+const syscall.getuid.argc 0
 
-macro syscall.getuid.argc 0
-    0
-;
-
-macro syscall.syslog 0
+macro syscall.syslog `
     103
     syscall3
-;
+` emit ;
 
-macro syscall.syslog.num 0
-    103
-;
+const syscall.syslog.num 103
+const syscall.syslog.argc 3
 
-macro syscall.syslog.argc 0
-    3
-;
-
-macro syscall.getgid 0
+macro syscall.getgid `
     104
     syscall0
-;
+` emit ;
 
-macro syscall.getgid.num 0
-    104
-;
+const syscall.getgid.num 104
+const syscall.getgid.argc 0
 
-macro syscall.getgid.argc 0
-    0
-;
-
-macro syscall.setuid 0
+macro syscall.setuid `
     105
     syscall1
-;
+` emit ;
 
-macro syscall.setuid.num 0
-    105
-;
+const syscall.setuid.num 105
+const syscall.setuid.argc 1
 
-macro syscall.setuid.argc 0
-    1
-;
-
-macro syscall.setgid 0
+macro syscall.setgid `
     106
     syscall1
-;
+` emit ;
 
-macro syscall.setgid.num 0
-    106
-;
+const syscall.setgid.num 106
+const syscall.setgid.argc 1
 
-macro syscall.setgid.argc 0
-    1
-;
-
-macro syscall.geteuid 0
+macro syscall.geteuid `
     107
     syscall0
-;
+` emit ;
 
-macro syscall.geteuid.num 0
-    107
-;
+const syscall.geteuid.num 107
+const syscall.geteuid.argc 0
 
-macro syscall.geteuid.argc 0
-    0
-;
-
-macro syscall.getegid 0
+macro syscall.getegid `
     108
     syscall0
-;
+` emit ;
 
-macro syscall.getegid.num 0
-    108
-;
+const syscall.getegid.num 108
+const syscall.getegid.argc 0
 
-macro syscall.getegid.argc 0
-    0
-;
-
-macro syscall.setpgid 0
+macro syscall.setpgid `
     109
     syscall2
-;
+` emit ;
 
-macro syscall.setpgid.num 0
-    109
-;
+const syscall.setpgid.num 109
+const syscall.setpgid.argc 2
 
-macro syscall.setpgid.argc 0
-    2
-;
-
-macro syscall.getppid 0
+macro syscall.getppid `
     110
     syscall0
-;
+` emit ;
 
-macro syscall.getppid.num 0
-    110
-;
+const syscall.getppid.num 110
+const syscall.getppid.argc 0
 
-macro syscall.getppid.argc 0
-    0
-;
-
-macro syscall.getpgrp 0
+macro syscall.getpgrp `
     111
     syscall0
-;
+` emit ;
 
-macro syscall.getpgrp.num 0
-    111
-;
+const syscall.getpgrp.num 111
+const syscall.getpgrp.argc 0
 
-macro syscall.getpgrp.argc 0
-    0
-;
-
-macro syscall.setsid 0
+macro syscall.setsid `
     112
     syscall0
-;
+` emit ;
 
-macro syscall.setsid.num 0
-    112
-;
+const syscall.setsid.num 112
+const syscall.setsid.argc 0
 
-macro syscall.setsid.argc 0
-    0
-;
-
-macro syscall.setreuid 0
+macro syscall.setreuid `
     113
     syscall2
-;
+` emit ;
 
-macro syscall.setreuid.num 0
-    113
-;
+const syscall.setreuid.num 113
+const syscall.setreuid.argc 2
 
-macro syscall.setreuid.argc 0
-    2
-;
-
-macro syscall.setregid 0
+macro syscall.setregid `
     114
     syscall2
-;
+` emit ;
 
-macro syscall.setregid.num 0
-    114
-;
+const syscall.setregid.num 114
+const syscall.setregid.argc 2
 
-macro syscall.setregid.argc 0
-    2
-;
-
-macro syscall.getgroups 0
+macro syscall.getgroups `
     115
     syscall2
-;
+` emit ;
 
-macro syscall.getgroups.num 0
-    115
-;
+const syscall.getgroups.num 115
+const syscall.getgroups.argc 2
 
-macro syscall.getgroups.argc 0
-    2
-;
-
-macro syscall.setgroups 0
+macro syscall.setgroups `
     116
     syscall2
-;
+` emit ;
 
-macro syscall.setgroups.num 0
-    116
-;
+const syscall.setgroups.num 116
+const syscall.setgroups.argc 2
 
-macro syscall.setgroups.argc 0
-    2
-;
-
-macro syscall.setresuid 0
+macro syscall.setresuid `
     117
     syscall3
-;
+` emit ;
 
-macro syscall.setresuid.num 0
-    117
-;
+const syscall.setresuid.num 117
+const syscall.setresuid.argc 3
 
-macro syscall.setresuid.argc 0
-    3
-;
-
-macro syscall.getresuid 0
+macro syscall.getresuid `
     118
     syscall3
-;
+` emit ;
 
-macro syscall.getresuid.num 0
-    118
-;
+const syscall.getresuid.num 118
+const syscall.getresuid.argc 3
 
-macro syscall.getresuid.argc 0
-    3
-;
-
-macro syscall.setresgid 0
+macro syscall.setresgid `
     119
     syscall3
-;
+` emit ;
 
-macro syscall.setresgid.num 0
-    119
-;
+const syscall.setresgid.num 119
+const syscall.setresgid.argc 3
 
-macro syscall.setresgid.argc 0
-    3
-;
-
-macro syscall.getresgid 0
+macro syscall.getresgid `
     120
     syscall3
-;
+` emit ;
 
-macro syscall.getresgid.num 0
-    120
-;
+const syscall.getresgid.num 120
+const syscall.getresgid.argc 3
 
-macro syscall.getresgid.argc 0
-    3
-;
-
-macro syscall.getpgid 0
+macro syscall.getpgid `
     121
     syscall1
-;
+` emit ;
 
-macro syscall.getpgid.num 0
-    121
-;
+const syscall.getpgid.num 121
+const syscall.getpgid.argc 1
 
-macro syscall.getpgid.argc 0
-    1
-;
-
-macro syscall.setfsuid 0
+macro syscall.setfsuid `
     122
     syscall1
-;
+` emit ;
 
-macro syscall.setfsuid.num 0
-    122
-;
+const syscall.setfsuid.num 122
+const syscall.setfsuid.argc 1
 
-macro syscall.setfsuid.argc 0
-    1
-;
-
-macro syscall.setfsgid 0
+macro syscall.setfsgid `
     123
     syscall1
-;
+` emit ;
 
-macro syscall.setfsgid.num 0
-    123
-;
+const syscall.setfsgid.num 123
+const syscall.setfsgid.argc 1
 
-macro syscall.setfsgid.argc 0
-    1
-;
-
-macro syscall.getsid 0
+macro syscall.getsid `
     124
     syscall1
-;
+` emit ;
 
-macro syscall.getsid.num 0
-    124
-;
+const syscall.getsid.num 124
+const syscall.getsid.argc 1
 
-macro syscall.getsid.argc 0
-    1
-;
-
-macro syscall.capget 0
+macro syscall.capget `
     125
     syscall2
-;
+` emit ;
 
-macro syscall.capget.num 0
-    125
-;
+const syscall.capget.num 125
+const syscall.capget.argc 2
 
-macro syscall.capget.argc 0
-    2
-;
-
-macro syscall.capset 0
+macro syscall.capset `
     126
     syscall2
-;
+` emit ;
 
-macro syscall.capset.num 0
-    126
-;
+const syscall.capset.num 126
+const syscall.capset.argc 2
 
-macro syscall.capset.argc 0
-    2
-;
-
-macro syscall.rt_sigpending 0
+macro syscall.rt_sigpending `
     127
     syscall2
-;
+` emit ;
 
-macro syscall.rt_sigpending.num 0
-    127
-;
+const syscall.rt_sigpending.num 127
+const syscall.rt_sigpending.argc 2
 
-macro syscall.rt_sigpending.argc 0
-    2
-;
-
-macro syscall.rt_sigtimedwait 0
+macro syscall.rt_sigtimedwait `
     128
     syscall4
-;
+` emit ;
 
-macro syscall.rt_sigtimedwait.num 0
-    128
-;
+const syscall.rt_sigtimedwait.num 128
+const syscall.rt_sigtimedwait.argc 4
 
-macro syscall.rt_sigtimedwait.argc 0
-    4
-;
-
-macro syscall.rt_sigqueueinfo 0
+macro syscall.rt_sigqueueinfo `
     129
     syscall3
-;
+` emit ;
 
-macro syscall.rt_sigqueueinfo.num 0
-    129
-;
+const syscall.rt_sigqueueinfo.num 129
+const syscall.rt_sigqueueinfo.argc 3
 
-macro syscall.rt_sigqueueinfo.argc 0
-    3
-;
-
-macro syscall.rt_sigsuspend 0
+macro syscall.rt_sigsuspend `
     130
     syscall2
-;
+` emit ;
 
-macro syscall.rt_sigsuspend.num 0
-    130
-;
+const syscall.rt_sigsuspend.num 130
+const syscall.rt_sigsuspend.argc 2
 
-macro syscall.rt_sigsuspend.argc 0
-    2
-;
-
-macro syscall.sigaltstack 0
+macro syscall.sigaltstack `
     131
     syscall2
-;
+` emit ;
 
-macro syscall.sigaltstack.num 0
-    131
-;
+const syscall.sigaltstack.num 131
+const syscall.sigaltstack.argc 2
 
-macro syscall.sigaltstack.argc 0
-    2
-;
-
-macro syscall.utime 0
+macro syscall.utime `
     132
     syscall2
-;
+` emit ;
 
-macro syscall.utime.num 0
-    132
-;
+const syscall.utime.num 132
+const syscall.utime.argc 2
 
-macro syscall.utime.argc 0
-    2
-;
-
-macro syscall.mknod 0
+macro syscall.mknod `
     133
     syscall3
-;
+` emit ;
 
-macro syscall.mknod.num 0
-    133
-;
+const syscall.mknod.num 133
+const syscall.mknod.argc 3
 
-macro syscall.mknod.argc 0
-    3
-;
-
-macro syscall.uselib 0
+macro syscall.uselib `
     134
     syscall1
-;
+` emit ;
 
-macro syscall.uselib.num 0
-    134
-;
+const syscall.uselib.num 134
+const syscall.uselib.argc 1
 
-macro syscall.uselib.argc 0
-    1
-;
-
-macro syscall.personality 0
+macro syscall.personality `
     135
     syscall1
-;
+` emit ;
 
-macro syscall.personality.num 0
-    135
-;
+const syscall.personality.num 135
+const syscall.personality.argc 1
 
-macro syscall.personality.argc 0
-    1
-;
-
-macro syscall.ustat 0
+macro syscall.ustat `
     136
     syscall2
-;
+` emit ;
 
-macro syscall.ustat.num 0
-    136
-;
+const syscall.ustat.num 136
+const syscall.ustat.argc 2
 
-macro syscall.ustat.argc 0
-    2
-;
-
-macro syscall.statfs 0
+macro syscall.statfs `
     137
     syscall2
-;
+` emit ;
 
-macro syscall.statfs.num 0
-    137
-;
+const syscall.statfs.num 137
+const syscall.statfs.argc 2
 
-macro syscall.statfs.argc 0
-    2
-;
-
-macro syscall.fstatfs 0
+macro syscall.fstatfs `
     138
     syscall2
-;
+` emit ;
 
-macro syscall.fstatfs.num 0
-    138
-;
+const syscall.fstatfs.num 138
+const syscall.fstatfs.argc 2
 
-macro syscall.fstatfs.argc 0
-    2
-;
-
-macro syscall.sysfs 0
+macro syscall.sysfs `
     139
     syscall3
-;
+` emit ;
 
-macro syscall.sysfs.num 0
-    139
-;
+const syscall.sysfs.num 139
+const syscall.sysfs.argc 3
 
-macro syscall.sysfs.argc 0
-    3
-;
-
-macro syscall.getpriority 0
+macro syscall.getpriority `
     140
     syscall2
-;
+` emit ;
 
-macro syscall.getpriority.num 0
-    140
-;
+const syscall.getpriority.num 140
+const syscall.getpriority.argc 2
 
-macro syscall.getpriority.argc 0
-    2
-;
-
-macro syscall.setpriority 0
+macro syscall.setpriority `
     141
     syscall3
-;
+` emit ;
 
-macro syscall.setpriority.num 0
-    141
-;
+const syscall.setpriority.num 141
+const syscall.setpriority.argc 3
 
-macro syscall.setpriority.argc 0
-    3
-;
-
-macro syscall.sched_setparam 0
+macro syscall.sched_setparam `
     142
     syscall2
-;
+` emit ;
 
-macro syscall.sched_setparam.num 0
-    142
-;
+const syscall.sched_setparam.num 142
+const syscall.sched_setparam.argc 2
 
-macro syscall.sched_setparam.argc 0
-    2
-;
-
-macro syscall.sched_getparam 0
+macro syscall.sched_getparam `
     143
     syscall2
-;
+` emit ;
 
-macro syscall.sched_getparam.num 0
-    143
-;
+const syscall.sched_getparam.num 143
+const syscall.sched_getparam.argc 2
 
-macro syscall.sched_getparam.argc 0
-    2
-;
-
-macro syscall.sched_setscheduler 0
+macro syscall.sched_setscheduler `
     144
     syscall3
-;
+` emit ;
 
-macro syscall.sched_setscheduler.num 0
-    144
-;
+const syscall.sched_setscheduler.num 144
+const syscall.sched_setscheduler.argc 3
 
-macro syscall.sched_setscheduler.argc 0
-    3
-;
-
-macro syscall.sched_getscheduler 0
+macro syscall.sched_getscheduler `
     145
     syscall1
-;
+` emit ;
 
-macro syscall.sched_getscheduler.num 0
-    145
-;
+const syscall.sched_getscheduler.num 145
+const syscall.sched_getscheduler.argc 1
 
-macro syscall.sched_getscheduler.argc 0
-    1
-;
-
-macro syscall.sched_get_priority_max 0
+macro syscall.sched_get_priority_max `
     146
     syscall1
-;
+` emit ;
 
-macro syscall.sched_get_priority_max.num 0
-    146
-;
+const syscall.sched_get_priority_max.num 146
+const syscall.sched_get_priority_max.argc 1
 
-macro syscall.sched_get_priority_max.argc 0
-    1
-;
-
-macro syscall.sched_get_priority_min 0
+macro syscall.sched_get_priority_min `
     147
     syscall1
-;
+` emit ;
 
-macro syscall.sched_get_priority_min.num 0
-    147
-;
+const syscall.sched_get_priority_min.num 147
+const syscall.sched_get_priority_min.argc 1
 
-macro syscall.sched_get_priority_min.argc 0
-    1
-;
-
-macro syscall.sched_rr_get_interval 0
+macro syscall.sched_rr_get_interval `
     148
     syscall2
-;
+` emit ;
 
-macro syscall.sched_rr_get_interval.num 0
-    148
-;
+const syscall.sched_rr_get_interval.num 148
+const syscall.sched_rr_get_interval.argc 2
 
-macro syscall.sched_rr_get_interval.argc 0
-    2
-;
-
-macro syscall.mlock 0
+macro syscall.mlock `
     149
     syscall2
-;
+` emit ;
 
-macro syscall.mlock.num 0
-    149
-;
+const syscall.mlock.num 149
+const syscall.mlock.argc 2
 
-macro syscall.mlock.argc 0
-    2
-;
-
-macro syscall.munlock 0
+macro syscall.munlock `
     150
     syscall2
-;
+` emit ;
 
-macro syscall.munlock.num 0
-    150
-;
+const syscall.munlock.num 150
+const syscall.munlock.argc 2
 
-macro syscall.munlock.argc 0
-    2
-;
-
-macro syscall.mlockall 0
+macro syscall.mlockall `
     151
     syscall1
-;
+` emit ;
 
-macro syscall.mlockall.num 0
-    151
-;
+const syscall.mlockall.num 151
+const syscall.mlockall.argc 1
 
-macro syscall.mlockall.argc 0
-    1
-;
-
-macro syscall.munlockall 0
+macro syscall.munlockall `
     152
     syscall0
-;
+` emit ;
 
-macro syscall.munlockall.num 0
-    152
-;
+const syscall.munlockall.num 152
+const syscall.munlockall.argc 0
 
-macro syscall.munlockall.argc 0
-    0
-;
-
-macro syscall.vhangup 0
+macro syscall.vhangup `
     153
     syscall0
-;
+` emit ;
 
-macro syscall.vhangup.num 0
-    153
-;
+const syscall.vhangup.num 153
+const syscall.vhangup.argc 0
 
-macro syscall.vhangup.argc 0
-    0
-;
-
-macro syscall.modify_ldt 0
+macro syscall.modify_ldt `
     154
     syscall3
-;
+` emit ;
 
-macro syscall.modify_ldt.num 0
-    154
-;
+const syscall.modify_ldt.num 154
+const syscall.modify_ldt.argc 3
 
-macro syscall.modify_ldt.argc 0
-    3
-;
-
-macro syscall.pivot_root 0
+macro syscall.pivot_root `
     155
     syscall2
-;
+` emit ;
 
-macro syscall.pivot_root.num 0
-    155
-;
+const syscall.pivot_root.num 155
+const syscall.pivot_root.argc 2
 
-macro syscall.pivot_root.argc 0
-    2
-;
-
-macro syscall.sysctl 0
+macro syscall.sysctl `
     156
     syscall1
-;
+` emit ;
 
-macro syscall.sysctl.num 0
-    156
-;
+const syscall.sysctl.num 156
+const syscall.sysctl.argc 1
 
-macro syscall.sysctl.argc 0
-    1
-;
-
-macro syscall.ni_syscall 0
+macro syscall.ni_syscall `
     156
     syscall1
-;
+` emit ;
 
-macro syscall.ni_syscall.num 0
-    156
-;
+const syscall.ni_syscall.num 156
+const syscall.ni_syscall.argc 1
 
-macro syscall.ni_syscall.argc 0
-    1
-;
-
-macro syscall.prctl 0
+macro syscall.prctl `
     157
     syscall5
-;
+` emit ;
 
-macro syscall.prctl.num 0
-    157
-;
+const syscall.prctl.num 157
+const syscall.prctl.argc 5
 
-macro syscall.prctl.argc 0
-    5
-;
-
-macro syscall.arch_prctl 0
+macro syscall.arch_prctl `
     158
     syscall2
-;
+` emit ;
 
-macro syscall.arch_prctl.num 0
-    158
-;
+const syscall.arch_prctl.num 158
+const syscall.arch_prctl.argc 2
 
-macro syscall.arch_prctl.argc 0
-    2
-;
-
-macro syscall.adjtimex 0
+macro syscall.adjtimex `
     159
     syscall1
-;
+` emit ;
 
-macro syscall.adjtimex.num 0
-    159
-;
+const syscall.adjtimex.num 159
+const syscall.adjtimex.argc 1
 
-macro syscall.adjtimex.argc 0
-    1
-;
-
-macro syscall.setrlimit 0
+macro syscall.setrlimit `
     160
     syscall2
-;
+` emit ;
 
-macro syscall.setrlimit.num 0
-    160
-;
+const syscall.setrlimit.num 160
+const syscall.setrlimit.argc 2
 
-macro syscall.setrlimit.argc 0
-    2
-;
-
-macro syscall.chroot 0
+macro syscall.chroot `
     161
     syscall1
-;
+` emit ;
 
-macro syscall.chroot.num 0
-    161
-;
+const syscall.chroot.num 161
+const syscall.chroot.argc 1
 
-macro syscall.chroot.argc 0
-    1
-;
-
-macro syscall.sync 0
+macro syscall.sync `
     162
     syscall0
-;
+` emit ;
 
-macro syscall.sync.num 0
-    162
-;
+const syscall.sync.num 162
+const syscall.sync.argc 0
 
-macro syscall.sync.argc 0
-    0
-;
-
-macro syscall.acct 0
+macro syscall.acct `
     163
     syscall1
-;
+` emit ;
 
-macro syscall.acct.num 0
-    163
-;
+const syscall.acct.num 163
+const syscall.acct.argc 1
 
-macro syscall.acct.argc 0
-    1
-;
-
-macro syscall.settimeofday 0
+macro syscall.settimeofday `
     164
     syscall2
-;
+` emit ;
 
-macro syscall.settimeofday.num 0
-    164
-;
+const syscall.settimeofday.num 164
+const syscall.settimeofday.argc 2
 
-macro syscall.settimeofday.argc 0
-    2
-;
-
-macro syscall.mount 0
+macro syscall.mount `
     165
     syscall5
-;
+` emit ;
 
-macro syscall.mount.num 0
-    165
-;
+const syscall.mount.num 165
+const syscall.mount.argc 5
 
-macro syscall.mount.argc 0
-    5
-;
-
-macro syscall.umount2 0
+macro syscall.umount2 `
     166
     syscall2
-;
+` emit ;
 
-macro syscall.umount2.num 0
-    166
-;
+const syscall.umount2.num 166
+const syscall.umount2.argc 2
 
-macro syscall.umount2.argc 0
-    2
-;
-
-macro syscall.umount 0
+macro syscall.umount `
     166
     syscall2
-;
+` emit ;
 
-macro syscall.umount.num 0
-    166
-;
+const syscall.umount.num 166
+const syscall.umount.argc 2
 
-macro syscall.umount.argc 0
-    2
-;
-
-macro syscall.swapon 0
+macro syscall.swapon `
     167
     syscall2
-;
+` emit ;
 
-macro syscall.swapon.num 0
-    167
-;
+const syscall.swapon.num 167
+const syscall.swapon.argc 2
 
-macro syscall.swapon.argc 0
-    2
-;
-
-macro syscall.swapoff 0
+macro syscall.swapoff `
     168
     syscall1
-;
+` emit ;
 
-macro syscall.swapoff.num 0
-    168
-;
+const syscall.swapoff.num 168
+const syscall.swapoff.argc 1
 
-macro syscall.swapoff.argc 0
-    1
-;
-
-macro syscall.reboot 0
+macro syscall.reboot `
     169
     syscall4
-;
+` emit ;
 
-macro syscall.reboot.num 0
-    169
-;
+const syscall.reboot.num 169
+const syscall.reboot.argc 4
 
-macro syscall.reboot.argc 0
-    4
-;
-
-macro syscall.sethostname 0
+macro syscall.sethostname `
     170
     syscall2
-;
+` emit ;
 
-macro syscall.sethostname.num 0
-    170
-;
+const syscall.sethostname.num 170
+const syscall.sethostname.argc 2
 
-macro syscall.sethostname.argc 0
-    2
-;
-
-macro syscall.setdomainname 0
+macro syscall.setdomainname `
     171
     syscall2
-;
+` emit ;
 
-macro syscall.setdomainname.num 0
-    171
-;
+const syscall.setdomainname.num 171
+const syscall.setdomainname.argc 2
 
-macro syscall.setdomainname.argc 0
-    2
-;
-
-macro syscall.iopl 0
+macro syscall.iopl `
     172
     syscall1
-;
+` emit ;
 
-macro syscall.iopl.num 0
-    172
-;
+const syscall.iopl.num 172
+const syscall.iopl.argc 1
 
-macro syscall.iopl.argc 0
-    1
-;
-
-macro syscall.ioperm 0
+macro syscall.ioperm `
     173
     syscall3
-;
+` emit ;
 
-macro syscall.ioperm.num 0
-    173
-;
+const syscall.ioperm.num 173
+const syscall.ioperm.argc 3
 
-macro syscall.ioperm.argc 0
-    3
-;
-
-macro syscall.create_module 0
+macro syscall.create_module `
     174
     syscall2
-;
+` emit ;
 
-macro syscall.create_module.num 0
-    174
-;
+const syscall.create_module.num 174
+const syscall.create_module.argc 2
 
-macro syscall.create_module.argc 0
-    2
-;
-
-macro syscall.init_module 0
+macro syscall.init_module `
     175
     syscall3
-;
+` emit ;
 
-macro syscall.init_module.num 0
-    175
-;
+const syscall.init_module.num 175
+const syscall.init_module.argc 3
 
-macro syscall.init_module.argc 0
-    3
-;
-
-macro syscall.delete_module 0
+macro syscall.delete_module `
     176
     syscall2
-;
+` emit ;
 
-macro syscall.delete_module.num 0
-    176
-;
+const syscall.delete_module.num 176
+const syscall.delete_module.argc 2
 
-macro syscall.delete_module.argc 0
-    2
-;
-
-macro syscall.get_kernel_syms 0
+macro syscall.get_kernel_syms `
     177
     syscall1
-;
+` emit ;
 
-macro syscall.get_kernel_syms.num 0
-    177
-;
+const syscall.get_kernel_syms.num 177
+const syscall.get_kernel_syms.argc 1
 
-macro syscall.get_kernel_syms.argc 0
-    1
-;
-
-macro syscall.query_module 0
+macro syscall.query_module `
     178
     syscall5
-;
+` emit ;
 
-macro syscall.query_module.num 0
-    178
-;
+const syscall.query_module.num 178
+const syscall.query_module.argc 5
 
-macro syscall.query_module.argc 0
-    5
-;
-
-macro syscall.quotactl 0
+macro syscall.quotactl `
     179
     syscall4
-;
+` emit ;
 
-macro syscall.quotactl.num 0
-    179
-;
+const syscall.quotactl.num 179
+const syscall.quotactl.argc 4
 
-macro syscall.quotactl.argc 0
-    4
-;
-
-macro syscall.nfsservctl 0
+macro syscall.nfsservctl `
     180
     syscall3
-;
+` emit ;
 
-macro syscall.nfsservctl.num 0
-    180
-;
+const syscall.nfsservctl.num 180
+const syscall.nfsservctl.argc 3
 
-macro syscall.nfsservctl.argc 0
-    3
-;
-
-macro syscall.getpmsg 0
+macro syscall.getpmsg `
     181
     syscall5
-;
+` emit ;
 
-macro syscall.getpmsg.num 0
-    181
-;
+const syscall.getpmsg.num 181
+const syscall.getpmsg.argc 5
 
-macro syscall.getpmsg.argc 0
-    5
-;
-
-macro syscall.putpmsg 0
+macro syscall.putpmsg `
     182
     syscall5
-;
+` emit ;
 
-macro syscall.putpmsg.num 0
-    182
-;
+const syscall.putpmsg.num 182
+const syscall.putpmsg.argc 5
 
-macro syscall.putpmsg.argc 0
-    5
-;
-
-macro syscall.afs_syscall 0
+macro syscall.afs_syscall `
     183
     syscall5
-;
+` emit ;
 
-macro syscall.afs_syscall.num 0
-    183
-;
+const syscall.afs_syscall.num 183
+const syscall.afs_syscall.argc 5
 
-macro syscall.afs_syscall.argc 0
-    5
-;
-
-macro syscall.tuxcall 0
+macro syscall.tuxcall `
     184
     syscall3
-;
+` emit ;
 
-macro syscall.tuxcall.num 0
-    184
-;
+const syscall.tuxcall.num 184
+const syscall.tuxcall.argc 3
 
-macro syscall.tuxcall.argc 0
-    3
-;
-
-macro syscall.security 0
+macro syscall.security `
     185
     syscall3
-;
+` emit ;
 
-macro syscall.security.num 0
-    185
-;
+const syscall.security.num 185
+const syscall.security.argc 3
 
-macro syscall.security.argc 0
-    3
-;
-
-macro syscall.gettid 0
+macro syscall.gettid `
     186
     syscall0
-;
+` emit ;
 
-macro syscall.gettid.num 0
-    186
-;
+const syscall.gettid.num 186
+const syscall.gettid.argc 0
 
-macro syscall.gettid.argc 0
-    0
-;
-
-macro syscall.readahead 0
+macro syscall.readahead `
     187
     syscall3
-;
+` emit ;
 
-macro syscall.readahead.num 0
-    187
-;
+const syscall.readahead.num 187
+const syscall.readahead.argc 3
 
-macro syscall.readahead.argc 0
-    3
-;
-
-macro syscall.setxattr 0
+macro syscall.setxattr `
     188
     syscall5
-;
+` emit ;
 
-macro syscall.setxattr.num 0
-    188
-;
+const syscall.setxattr.num 188
+const syscall.setxattr.argc 5
 
-macro syscall.setxattr.argc 0
-    5
-;
-
-macro syscall.lsetxattr 0
+macro syscall.lsetxattr `
     189
     syscall5
-;
+` emit ;
 
-macro syscall.lsetxattr.num 0
-    189
-;
+const syscall.lsetxattr.num 189
+const syscall.lsetxattr.argc 5
 
-macro syscall.lsetxattr.argc 0
-    5
-;
-
-macro syscall.fsetxattr 0
+macro syscall.fsetxattr `
     190
     syscall5
-;
+` emit ;
 
-macro syscall.fsetxattr.num 0
-    190
-;
+const syscall.fsetxattr.num 190
+const syscall.fsetxattr.argc 5
 
-macro syscall.fsetxattr.argc 0
-    5
-;
-
-macro syscall.getxattr 0
+macro syscall.getxattr `
     191
     syscall4
-;
+` emit ;
 
-macro syscall.getxattr.num 0
-    191
-;
+const syscall.getxattr.num 191
+const syscall.getxattr.argc 4
 
-macro syscall.getxattr.argc 0
-    4
-;
-
-macro syscall.lgetxattr 0
+macro syscall.lgetxattr `
     192
     syscall4
-;
+` emit ;
 
-macro syscall.lgetxattr.num 0
-    192
-;
+const syscall.lgetxattr.num 192
+const syscall.lgetxattr.argc 4
 
-macro syscall.lgetxattr.argc 0
-    4
-;
-
-macro syscall.fgetxattr 0
+macro syscall.fgetxattr `
     193
     syscall4
-;
+` emit ;
 
-macro syscall.fgetxattr.num 0
-    193
-;
+const syscall.fgetxattr.num 193
+const syscall.fgetxattr.argc 4
 
-macro syscall.fgetxattr.argc 0
-    4
-;
-
-macro syscall.listxattr 0
+macro syscall.listxattr `
     194
     syscall3
-;
+` emit ;
 
-macro syscall.listxattr.num 0
-    194
-;
+const syscall.listxattr.num 194
+const syscall.listxattr.argc 3
 
-macro syscall.listxattr.argc 0
-    3
-;
-
-macro syscall.llistxattr 0
+macro syscall.llistxattr `
     195
     syscall3
-;
+` emit ;
 
-macro syscall.llistxattr.num 0
-    195
-;
+const syscall.llistxattr.num 195
+const syscall.llistxattr.argc 3
 
-macro syscall.llistxattr.argc 0
-    3
-;
-
-macro syscall.flistxattr 0
+macro syscall.flistxattr `
     196
     syscall3
-;
+` emit ;
 
-macro syscall.flistxattr.num 0
-    196
-;
+const syscall.flistxattr.num 196
+const syscall.flistxattr.argc 3
 
-macro syscall.flistxattr.argc 0
-    3
-;
-
-macro syscall.removexattr 0
+macro syscall.removexattr `
     197
     syscall2
-;
+` emit ;
 
-macro syscall.removexattr.num 0
-    197
-;
+const syscall.removexattr.num 197
+const syscall.removexattr.argc 2
 
-macro syscall.removexattr.argc 0
-    2
-;
-
-macro syscall.lremovexattr 0
+macro syscall.lremovexattr `
     198
     syscall2
-;
+` emit ;
 
-macro syscall.lremovexattr.num 0
-    198
-;
+const syscall.lremovexattr.num 198
+const syscall.lremovexattr.argc 2
 
-macro syscall.lremovexattr.argc 0
-    2
-;
-
-macro syscall.fremovexattr 0
+macro syscall.fremovexattr `
     199
     syscall2
-;
+` emit ;
 
-macro syscall.fremovexattr.num 0
-    199
-;
+const syscall.fremovexattr.num 199
+const syscall.fremovexattr.argc 2
 
-macro syscall.fremovexattr.argc 0
-    2
-;
-
-macro syscall.tkill 0
+macro syscall.tkill `
     200
     syscall2
-;
+` emit ;
 
-macro syscall.tkill.num 0
-    200
-;
+const syscall.tkill.num 200
+const syscall.tkill.argc 2
 
-macro syscall.tkill.argc 0
-    2
-;
-
-macro syscall.time 0
+macro syscall.time `
     201
     syscall1
-;
+` emit ;
 
-macro syscall.time.num 0
-    201
-;
+const syscall.time.num 201
+const syscall.time.argc 1
 
-macro syscall.time.argc 0
-    1
-;
-
-macro syscall.futex 0
+macro syscall.futex `
     202
     syscall6
-;
+` emit ;
 
-macro syscall.futex.num 0
-    202
-;
+const syscall.futex.num 202
+const syscall.futex.argc 6
 
-macro syscall.futex.argc 0
-    6
-;
-
-macro syscall.sched_setaffinity 0
+macro syscall.sched_setaffinity `
     203
     syscall3
-;
+` emit ;
 
-macro syscall.sched_setaffinity.num 0
-    203
-;
+const syscall.sched_setaffinity.num 203
+const syscall.sched_setaffinity.argc 3
 
-macro syscall.sched_setaffinity.argc 0
-    3
-;
-
-macro syscall.sched_getaffinity 0
+macro syscall.sched_getaffinity `
     204
     syscall3
-;
+` emit ;
 
-macro syscall.sched_getaffinity.num 0
-    204
-;
+const syscall.sched_getaffinity.num 204
+const syscall.sched_getaffinity.argc 3
 
-macro syscall.sched_getaffinity.argc 0
-    3
-;
-
-macro syscall.set_thread_area 0
+macro syscall.set_thread_area `
     205
     syscall1
-;
+` emit ;
 
-macro syscall.set_thread_area.num 0
-    205
-;
+const syscall.set_thread_area.num 205
+const syscall.set_thread_area.argc 1
 
-macro syscall.set_thread_area.argc 0
-    1
-;
-
-macro syscall.io_setup 0
+macro syscall.io_setup `
     206
     syscall2
-;
+` emit ;
 
-macro syscall.io_setup.num 0
-    206
-;
+const syscall.io_setup.num 206
+const syscall.io_setup.argc 2
 
-macro syscall.io_setup.argc 0
-    2
-;
-
-macro syscall.io_destroy 0
+macro syscall.io_destroy `
     207
     syscall1
-;
+` emit ;
 
-macro syscall.io_destroy.num 0
-    207
-;
+const syscall.io_destroy.num 207
+const syscall.io_destroy.argc 1
 
-macro syscall.io_destroy.argc 0
-    1
-;
-
-macro syscall.io_getevents 0
+macro syscall.io_getevents `
     208
     syscall5
-;
+` emit ;
 
-macro syscall.io_getevents.num 0
-    208
-;
+const syscall.io_getevents.num 208
+const syscall.io_getevents.argc 5
 
-macro syscall.io_getevents.argc 0
-    5
-;
-
-macro syscall.io_submit 0
+macro syscall.io_submit `
     209
     syscall3
-;
+` emit ;
 
-macro syscall.io_submit.num 0
-    209
-;
+const syscall.io_submit.num 209
+const syscall.io_submit.argc 3
 
-macro syscall.io_submit.argc 0
-    3
-;
-
-macro syscall.io_cancel 0
+macro syscall.io_cancel `
     210
     syscall3
-;
+` emit ;
 
-macro syscall.io_cancel.num 0
-    210
-;
+const syscall.io_cancel.num 210
+const syscall.io_cancel.argc 3
 
-macro syscall.io_cancel.argc 0
-    3
-;
-
-macro syscall.get_thread_area 0
+macro syscall.get_thread_area `
     211
     syscall1
-;
+` emit ;
 
-macro syscall.get_thread_area.num 0
-    211
-;
+const syscall.get_thread_area.num 211
+const syscall.get_thread_area.argc 1
 
-macro syscall.get_thread_area.argc 0
-    1
-;
-
-macro syscall.lookup_dcookie 0
+macro syscall.lookup_dcookie `
     212
     syscall3
-;
+` emit ;
 
-macro syscall.lookup_dcookie.num 0
-    212
-;
+const syscall.lookup_dcookie.num 212
+const syscall.lookup_dcookie.argc 3
 
-macro syscall.lookup_dcookie.argc 0
-    3
-;
-
-macro syscall.epoll_create 0
+macro syscall.epoll_create `
     213
     syscall1
-;
+` emit ;
 
-macro syscall.epoll_create.num 0
-    213
-;
+const syscall.epoll_create.num 213
+const syscall.epoll_create.argc 1
 
-macro syscall.epoll_create.argc 0
-    1
-;
-
-macro syscall.epoll_ctl_old 0
+macro syscall.epoll_ctl_old `
     214
     syscall4
-;
+` emit ;
 
-macro syscall.epoll_ctl_old.num 0
-    214
-;
+const syscall.epoll_ctl_old.num 214
+const syscall.epoll_ctl_old.argc 4
 
-macro syscall.epoll_ctl_old.argc 0
-    4
-;
-
-macro syscall.epoll_wait_old 0
+macro syscall.epoll_wait_old `
     215
     syscall4
-;
+` emit ;
 
-macro syscall.epoll_wait_old.num 0
-    215
-;
+const syscall.epoll_wait_old.num 215
+const syscall.epoll_wait_old.argc 4
 
-macro syscall.epoll_wait_old.argc 0
-    4
-;
-
-macro syscall.remap_file_pages 0
+macro syscall.remap_file_pages `
     216
     syscall5
-;
+` emit ;
 
-macro syscall.remap_file_pages.num 0
-    216
-;
+const syscall.remap_file_pages.num 216
+const syscall.remap_file_pages.argc 5
 
-macro syscall.remap_file_pages.argc 0
-    5
-;
-
-macro syscall.getdents64 0
+macro syscall.getdents64 `
     217
     syscall3
-;
+` emit ;
 
-macro syscall.getdents64.num 0
-    217
-;
+const syscall.getdents64.num 217
+const syscall.getdents64.argc 3
 
-macro syscall.getdents64.argc 0
-    3
-;
-
-macro syscall.set_tid_address 0
+macro syscall.set_tid_address `
     218
     syscall1
-;
+` emit ;
 
-macro syscall.set_tid_address.num 0
-    218
-;
+const syscall.set_tid_address.num 218
+const syscall.set_tid_address.argc 1
 
-macro syscall.set_tid_address.argc 0
-    1
-;
-
-macro syscall.restart_syscall 0
+macro syscall.restart_syscall `
     219
     syscall0
-;
+` emit ;
 
-macro syscall.restart_syscall.num 0
-    219
-;
+const syscall.restart_syscall.num 219
+const syscall.restart_syscall.argc 0
 
-macro syscall.restart_syscall.argc 0
-    0
-;
-
-macro syscall.semtimedop 0
+macro syscall.semtimedop `
     220
     syscall4
-;
+` emit ;
 
-macro syscall.semtimedop.num 0
-    220
-;
+const syscall.semtimedop.num 220
+const syscall.semtimedop.argc 4
 
-macro syscall.semtimedop.argc 0
-    4
-;
-
-macro syscall.fadvise64 0
+macro syscall.fadvise64 `
     221
     syscall4
-;
+` emit ;
 
-macro syscall.fadvise64.num 0
-    221
-;
+const syscall.fadvise64.num 221
+const syscall.fadvise64.argc 4
 
-macro syscall.fadvise64.argc 0
-    4
-;
-
-macro syscall.timer_create 0
+macro syscall.timer_create `
     222
     syscall3
-;
+` emit ;
 
-macro syscall.timer_create.num 0
-    222
-;
+const syscall.timer_create.num 222
+const syscall.timer_create.argc 3
 
-macro syscall.timer_create.argc 0
-    3
-;
-
-macro syscall.timer_settime 0
+macro syscall.timer_settime `
     223
     syscall4
-;
+` emit ;
 
-macro syscall.timer_settime.num 0
-    223
-;
+const syscall.timer_settime.num 223
+const syscall.timer_settime.argc 4
 
-macro syscall.timer_settime.argc 0
-    4
-;
-
-macro syscall.timer_gettime 0
+macro syscall.timer_gettime `
     224
     syscall2
-;
+` emit ;
 
-macro syscall.timer_gettime.num 0
-    224
-;
+const syscall.timer_gettime.num 224
+const syscall.timer_gettime.argc 2
 
-macro syscall.timer_gettime.argc 0
-    2
-;
-
-macro syscall.timer_getoverrun 0
+macro syscall.timer_getoverrun `
     225
     syscall1
-;
+` emit ;
 
-macro syscall.timer_getoverrun.num 0
-    225
-;
+const syscall.timer_getoverrun.num 225
+const syscall.timer_getoverrun.argc 1
 
-macro syscall.timer_getoverrun.argc 0
-    1
-;
-
-macro syscall.timer_delete 0
+macro syscall.timer_delete `
     226
     syscall1
-;
+` emit ;
 
-macro syscall.timer_delete.num 0
-    226
-;
+const syscall.timer_delete.num 226
+const syscall.timer_delete.argc 1
 
-macro syscall.timer_delete.argc 0
-    1
-;
-
-macro syscall.clock_settime 0
+macro syscall.clock_settime `
     227
     syscall2
-;
+` emit ;
 
-macro syscall.clock_settime.num 0
-    227
-;
+const syscall.clock_settime.num 227
+const syscall.clock_settime.argc 2
 
-macro syscall.clock_settime.argc 0
-    2
-;
-
-macro syscall.clock_gettime 0
+macro syscall.clock_gettime `
     228
     syscall2
-;
+` emit ;
 
-macro syscall.clock_gettime.num 0
-    228
-;
+const syscall.clock_gettime.num 228
+const syscall.clock_gettime.argc 2
 
-macro syscall.clock_gettime.argc 0
-    2
-;
-
-macro syscall.clock_getres 0
+macro syscall.clock_getres `
     229
     syscall2
-;
+` emit ;
 
-macro syscall.clock_getres.num 0
-    229
-;
+const syscall.clock_getres.num 229
+const syscall.clock_getres.argc 2
 
-macro syscall.clock_getres.argc 0
-    2
-;
-
-macro syscall.clock_nanosleep 0
+macro syscall.clock_nanosleep `
     230
     syscall4
-;
+` emit ;
 
-macro syscall.clock_nanosleep.num 0
-    230
-;
+const syscall.clock_nanosleep.num 230
+const syscall.clock_nanosleep.argc 4
 
-macro syscall.clock_nanosleep.argc 0
-    4
-;
-
-macro syscall.exit_group 0
+macro syscall.exit_group `
     231
     syscall1
-;
+` emit ;
 
-macro syscall.exit_group.num 0
-    231
-;
+const syscall.exit_group.num 231
+const syscall.exit_group.argc 1
 
-macro syscall.exit_group.argc 0
-    1
-;
-
-macro syscall.epoll_wait 0
+macro syscall.epoll_wait `
     232
     syscall4
-;
+` emit ;
 
-macro syscall.epoll_wait.num 0
-    232
-;
+const syscall.epoll_wait.num 232
+const syscall.epoll_wait.argc 4
 
-macro syscall.epoll_wait.argc 0
-    4
-;
-
-macro syscall.epoll_ctl 0
+macro syscall.epoll_ctl `
     233
     syscall4
-;
+` emit ;
 
-macro syscall.epoll_ctl.num 0
-    233
-;
+const syscall.epoll_ctl.num 233
+const syscall.epoll_ctl.argc 4
 
-macro syscall.epoll_ctl.argc 0
-    4
-;
-
-macro syscall.tgkill 0
+macro syscall.tgkill `
     234
     syscall3
-;
+` emit ;
 
-macro syscall.tgkill.num 0
-    234
-;
+const syscall.tgkill.num 234
+const syscall.tgkill.argc 3
 
-macro syscall.tgkill.argc 0
-    3
-;
-
-macro syscall.utimes 0
+macro syscall.utimes `
     235
     syscall2
-;
+` emit ;
 
-macro syscall.utimes.num 0
-    235
-;
+const syscall.utimes.num 235
+const syscall.utimes.argc 2
 
-macro syscall.utimes.argc 0
-    2
-;
-
-macro syscall.vserver 0
+macro syscall.vserver `
     236
     syscall5
-;
+` emit ;
 
-macro syscall.vserver.num 0
-    236
-;
+const syscall.vserver.num 236
+const syscall.vserver.argc 5
 
-macro syscall.vserver.argc 0
-    5
-;
-
-macro syscall.mbind 0
+macro syscall.mbind `
     237
     syscall6
-;
+` emit ;
 
-macro syscall.mbind.num 0
-    237
-;
+const syscall.mbind.num 237
+const syscall.mbind.argc 6
 
-macro syscall.mbind.argc 0
-    6
-;
-
-macro syscall.set_mempolicy 0
+macro syscall.set_mempolicy `
     238
     syscall3
-;
+` emit ;
 
-macro syscall.set_mempolicy.num 0
-    238
-;
+const syscall.set_mempolicy.num 238
+const syscall.set_mempolicy.argc 3
 
-macro syscall.set_mempolicy.argc 0
-    3
-;
-
-macro syscall.get_mempolicy 0
+macro syscall.get_mempolicy `
     239
     syscall5
-;
+` emit ;
 
-macro syscall.get_mempolicy.num 0
-    239
-;
+const syscall.get_mempolicy.num 239
+const syscall.get_mempolicy.argc 5
 
-macro syscall.get_mempolicy.argc 0
-    5
-;
-
-macro syscall.mq_open 0
+macro syscall.mq_open `
     240
     syscall4
-;
+` emit ;
 
-macro syscall.mq_open.num 0
-    240
-;
+const syscall.mq_open.num 240
+const syscall.mq_open.argc 4
 
-macro syscall.mq_open.argc 0
-    4
-;
-
-macro syscall.mq_unlink 0
+macro syscall.mq_unlink `
     241
     syscall1
-;
+` emit ;
 
-macro syscall.mq_unlink.num 0
-    241
-;
+const syscall.mq_unlink.num 241
+const syscall.mq_unlink.argc 1
 
-macro syscall.mq_unlink.argc 0
-    1
-;
-
-macro syscall.mq_timedsend 0
+macro syscall.mq_timedsend `
     242
     syscall5
-;
+` emit ;
 
-macro syscall.mq_timedsend.num 0
-    242
-;
+const syscall.mq_timedsend.num 242
+const syscall.mq_timedsend.argc 5
 
-macro syscall.mq_timedsend.argc 0
-    5
-;
-
-macro syscall.mq_timedreceive 0
+macro syscall.mq_timedreceive `
     243
     syscall5
-;
+` emit ;
 
-macro syscall.mq_timedreceive.num 0
-    243
-;
+const syscall.mq_timedreceive.num 243
+const syscall.mq_timedreceive.argc 5
 
-macro syscall.mq_timedreceive.argc 0
-    5
-;
-
-macro syscall.mq_notify 0
+macro syscall.mq_notify `
     244
     syscall2
-;
+` emit ;
 
-macro syscall.mq_notify.num 0
-    244
-;
+const syscall.mq_notify.num 244
+const syscall.mq_notify.argc 2
 
-macro syscall.mq_notify.argc 0
-    2
-;
-
-macro syscall.mq_getsetattr 0
+macro syscall.mq_getsetattr `
     245
     syscall3
-;
+` emit ;
 
-macro syscall.mq_getsetattr.num 0
-    245
-;
+const syscall.mq_getsetattr.num 245
+const syscall.mq_getsetattr.argc 3
 
-macro syscall.mq_getsetattr.argc 0
-    3
-;
-
-macro syscall.kexec_load 0
+macro syscall.kexec_load `
     246
     syscall4
-;
+` emit ;
 
-macro syscall.kexec_load.num 0
-    246
-;
+const syscall.kexec_load.num 246
+const syscall.kexec_load.argc 4
 
-macro syscall.kexec_load.argc 0
-    4
-;
-
-macro syscall.waitid 0
+macro syscall.waitid `
     247
     syscall5
-;
+` emit ;
 
-macro syscall.waitid.num 0
-    247
-;
+const syscall.waitid.num 247
+const syscall.waitid.argc 5
 
-macro syscall.waitid.argc 0
-    5
-;
-
-macro syscall.add_key 0
+macro syscall.add_key `
     248
     syscall5
-;
+` emit ;
 
-macro syscall.add_key.num 0
-    248
-;
+const syscall.add_key.num 248
+const syscall.add_key.argc 5
 
-macro syscall.add_key.argc 0
-    5
-;
-
-macro syscall.request_key 0
+macro syscall.request_key `
     249
     syscall4
-;
+` emit ;
 
-macro syscall.request_key.num 0
-    249
-;
+const syscall.request_key.num 249
+const syscall.request_key.argc 4
 
-macro syscall.request_key.argc 0
-    4
-;
-
-macro syscall.keyctl 0
+macro syscall.keyctl `
     250
     syscall5
-;
+` emit ;
 
-macro syscall.keyctl.num 0
-    250
-;
+const syscall.keyctl.num 250
+const syscall.keyctl.argc 5
 
-macro syscall.keyctl.argc 0
-    5
-;
-
-macro syscall.ioprio_set 0
+macro syscall.ioprio_set `
     251
     syscall3
-;
+` emit ;
 
-macro syscall.ioprio_set.num 0
-    251
-;
+const syscall.ioprio_set.num 251
+const syscall.ioprio_set.argc 3
 
-macro syscall.ioprio_set.argc 0
-    3
-;
-
-macro syscall.ioprio_get 0
+macro syscall.ioprio_get `
     252
     syscall2
-;
+` emit ;
 
-macro syscall.ioprio_get.num 0
-    252
-;
+const syscall.ioprio_get.num 252
+const syscall.ioprio_get.argc 2
 
-macro syscall.ioprio_get.argc 0
-    2
-;
-
-macro syscall.inotify_init 0
+macro syscall.inotify_init `
     253
     syscall0
-;
+` emit ;
 
-macro syscall.inotify_init.num 0
-    253
-;
+const syscall.inotify_init.num 253
+const syscall.inotify_init.argc 0
 
-macro syscall.inotify_init.argc 0
-    0
-;
-
-macro syscall.inotify_add_watch 0
+macro syscall.inotify_add_watch `
     254
     syscall3
-;
+` emit ;
 
-macro syscall.inotify_add_watch.num 0
-    254
-;
+const syscall.inotify_add_watch.num 254
+const syscall.inotify_add_watch.argc 3
 
-macro syscall.inotify_add_watch.argc 0
-    3
-;
-
-macro syscall.inotify_rm_watch 0
+macro syscall.inotify_rm_watch `
     255
     syscall2
-;
+` emit ;
 
-macro syscall.inotify_rm_watch.num 0
-    255
-;
+const syscall.inotify_rm_watch.num 255
+const syscall.inotify_rm_watch.argc 2
 
-macro syscall.inotify_rm_watch.argc 0
-    2
-;
-
-macro syscall.migrate_pages 0
+macro syscall.migrate_pages `
     256
     syscall4
-;
+` emit ;
 
-macro syscall.migrate_pages.num 0
-    256
-;
+const syscall.migrate_pages.num 256
+const syscall.migrate_pages.argc 4
 
-macro syscall.migrate_pages.argc 0
-    4
-;
-
-macro syscall.openat 0
+macro syscall.openat `
     257
     syscall4
-;
+` emit ;
 
-macro syscall.openat.num 0
-    257
-;
+const syscall.openat.num 257
+const syscall.openat.argc 4
 
-macro syscall.openat.argc 0
-    4
-;
-
-macro syscall.mkdirat 0
+macro syscall.mkdirat `
     258
     syscall3
-;
+` emit ;
 
-macro syscall.mkdirat.num 0
-    258
-;
+const syscall.mkdirat.num 258
+const syscall.mkdirat.argc 3
 
-macro syscall.mkdirat.argc 0
-    3
-;
-
-macro syscall.mknodat 0
+macro syscall.mknodat `
     259
     syscall4
-;
+` emit ;
 
-macro syscall.mknodat.num 0
-    259
-;
+const syscall.mknodat.num 259
+const syscall.mknodat.argc 4
 
-macro syscall.mknodat.argc 0
-    4
-;
-
-macro syscall.fchownat 0
+macro syscall.fchownat `
     260
     syscall5
-;
+` emit ;
 
-macro syscall.fchownat.num 0
-    260
-;
+const syscall.fchownat.num 260
+const syscall.fchownat.argc 5
 
-macro syscall.fchownat.argc 0
-    5
-;
-
-macro syscall.futimesat 0
+macro syscall.futimesat `
     261
     syscall3
-;
+` emit ;
 
-macro syscall.futimesat.num 0
-    261
-;
+const syscall.futimesat.num 261
+const syscall.futimesat.argc 3
 
-macro syscall.futimesat.argc 0
-    3
-;
-
-macro syscall.newfstatat 0
+macro syscall.newfstatat `
     262
     syscall4
-;
+` emit ;
 
-macro syscall.newfstatat.num 0
-    262
-;
+const syscall.newfstatat.num 262
+const syscall.newfstatat.argc 4
 
-macro syscall.newfstatat.argc 0
-    4
-;
-
-macro syscall.unlinkat 0
+macro syscall.unlinkat `
     263
     syscall3
-;
+` emit ;
 
-macro syscall.unlinkat.num 0
-    263
-;
+const syscall.unlinkat.num 263
+const syscall.unlinkat.argc 3
 
-macro syscall.unlinkat.argc 0
-    3
-;
-
-macro syscall.renameat 0
+macro syscall.renameat `
     264
     syscall4
-;
+` emit ;
 
-macro syscall.renameat.num 0
-    264
-;
+const syscall.renameat.num 264
+const syscall.renameat.argc 4
 
-macro syscall.renameat.argc 0
-    4
-;
-
-macro syscall.linkat 0
+macro syscall.linkat `
     265
     syscall5
-;
+` emit ;
 
-macro syscall.linkat.num 0
-    265
-;
+const syscall.linkat.num 265
+const syscall.linkat.argc 5
 
-macro syscall.linkat.argc 0
-    5
-;
-
-macro syscall.symlinkat 0
+macro syscall.symlinkat `
     266
     syscall3
-;
+` emit ;
 
-macro syscall.symlinkat.num 0
-    266
-;
+const syscall.symlinkat.num 266
+const syscall.symlinkat.argc 3
 
-macro syscall.symlinkat.argc 0
-    3
-;
-
-macro syscall.readlinkat 0
+macro syscall.readlinkat `
     267
     syscall4
-;
+` emit ;
 
-macro syscall.readlinkat.num 0
-    267
-;
+const syscall.readlinkat.num 267
+const syscall.readlinkat.argc 4
 
-macro syscall.readlinkat.argc 0
-    4
-;
-
-macro syscall.fchmodat 0
+macro syscall.fchmodat `
     268
     syscall3
-;
+` emit ;
 
-macro syscall.fchmodat.num 0
-    268
-;
+const syscall.fchmodat.num 268
+const syscall.fchmodat.argc 3
 
-macro syscall.fchmodat.argc 0
-    3
-;
-
-macro syscall.faccessat 0
+macro syscall.faccessat `
     269
     syscall3
-;
+` emit ;
 
-macro syscall.faccessat.num 0
-    269
-;
+const syscall.faccessat.num 269
+const syscall.faccessat.argc 3
 
-macro syscall.faccessat.argc 0
-    3
-;
-
-macro syscall.pselect6 0
+macro syscall.pselect6 `
     270
     syscall6
-;
+` emit ;
 
-macro syscall.pselect6.num 0
-    270
-;
+const syscall.pselect6.num 270
+const syscall.pselect6.argc 6
 
-macro syscall.pselect6.argc 0
-    6
-;
-
-macro syscall.ppoll 0
+macro syscall.ppoll `
     271
     syscall5
-;
+` emit ;
 
-macro syscall.ppoll.num 0
-    271
-;
+const syscall.ppoll.num 271
+const syscall.ppoll.argc 5
 
-macro syscall.ppoll.argc 0
-    5
-;
-
-macro syscall.unshare 0
+macro syscall.unshare `
     272
     syscall1
-;
+` emit ;
 
-macro syscall.unshare.num 0
-    272
-;
+const syscall.unshare.num 272
+const syscall.unshare.argc 1
 
-macro syscall.unshare.argc 0
-    1
-;
-
-macro syscall.set_robust_list 0
+macro syscall.set_robust_list `
     273
     syscall2
-;
+` emit ;
 
-macro syscall.set_robust_list.num 0
-    273
-;
+const syscall.set_robust_list.num 273
+const syscall.set_robust_list.argc 2
 
-macro syscall.set_robust_list.argc 0
-    2
-;
-
-macro syscall.get_robust_list 0
+macro syscall.get_robust_list `
     274
     syscall3
-;
+` emit ;
 
-macro syscall.get_robust_list.num 0
-    274
-;
+const syscall.get_robust_list.num 274
+const syscall.get_robust_list.argc 3
 
-macro syscall.get_robust_list.argc 0
-    3
-;
-
-macro syscall.splice 0
+macro syscall.splice `
     275
     syscall6
-;
+` emit ;
 
-macro syscall.splice.num 0
-    275
-;
+const syscall.splice.num 275
+const syscall.splice.argc 6
 
-macro syscall.splice.argc 0
-    6
-;
-
-macro syscall.tee 0
+macro syscall.tee `
     276
     syscall4
-;
+` emit ;
 
-macro syscall.tee.num 0
-    276
-;
+const syscall.tee.num 276
+const syscall.tee.argc 4
 
-macro syscall.tee.argc 0
-    4
-;
-
-macro syscall.sync_file_range 0
+macro syscall.sync_file_range `
     277
     syscall4
-;
+` emit ;
 
-macro syscall.sync_file_range.num 0
-    277
-;
+const syscall.sync_file_range.num 277
+const syscall.sync_file_range.argc 4
 
-macro syscall.sync_file_range.argc 0
-    4
-;
-
-macro syscall.vmsplice 0
+macro syscall.vmsplice `
     278
     syscall4
-;
+` emit ;
 
-macro syscall.vmsplice.num 0
-    278
-;
+const syscall.vmsplice.num 278
+const syscall.vmsplice.argc 4
 
-macro syscall.vmsplice.argc 0
-    4
-;
-
-macro syscall.move_pages 0
+macro syscall.move_pages `
     279
     syscall6
-;
+` emit ;
 
-macro syscall.move_pages.num 0
-    279
-;
+const syscall.move_pages.num 279
+const syscall.move_pages.argc 6
 
-macro syscall.move_pages.argc 0
-    6
-;
-
-macro syscall.utimensat 0
+macro syscall.utimensat `
     280
     syscall4
-;
+` emit ;
 
-macro syscall.utimensat.num 0
-    280
-;
+const syscall.utimensat.num 280
+const syscall.utimensat.argc 4
 
-macro syscall.utimensat.argc 0
-    4
-;
-
-macro syscall.epoll_pwait 0
+macro syscall.epoll_pwait `
     281
     syscall6
-;
+` emit ;
 
-macro syscall.epoll_pwait.num 0
-    281
-;
+const syscall.epoll_pwait.num 281
+const syscall.epoll_pwait.argc 6
 
-macro syscall.epoll_pwait.argc 0
-    6
-;
-
-macro syscall.signalfd 0
+macro syscall.signalfd `
     282
     syscall3
-;
+` emit ;
 
-macro syscall.signalfd.num 0
-    282
-;
+const syscall.signalfd.num 282
+const syscall.signalfd.argc 3
 
-macro syscall.signalfd.argc 0
-    3
-;
-
-macro syscall.timerfd_create 0
+macro syscall.timerfd_create `
     283
     syscall2
-;
+` emit ;
 
-macro syscall.timerfd_create.num 0
-    283
-;
+const syscall.timerfd_create.num 283
+const syscall.timerfd_create.argc 2
 
-macro syscall.timerfd_create.argc 0
-    2
-;
-
-macro syscall.eventfd 0
+macro syscall.eventfd `
     284
     syscall1
-;
+` emit ;
 
-macro syscall.eventfd.num 0
-    284
-;
+const syscall.eventfd.num 284
+const syscall.eventfd.argc 1
 
-macro syscall.eventfd.argc 0
-    1
-;
-
-macro syscall.fallocate 0
+macro syscall.fallocate `
     285
     syscall4
-;
+` emit ;
 
-macro syscall.fallocate.num 0
-    285
-;
+const syscall.fallocate.num 285
+const syscall.fallocate.argc 4
 
-macro syscall.fallocate.argc 0
-    4
-;
-
-macro syscall.timerfd_settime 0
+macro syscall.timerfd_settime `
     286
     syscall4
-;
+` emit ;
 
-macro syscall.timerfd_settime.num 0
-    286
-;
+const syscall.timerfd_settime.num 286
+const syscall.timerfd_settime.argc 4
 
-macro syscall.timerfd_settime.argc 0
-    4
-;
-
-macro syscall.timerfd_gettime 0
+macro syscall.timerfd_gettime `
     287
     syscall2
-;
+` emit ;
 
-macro syscall.timerfd_gettime.num 0
-    287
-;
+const syscall.timerfd_gettime.num 287
+const syscall.timerfd_gettime.argc 2
 
-macro syscall.timerfd_gettime.argc 0
-    2
-;
-
-macro syscall.accept4 0
+macro syscall.accept4 `
     288
     syscall4
-;
+` emit ;
 
-macro syscall.accept4.num 0
-    288
-;
+const syscall.accept4.num 288
+const syscall.accept4.argc 4
 
-macro syscall.accept4.argc 0
-    4
-;
-
-macro syscall.signalfd4 0
+macro syscall.signalfd4 `
     289
     syscall4
-;
+` emit ;
 
-macro syscall.signalfd4.num 0
-    289
-;
+const syscall.signalfd4.num 289
+const syscall.signalfd4.argc 4
 
-macro syscall.signalfd4.argc 0
-    4
-;
-
-macro syscall.eventfd2 0
+macro syscall.eventfd2 `
     290
     syscall2
-;
+` emit ;
 
-macro syscall.eventfd2.num 0
-    290
-;
+const syscall.eventfd2.num 290
+const syscall.eventfd2.argc 2
 
-macro syscall.eventfd2.argc 0
-    2
-;
-
-macro syscall.epoll_create1 0
+macro syscall.epoll_create1 `
     291
     syscall1
-;
+` emit ;
 
-macro syscall.epoll_create1.num 0
-    291
-;
+const syscall.epoll_create1.num 291
+const syscall.epoll_create1.argc 1
 
-macro syscall.epoll_create1.argc 0
-    1
-;
-
-macro syscall.dup3 0
+macro syscall.dup3 `
     292
     syscall3
-;
+` emit ;
 
-macro syscall.dup3.num 0
-    292
-;
+const syscall.dup3.num 292
+const syscall.dup3.argc 3
 
-macro syscall.dup3.argc 0
-    3
-;
-
-macro syscall.pipe2 0
+macro syscall.pipe2 `
     293
     syscall2
-;
+` emit ;
 
-macro syscall.pipe2.num 0
-    293
-;
+const syscall.pipe2.num 293
+const syscall.pipe2.argc 2
 
-macro syscall.pipe2.argc 0
-    2
-;
-
-macro syscall.inotify_init1 0
+macro syscall.inotify_init1 `
     294
     syscall1
-;
+` emit ;
 
-macro syscall.inotify_init1.num 0
-    294
-;
+const syscall.inotify_init1.num 294
+const syscall.inotify_init1.argc 1
 
-macro syscall.inotify_init1.argc 0
-    1
-;
-
-macro syscall.preadv 0
+macro syscall.preadv `
     295
     syscall4
-;
+` emit ;
 
-macro syscall.preadv.num 0
-    295
-;
+const syscall.preadv.num 295
+const syscall.preadv.argc 4
 
-macro syscall.preadv.argc 0
-    4
-;
-
-macro syscall.pwritev 0
+macro syscall.pwritev `
     296
     syscall4
-;
+` emit ;
 
-macro syscall.pwritev.num 0
-    296
-;
+const syscall.pwritev.num 296
+const syscall.pwritev.argc 4
 
-macro syscall.pwritev.argc 0
-    4
-;
-
-macro syscall.rt_tgsigqueueinfo 0
+macro syscall.rt_tgsigqueueinfo `
     297
     syscall4
-;
+` emit ;
 
-macro syscall.rt_tgsigqueueinfo.num 0
-    297
-;
+const syscall.rt_tgsigqueueinfo.num 297
+const syscall.rt_tgsigqueueinfo.argc 4
 
-macro syscall.rt_tgsigqueueinfo.argc 0
-    4
-;
-
-macro syscall.perf_event_open 0
+macro syscall.perf_event_open `
     298
     syscall5
-;
+` emit ;
 
-macro syscall.perf_event_open.num 0
-    298
-;
+const syscall.perf_event_open.num 298
+const syscall.perf_event_open.argc 5
 
-macro syscall.perf_event_open.argc 0
-    5
-;
-
-macro syscall.recvmmsg 0
+macro syscall.recvmmsg `
     299
     syscall5
-;
+` emit ;
 
-macro syscall.recvmmsg.num 0
-    299
-;
+const syscall.recvmmsg.num 299
+const syscall.recvmmsg.argc 5
 
-macro syscall.recvmmsg.argc 0
-    5
-;
-
-macro syscall.fanotify_init 0
+macro syscall.fanotify_init `
     300
     syscall2
-;
+` emit ;
 
-macro syscall.fanotify_init.num 0
-    300
-;
+const syscall.fanotify_init.num 300
+const syscall.fanotify_init.argc 2
 
-macro syscall.fanotify_init.argc 0
-    2
-;
-
-macro syscall.fanotify_mark 0
+macro syscall.fanotify_mark `
     301
     syscall5
-;
+` emit ;
 
-macro syscall.fanotify_mark.num 0
-    301
-;
+const syscall.fanotify_mark.num 301
+const syscall.fanotify_mark.argc 5
 
-macro syscall.fanotify_mark.argc 0
-    5
-;
-
-macro syscall.prlimit64 0
+macro syscall.prlimit64 `
     302
     syscall4
-;
+` emit ;
 
-macro syscall.prlimit64.num 0
-    302
-;
+const syscall.prlimit64.num 302
+const syscall.prlimit64.argc 4
 
-macro syscall.prlimit64.argc 0
-    4
-;
-
-macro syscall.name_to_handle_at 0
+macro syscall.name_to_handle_at `
     303
     syscall5
-;
+` emit ;
 
-macro syscall.name_to_handle_at.num 0
-    303
-;
+const syscall.name_to_handle_at.num 303
+const syscall.name_to_handle_at.argc 5
 
-macro syscall.name_to_handle_at.argc 0
-    5
-;
-
-macro syscall.open_by_handle_at 0
+macro syscall.open_by_handle_at `
     304
     syscall3
-;
+` emit ;
 
-macro syscall.open_by_handle_at.num 0
-    304
-;
+const syscall.open_by_handle_at.num 304
+const syscall.open_by_handle_at.argc 3
 
-macro syscall.open_by_handle_at.argc 0
-    3
-;
-
-macro syscall.clock_adjtime 0
+macro syscall.clock_adjtime `
     305
     syscall2
-;
+` emit ;
 
-macro syscall.clock_adjtime.num 0
-    305
-;
+const syscall.clock_adjtime.num 305
+const syscall.clock_adjtime.argc 2
 
-macro syscall.clock_adjtime.argc 0
-    2
-;
-
-macro syscall.syncfs 0
+macro syscall.syncfs `
     306
     syscall1
-;
+` emit ;
 
-macro syscall.syncfs.num 0
-    306
-;
+const syscall.syncfs.num 306
+const syscall.syncfs.argc 1
 
-macro syscall.syncfs.argc 0
-    1
-;
-
-macro syscall.sendmmsg 0
+macro syscall.sendmmsg `
     307
     syscall4
-;
+` emit ;
 
-macro syscall.sendmmsg.num 0
-    307
-;
+const syscall.sendmmsg.num 307
+const syscall.sendmmsg.argc 4
 
-macro syscall.sendmmsg.argc 0
-    4
-;
-
-macro syscall.setns 0
+macro syscall.setns `
     308
     syscall2
-;
+` emit ;
 
-macro syscall.setns.num 0
-    308
-;
+const syscall.setns.num 308
+const syscall.setns.argc 2
 
-macro syscall.setns.argc 0
-    2
-;
-
-macro syscall.getcpu 0
+macro syscall.getcpu `
     309
     syscall3
-;
+` emit ;
 
-macro syscall.getcpu.num 0
-    309
-;
+const syscall.getcpu.num 309
+const syscall.getcpu.argc 3
 
-macro syscall.getcpu.argc 0
-    3
-;
-
-macro syscall.process_vm_readv 0
+macro syscall.process_vm_readv `
     310
     syscall6
-;
+` emit ;
 
-macro syscall.process_vm_readv.num 0
-    310
-;
+const syscall.process_vm_readv.num 310
+const syscall.process_vm_readv.argc 6
 
-macro syscall.process_vm_readv.argc 0
-    6
-;
-
-macro syscall.process_vm_writev 0
+macro syscall.process_vm_writev `
     311
     syscall6
-;
+` emit ;
 
-macro syscall.process_vm_writev.num 0
-    311
-;
+const syscall.process_vm_writev.num 311
+const syscall.process_vm_writev.argc 6
 
-macro syscall.process_vm_writev.argc 0
-    6
-;
-
-macro syscall.kcmp 0
+macro syscall.kcmp `
     312
     syscall5
-;
+` emit ;
 
-macro syscall.kcmp.num 0
-    312
-;
+const syscall.kcmp.num 312
+const syscall.kcmp.argc 5
 
-macro syscall.kcmp.argc 0
-    5
-;
-
-macro syscall.finit_module 0
+macro syscall.finit_module `
     313
     syscall3
-;
+` emit ;
 
-macro syscall.finit_module.num 0
-    313
-;
+const syscall.finit_module.num 313
+const syscall.finit_module.argc 3
 
-macro syscall.finit_module.argc 0
-    3
-;
-
-macro syscall.sched_setattr 0
+macro syscall.sched_setattr `
     314
     syscall3
-;
+` emit ;
 
-macro syscall.sched_setattr.num 0
-    314
-;
+const syscall.sched_setattr.num 314
+const syscall.sched_setattr.argc 3
 
-macro syscall.sched_setattr.argc 0
-    3
-;
-
-macro syscall.sched_getattr 0
+macro syscall.sched_getattr `
     315
     syscall4
-;
+` emit ;
 
-macro syscall.sched_getattr.num 0
-    315
-;
+const syscall.sched_getattr.num 315
+const syscall.sched_getattr.argc 4
 
-macro syscall.sched_getattr.argc 0
-    4
-;
-
-macro syscall.renameat2 0
+macro syscall.renameat2 `
     316
     syscall5
-;
+` emit ;
 
-macro syscall.renameat2.num 0
-    316
-;
+const syscall.renameat2.num 316
+const syscall.renameat2.argc 5
 
-macro syscall.renameat2.argc 0
-    5
-;
-
-macro syscall.seccomp 0
+macro syscall.seccomp `
     317
     syscall3
-;
+` emit ;
 
-macro syscall.seccomp.num 0
-    317
-;
+const syscall.seccomp.num 317
+const syscall.seccomp.argc 3
 
-macro syscall.seccomp.argc 0
-    3
-;
-
-macro syscall.getrandom 0
+macro syscall.getrandom `
     318
     syscall3
-;
+` emit ;
 
-macro syscall.getrandom.num 0
-    318
-;
+const syscall.getrandom.num 318
+const syscall.getrandom.argc 3
 
-macro syscall.getrandom.argc 0
-    3
-;
-
-macro syscall.memfd_create 0
+macro syscall.memfd_create `
     319
     syscall2
-;
+` emit ;
 
-macro syscall.memfd_create.num 0
-    319
-;
+const syscall.memfd_create.num 319
+const syscall.memfd_create.argc 2
 
-macro syscall.memfd_create.argc 0
-    2
-;
-
-macro syscall.kexec_file_load 0
+macro syscall.kexec_file_load `
     320
     syscall5
-;
+` emit ;
 
-macro syscall.kexec_file_load.num 0
-    320
-;
+const syscall.kexec_file_load.num 320
+const syscall.kexec_file_load.argc 5
 
-macro syscall.kexec_file_load.argc 0
-    5
-;
-
-macro syscall.bpf 0
+macro syscall.bpf `
     321
     syscall3
-;
+` emit ;
 
-macro syscall.bpf.num 0
-    321
-;
+const syscall.bpf.num 321
+const syscall.bpf.argc 3
 
-macro syscall.bpf.argc 0
-    3
-;
-
-macro syscall.execveat 0
+macro syscall.execveat `
     322
     syscall5
-;
+` emit ;
 
-macro syscall.execveat.num 0
-    322
-;
+const syscall.execveat.num 322
+const syscall.execveat.argc 5
 
-macro syscall.execveat.argc 0
-    5
-;
-
-macro syscall.userfaultfd 0
+macro syscall.userfaultfd `
     323
     syscall1
-;
+` emit ;
 
-macro syscall.userfaultfd.num 0
-    323
-;
+const syscall.userfaultfd.num 323
+const syscall.userfaultfd.argc 1
 
-macro syscall.userfaultfd.argc 0
-    1
-;
-
-macro syscall.membarrier 0
+macro syscall.membarrier `
     324
     syscall3
-;
+` emit ;
 
-macro syscall.membarrier.num 0
-    324
-;
+const syscall.membarrier.num 324
+const syscall.membarrier.argc 3
 
-macro syscall.membarrier.argc 0
-    3
-;
-
-macro syscall.mlock2 0
+macro syscall.mlock2 `
     325
     syscall3
-;
+` emit ;
 
-macro syscall.mlock2.num 0
-    325
-;
+const syscall.mlock2.num 325
+const syscall.mlock2.argc 3
 
-macro syscall.mlock2.argc 0
-    3
-;
-
-macro syscall.copy_file_range 0
+macro syscall.copy_file_range `
     326
     syscall6
-;
+` emit ;
 
-macro syscall.copy_file_range.num 0
-    326
-;
+const syscall.copy_file_range.num 326
+const syscall.copy_file_range.argc 6
 
-macro syscall.copy_file_range.argc 0
-    6
-;
-
-macro syscall.preadv2 0
+macro syscall.preadv2 `
     327
     syscall6
-;
+` emit ;
 
-macro syscall.preadv2.num 0
-    327
-;
+const syscall.preadv2.num 327
+const syscall.preadv2.argc 6
 
-macro syscall.preadv2.argc 0
-    6
-;
-
-macro syscall.pwritev2 0
+macro syscall.pwritev2 `
     328
     syscall6
-;
+` emit ;
 
-macro syscall.pwritev2.num 0
-    328
-;
+const syscall.pwritev2.num 328
+const syscall.pwritev2.argc 6
 
-macro syscall.pwritev2.argc 0
-    6
-;
-
-macro syscall.pkey_mprotect 0
+macro syscall.pkey_mprotect `
     329
     syscall4
-;
+` emit ;
 
-macro syscall.pkey_mprotect.num 0
-    329
-;
+const syscall.pkey_mprotect.num 329
+const syscall.pkey_mprotect.argc 4
 
-macro syscall.pkey_mprotect.argc 0
-    4
-;
-
-macro syscall.pkey_alloc 0
+macro syscall.pkey_alloc `
     330
     syscall2
-;
+` emit ;
 
-macro syscall.pkey_alloc.num 0
-    330
-;
+const syscall.pkey_alloc.num 330
+const syscall.pkey_alloc.argc 2
 
-macro syscall.pkey_alloc.argc 0
-    2
-;
-
-macro syscall.pkey_free 0
+macro syscall.pkey_free `
     331
     syscall1
-;
+` emit ;
 
-macro syscall.pkey_free.num 0
-    331
-;
+const syscall.pkey_free.num 331
+const syscall.pkey_free.argc 1
 
-macro syscall.pkey_free.argc 0
-    1
-;
-
-macro syscall.statx 0
+macro syscall.statx `
     332
     syscall5
-;
+` emit ;
 
-macro syscall.statx.num 0
-    332
-;
+const syscall.statx.num 332
+const syscall.statx.argc 5
 
-macro syscall.statx.argc 0
-    5
-;
-
-macro syscall.io_pgetevents 0
+macro syscall.io_pgetevents `
     333
     syscall6
-;
+` emit ;
 
-macro syscall.io_pgetevents.num 0
-    333
-;
+const syscall.io_pgetevents.num 333
+const syscall.io_pgetevents.argc 6
 
-macro syscall.io_pgetevents.argc 0
-    6
-;
-
-macro syscall.rseq 0
+macro syscall.rseq `
     334
     syscall4
-;
+` emit ;
 
-macro syscall.rseq.num 0
-    334
-;
+const syscall.rseq.num 334
+const syscall.rseq.argc 4
 
-macro syscall.rseq.argc 0
-    4
-;
-
-macro syscall.uretprobe 0
+macro syscall.uretprobe `
     335
     syscall0
-;
+` emit ;
 
-macro syscall.uretprobe.num 0
-    335
-;
+const syscall.uretprobe.num 335
+const syscall.uretprobe.argc 0
 
-macro syscall.uretprobe.argc 0
-    0
-;
-
-macro syscall.uprobe 0
+macro syscall.uprobe `
     336
     syscall0
-;
+` emit ;
 
-macro syscall.uprobe.num 0
-    336
-;
+const syscall.uprobe.num 336
+const syscall.uprobe.argc 0
 
-macro syscall.uprobe.argc 0
-    0
-;
-
-macro syscall.pidfd_send_signal 0
+macro syscall.pidfd_send_signal `
     424
     syscall0
-;
+` emit ;
 
-macro syscall.pidfd_send_signal.num 0
-    424
-;
+const syscall.pidfd_send_signal.num 424
+const syscall.pidfd_send_signal.argc 0
 
-macro syscall.pidfd_send_signal.argc 0
-    0
-;
-
-macro syscall.io_uring_setup 0
+macro syscall.io_uring_setup `
     425
     syscall0
-;
+` emit ;
 
-macro syscall.io_uring_setup.num 0
-    425
-;
+const syscall.io_uring_setup.num 425
+const syscall.io_uring_setup.argc 0
 
-macro syscall.io_uring_setup.argc 0
-    0
-;
-
-macro syscall.io_uring_enter 0
+macro syscall.io_uring_enter `
     426
     syscall0
-;
+` emit ;
 
-macro syscall.io_uring_enter.num 0
-    426
-;
+const syscall.io_uring_enter.num 426
+const syscall.io_uring_enter.argc 0
 
-macro syscall.io_uring_enter.argc 0
-    0
-;
-
-macro syscall.io_uring_register 0
+macro syscall.io_uring_register `
     427
     syscall0
-;
+` emit ;
 
-macro syscall.io_uring_register.num 0
-    427
-;
+const syscall.io_uring_register.num 427
+const syscall.io_uring_register.argc 0
 
-macro syscall.io_uring_register.argc 0
-    0
-;
-
-macro syscall.open_tree 0
+macro syscall.open_tree `
     428
     syscall0
-;
+` emit ;
 
-macro syscall.open_tree.num 0
-    428
-;
+const syscall.open_tree.num 428
+const syscall.open_tree.argc 0
 
-macro syscall.open_tree.argc 0
-    0
-;
-
-macro syscall.move_mount 0
+macro syscall.move_mount `
     429
     syscall0
-;
+` emit ;
 
-macro syscall.move_mount.num 0
-    429
-;
+const syscall.move_mount.num 429
+const syscall.move_mount.argc 0
 
-macro syscall.move_mount.argc 0
-    0
-;
-
-macro syscall.fsopen 0
+macro syscall.fsopen `
     430
     syscall0
-;
+` emit ;
 
-macro syscall.fsopen.num 0
-    430
-;
+const syscall.fsopen.num 430
+const syscall.fsopen.argc 0
 
-macro syscall.fsopen.argc 0
-    0
-;
-
-macro syscall.fsconfig 0
+macro syscall.fsconfig `
     431
     syscall0
-;
+` emit ;
 
-macro syscall.fsconfig.num 0
-    431
-;
+const syscall.fsconfig.num 431
+const syscall.fsconfig.argc 0
 
-macro syscall.fsconfig.argc 0
-    0
-;
-
-macro syscall.fsmount 0
+macro syscall.fsmount `
     432
     syscall0
-;
+` emit ;
 
-macro syscall.fsmount.num 0
-    432
-;
+const syscall.fsmount.num 432
+const syscall.fsmount.argc 0
 
-macro syscall.fsmount.argc 0
-    0
-;
-
-macro syscall.fspick 0
+macro syscall.fspick `
     433
     syscall0
-;
+` emit ;
 
-macro syscall.fspick.num 0
-    433
-;
+const syscall.fspick.num 433
+const syscall.fspick.argc 0
 
-macro syscall.fspick.argc 0
-    0
-;
-
-macro syscall.pidfd_open 0
+macro syscall.pidfd_open `
     434
     syscall0
-;
+` emit ;
 
-macro syscall.pidfd_open.num 0
-    434
-;
+const syscall.pidfd_open.num 434
+const syscall.pidfd_open.argc 0
 
-macro syscall.pidfd_open.argc 0
-    0
-;
-
-macro syscall.clone3 0
+macro syscall.clone3 `
     435
     syscall0
-;
+` emit ;
 
-macro syscall.clone3.num 0
-    435
-;
+const syscall.clone3.num 435
+const syscall.clone3.argc 0
 
-macro syscall.clone3.argc 0
-    0
-;
-
-macro syscall.close_range 0
+macro syscall.close_range `
     436
     syscall0
-;
+` emit ;
 
-macro syscall.close_range.num 0
-    436
-;
+const syscall.close_range.num 436
+const syscall.close_range.argc 0
 
-macro syscall.close_range.argc 0
-    0
-;
-
-macro syscall.openat2 0
+macro syscall.openat2 `
     437
     syscall0
-;
+` emit ;
 
-macro syscall.openat2.num 0
-    437
-;
+const syscall.openat2.num 437
+const syscall.openat2.argc 0
 
-macro syscall.openat2.argc 0
-    0
-;
-
-macro syscall.pidfd_getfd 0
+macro syscall.pidfd_getfd `
     438
     syscall0
-;
+` emit ;
 
-macro syscall.pidfd_getfd.num 0
-    438
-;
+const syscall.pidfd_getfd.num 438
+const syscall.pidfd_getfd.argc 0
 
-macro syscall.pidfd_getfd.argc 0
-    0
-;
-
-macro syscall.faccessat2 0
+macro syscall.faccessat2 `
     439
     syscall0
-;
+` emit ;
 
-macro syscall.faccessat2.num 0
-    439
-;
+const syscall.faccessat2.num 439
+const syscall.faccessat2.argc 0
 
-macro syscall.faccessat2.argc 0
-    0
-;
-
-macro syscall.process_madvise 0
+macro syscall.process_madvise `
     440
     syscall0
-;
+` emit ;
 
-macro syscall.process_madvise.num 0
-    440
-;
+const syscall.process_madvise.num 440
+const syscall.process_madvise.argc 0
 
-macro syscall.process_madvise.argc 0
-    0
-;
-
-macro syscall.epoll_pwait2 0
+macro syscall.epoll_pwait2 `
     441
     syscall0
-;
+` emit ;
 
-macro syscall.epoll_pwait2.num 0
-    441
-;
+const syscall.epoll_pwait2.num 441
+const syscall.epoll_pwait2.argc 0
 
-macro syscall.epoll_pwait2.argc 0
-    0
-;
-
-macro syscall.mount_setattr 0
+macro syscall.mount_setattr `
     442
     syscall0
-;
+` emit ;
 
-macro syscall.mount_setattr.num 0
-    442
-;
+const syscall.mount_setattr.num 442
+const syscall.mount_setattr.argc 0
 
-macro syscall.mount_setattr.argc 0
-    0
-;
-
-macro syscall.quotactl_fd 0
+macro syscall.quotactl_fd `
     443
     syscall0
-;
+` emit ;
 
-macro syscall.quotactl_fd.num 0
-    443
-;
+const syscall.quotactl_fd.num 443
+const syscall.quotactl_fd.argc 0
 
-macro syscall.quotactl_fd.argc 0
-    0
-;
-
-macro syscall.landlock_create_ruleset 0
+macro syscall.landlock_create_ruleset `
     444
     syscall0
-;
+` emit ;
 
-macro syscall.landlock_create_ruleset.num 0
-    444
-;
+const syscall.landlock_create_ruleset.num 444
+const syscall.landlock_create_ruleset.argc 0
 
-macro syscall.landlock_create_ruleset.argc 0
-    0
-;
-
-macro syscall.landlock_add_rule 0
+macro syscall.landlock_add_rule `
     445
     syscall0
-;
+` emit ;
 
-macro syscall.landlock_add_rule.num 0
-    445
-;
+const syscall.landlock_add_rule.num 445
+const syscall.landlock_add_rule.argc 0
 
-macro syscall.landlock_add_rule.argc 0
-    0
-;
-
-macro syscall.landlock_restrict_self 0
+macro syscall.landlock_restrict_self `
     446
     syscall0
-;
+` emit ;
 
-macro syscall.landlock_restrict_self.num 0
-    446
-;
+const syscall.landlock_restrict_self.num 446
+const syscall.landlock_restrict_self.argc 0
 
-macro syscall.landlock_restrict_self.argc 0
-    0
-;
-
-macro syscall.memfd_secret 0
+macro syscall.memfd_secret `
     447
     syscall0
-;
+` emit ;
 
-macro syscall.memfd_secret.num 0
-    447
-;
+const syscall.memfd_secret.num 447
+const syscall.memfd_secret.argc 0
 
-macro syscall.memfd_secret.argc 0
-    0
-;
-
-macro syscall.process_mrelease 0
+macro syscall.process_mrelease `
     448
     syscall0
-;
+` emit ;
 
-macro syscall.process_mrelease.num 0
-    448
-;
+const syscall.process_mrelease.num 448
+const syscall.process_mrelease.argc 0
 
-macro syscall.process_mrelease.argc 0
-    0
-;
-
-macro syscall.futex_waitv 0
+macro syscall.futex_waitv `
     449
     syscall0
-;
+` emit ;
 
-macro syscall.futex_waitv.num 0
-    449
-;
+const syscall.futex_waitv.num 449
+const syscall.futex_waitv.argc 0
 
-macro syscall.futex_waitv.argc 0
-    0
-;
-
-macro syscall.set_mempolicy_home_node 0
+macro syscall.set_mempolicy_home_node `
     450
     syscall0
-;
+` emit ;
 
-macro syscall.set_mempolicy_home_node.num 0
-    450
-;
+const syscall.set_mempolicy_home_node.num 450
+const syscall.set_mempolicy_home_node.argc 0
 
-macro syscall.set_mempolicy_home_node.argc 0
-    0
-;
-
-macro syscall.cachestat 0
+macro syscall.cachestat `
     451
     syscall0
-;
+` emit ;
 
-macro syscall.cachestat.num 0
-    451
-;
+const syscall.cachestat.num 451
+const syscall.cachestat.argc 0
 
-macro syscall.cachestat.argc 0
-    0
-;
-
-macro syscall.fchmodat2 0
+macro syscall.fchmodat2 `
     452
     syscall0
-;
+` emit ;
 
-macro syscall.fchmodat2.num 0
-    452
-;
+const syscall.fchmodat2.num 452
+const syscall.fchmodat2.argc 0
 
-macro syscall.fchmodat2.argc 0
-    0
-;
-
-macro syscall.map_shadow_stack 0
+macro syscall.map_shadow_stack `
     453
     syscall0
-;
+` emit ;
 
-macro syscall.map_shadow_stack.num 0
-    453
-;
+const syscall.map_shadow_stack.num 453
+const syscall.map_shadow_stack.argc 0
 
-macro syscall.map_shadow_stack.argc 0
-    0
-;
-
-macro syscall.futex_wake 0
+macro syscall.futex_wake `
     454
     syscall0
-;
+` emit ;
 
-macro syscall.futex_wake.num 0
-    454
-;
+const syscall.futex_wake.num 454
+const syscall.futex_wake.argc 0
 
-macro syscall.futex_wake.argc 0
-    0
-;
-
-macro syscall.futex_wait 0
+macro syscall.futex_wait `
     455
     syscall0
-;
+` emit ;
 
-macro syscall.futex_wait.num 0
-    455
-;
+const syscall.futex_wait.num 455
+const syscall.futex_wait.argc 0
 
-macro syscall.futex_wait.argc 0
-    0
-;
-
-macro syscall.futex_requeue 0
+macro syscall.futex_requeue `
     456
     syscall0
-;
+` emit ;
 
-macro syscall.futex_requeue.num 0
-    456
-;
+const syscall.futex_requeue.num 456
+const syscall.futex_requeue.argc 0
 
-macro syscall.futex_requeue.argc 0
-    0
-;
-
-macro syscall.statmount 0
+macro syscall.statmount `
     457
     syscall0
-;
+` emit ;
 
-macro syscall.statmount.num 0
-    457
-;
+const syscall.statmount.num 457
+const syscall.statmount.argc 0
 
-macro syscall.statmount.argc 0
-    0
-;
-
-macro syscall.listmount 0
+macro syscall.listmount `
     458
     syscall0
-;
+` emit ;
 
-macro syscall.listmount.num 0
-    458
-;
+const syscall.listmount.num 458
+const syscall.listmount.argc 0
 
-macro syscall.listmount.argc 0
-    0
-;
-
-macro syscall.lsm_get_self_attr 0
+macro syscall.lsm_get_self_attr `
     459
     syscall0
-;
+` emit ;
 
-macro syscall.lsm_get_self_attr.num 0
-    459
-;
+const syscall.lsm_get_self_attr.num 459
+const syscall.lsm_get_self_attr.argc 0
 
-macro syscall.lsm_get_self_attr.argc 0
-    0
-;
-
-macro syscall.lsm_set_self_attr 0
+macro syscall.lsm_set_self_attr `
     460
     syscall0
-;
+` emit ;
 
-macro syscall.lsm_set_self_attr.num 0
-    460
-;
+const syscall.lsm_set_self_attr.num 460
+const syscall.lsm_set_self_attr.argc 0
 
-macro syscall.lsm_set_self_attr.argc 0
-    0
-;
-
-macro syscall.lsm_list_modules 0
+macro syscall.lsm_list_modules `
     461
     syscall0
-;
+` emit ;
 
-macro syscall.lsm_list_modules.num 0
-    461
-;
+const syscall.lsm_list_modules.num 461
+const syscall.lsm_list_modules.argc 0
 
-macro syscall.lsm_list_modules.argc 0
-    0
-;
-
-macro syscall.mseal 0
+macro syscall.mseal `
     462
     syscall0
-;
+` emit ;
 
-macro syscall.mseal.num 0
-    462
-;
+const syscall.mseal.num 462
+const syscall.mseal.argc 0
 
-macro syscall.mseal.argc 0
-    0
-;
-
-macro syscall.setxattrat 0
+macro syscall.setxattrat `
     463
     syscall0
-;
+` emit ;
 
-macro syscall.setxattrat.num 0
-    463
-;
+const syscall.setxattrat.num 463
+const syscall.setxattrat.argc 0
 
-macro syscall.setxattrat.argc 0
-    0
-;
-
-macro syscall.getxattrat 0
+macro syscall.getxattrat `
     464
     syscall0
-;
+` emit ;
 
-macro syscall.getxattrat.num 0
-    464
-;
+const syscall.getxattrat.num 464
+const syscall.getxattrat.argc 0
 
-macro syscall.getxattrat.argc 0
-    0
-;
-
-macro syscall.listxattrat 0
+macro syscall.listxattrat `
     465
     syscall0
-;
+` emit ;
 
-macro syscall.listxattrat.num 0
-    465
-;
+const syscall.listxattrat.num 465
+const syscall.listxattrat.argc 0
 
-macro syscall.listxattrat.argc 0
-    0
-;
-
-macro syscall.removexattrat 0
+macro syscall.removexattrat `
     466
     syscall0
-;
+` emit ;
 
-macro syscall.removexattrat.num 0
-    466
-;
+const syscall.removexattrat.num 466
+const syscall.removexattrat.argc 0
 
-macro syscall.removexattrat.argc 0
-    0
-;
-
-macro syscall.open_tree_attr 0
+macro syscall.open_tree_attr `
     467
     syscall0
-;
+` emit ;
 
-macro syscall.open_tree_attr.num 0
-    467
-;
+const syscall.open_tree_attr.num 467
+const syscall.open_tree_attr.argc 0
 
-macro syscall.open_tree_attr.argc 0
-    0
-;
-
-macro syscall.file_getattr 0
+macro syscall.file_getattr `
     468
     syscall0
-;
+` emit ;
 
-macro syscall.file_getattr.num 0
-    468
-;
+const syscall.file_getattr.num 468
+const syscall.file_getattr.argc 0
 
-macro syscall.file_getattr.argc 0
-    0
-;
-
-macro syscall.file_setattr 0
+macro syscall.file_setattr `
     469
     syscall0
-;
+` emit ;
 
-macro syscall.file_setattr.num 0
-    469
-;
+const syscall.file_setattr.num 469
+const syscall.file_setattr.argc 0
 
-macro syscall.file_setattr.argc 0
-    0
-;
-
-macro syscall.listns 0
+macro syscall.listns `
     470
     syscall0
-;
+` emit ;
 
-macro syscall.listns.num 0
-    470
-;
+const syscall.listns.num 470
+const syscall.listns.argc 0
 
-macro syscall.listns.argc 0
-    0
-;
-
-macro syscall.compat_sys_rt_sigaction 0
+macro syscall.compat_sys_rt_sigaction `
     512
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_rt_sigaction.num 0
-    512
-;
+const syscall.compat_sys_rt_sigaction.num 512
+const syscall.compat_sys_rt_sigaction.argc 0
 
-macro syscall.compat_sys_rt_sigaction.argc 0
-    0
-;
-
-macro syscall.compat_sys_x32_rt_sigreturn 0
+macro syscall.compat_sys_x32_rt_sigreturn `
     513
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_x32_rt_sigreturn.num 0
-    513
-;
+const syscall.compat_sys_x32_rt_sigreturn.num 513
+const syscall.compat_sys_x32_rt_sigreturn.argc 0
 
-macro syscall.compat_sys_x32_rt_sigreturn.argc 0
-    0
-;
-
-macro syscall.compat_sys_ioctl 0
+macro syscall.compat_sys_ioctl `
     514
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_ioctl.num 0
-    514
-;
+const syscall.compat_sys_ioctl.num 514
+const syscall.compat_sys_ioctl.argc 0
 
-macro syscall.compat_sys_ioctl.argc 0
-    0
-;
-
-macro syscall.compat_sys_recvfrom 0
+macro syscall.compat_sys_recvfrom `
     517
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_recvfrom.num 0
-    517
-;
+const syscall.compat_sys_recvfrom.num 517
+const syscall.compat_sys_recvfrom.argc 0
 
-macro syscall.compat_sys_recvfrom.argc 0
-    0
-;
-
-macro syscall.compat_sys_sendmsg 0
+macro syscall.compat_sys_sendmsg `
     518
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_sendmsg.num 0
-    518
-;
+const syscall.compat_sys_sendmsg.num 518
+const syscall.compat_sys_sendmsg.argc 0
 
-macro syscall.compat_sys_sendmsg.argc 0
-    0
-;
-
-macro syscall.compat_sys_recvmsg 0
+macro syscall.compat_sys_recvmsg `
     519
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_recvmsg.num 0
-    519
-;
+const syscall.compat_sys_recvmsg.num 519
+const syscall.compat_sys_recvmsg.argc 0
 
-macro syscall.compat_sys_recvmsg.argc 0
-    0
-;
-
-macro syscall.compat_sys_execve 0
+macro syscall.compat_sys_execve `
     520
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_execve.num 0
-    520
-;
+const syscall.compat_sys_execve.num 520
+const syscall.compat_sys_execve.argc 0
 
-macro syscall.compat_sys_execve.argc 0
-    0
-;
-
-macro syscall.compat_sys_ptrace 0
+macro syscall.compat_sys_ptrace `
     521
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_ptrace.num 0
-    521
-;
+const syscall.compat_sys_ptrace.num 521
+const syscall.compat_sys_ptrace.argc 0
 
-macro syscall.compat_sys_ptrace.argc 0
-    0
-;
-
-macro syscall.compat_sys_rt_sigpending 0
+macro syscall.compat_sys_rt_sigpending `
     522
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_rt_sigpending.num 0
-    522
-;
+const syscall.compat_sys_rt_sigpending.num 522
+const syscall.compat_sys_rt_sigpending.argc 0
 
-macro syscall.compat_sys_rt_sigpending.argc 0
-    0
-;
-
-macro syscall.compat_sys_rt_sigtimedwait_time64 0
+macro syscall.compat_sys_rt_sigtimedwait_time64 `
     523
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_rt_sigtimedwait_time64.num 0
-    523
-;
+const syscall.compat_sys_rt_sigtimedwait_time64.num 523
+const syscall.compat_sys_rt_sigtimedwait_time64.argc 0
 
-macro syscall.compat_sys_rt_sigtimedwait_time64.argc 0
-    0
-;
-
-macro syscall.compat_sys_rt_sigqueueinfo 0
+macro syscall.compat_sys_rt_sigqueueinfo `
     524
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_rt_sigqueueinfo.num 0
-    524
-;
+const syscall.compat_sys_rt_sigqueueinfo.num 524
+const syscall.compat_sys_rt_sigqueueinfo.argc 0
 
-macro syscall.compat_sys_rt_sigqueueinfo.argc 0
-    0
-;
-
-macro syscall.compat_sys_sigaltstack 0
+macro syscall.compat_sys_sigaltstack `
     525
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_sigaltstack.num 0
-    525
-;
+const syscall.compat_sys_sigaltstack.num 525
+const syscall.compat_sys_sigaltstack.argc 0
 
-macro syscall.compat_sys_sigaltstack.argc 0
-    0
-;
-
-macro syscall.compat_sys_timer_create 0
+macro syscall.compat_sys_timer_create `
     526
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_timer_create.num 0
-    526
-;
+const syscall.compat_sys_timer_create.num 526
+const syscall.compat_sys_timer_create.argc 0
 
-macro syscall.compat_sys_timer_create.argc 0
-    0
-;
-
-macro syscall.compat_sys_mq_notify 0
+macro syscall.compat_sys_mq_notify `
     527
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_mq_notify.num 0
-    527
-;
+const syscall.compat_sys_mq_notify.num 527
+const syscall.compat_sys_mq_notify.argc 0
 
-macro syscall.compat_sys_mq_notify.argc 0
-    0
-;
-
-macro syscall.compat_sys_kexec_load 0
+macro syscall.compat_sys_kexec_load `
     528
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_kexec_load.num 0
-    528
-;
+const syscall.compat_sys_kexec_load.num 528
+const syscall.compat_sys_kexec_load.argc 0
 
-macro syscall.compat_sys_kexec_load.argc 0
-    0
-;
-
-macro syscall.compat_sys_waitid 0
+macro syscall.compat_sys_waitid `
     529
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_waitid.num 0
-    529
-;
+const syscall.compat_sys_waitid.num 529
+const syscall.compat_sys_waitid.argc 0
 
-macro syscall.compat_sys_waitid.argc 0
-    0
-;
-
-macro syscall.compat_sys_set_robust_list 0
+macro syscall.compat_sys_set_robust_list `
     530
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_set_robust_list.num 0
-    530
-;
+const syscall.compat_sys_set_robust_list.num 530
+const syscall.compat_sys_set_robust_list.argc 0
 
-macro syscall.compat_sys_set_robust_list.argc 0
-    0
-;
-
-macro syscall.compat_sys_get_robust_list 0
+macro syscall.compat_sys_get_robust_list `
     531
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_get_robust_list.num 0
-    531
-;
+const syscall.compat_sys_get_robust_list.num 531
+const syscall.compat_sys_get_robust_list.argc 0
 
-macro syscall.compat_sys_get_robust_list.argc 0
-    0
-;
-
-macro syscall.compat_sys_preadv64 0
+macro syscall.compat_sys_preadv64 `
     534
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_preadv64.num 0
-    534
-;
+const syscall.compat_sys_preadv64.num 534
+const syscall.compat_sys_preadv64.argc 0
 
-macro syscall.compat_sys_preadv64.argc 0
-    0
-;
-
-macro syscall.compat_sys_pwritev64 0
+macro syscall.compat_sys_pwritev64 `
     535
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_pwritev64.num 0
-    535
-;
+const syscall.compat_sys_pwritev64.num 535
+const syscall.compat_sys_pwritev64.argc 0
 
-macro syscall.compat_sys_pwritev64.argc 0
-    0
-;
-
-macro syscall.compat_sys_rt_tgsigqueueinfo 0
+macro syscall.compat_sys_rt_tgsigqueueinfo `
     536
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_rt_tgsigqueueinfo.num 0
-    536
-;
+const syscall.compat_sys_rt_tgsigqueueinfo.num 536
+const syscall.compat_sys_rt_tgsigqueueinfo.argc 0
 
-macro syscall.compat_sys_rt_tgsigqueueinfo.argc 0
-    0
-;
-
-macro syscall.compat_sys_recvmmsg_time64 0
+macro syscall.compat_sys_recvmmsg_time64 `
     537
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_recvmmsg_time64.num 0
-    537
-;
+const syscall.compat_sys_recvmmsg_time64.num 537
+const syscall.compat_sys_recvmmsg_time64.argc 0
 
-macro syscall.compat_sys_recvmmsg_time64.argc 0
-    0
-;
-
-macro syscall.compat_sys_sendmmsg 0
+macro syscall.compat_sys_sendmmsg `
     538
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_sendmmsg.num 0
-    538
-;
+const syscall.compat_sys_sendmmsg.num 538
+const syscall.compat_sys_sendmmsg.argc 0
 
-macro syscall.compat_sys_sendmmsg.argc 0
-    0
-;
-
-macro syscall.compat_sys_io_setup 0
+macro syscall.compat_sys_io_setup `
     543
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_io_setup.num 0
-    543
-;
+const syscall.compat_sys_io_setup.num 543
+const syscall.compat_sys_io_setup.argc 0
 
-macro syscall.compat_sys_io_setup.argc 0
-    0
-;
-
-macro syscall.compat_sys_io_submit 0
+macro syscall.compat_sys_io_submit `
     544
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_io_submit.num 0
-    544
-;
+const syscall.compat_sys_io_submit.num 544
+const syscall.compat_sys_io_submit.argc 0
 
-macro syscall.compat_sys_io_submit.argc 0
-    0
-;
-
-macro syscall.compat_sys_execveat 0
+macro syscall.compat_sys_execveat `
     545
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_execveat.num 0
-    545
-;
+const syscall.compat_sys_execveat.num 545
+const syscall.compat_sys_execveat.argc 0
 
-macro syscall.compat_sys_execveat.argc 0
-    0
-;
-
-macro syscall.compat_sys_preadv64v2 0
+macro syscall.compat_sys_preadv64v2 `
     546
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_preadv64v2.num 0
-    546
-;
+const syscall.compat_sys_preadv64v2.num 546
+const syscall.compat_sys_preadv64v2.argc 0
 
-macro syscall.compat_sys_preadv64v2.argc 0
-    0
-;
-
-macro syscall.compat_sys_pwritev64v2 0
+macro syscall.compat_sys_pwritev64v2 `
     547
     syscall0
-;
+` emit ;
 
-macro syscall.compat_sys_pwritev64v2.num 0
-    547
-;
-
-macro syscall.compat_sys_pwritev64v2.argc 0
-    0
-;
+const syscall.compat_sys_pwritev64v2.num 547
+const syscall.compat_sys_pwritev64v2.argc 0

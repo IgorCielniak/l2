@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <fcntl.h>
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -23,7 +24,7 @@ int l2_cli(int argc, char **argv);
 void eval_env(const char *source, long source_len, long stack_top_addr);
 int eval_program(const char *source, long source_len);
 int eval_program_cstr(const char *source);
-const char *l2_get_source_from_embedded(const char *func_name, long *out_len);
+const char *l2_source_catalog_lookup(const char *name, long name_len, long *out_len);
 void l2_set_embedded_source(const char *source, long source_len);
 void l2_set_eval_stack_top(uintptr_t stack_top_addr);
 typedef enum {
@@ -53,6 +54,16 @@ uint64_t l2_invoke_trampoline(void *fn, uint64_t r12_in);
 // with l2_jit_release; set L2_KEYSTONE_PATH to select a library explicitly.
 int l2_ks_available(void);
 int l2_ks_assemble(const char *asm_src, uint8_t **out_buf, size_t *out_len);
+/* Like l2_ks_assemble, without the error message (for attempts that have a
+ * fallback). */
+static bool g_ks_quiet = false;
+static int l2_ks_assemble_quiet(const char *asm_src, uint8_t **out_buf, size_t *out_len) {
+    g_ks_quiet = true;
+    int rc = l2_ks_assemble(asm_src, out_buf, out_len);
+    g_ks_quiet = false;
+    return rc;
+}
+static void *l2_jit_install(const uint8_t *bytes, size_t len);
 void *l2_jit_from_asm(const char *asm_src, long src_len);
 void *l2_jit_from_asm_cstr(const char *asm_src);
 void l2_jit_release(void *fn_ptr);
@@ -245,8 +256,28 @@ typedef enum {
     OP_FOR_END,
     OP_LIST_BEGIN,
     OP_LIST_END,
-    OP_RET
+    OP_RET,
+    OP_SYNTAX,   /* push a quotation's Syntax value (data.ptr: QuoteTemplate) */
+    OP_BINDING   /* push the value bound to a macro parameter (data.word) */
 } OpKind;
+
+/* A parsed quotation: literal tokens, `$name` splices, and `$( )` unquotes
+ * (whose values the code before the quotation op left on the VM's unquote
+ * stack). */
+typedef struct {
+    int kind;        /* 0 token, 1 splice, 2 unquote */
+    char *lexeme;    /* token text, or the splice name */
+    char *prefix;    /* unquote: text pasted before / after its value */
+    char *suffix;
+    int line;
+    int column;
+} QuotePart;
+
+typedef struct {
+    QuotePart *parts;
+    size_t len;
+    size_t unquotes;
+} QuoteTemplate;
 
 typedef enum {
     LIT_INT,
@@ -268,6 +299,7 @@ typedef struct {
             char *loop;
             char *end;
         } loop;
+        void *ptr;
     } data;
 } Op;
 
@@ -352,6 +384,9 @@ struct Word {
     CompileTimeIntrinsic ct_intrinsic;
     char **macro_expansion;
     int macro_param_count;
+    /* A general macro: its compile-time body and parameter names. */
+    Definition *macro_body;
+    char **macro_params;
 };
 
 typedef struct {
@@ -480,43 +515,6 @@ static void reader_init(Reader *reader) {
     }
 }
 
-static void reader_resort(Reader *reader) {
-    for (size_t i = 0; i < reader->token_order.len; i++) {
-        for (size_t j = i + 1; j < reader->token_order.len; j++) {
-            if (strlen(reader->token_order.data[j]) > strlen(reader->token_order.data[i])) {
-                char *tmp = reader->token_order.data[i];
-                reader->token_order.data[i] = reader->token_order.data[j];
-                reader->token_order.data[j] = tmp;
-            }
-        }
-    }
-}
-
-static void reader_add_tokens(Reader *reader, const char *tok) {
-    if (!tok || !*tok) {
-        return;
-    }
-    for (size_t i = 0; i < reader->custom_tokens.len; i++) {
-        if (strcmp(reader->custom_tokens.data[i], tok) == 0) {
-            return;
-        }
-    }
-    VEC_PUSH(&reader->custom_tokens, str_dup(tok));
-    VEC_PUSH(&reader->token_order, reader->custom_tokens.data[reader->custom_tokens.len - 1]);
-    reader_resort(reader);
-}
-
-static void reader_add_token_chars(Reader *reader, const char *chars) {
-    if (!chars) {
-        return;
-    }
-    char buf[2] = {0, 0};
-    for (const char *p = chars; *p; p++) {
-        buf[0] = *p;
-        reader_add_tokens(reader, buf);
-    }
-}
-
 typedef struct {
     const char *source;
     size_t length;
@@ -524,6 +522,13 @@ typedef struct {
     int line;
     int column;
     Reader *reader;
+    /* Raw `:asm` bodies, as in the Python reader: `:asm NAME [( .. )] {`
+     * outside a quotation makes the body one raw token; inside a quotation the
+     * body stays tokenized, but a `;` comment is one token to the line end. */
+    int asm_state;
+    bool in_quotation;
+    bool quoted_asm;
+    bool raw_pending;
 } Tokenizer;
 
 static void tokenizer_init(Tokenizer *tokenizer, Reader *reader, const char *source) {
@@ -533,9 +538,128 @@ static void tokenizer_init(Tokenizer *tokenizer, Reader *reader, const char *sou
     tokenizer->line = 1;
     tokenizer->column = 0;
     tokenizer->reader = reader;
+    tokenizer->asm_state = 0;
+    tokenizer->in_quotation = false;
+    tokenizer->quoted_asm = false;
+    tokenizer->raw_pending = false;
+}
+
+static bool tokenizer_next_basic(Tokenizer *tokenizer, Token *out);
+
+/* Index of the `}` closing a raw :asm body that starts at `pos`, or -1:
+ * `;` comments run to the line end and quotes to their match (or the line
+ * end), so neither can close the body. */
+static long asm_raw_body_end(const char *src, size_t len, size_t pos) {
+    size_t i = pos;
+    while (i < len) {
+        char ch = src[i];
+        if (ch == '}') return (long)i;
+        if (ch == ';') {
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        if (ch == '\'' || ch == '"' || ch == '`') {
+            size_t j = i + 1;
+            while (j < len && src[j] != '\n' && src[j] != ch) j++;
+            i = (j < len && src[j] == ch) ? j + 1 : j;
+            continue;
+        }
+        i++;
+    }
+    return -1;
+}
+
+static void tokenizer_advance_to(Tokenizer *tokenizer, size_t target) {
+    while (tokenizer->index < target) {
+        if (tokenizer->source[tokenizer->index] == '\n') {
+            tokenizer->line++;
+            tokenizer->column = 0;
+        } else {
+            tokenizer->column++;
+        }
+        tokenizer->index++;
+    }
+}
+
+static bool tokenizer_take_span(Tokenizer *tokenizer, size_t start, size_t end, Token *out) {
+    tokenizer_advance_to(tokenizer, start);
+    out->line = tokenizer->line;
+    out->column = tokenizer->column;
+    out->start = (int)start;
+    out->end = (int)end;
+    out->lexeme = (char *)xmalloc(end - start + 1);
+    memcpy(out->lexeme, tokenizer->source + start, end - start);
+    out->lexeme[end - start] = '\0';
+    tokenizer_advance_to(tokenizer, end);
+    return true;
+}
+
+/* Feed one lexeme to the `:asm NAME [( .. )] {` recognizer. */
+static bool tokenizer_asm_header(Tokenizer *tokenizer, const char *lex) {
+    switch (tokenizer->asm_state) {
+    case 0:
+        if (strcmp(lex, ":asm") == 0) tokenizer->asm_state = 1;
+        return false;
+    case 1:
+        tokenizer->asm_state = 2;
+        return false;
+    case 2:
+        if (strcmp(lex, "(") == 0) {
+            tokenizer->asm_state = 3;
+            return false;
+        }
+        tokenizer->asm_state = strcmp(lex, ":asm") == 0 ? 1 : 0;
+        return strcmp(lex, "{") == 0;
+    default:
+        if (strcmp(lex, ")") == 0) tokenizer->asm_state = 2;
+        return false;
+    }
 }
 
 static bool tokenizer_next(Tokenizer *tokenizer, Token *out) {
+    const char *src = tokenizer->source;
+    size_t len = tokenizer->length;
+    if (tokenizer->raw_pending) {
+        tokenizer->raw_pending = false;
+        long close = asm_raw_body_end(src, len, tokenizer->index);
+        if (close >= 0) {
+            size_t body = tokenizer->index;
+            while (body < (size_t)close && isspace((unsigned char)src[body])) body++;
+            if (body < (size_t)close) {
+                return tokenizer_take_span(tokenizer, body, (size_t)close, out);
+            }
+            tokenizer_advance_to(tokenizer, (size_t)close);
+        }
+    }
+    if (tokenizer->quoted_asm) {
+        size_t i = tokenizer->index;
+        while (i < len && isspace((unsigned char)src[i])) i++;
+        if (i < len && src[i] == ';') {
+            size_t end = i;
+            while (end < len && src[end] != '\n') end++;
+            return tokenizer_take_span(tokenizer, i, end, out);
+        }
+    }
+    if (!tokenizer_next_basic(tokenizer, out)) {
+        return false;
+    }
+    const char *lex = out->lexeme;
+    if (strcmp(lex, "`") == 0) {
+        tokenizer->in_quotation = !tokenizer->in_quotation;
+        tokenizer->quoted_asm = false;
+    } else if (tokenizer->quoted_asm) {
+        if (strcmp(lex, "}") == 0) tokenizer->quoted_asm = false;
+    } else if (tokenizer_asm_header(tokenizer, lex)) {
+        if (tokenizer->in_quotation) {
+            tokenizer->quoted_asm = true;
+        } else {
+            tokenizer->raw_pending = true;
+        }
+    }
+    return true;
+}
+
+static bool tokenizer_next_basic(Tokenizer *tokenizer, Token *out) {
     const char *src = tokenizer->source;
     size_t len = tokenizer->length;
     size_t idx = tokenizer->index;
@@ -588,29 +712,26 @@ static bool tokenizer_next(Tokenizer *tokenizer, Token *out) {
             exit(1);
         }
         if (ch == '#') {
-            while (idx < len && src[idx] != '\n') {
+            while (idx < len && src[idx] != '\n' && src[idx] != '\r') {
                 idx++;
             }
             continue;
         }
-        if (ch == ';' && idx + 1 < len && isalpha((unsigned char)src[idx + 1])) {
-            size_t start = idx;
-            int token_line = line;
-            int token_col = col;
-            idx++;
-            col++;
-            size_t tok_len = idx - start;
+        /* Fixed backtick rule: '`' and the escaped backtick '\`' are always
+         * tokens of their own and end a word in progress. */
+        if (ch == '`' || (ch == '\\' && idx + 1 < len && src[idx + 1] == '`')) {
+            size_t tok_len = ch == '`' ? 1 : 2;
             char *lex = (char *)xmalloc(tok_len + 1);
-            memcpy(lex, src + start, tok_len);
+            memcpy(lex, src + idx, tok_len);
             lex[tok_len] = '\0';
             out->lexeme = lex;
-            out->line = token_line;
-            out->column = token_col;
-            out->start = (int)start;
-            out->end = (int)idx;
-            tokenizer->index = idx;
+            out->line = line;
+            out->column = col;
+            out->start = (int)idx;
+            out->end = (int)(idx + tok_len);
+            tokenizer->index = idx + tok_len;
             tokenizer->line = line;
-            tokenizer->column = col;
+            tokenizer->column = col + (int)tok_len;
             return true;
         }
 
@@ -659,7 +780,8 @@ static bool tokenizer_next(Tokenizer *tokenizer, Token *out) {
         int token_col = col;
         while (idx < len) {
             char c = src[idx];
-            bool is_sep = isspace((unsigned char)c) || c == '"' || c == '#';
+            bool is_sep = isspace((unsigned char)c) || c == '"' || c == '#' || c == '`' ||
+                          (c == '\\' && idx + 1 < len && src[idx + 1] == '`');
             if (is_sep) {
                 break;
             }
@@ -730,6 +852,17 @@ struct Parser {
         bool active;
     } macro_recording;
     struct {
+        bool active;
+        char *name;
+        char **params;
+        int param_count;
+        size_t control_depth;
+        Definition *def;
+    } macro_body;
+    /* Quotations waiting for their `$( )` expressions to be parsed. */
+    QuoteTemplate **pending_quotes;
+    size_t pending_quote_len;
+    struct {
         char *type;
         char *false_label;
         char *end_label;
@@ -748,8 +881,13 @@ struct Parser {
     StrMap variable_labels;
     StrMap variable_words;
     CompileTimeVM *ct_vm;
+    /* Assembly output buffers: CT .text and .data fragments, and
+     * the runtime BSS buffer, which holds the standard layout until it is
+     * replaced or cleared (bss_replaced). */
     StrVec *custom_prelude;
+    StrVec *custom_data;
     StrVec *custom_bss;
+    bool bss_replaced;
     bool pending_inline_def;
     bool uses_libc;
     bool uses_libm;
@@ -761,6 +899,7 @@ static char *path_dirname(const char *path);
 static char *l2_default_root_dir(void);
 static char *expand_imports_from_source(const char *content, const char *base_dir, StrVec *include_dirs, StrMap *visited, FileSpanVec *spans, int *line_counter);
 static void parse_tokens(Parser *parser, const char *source);
+static void parse_tokens_continue(Parser *parser, const char *source);
 
 typedef enum {
     CT_NIL,
@@ -769,7 +908,7 @@ typedef enum {
     CT_TOKEN,
     CT_LIST,
     CT_MAP,
-    CT_LEXER
+    CT_SYNTAX   /* a quotation value: as.list holds CT_TOKEN items */
 } CtValueKind;
 
 typedef struct CtValue CtValue;
@@ -780,18 +919,16 @@ typedef struct {
     CtValueVec items;
 } CtList;
 
+/* CT map: insertion-ordered entries with typed keys
+ * (string, integer, or nil), plus an index from an encoded key to the entry
+ * position.  Updating an existing key keeps its stored key and position. */
 typedef struct {
-    char **keys;
+    CtValue *keys;
     CtValue *values;
     size_t cap;
     size_t len;
+    StrMap index;
 } CtMap;
-
-typedef struct {
-    Parser *parser;
-    bool separators[256];
-    TokenVec buffer;
-} SplitLexer;
 
 struct CtValue {
     CtValueKind kind;
@@ -801,7 +938,6 @@ struct CtValue {
         Token token;
         CtList *list;
         CtMap *map;
-        SplitLexer *lexer;
     } as;
 };
 
@@ -814,9 +950,15 @@ struct CompileTimeVM {
     IntVec loop_begin;
     IntVec loop_initial;
     StrVec call_stack;
+    /* Macro expansion: the running body's parameter bindings and output. */
+    char **binding_names;
+    CtValue *binding_values;
+    size_t binding_len;
+    TokenVec *emit_out;
+    /* `$( )` values awaiting their quotation, and expression stack depths. */
+    CtValueVec unquote_values;
+    IntVec unquote_depths;
 };
-
-static void ct_value_free(CtValue *value);
 
 static CtValue ct_make_nil(void) {
     CtValue v = {0};
@@ -859,21 +1001,6 @@ static CtValue ct_make_map(CtMap *map) {
     return v;
 }
 
-static CtValue ct_make_lexer(SplitLexer *lexer) {
-    CtValue v = {0};
-    v.kind = CT_LEXER;
-    v.as.lexer = lexer;
-    return v;
-}
-
-static void ct_value_free(CtValue *value) {
-    if (!value) {
-        return;
-    }
-    if (value->kind == CT_STR) {
-        free(value->as.str);
-    }
-}
 
 static void ct_stack_init(CtValueVec *vec) {
     VEC_INIT(vec);
@@ -932,74 +1059,68 @@ static CtMap *ct_map_new(void) {
     map->values = NULL;
     map->cap = 0;
     map->len = 0;
+    strmap_init(&map->index);
     return map;
 }
 
-static void ct_map_grow(CtMap *map) {
-    size_t new_cap = map->cap ? map->cap * 2 : 64;
-    char **new_keys = (char **)xmalloc(new_cap * sizeof(char *));
-    CtValue *new_vals = (CtValue *)xmalloc(new_cap * sizeof(CtValue));
-    for (size_t i = 0; i < new_cap; i++) {
-        new_keys[i] = NULL;
+/* Encode a supported map key; returns NULL for unsupported key kinds. */
+static char *ct_map_encode_key(CtValue key) {
+    switch (key.kind) {
+        case CT_STR:
+            return str_printf("s%s", key.as.str ? key.as.str : "");
+        case CT_INT:
+            return str_printf("i%lld", (long long)key.as.i64);
+        case CT_NIL:
+            return str_dup("n");
+        default:
+            return NULL;
     }
-    if (map->keys) {
-        for (size_t i = 0; i < map->cap; i++) {
-            if (!map->keys[i]) {
-                continue;
-            }
-            uint64_t hash = hash_str(map->keys[i]);
-            size_t idx = (size_t)(hash & (new_cap - 1));
-            while (new_keys[idx]) {
-                idx = (idx + 1) & (new_cap - 1);
-            }
-            new_keys[idx] = map->keys[i];
-            new_vals[idx] = map->values[i];
-        }
-    }
-    free(map->keys);
-    free(map->values);
-    map->keys = new_keys;
-    map->values = new_vals;
-    map->cap = new_cap;
 }
 
-static void ct_map_set(CtMap *map, const char *key, CtValue value) {
-    if (!map->cap || (map->len + 1) * 3 >= map->cap * 2) {
-        ct_map_grow(map);
+static long ct_map_find(CtMap *map, const char *encoded) {
+    void *slot = strmap_get(&map->index, encoded);
+    return slot ? (long)((uintptr_t)slot - 1) : -1;
+}
+
+/* Insert or update; the key must already be validated as supported. */
+static void ct_map_put(CtMap *map, CtValue key, CtValue value) {
+    char *encoded = ct_map_encode_key(key);
+    long found = ct_map_find(map, encoded);
+    if (found >= 0) {
+        map->values[found] = value;
+        free(encoded);
+        return;
     }
-    uint64_t hash = hash_str(key);
-    size_t idx = (size_t)(hash & (map->cap - 1));
-    while (map->keys[idx]) {
-        if (strcmp(map->keys[idx], key) == 0) {
-            ct_value_free(&map->values[idx]);
-            map->values[idx] = value;
-            return;
-        }
-        idx = (idx + 1) & (map->cap - 1);
+    if (map->len + 1 > map->cap) {
+        map->cap = map->cap ? map->cap * 2 : 8;
+        map->keys = (CtValue *)xrealloc(map->keys, map->cap * sizeof(CtValue));
+        map->values = (CtValue *)xrealloc(map->values, map->cap * sizeof(CtValue));
     }
-    map->keys[idx] = str_dup(key);
-    map->values[idx] = value;
+    CtValue stored_key = key.kind == CT_STR ? ct_make_str(key.as.str ? key.as.str : "") : key;
+    map->keys[map->len] = stored_key;
+    map->values[map->len] = value;
     map->len++;
+    strmap_set(&map->index, encoded, (void *)(uintptr_t)map->len);
+    free(encoded);
 }
 
-static bool ct_map_get(CtMap *map, const char *key, CtValue *out) {
-    if (!map->cap) {
+static bool ct_map_lookup(CtMap *map, CtValue key, CtValue *out) {
+    char *encoded = ct_map_encode_key(key);
+    if (!encoded) {
         return false;
     }
-    uint64_t hash = hash_str(key);
-    size_t idx = (size_t)(hash & (map->cap - 1));
-    size_t start = idx;
-    while (map->keys[idx]) {
-        if (strcmp(map->keys[idx], key) == 0) {
-            *out = map->values[idx];
-            return true;
-        }
-        idx = (idx + 1) & (map->cap - 1);
-        if (idx == start) {
-            break;
-        }
+    long found = ct_map_find(map, encoded);
+    free(encoded);
+    if (found < 0) {
+        return false;
     }
-    return false;
+    *out = map->values[found];
+    return true;
+}
+
+static void ct_map_clear_entries(CtMap *map) {
+    map->len = 0;
+    strmap_init(&map->index);
 }
 
 static void emit_line(FunctionEmitter *builder, const char *line) {
@@ -1034,21 +1155,6 @@ static char *sanitize_label(const char *name) {
     }
     out[pos] = '\0';
     return out;
-}
-
-static bool is_identifier(const char *text) {
-    if (!text || !*text) {
-        return false;
-    }
-    if (!(isalpha((unsigned char)text[0]) || text[0] == '_')) {
-        return false;
-    }
-    for (const char *p = text + 1; *p; p++) {
-        if (!(isalnum((unsigned char)*p) || *p == '_')) {
-            return false;
-        }
-    }
-    return true;
 }
 
 static char *path_basename(const char *path);
@@ -1137,6 +1243,9 @@ static void parser_init(Parser *parser, Dictionary *dict, Reader *reader) {
     VEC_INIT(&parser->file_spans);
     parser->source = NULL;
     parser->macro_recording.active = false;
+    memset(&parser->macro_body, 0, sizeof(parser->macro_body));
+    parser->pending_quotes = NULL;
+    parser->pending_quote_len = 0;
     parser->control_stack = NULL;
     parser->control_len = 0;
     parser->control_cap = 0;
@@ -1147,7 +1256,9 @@ static void parser_init(Parser *parser, Dictionary *dict, Reader *reader) {
     strmap_init(&parser->variable_words);
     parser->ct_vm = NULL;
     parser->custom_prelude = NULL;
+    parser->custom_data = NULL;
     parser->custom_bss = NULL;
+    parser->bss_replaced = false;
     parser->pending_inline_def = false;
     parser->uses_libc = false;
     parser->uses_libm = false;
@@ -1272,6 +1383,12 @@ static void ct_vm_init(CompileTimeVM *vm, Parser *parser) {
     VEC_INIT(&vm->loop_begin);
     VEC_INIT(&vm->loop_initial);
     VEC_INIT(&vm->call_stack);
+    vm->binding_names = NULL;
+    vm->binding_values = NULL;
+    vm->binding_len = 0;
+    vm->emit_out = NULL;
+    ct_stack_init(&vm->unquote_values);
+    VEC_INIT(&vm->unquote_depths);
 }
 
 static void ct_vm_reset(CompileTimeVM *vm) {
@@ -1297,8 +1414,20 @@ static void ct_trace_error(CompileTimeVM *vm, const char *msg) {
     exit(1);
 }
 
+// Pop the data stack; popping an empty one is an error, as in the Python
+// compile-time VM (it used to yield nil, so `drop` on an empty stack passed).
+static CtValue ct_pop(CompileTimeVM *vm) {
+    if (!vm->stack.len) {
+        const char *word = vm->call_stack.len ? vm->call_stack.data[vm->call_stack.len - 1] : "?";
+        char *msg = str_printf("stack underflow in '%s': the stack is empty", word);
+        ct_trace_error(vm, msg);
+        free(msg);
+    }
+    return VEC_POP(&vm->stack);
+}
+
 static int64_t ct_pop_int(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     if (v.kind == CT_STR) {
         int64_t out = 0;
         if (try_parse_int(v.as.str, &out)) {
@@ -1320,8 +1449,6 @@ static int64_t ct_pop_int(CompileTimeVM *vm) {
             kind = "list";
         } else if (v.kind == CT_MAP) {
             kind = "map";
-        } else if (v.kind == CT_LEXER) {
-            kind = "lexer";
         }
         char *msg = NULL;
         if (extra[0] != '\0') {
@@ -1337,7 +1464,7 @@ static int64_t ct_pop_int(CompileTimeVM *vm) {
 
 
 static char *ct_pop_str(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     if (v.kind == CT_TOKEN) {
         return str_dup(v.as.token.lexeme);
     }
@@ -1348,23 +1475,15 @@ static char *ct_pop_str(CompileTimeVM *vm) {
 }
 
 static CtList *ct_pop_list(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     if (v.kind != CT_LIST) {
         ct_trace_error(vm, "expected list on compile-time stack");
     }
     return v.as.list;
 }
 
-static CtMap *ct_pop_map(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_MAP) {
-        ct_trace_error(vm, "expected map on compile-time stack");
-    }
-    return v.as.map;
-}
-
 static Token ct_pop_token(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     if (v.kind == CT_TOKEN) {
         return v.as.token;
     }
@@ -1403,7 +1522,7 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
         return true;
     }
     if (strcmp(word->name, "print") == 0) {
-        CtValue v = ct_stack_pop(&vm->stack);
+        CtValue v = ct_pop(vm);
         if (v.kind == CT_STR) {
             fputs(v.as.str ? v.as.str : "", stdout);
         } else if (v.kind == CT_TOKEN) {
@@ -1420,7 +1539,7 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
         return true;
     }
     if (asm_def && asm_def->effect_string_io) {
-        CtValue v = ct_stack_pop(&vm->stack);
+        CtValue v = ct_pop(vm);
         if (v.kind == CT_STR) {
             FILE *out = stdout;
             if (strcmp(word->name, "ewrite_buf") == 0) {
@@ -1436,12 +1555,12 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
             fputs(v.as.token.lexeme ? v.as.token.lexeme : "", out);
             fflush(out);
         } else {
-            ct_stack_pop(&vm->stack);
+            ct_pop(vm);
         }
         return true;
     }
     if (strcmp(word->name, "putc") == 0) {
-        CtValue v = ct_stack_pop(&vm->stack);
+        CtValue v = ct_pop(vm);
         int ch = 0;
         if (v.kind == CT_INT) {
             ch = (int)v.as.i64;
@@ -1454,6 +1573,9 @@ static bool ct_try_asm_io(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def)
     }
     return false;
 }
+
+static CtValue ct_eval_quotation(CompileTimeVM *vm, QuoteTemplate *tpl);
+static bool ct_lookup_binding(CompileTimeVM *vm, const char *name, CtValue *out);
 
 static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
     StrMap labels;
@@ -1474,7 +1596,10 @@ static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
             if (node.lit_kind == LIT_INT) {
                 ct_stack_push(&vm->stack, ct_make_int(node.data.i64));
             } else if (node.lit_kind == LIT_FLOAT) {
-                ct_stack_push(&vm->stack, ct_make_int((int64_t)node.data.f64));
+                /* A float is its IEEE-754 bit pattern, as at runtime. */
+                int64_t bits;
+                memcpy(&bits, &node.data.f64, sizeof(bits));
+                ct_stack_push(&vm->stack, ct_make_int(bits));
             } else if (node.lit_kind == LIT_STRING) {
                 ct_stack_push(&vm->stack, ct_make_str(node.data.str));
             }
@@ -1516,8 +1641,24 @@ static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
             ip++;
             continue;
         }
+        if (node.kind == OP_SYNTAX) {
+            ct_stack_push(&vm->stack, ct_eval_quotation(vm, (QuoteTemplate *)node.data.ptr));
+            ip++;
+            continue;
+        }
+        if (node.kind == OP_BINDING) {
+            CtValue value;
+            if (!ct_lookup_binding(vm, node.data.word, &value)) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "unbound '$%s'", node.data.word);
+                ct_trace_error(vm, msg);
+            }
+            ct_stack_push(&vm->stack, value);
+            ip++;
+            continue;
+        }
         if (node.kind == OP_BRANCH_ZERO) {
-            CtValue v = ct_stack_pop(&vm->stack);
+            CtValue v = ct_pop(vm);
             bool flag = false;
             if (v.kind == CT_INT) {
                 flag = v.as.i64 != 0;
@@ -1579,7 +1720,19 @@ static void ct_execute_nodes(CompileTimeVM *vm, OpVec *nodes) {
     }
 }
 
+static void parser_macro_expand_into(Parser *parser, Word *word, TokenVec *out);
+
 static void ct_word_call(CompileTimeVM *vm, Word *word) {
+    if (word->macro_body || word->macro_expansion) {
+        /* A macro called from compile-time code reads its arguments from the
+         * input and adds its output to the running macro's output (or, from
+         * other code, to the input read next). */
+        TokenVec local;
+        VEC_INIT(&local);
+        parser_macro_expand_into(vm->parser, word, vm->emit_out ? vm->emit_out : &local);
+        if (!vm->emit_out) parser_inject_tokens(vm->parser, &local);
+        return;
+    }
     VEC_PUSH(&vm->call_stack, str_dup(word->name));
     if (word->runtime_only) {
         fprintf(stderr, "[error] word '%s' is runtime-only and cannot be executed at compile time\n", word->name);
@@ -1646,7 +1799,7 @@ static void ct_word_call(CompileTimeVM *vm, Word *word) {
         if (word->is_extern) {
             int pops = word->extern_arg_count > 0 ? word->extern_arg_count : word->extern_inputs;
             for (int i = 0; i < pops; i++) {
-                ct_stack_pop(&vm->stack);
+                ct_pop(vm);
             }
             int outputs = 0;
             if (word->extern_arg_count > 0) {
@@ -1701,12 +1854,12 @@ static void ct_intrinsic_dup(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_drop(CompileTimeVM *vm) {
-    ct_stack_pop(&vm->stack);
+    ct_pop(vm);
 }
 
 static void ct_intrinsic_swap(CompileTimeVM *vm) {
-    CtValue a = ct_stack_pop(&vm->stack);
-    CtValue b = ct_stack_pop(&vm->stack);
+    CtValue a = ct_pop(vm);
+    CtValue b = ct_pop(vm);
     ct_stack_push(&vm->stack, a);
     ct_stack_push(&vm->stack, b);
 }
@@ -1754,7 +1907,7 @@ static void ct_intrinsic_rpick(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_to_r(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     ct_stack_push(&vm->rstack, v);
 }
 
@@ -1806,8 +1959,8 @@ static void ct_intrinsic_mod(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_eq(CompileTimeVM *vm) {
-    CtValue b = ct_stack_pop(&vm->stack);
-    CtValue a = ct_stack_pop(&vm->stack);
+    CtValue b = ct_pop(vm);
+    CtValue a = ct_pop(vm);
     if (a.kind == CT_INT && b.kind == CT_INT) {
         ct_stack_push(&vm->stack, ct_make_int(a.as.i64 == b.as.i64));
         return;
@@ -1845,8 +1998,8 @@ static void ct_intrinsic_le(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_ne(CompileTimeVM *vm) {
-    CtValue b = ct_stack_pop(&vm->stack);
-    CtValue a = ct_stack_pop(&vm->stack);
+    CtValue b = ct_pop(vm);
+    CtValue a = ct_pop(vm);
     if (a.kind == CT_INT && b.kind == CT_INT) {
         ct_stack_push(&vm->stack, ct_make_int(a.as.i64 != b.as.i64));
         return;
@@ -1860,8 +2013,199 @@ static void ct_intrinsic_ne(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_not(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     ct_stack_push(&vm->stack, ct_make_int(!ct_truthy(v)));
+}
+
+/* ---------------------------------------------------------------------------
+ * CT data and value words (nil, lists, maps, strings) for the C compile-time VM.
+ * Same names, stack effects, and strict inputs as the Python compiler:
+ * reads consume their subject, mutations return the subject first, invalid
+ * types/indexes/keys are CT errors raised before any mutation.
+ * ------------------------------------------------------------------------- */
+
+static const char *ct_kind_name(CtValueKind kind) {
+    switch (kind) {
+        case CT_NIL: return "nil";
+        case CT_INT: return "integer";
+        case CT_STR: return "string";
+        case CT_TOKEN: return "token";
+        case CT_LIST: return "list";
+        case CT_MAP: return "map";
+        case CT_SYNTAX: return "syntax";
+    }
+    return "unknown";
+}
+
+static void ct_value_type_error(CompileTimeVM *vm, const char *word, const char *expected, CtValue got) {
+    char *msg = str_printf("%s expects %s, got %s", word, expected, ct_kind_name(got.kind));
+    ct_trace_error(vm, msg);
+    free(msg);
+}
+
+/* Strict string pop: tokens and integers are not coerced. */
+static char *ct_strict_pop_string(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_STR) {
+        ct_value_type_error(vm, word, "a string", v);
+    }
+    return str_dup(v.as.str ? v.as.str : "");
+}
+
+static int64_t ct_strict_pop_index(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_INT) {
+        ct_value_type_error(vm, word, "an integer index", v);
+    }
+    return v.as.i64;
+}
+
+static CtList *ct_strict_pop_list(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_LIST) {
+        ct_value_type_error(vm, word, "a list", v);
+    }
+    return v.as.list;
+}
+
+static CtMap *ct_strict_pop_map(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_MAP) {
+        ct_value_type_error(vm, word, "a map", v);
+    }
+    return v.as.map;
+}
+
+static void ct_check_map_key(CompileTimeVM *vm, const char *word, CtValue key) {
+    if (key.kind == CT_STR || key.kind == CT_INT || key.kind == CT_NIL) {
+        return;
+    }
+    char *msg = str_printf("%s: unsupported map key type %s; keys must be strings, integers, booleans, or nil",
+                           word, ct_kind_name(key.kind));
+    ct_trace_error(vm, msg);
+    free(msg);
+}
+
+/* Normalize a Python-style index for an existing element. */
+static size_t ct_checked_index(CompileTimeVM *vm, const char *word, CtList *list, int64_t index) {
+    int64_t len = (int64_t)list->items.len;
+    if (index < -len || index >= len) {
+        char *msg = str_printf("%s: index %lld out of range for list of length %lld",
+                               word, (long long)index, (long long)len);
+        ct_trace_error(vm, msg);
+        free(msg);
+    }
+    return (size_t)(index < 0 ? index + len : index);
+}
+
+/* Decode one UTF-8 code point starting at *p; advances *p.  Invalid bytes
+ * decode as themselves so scanning always makes progress. */
+static uint32_t utf8_next(const unsigned char **p) {
+    const unsigned char *s = *p;
+    uint32_t c = s[0];
+    int extra = 0;
+    if (c >= 0xF0 && c <= 0xF4) { c &= 0x07; extra = 3; }
+    else if (c >= 0xE0) { c &= 0x0F; extra = 2; }
+    else if (c >= 0xC2 && c < 0xE0) { c &= 0x1F; extra = 1; }
+    else { *p = s + 1; return c; }
+    for (int i = 1; i <= extra; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *p = s + 1; return s[0]; }
+        c = (c << 6) | (s[i] & 0x3F);
+    }
+    *p = s + extra + 1;
+    return c;
+}
+
+/* The Unicode White_Space property, frozen as part of the L2 spec. */
+static bool l2_is_whitespace_cp(uint32_t c) {
+    return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F ||
+           c == 0x205F || c == 0x3000;
+}
+
+static size_t utf8_codepoint_count(const char *text) {
+    size_t count = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if ((*p & 0xC0) != 0x80) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* L2 identifier rule: first code point is an ASCII letter, `_`, or any code
+ * point >= U+0080; later ones may also be ASCII digits.  In UTF-8 every
+ * byte of a non-ASCII code point is >= 0x80, so a byte test is exact. */
+static bool l2_is_identifier(const char *text) {
+    if (!text || !*text) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        unsigned char c = *p;
+        bool ok = c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80 ||
+                  (p != (const unsigned char *)text && c >= '0' && c <= '9');
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* try-string>int parser.  The C VM has 64-bit integers, so values outside
+ * that range fail to parse (the Python VM uses arbitrary precision). */
+static bool l2_parse_int(const char *text, int64_t *out) {
+    const unsigned char *start = (const unsigned char *)text;
+    const unsigned char *end = start + strlen(text);
+    /* trim leading White_Space */
+    while (start < end) {
+        const unsigned char *next = start;
+        uint32_t c = utf8_next(&next);
+        if (!l2_is_whitespace_cp(c)) break;
+        start = next;
+    }
+    /* trim trailing White_Space: scan forward remembering the last non-space end */
+    const unsigned char *last_end = start;
+    for (const unsigned char *p = start; p < end;) {
+        uint32_t c = utf8_next(&p);
+        if (!l2_is_whitespace_cp(c)) last_end = p;
+    }
+    end = last_end;
+    if (start >= end) return false;
+    bool negative = false;
+    if (*start == '+' || *start == '-') {
+        negative = *start == '-';
+        start++;
+    }
+    int base = 10;
+    if (end - start >= 2 && start[0] == '0') {
+        char k = (char)(start[1] | 0x20);
+        if (k == 'x') base = 16;
+        else if (k == 'b') base = 2;
+        else if (k == 'o') base = 8;
+        if (base != 10) start += 2;
+    }
+    if (start >= end) return false;
+    unsigned __int128 value = 0;
+    bool previous_underscore = true;
+    for (const unsigned char *p = start; p < end; p++) {
+        unsigned char c = *p;
+        if (c == '_') {
+            if (previous_underscore) return false;
+            previous_underscore = true;
+            continue;
+        }
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') digit = (c | 0x20) - 'a' + 10;
+        if (digit < 0 || digit >= base) return false;
+        value = value * (unsigned)base + (unsigned)digit;
+        if (value > (unsigned __int128)INT64_MAX + 1) return false;
+        previous_underscore = false;
+    }
+    if (previous_underscore) return false;
+    if (!negative && value > (unsigned __int128)INT64_MAX) return false;
+    *out = negative ? (int64_t)(-(__int128)value) : (int64_t)value;
+    return true;
 }
 
 static void ct_intrinsic_nil(CompileTimeVM *vm) {
@@ -1869,13 +2213,13 @@ static void ct_intrinsic_nil(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_nilp(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
+    CtValue v = ct_pop(vm);
     ct_stack_push(&vm->stack, ct_make_int(v.kind == CT_NIL));
 }
 
-static void ct_intrinsic_string_eq(CompileTimeVM *vm) {
-    char *b = ct_pop_str(vm);
-    char *a = ct_pop_str(vm);
+static void ct_intrinsic_string_equal(CompileTimeVM *vm) {
+    char *b = ct_strict_pop_string(vm, "string-equal?");
+    char *a = ct_strict_pop_string(vm, "string-equal?");
     bool eq = strcmp(a, b) == 0;
     free(a);
     free(b);
@@ -1883,14 +2227,14 @@ static void ct_intrinsic_string_eq(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_string_length(CompileTimeVM *vm) {
-    char *s = ct_pop_str(vm);
-    ct_stack_push(&vm->stack, ct_make_int((int64_t)strlen(s)));
+    char *s = ct_strict_pop_string(vm, "string-length");
+    ct_stack_push(&vm->stack, ct_make_int((int64_t)utf8_codepoint_count(s)));
     free(s);
 }
 
 static void ct_intrinsic_string_append(CompileTimeVM *vm) {
-    char *b = ct_pop_str(vm);
-    char *a = ct_pop_str(vm);
+    char *b = ct_strict_pop_string(vm, "string-append");
+    char *a = ct_strict_pop_string(vm, "string-append");
     char *out = str_printf("%s%s", a, b);
     free(a);
     free(b);
@@ -1898,26 +2242,31 @@ static void ct_intrinsic_string_append(CompileTimeVM *vm) {
     free(out);
 }
 
-static void ct_intrinsic_string_to_number(CompileTimeVM *vm) {
-    char *s = ct_pop_str(vm);
+static void ct_intrinsic_try_string_to_int(CompileTimeVM *vm) {
+    char *s = ct_strict_pop_string(vm, "try-string>int");
     int64_t out = 0;
-    bool ok = try_parse_int(s, &out);
-    ct_stack_push(&vm->stack, ct_make_int(out));
+    bool ok = l2_parse_int(s, &out);
+    ct_stack_push(&vm->stack, ct_make_int(ok ? out : 0));
     ct_stack_push(&vm->stack, ct_make_int(ok ? 1 : 0));
     free(s);
 }
 
 static void ct_intrinsic_int_to_string(CompileTimeVM *vm) {
-    int64_t v = ct_pop_int(vm);
-    char *out = str_printf("%lld", (long long)v);
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_INT) {
+        ct_value_type_error(vm, "int>string", "an integer", v);
+    }
+    char *out = str_printf("%lld", (long long)v.as.i64);
     ct_stack_push(&vm->stack, ct_make_str(out));
     free(out);
 }
 
 static void ct_intrinsic_identifierp(CompileTimeVM *vm) {
-    char *s = ct_pop_str(vm);
-    ct_stack_push(&vm->stack, ct_make_int(is_identifier(s)));
-    free(s);
+    CtValue v = ct_pop(vm);
+    const char *text = NULL;
+    if (v.kind == CT_STR) text = v.as.str;
+    else if (v.kind == CT_TOKEN) text = v.as.token.lexeme;
+    ct_stack_push(&vm->stack, ct_make_int(text && l2_is_identifier(text)));
 }
 
 static void ct_intrinsic_list_new(CompileTimeVM *vm) {
@@ -1926,51 +2275,52 @@ static void ct_intrinsic_list_new(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_list_append(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    CtList *list = ct_pop_list(vm);
+    CtValue v = ct_pop(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-append");
     VEC_PUSH(&list->items, v);
     ct_stack_push(&vm->stack, ct_make_list(list));
 }
 
+/* list-pop / list-pop-front: list -- list value found? */
 static void ct_intrinsic_list_pop(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-pop");
+    ct_stack_push(&vm->stack, ct_make_list(list));
     if (!list->items.len) {
-        ct_stack_push(&vm->stack, ct_make_list(list));
         ct_stack_push(&vm->stack, ct_make_nil());
+        ct_stack_push(&vm->stack, ct_make_int(0));
         return;
     }
     CtValue v = VEC_POP(&list->items);
-    ct_stack_push(&vm->stack, ct_make_list(list));
     ct_stack_push(&vm->stack, v);
+    ct_stack_push(&vm->stack, ct_make_int(1));
 }
 
 static void ct_intrinsic_list_pop_front(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-pop-front");
+    ct_stack_push(&vm->stack, ct_make_list(list));
     if (!list->items.len) {
-        ct_stack_push(&vm->stack, ct_make_list(list));
         ct_stack_push(&vm->stack, ct_make_nil());
+        ct_stack_push(&vm->stack, ct_make_int(0));
         return;
     }
     CtValue v = list->items.data[0];
     memmove(&list->items.data[0], &list->items.data[1], (list->items.len - 1) * sizeof(CtValue));
     list->items.len--;
-    ct_stack_push(&vm->stack, ct_make_list(list));
     ct_stack_push(&vm->stack, v);
+    ct_stack_push(&vm->stack, ct_make_int(1));
 }
 
 static void ct_intrinsic_list_peek_front(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
-    CtValue v = ct_make_nil();
-    if (list->items.len) {
-        v = list->items.data[0];
+    CtList *list = ct_strict_pop_list(vm, "list-peek-front");
+    if (!list->items.len) {
+        ct_trace_error(vm, "list-peek-front: list is empty");
     }
-    ct_stack_push(&vm->stack, ct_make_list(list));
-    ct_stack_push(&vm->stack, v);
+    ct_stack_push(&vm->stack, list->items.data[0]);
 }
 
 static void ct_intrinsic_list_push_front(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    CtList *list = ct_pop_list(vm);
+    CtValue v = ct_pop(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-push-front");
     if (list->items.len + 1 > list->items.cap) {
         size_t new_cap = list->items.cap ? list->items.cap * 2 : 8;
         list->items.data = xrealloc(list->items.data, new_cap * sizeof(CtValue));
@@ -1983,48 +2333,43 @@ static void ct_intrinsic_list_push_front(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_list_length(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-length");
     ct_stack_push(&vm->stack, ct_make_int((int64_t)list->items.len));
 }
 
 static void ct_intrinsic_list_empty(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-empty?");
     ct_stack_push(&vm->stack, ct_make_int(list->items.len == 0));
 }
 
 static void ct_intrinsic_list_get(CompileTimeVM *vm) {
-    int64_t idx = ct_pop_int(vm);
-    CtList *list = ct_pop_list(vm);
-    CtValue v = ct_make_nil();
-    if (idx >= 0 && (size_t)idx < list->items.len) {
-        v = list->items.data[idx];
-    }
-    ct_stack_push(&vm->stack, v);
+    int64_t idx = ct_strict_pop_index(vm, "list-get");
+    CtList *list = ct_strict_pop_list(vm, "list-get");
+    size_t at = ct_checked_index(vm, "list-get", list, idx);
+    ct_stack_push(&vm->stack, list->items.data[at]);
 }
 
 static void ct_intrinsic_list_set(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    int64_t idx = ct_pop_int(vm);
-    CtList *list = ct_pop_list(vm);
-    if (idx < 0 || (size_t)idx >= list->items.len) {
-        fprintf(stderr, "[error] list-set index out of range\n");
-        exit(1);
-    }
-    list->items.data[idx] = v;
+    CtValue v = ct_pop(vm);
+    int64_t idx = ct_strict_pop_index(vm, "list-set");
+    CtList *list = ct_strict_pop_list(vm, "list-set");
+    size_t at = ct_checked_index(vm, "list-set", list, idx);
+    list->items.data[at] = v;
     ct_stack_push(&vm->stack, ct_make_list(list));
 }
 
 static void ct_intrinsic_list_extend(CompileTimeVM *vm) {
-    CtList *list2 = ct_pop_list(vm);
-    CtList *list1 = ct_pop_list(vm);
-    for (size_t i = 0; i < list2->items.len; i++) {
-        VEC_PUSH(&list1->items, list2->items.data[i]);
+    CtList *source = ct_strict_pop_list(vm, "list-extend");
+    CtList *target = ct_strict_pop_list(vm, "list-extend");
+    size_t count = source->items.len;  /* snapshot: self-extension appends once */
+    for (size_t i = 0; i < count; i++) {
+        VEC_PUSH(&target->items, source->items.data[i]);
     }
-    ct_stack_push(&vm->stack, ct_make_list(list1));
+    ct_stack_push(&vm->stack, ct_make_list(target));
 }
 
 static void ct_intrinsic_list_reverse(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-reverse");
     if (list->items.len > 1) {
         size_t i = 0;
         size_t j = list->items.len - 1;
@@ -2040,27 +2385,26 @@ static void ct_intrinsic_list_reverse(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_list_clear(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-clear");
     list->items.len = 0;
     ct_stack_push(&vm->stack, ct_make_list(list));
 }
 
 static void ct_intrinsic_list_last(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
-    CtValue v = ct_make_nil();
-    if (list->items.len) {
-        v = list->items.data[list->items.len - 1];
+    CtList *list = ct_strict_pop_list(vm, "list-last");
+    if (!list->items.len) {
+        ct_trace_error(vm, "list-last: list is empty");
     }
-    ct_stack_push(&vm->stack, v);
+    ct_stack_push(&vm->stack, list->items.data[list->items.len - 1]);
 }
 
+/* list-clone: list -- new-list (shallow). */
 static void ct_intrinsic_list_clone(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
+    CtList *list = ct_strict_pop_list(vm, "list-clone");
     CtList *out = ct_list_new();
     for (size_t i = 0; i < list->items.len; i++) {
         VEC_PUSH(&out->items, list->items.data[i]);
     }
-    ct_stack_push(&vm->stack, ct_make_list(list));
     ct_stack_push(&vm->stack, ct_make_list(out));
 }
 
@@ -2070,88 +2414,71 @@ static void ct_intrinsic_map_new(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_map_set(CompileTimeVM *vm) {
-    CtValue val = ct_stack_pop(&vm->stack);
-    char *key = ct_pop_str(vm);
-    CtMap *map = ct_pop_map(vm);
-    ct_map_set(map, key, val);
-    free(key);
+    CtValue val = ct_pop(vm);
+    CtValue key = ct_pop(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-set");
+    ct_check_map_key(vm, "map-set", key);
+    ct_map_put(map, key, val);
     ct_stack_push(&vm->stack, ct_make_map(map));
 }
 
+/* map-get: map key -- value found? */
 static void ct_intrinsic_map_get(CompileTimeVM *vm) {
-    char *key = ct_pop_str(vm);
-    CtMap *map = ct_pop_map(vm);
+    CtValue key = ct_pop(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-get");
+    ct_check_map_key(vm, "map-get", key);
     CtValue out = ct_make_nil();
-    bool ok = ct_map_get(map, key, &out);
-    ct_stack_push(&vm->stack, ct_make_map(map));
-    ct_stack_push(&vm->stack, out);
+    bool ok = ct_map_lookup(map, key, &out);
+    ct_stack_push(&vm->stack, ok ? out : ct_make_nil());
     ct_stack_push(&vm->stack, ct_make_int(ok));
-    free(key);
 }
 
+/* map-has?: map key -- found? */
 static void ct_intrinsic_map_has(CompileTimeVM *vm) {
-    char *key = ct_pop_str(vm);
-    CtMap *map = ct_pop_map(vm);
+    CtValue key = ct_pop(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-has?");
+    ct_check_map_key(vm, "map-has?", key);
     CtValue out = ct_make_nil();
-    bool ok = ct_map_get(map, key, &out);
-    ct_stack_push(&vm->stack, ct_make_map(map));
-    ct_stack_push(&vm->stack, ct_make_int(ok));
-    free(key);
+    ct_stack_push(&vm->stack, ct_make_int(ct_map_lookup(map, key, &out)));
 }
 
 static void ct_intrinsic_map_length(CompileTimeVM *vm) {
-    CtMap *map = ct_pop_map(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-length");
     ct_stack_push(&vm->stack, ct_make_int((int64_t)map->len));
 }
 
 static void ct_intrinsic_map_empty(CompileTimeVM *vm) {
-    CtMap *map = ct_pop_map(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-empty?");
     ct_stack_push(&vm->stack, ct_make_int(map->len == 0));
 }
 
 static void ct_intrinsic_map_clear(CompileTimeVM *vm) {
-    CtMap *map = ct_pop_map(vm);
-    if (map->keys) {
-        for (size_t i = 0; i < map->cap; i++) {
-            if (map->keys[i]) {
-                free(map->keys[i]);
-                map->keys[i] = NULL;
-            }
-        }
-    }
-    map->len = 0;
+    CtMap *map = ct_strict_pop_map(vm, "map-clear");
+    ct_map_clear_entries(map);
     ct_stack_push(&vm->stack, ct_make_map(map));
 }
 
 static void ct_intrinsic_map_keys(CompileTimeVM *vm) {
-    CtMap *map = ct_pop_map(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-keys");
     CtList *out = ct_list_new();
-    if (map->keys) {
-        for (size_t i = 0; i < map->cap; i++) {
-            if (map->keys[i]) {
-                VEC_PUSH(&out->items, ct_make_str(map->keys[i]));
-            }
-        }
+    for (size_t i = 0; i < map->len; i++) {
+        VEC_PUSH(&out->items, map->keys[i]);
     }
     ct_stack_push(&vm->stack, ct_make_list(out));
 }
 
 static void ct_intrinsic_map_values(CompileTimeVM *vm) {
-    CtMap *map = ct_pop_map(vm);
+    CtMap *map = ct_strict_pop_map(vm, "map-values");
     CtList *out = ct_list_new();
-    if (map->keys) {
-        for (size_t i = 0; i < map->cap; i++) {
-            if (map->keys[i]) {
-                VEC_PUSH(&out->items, map->values[i]);
-            }
-        }
+    for (size_t i = 0; i < map->len; i++) {
+        VEC_PUSH(&out->items, map->values[i]);
     }
     ct_stack_push(&vm->stack, ct_make_list(out));
 }
 
 static void ct_intrinsic_string_contains(CompileTimeVM *vm) {
-    char *needle = ct_pop_str(vm);
-    char *text = ct_pop_str(vm);
+    char *needle = ct_strict_pop_string(vm, "string-contains?");
+    char *text = ct_strict_pop_string(vm, "string-contains?");
     bool found = strstr(text, needle) != NULL;
     free(text);
     free(needle);
@@ -2159,8 +2486,8 @@ static void ct_intrinsic_string_contains(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_string_starts_with(CompileTimeVM *vm) {
-    char *prefix = ct_pop_str(vm);
-    char *text = ct_pop_str(vm);
+    char *prefix = ct_strict_pop_string(vm, "string-starts-with?");
+    char *text = ct_strict_pop_string(vm, "string-starts-with?");
     size_t plen = strlen(prefix);
     bool ok = strncmp(text, prefix, plen) == 0;
     free(text);
@@ -2169,8 +2496,8 @@ static void ct_intrinsic_string_starts_with(CompileTimeVM *vm) {
 }
 
 static void ct_intrinsic_string_ends_with(CompileTimeVM *vm) {
-    char *suffix = ct_pop_str(vm);
-    char *text = ct_pop_str(vm);
+    char *suffix = ct_strict_pop_string(vm, "string-ends-with?");
+    char *text = ct_strict_pop_string(vm, "string-ends-with?");
     size_t slen = strlen(suffix);
     size_t tlen = strlen(text);
     bool ok = false;
@@ -2182,76 +2509,88 @@ static void ct_intrinsic_string_ends_with(CompileTimeVM *vm) {
     ct_stack_push(&vm->stack, ct_make_int(ok));
 }
 
+/* Strict token pop for the Token accessor words: strings are not coerced. */
+static Token ct_strict_pop_token(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_TOKEN) {
+        ct_value_type_error(vm, word, "a token", v);
+    }
+    return v.as.token;
+}
+
 static void ct_intrinsic_token_lexeme(CompileTimeVM *vm) {
-    Token tok = ct_pop_token(vm);
+    Token tok = ct_strict_pop_token(vm, "token-lexeme");
     ct_stack_push(&vm->stack, ct_make_str(tok.lexeme));
 }
 
-static void ct_intrinsic_token_from_lexeme(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind == CT_NIL) {
-        v = ct_stack_pop(&vm->stack);
+/* token-with-lexeme: token lexeme -- new-token.  The C VM has no source
+ * provenance, so the new token keeps the template's coordinates. */
+static void ct_intrinsic_token_with_lexeme(CompileTimeVM *vm) {
+    char *lexeme = ct_strict_pop_string(vm, "token-with-lexeme");
+    if (!*lexeme) {
+        ct_trace_error(vm, "token-with-lexeme: lexeme must not be empty");
     }
-    char *lex = NULL;
-    if (v.kind == CT_STR) {
-        lex = str_dup(v.as.str);
-    } else if (v.kind == CT_TOKEN) {
-        lex = str_dup(v.as.token.lexeme);
-    } else {
-        ct_trace_error(vm, "expected string for token-from-lexeme");
-    }
-    Token tok = {0};
-    tok.lexeme = lex;
-    tok.line = 0;
-    tok.column = 0;
-    tok.start = 0;
-    tok.end = 0;
+    Token tok = ct_strict_pop_token(vm, "token-with-lexeme");
+    tok.lexeme = lexeme;
     ct_stack_push(&vm->stack, ct_make_token(tok));
 }
 
 static void ct_intrinsic_token_line(CompileTimeVM *vm) {
-    Token tok = ct_pop_token(vm);
+    Token tok = ct_strict_pop_token(vm, "token-line");
     ct_stack_push(&vm->stack, ct_make_int(tok.line));
 }
 
+/* Columns are 1-based in the CT API (the tokenizer counts from 0). */
 static void ct_intrinsic_token_column(CompileTimeVM *vm) {
-    Token tok = ct_pop_token(vm);
-    ct_stack_push(&vm->stack, ct_make_int(tok.column));
+    Token tok = ct_strict_pop_token(vm, "token-column");
+    ct_stack_push(&vm->stack, ct_make_int(tok.column + 1));
 }
 
-static void ct_intrinsic_next_token(CompileTimeVM *vm) {
+static void ct_intrinsic_parser_consume(CompileTimeVM *vm) {
     Token tok = parser_next_token(vm->parser);
     if (!tok.lexeme) {
-        ct_stack_push(&vm->stack, ct_make_nil());
-        return;
+        ct_trace_error(vm, "ct-parser-consume: unexpected end of input");
     }
     ct_stack_push(&vm->stack, ct_make_token(tok));
 }
 
-static void ct_intrinsic_peek_token(CompileTimeVM *vm) {
-    Token tok = parser_peek_token(vm->parser);
-    if (!tok.lexeme) {
+static void ct_intrinsic_parser_peek(CompileTimeVM *vm) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_INT) {
+        char *msg = str_printf("ct-parser-peek expects an integer offset, got %s", ct_kind_name(v.kind));
+        ct_trace_error(vm, msg);
+    }
+    if (v.as.i64 < 0) {
+        char *msg = str_printf("ct-parser-peek: offset must not be negative, got %lld", (long long)v.as.i64);
+        ct_trace_error(vm, msg);
+    }
+    Parser *parser = vm->parser;
+    size_t idx = parser->pos + (size_t)v.as.i64;
+    ensure_tokens(parser, idx);
+    if (idx >= parser->tokens.len) {
         ct_stack_push(&vm->stack, ct_make_nil());
         return;
     }
-    ct_stack_push(&vm->stack, ct_make_token(tok));
+    ct_stack_push(&vm->stack, ct_make_token(parser->tokens.data[idx]));
 }
 
-static void ct_intrinsic_inject_tokens(CompileTimeVM *vm) {
+static void ct_intrinsic_parser_eof(CompileTimeVM *vm) {
+    ct_stack_push(&vm->stack, ct_make_int(parser_eof(vm->parser) ? 1 : 0));
+}
+
+static void ct_intrinsic_parser_inject(CompileTimeVM *vm) {
     CtList *list = ct_pop_list(vm);
+    for (size_t i = 0; i < list->items.len; i++) {
+        if (list->items.data[i].kind != CT_TOKEN) {
+            char *msg = str_printf("ct-parser-inject: element %zu is %s, expected token",
+                                   i, ct_kind_name(list->items.data[i].kind));
+            ct_trace_error(vm, msg);
+        }
+    }
     TokenVec injected;
     VEC_INIT(&injected);
     for (size_t i = 0; i < list->items.len; i++) {
-        CtValue v = list->items.data[i];
-        Token tok = {0};
-        if (v.kind == CT_TOKEN) {
-            tok = v.as.token;
-        } else if (v.kind == CT_STR) {
-            tok.lexeme = str_dup(v.as.str);
-        } else {
-            tok.lexeme = ct_string_from_value(v);
-        }
-        VEC_PUSH(&injected, tok);
+        VEC_PUSH(&injected, list->items.data[i].as.token);
     }
     parser_inject_tokens(vm->parser, &injected);
 }
@@ -2278,67 +2617,96 @@ static void ct_intrinsic_parse_error(CompileTimeVM *vm) {
     exit(1);
 }
 
-static void ct_intrinsic_add_token(CompileTimeVM *vm) {
-    char *tok = ct_pop_str(vm);
-    reader_add_tokens(vm->parser->reader, tok);
-    free(tok);
-}
-
-static void ct_intrinsic_add_token_chars(CompileTimeVM *vm) {
-    char *chars = ct_pop_str(vm);
-    reader_add_token_chars(vm->parser->reader, chars);
-    free(chars);
-}
-
-static void ct_intrinsic_prelude_clear(CompileTimeVM *vm) {
-    if (!vm->parser->custom_prelude) {
-        vm->parser->custom_prelude = (StrVec *)xmalloc(sizeof(StrVec));
-        VEC_INIT(vm->parser->custom_prelude);
+static StrVec *ct_output_buffer(StrVec **slot) {
+    if (!*slot) {
+        *slot = (StrVec *)xmalloc(sizeof(StrVec));
+        VEC_INIT(*slot);
     }
-    vm->parser->custom_prelude->len = 0;
+    return *slot;
 }
 
-static void ct_intrinsic_prelude_append(CompileTimeVM *vm) {
-    char *line = ct_pop_str(vm);
-    if (!vm->parser->custom_prelude) {
-        vm->parser->custom_prelude = (StrVec *)xmalloc(sizeof(StrVec));
-        VEC_INIT(vm->parser->custom_prelude);
+/* fragment -- */
+static void ct_output_append(CompileTimeVM *vm, StrVec **slot, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_STR) {
+        ct_value_type_error(vm, word, "a string", v);
     }
-    VEC_PUSH(vm->parser->custom_prelude, line);
+    VEC_PUSH(ct_output_buffer(slot), str_dup(v.as.str));
 }
 
-static void ct_intrinsic_bss_clear(CompileTimeVM *vm) {
-    if (!vm->parser->custom_bss) {
-        vm->parser->custom_bss = (StrVec *)xmalloc(sizeof(StrVec));
-        VEC_INIT(vm->parser->custom_bss);
+/* fragment-list -- : validated in full before the buffer changes. */
+static void ct_output_set(CompileTimeVM *vm, StrVec **slot, const char *word) {
+    CtList *list = ct_strict_pop_list(vm, word);
+    for (size_t i = 0; i < list->items.len; i++) {
+        if (list->items.data[i].kind != CT_STR) {
+            ct_value_type_error(vm, word, "a list of strings", list->items.data[i]);
+        }
     }
-    vm->parser->custom_bss->len = 0;
-}
-
-static void ct_intrinsic_bss_append(CompileTimeVM *vm) {
-    char *line = ct_pop_str(vm);
-    if (!vm->parser->custom_bss) {
-        vm->parser->custom_bss = (StrVec *)xmalloc(sizeof(StrVec));
-        VEC_INIT(vm->parser->custom_bss);
+    StrVec *buffer = ct_output_buffer(slot);
+    buffer->len = 0;
+    for (size_t i = 0; i < list->items.len; i++) {
+        VEC_PUSH(buffer, str_dup(list->items.data[i].as.str));
     }
-    VEC_PUSH(vm->parser->custom_bss, line);
 }
 
-static void ct_intrinsic_use_l2_ct(CompileTimeVM *vm) {
+static void ct_intrinsic_output_append_text_preamble(CompileTimeVM *vm) {
+    ct_output_append(vm, &vm->parser->custom_prelude, "ct-output-append-text-preamble");
+}
+
+static void ct_intrinsic_output_set_text_preamble(CompileTimeVM *vm) {
+    ct_output_set(vm, &vm->parser->custom_prelude, "ct-output-set-text-preamble");
+}
+
+static void ct_intrinsic_output_clear_text_preamble(CompileTimeVM *vm) {
+    ct_output_buffer(&vm->parser->custom_prelude)->len = 0;
+}
+
+static void ct_intrinsic_output_append_data(CompileTimeVM *vm) {
+    ct_output_append(vm, &vm->parser->custom_data, "ct-output-append-data");
+}
+
+static void ct_intrinsic_output_set_data(CompileTimeVM *vm) {
+    ct_output_set(vm, &vm->parser->custom_data, "ct-output-set-data");
+}
+
+static void ct_intrinsic_output_clear_data(CompileTimeVM *vm) {
+    ct_output_buffer(&vm->parser->custom_data)->len = 0;
+}
+
+/* Appending keeps the standard runtime BSS layout; set and clear replace it. */
+static void ct_intrinsic_output_append_bss(CompileTimeVM *vm) {
+    ct_output_append(vm, &vm->parser->custom_bss, "ct-output-append-bss");
+}
+
+static void ct_intrinsic_output_set_bss(CompileTimeVM *vm) {
+    ct_output_set(vm, &vm->parser->custom_bss, "ct-output-set-bss");
+    vm->parser->bss_replaced = true;
+}
+
+static void ct_intrinsic_output_clear_bss(CompileTimeVM *vm) {
+    ct_output_buffer(&vm->parser->custom_bss)->len = 0;
+    vm->parser->bss_replaced = true;
+}
+
+/* ct-definition-prefer-l2-by-name: name -- ok?  Marks the selected
+ * definition to run its L2 body at compile time instead of the name's
+ * compile-time intrinsic.  A missing name (or one with no definition)
+ * pushes 0. */
+static void ct_intrinsic_definition_prefer_l2_by_name(CompileTimeVM *vm) {
     char *name = ct_pop_str(vm);
     Word *word = dictionary_lookup(vm->dictionary, name);
-    if (!word) {
-        word = (Word *)xmalloc(sizeof(Word));
-        memset(word, 0, sizeof(Word));
-        word->name = str_dup(name);
-        dictionary_register(vm->dictionary, word);
+    if (!word || (!word->definition && !word->ct_definition)) {
+        free(name);
+        ct_stack_push(&vm->stack, ct_make_int(0));
+        return;
     }
     if (word->runtime_only) {
-        fprintf(stderr, "[error] word '%s' is runtime-only and cannot be executed at compile time\n", word->name);
+        fprintf(stderr, "[error] ct-definition-prefer-l2-by-name: '%s' is runtime-only and cannot run at compile time\n", word->name);
         exit(1);
     }
     word->compile_time_override = true;
     free(name);
+    ct_stack_push(&vm->stack, ct_make_int(1));
 }
 
 static void ct_intrinsic_ct_flag(CompileTimeVM *vm) {
@@ -2353,350 +2721,211 @@ static CtList *ct_list_from_tokens(const char **tokens, size_t count) {
     return list;
 }
 
-static void ct_intrinsic_shunt(CompileTimeVM *vm) {
-    CtList *list = ct_pop_list(vm);
-    CtList *output = ct_list_new();
-    CtList *ops = ct_list_new();
-    for (size_t i = 0; i < list->items.len; i++) {
-        CtValue tok = list->items.data[i];
-        char *lex = ct_string_from_value(tok);
-        if (strcmp(lex, "(") == 0) {
-            VEC_PUSH(&ops->items, ct_make_str(lex));
-            free(lex);
-            continue;
-        }
-        if (strcmp(lex, ")") == 0) {
-            while (ops->items.len) {
-                CtValue top = ops->items.data[ops->items.len - 1];
-                char *top_lex = ct_string_from_value(top);
-                if (strcmp(top_lex, "(") == 0) {
-                    ops->items.len--;
-                    free(top_lex);
-                    break;
-                }
-                VEC_PUSH(&output->items, top);
-                ops->items.len--;
-                free(top_lex);
-            }
-            free(lex);
-            continue;
-        }
-        int prec = 0;
-        if (strcmp(lex, "+") == 0 || strcmp(lex, "-") == 0) {
-            prec = 1;
-        } else if (strcmp(lex, "*") == 0 || strcmp(lex, "/") == 0 || strcmp(lex, "%") == 0) {
-            prec = 2;
-        }
-        if (prec > 0) {
-            while (ops->items.len) {
-                CtValue top = ops->items.data[ops->items.len - 1];
-                char *top_lex = ct_string_from_value(top);
-                int top_prec = 0;
-                if (strcmp(top_lex, "+") == 0 || strcmp(top_lex, "-") == 0) {
-                    top_prec = 1;
-                } else if (strcmp(top_lex, "*") == 0 || strcmp(top_lex, "/") == 0 || strcmp(top_lex, "%") == 0) {
-                    top_prec = 2;
-                }
-                if (top_prec >= prec) {
-                    VEC_PUSH(&output->items, top);
-                    ops->items.len--;
-                } else {
-                    free(top_lex);
-                    break;
-                }
-                free(top_lex);
-            }
-            VEC_PUSH(&ops->items, ct_make_str(lex));
-            free(lex);
-            continue;
-        }
-        VEC_PUSH(&output->items, ct_make_str(lex));
-        free(lex);
-    }
-    while (ops->items.len) {
-        CtValue top = VEC_POP(&ops->items);
-        VEC_PUSH(&output->items, top);
-    }
-    ct_stack_push(&vm->stack, ct_make_list(output));
-}
-
-static SplitLexer *split_lexer_new(Parser *parser, const char *seps) {
-    SplitLexer *lexer = (SplitLexer *)xmalloc(sizeof(SplitLexer));
-    lexer->parser = parser;
-    memset(lexer->separators, 0, sizeof(lexer->separators));
-    for (const char *p = seps; p && *p; p++) {
-        lexer->separators[(unsigned char)*p] = true;
-    }
-    VEC_INIT(&lexer->buffer);
-    return lexer;
-}
-
-static void split_lexer_buffer_token(SplitLexer *lexer, Token tok) {
-    if (!tok.lexeme) {
-        return;
-    }
-    size_t len = strlen(tok.lexeme);
-    if (len == 0 || tok.lexeme[0] == '"') {
-        VEC_PUSH(&lexer->buffer, tok);
-        return;
-    }
-    size_t start = 0;
-    for (size_t i = 0; i <= len; i++) {
-        bool is_sep = (i < len) && lexer->separators[(unsigned char)tok.lexeme[i]];
-        bool at_end = (i == len);
-        if (is_sep || at_end) {
-            if (i > start) {
-                size_t tok_len = i - start;
-                char *lex = (char *)xmalloc(tok_len + 1);
-                memcpy(lex, tok.lexeme + start, tok_len);
-                lex[tok_len] = '\0';
-                Token out = tok;
-                out.lexeme = lex;
-                VEC_PUSH(&lexer->buffer, out);
-            }
-            if (is_sep) {
-                char sep[2] = {tok.lexeme[i], '\0'};
-                Token out = tok;
-                out.lexeme = str_dup(sep);
-                VEC_PUSH(&lexer->buffer, out);
-            }
-            start = i + 1;
-        }
-    }
-}
-
-static Token split_lexer_pop(SplitLexer *lexer) {
-    if (lexer->buffer.len == 0) {
-        Token tok = parser_next_token(lexer->parser);
-        if (!tok.lexeme) {
-            Token empty = {0};
-            empty.lexeme = NULL;
-            return empty;
-        }
-        split_lexer_buffer_token(lexer, tok);
-    }
-    if (lexer->buffer.len == 0) {
-        Token empty = {0};
-        empty.lexeme = NULL;
-        return empty;
-    }
-    Token out = lexer->buffer.data[0];
-    memmove(&lexer->buffer.data[0], &lexer->buffer.data[1], (lexer->buffer.len - 1) * sizeof(Token));
-    lexer->buffer.len--;
-    return out;
-}
-
-static Token split_lexer_peek(SplitLexer *lexer) {
-    if (lexer->buffer.len == 0) {
-        Token tok = parser_next_token(lexer->parser);
-        if (!tok.lexeme) {
-            Token empty = {0};
-            empty.lexeme = NULL;
-            return empty;
-        }
-        split_lexer_buffer_token(lexer, tok);
-    }
-    if (lexer->buffer.len == 0) {
-        Token empty = {0};
-        empty.lexeme = NULL;
-        return empty;
-    }
-    return lexer->buffer.data[0];
-}
-
-static void split_lexer_push_back(SplitLexer *lexer, Token tok) {
-    if (lexer->buffer.len + 1 > lexer->buffer.cap) {
-        lexer->buffer.cap = lexer->buffer.cap ? lexer->buffer.cap * 2 : 8;
-        lexer->buffer.data = xrealloc(lexer->buffer.data, lexer->buffer.cap * sizeof(Token));
-    }
-    memmove(&lexer->buffer.data[1], &lexer->buffer.data[0], lexer->buffer.len * sizeof(Token));
-    lexer->buffer.data[0] = tok;
-    lexer->buffer.len++;
-}
-
-static void ct_intrinsic_lexer_new(CompileTimeVM *vm) {
-    char *seps = ct_pop_str(vm);
-    SplitLexer *lexer = split_lexer_new(vm->parser, seps);
-    free(seps);
-    ct_stack_push(&vm->stack, ct_make_lexer(lexer));
-}
-
-static void ct_intrinsic_lexer_pop(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_LEXER) {
-        fprintf(stderr, "[error] lexer-pop expects lexer\n");
-        exit(1);
-    }
-    Token tok = split_lexer_pop(v.as.lexer);
-    ct_stack_push(&vm->stack, ct_make_lexer(v.as.lexer));
-    if (!tok.lexeme) {
-        ct_stack_push(&vm->stack, ct_make_nil());
-    } else {
-        ct_stack_push(&vm->stack, ct_make_token(tok));
-    }
-}
-
-static void ct_intrinsic_lexer_peek(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_LEXER) {
-        fprintf(stderr, "[error] lexer-peek expects lexer\n");
-        exit(1);
-    }
-    Token tok = split_lexer_peek(v.as.lexer);
-    ct_stack_push(&vm->stack, ct_make_lexer(v.as.lexer));
-    if (!tok.lexeme) {
-        ct_stack_push(&vm->stack, ct_make_nil());
-    } else {
-        ct_stack_push(&vm->stack, ct_make_token(tok));
-    }
-}
-
-static void ct_intrinsic_lexer_expect(CompileTimeVM *vm) {
-    char *expected = ct_pop_str(vm);
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_LEXER) {
-        fprintf(stderr, "[error] lexer-expect expects lexer\n");
-        exit(1);
-    }
-    Token tok = split_lexer_pop(v.as.lexer);
-    if (!tok.lexeme || strcmp(tok.lexeme, expected) != 0) {
-        fprintf(stderr, "[error] lexer-expect expected '%s'\n", expected);
-        exit(1);
-    }
-    ct_stack_push(&vm->stack, ct_make_lexer(v.as.lexer));
-    ct_stack_push(&vm->stack, ct_make_token(tok));
-    free(expected);
-}
-
-static void ct_intrinsic_lexer_collect_brace(CompileTimeVM *vm) {
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_LEXER) {
-        fprintf(stderr, "[error] lexer-collect-brace expects lexer\n");
-        exit(1);
-    }
-    int depth = 1;
-    CtList *list = ct_list_new();
-    while (depth > 0) {
-        Token tok = split_lexer_pop(v.as.lexer);
-        if (!tok.lexeme) {
-            fprintf(stderr, "[error] unterminated brace in lexer\n");
-            exit(1);
-        }
-        if (strcmp(tok.lexeme, "{") == 0) {
-            depth++;
-        } else if (strcmp(tok.lexeme, "}") == 0) {
-            depth--;
-            if (depth == 0) {
-                break;
-            }
-        }
-        VEC_PUSH(&list->items, ct_make_token(tok));
-    }
-    ct_stack_push(&vm->stack, ct_make_lexer(v.as.lexer));
-    ct_stack_push(&vm->stack, ct_make_list(list));
-}
-
-static void ct_intrinsic_lexer_push_back(CompileTimeVM *vm) {
-    Token tok = ct_pop_token(vm);
-    CtValue v = ct_stack_pop(&vm->stack);
-    if (v.kind != CT_LEXER) {
-        fprintf(stderr, "[error] lexer-push-back expects lexer\n");
-        exit(1);
-    }
-    split_lexer_push_back(v.as.lexer, tok);
-    ct_stack_push(&vm->stack, ct_make_lexer(v.as.lexer));
-}
-
-static void ct_intrinsic_emit_definition(CompileTimeVM *vm) {
-    CtList *body = ct_pop_list(vm);
-    Token name = ct_pop_token(vm);
-    TokenVec injected;
-    VEC_INIT(&injected);
-    Token tok = {0};
-    tok.lexeme = str_dup("word");
-    VEC_PUSH(&injected, tok);
-    VEC_PUSH(&injected, name);
-    for (size_t i = 0; i < body->items.len; i++) {
-        CtValue item = body->items.data[i];
-        Token t = {0};
-        if (item.kind == CT_TOKEN) {
-            t = item.as.token;
-        } else if (item.kind == CT_STR) {
-            t.lexeme = str_dup(item.as.str);
-        } else if (item.kind == CT_INT) {
-            t.lexeme = str_printf("%lld", (long long)item.as.i64);
-        } else {
-            t.lexeme = ct_string_from_value(item);
-        }
-        VEC_PUSH(&injected, t);
-    }
-    tok.lexeme = str_dup("end");
-    VEC_PUSH(&injected, tok);
-    parser_inject_tokens(vm->parser, &injected);
-}
-
-static void ct_intrinsic_prelude_set(CompileTimeVM *vm) {
-    ct_intrinsic_prelude_clear(vm);
-    ct_intrinsic_prelude_append(vm);
-}
-
-static void ct_intrinsic_bss_set(CompileTimeVM *vm) {
-    ct_intrinsic_bss_clear(vm);
-    ct_intrinsic_bss_append(vm);
-}
-
-/* eval_env stubs consume full-compiler-only data/BSS/prelude arguments. */
-static void ct_intrinsic_data_append(CompileTimeVM *vm) {
-    char *line = ct_pop_str(vm);
-    free(line);
-}
-
-static void ct_intrinsic_data_set(CompileTimeVM *vm) {
-    (void)ct_pop_list(vm);
-}
-
-static void ct_intrinsic_ct_current_token(CompileTimeVM *vm) {
+static void ct_intrinsic_parser_current(CompileTimeVM *vm) {
     if (vm->parser && vm->parser->has_last_token) {
         ct_stack_push(&vm->stack, ct_make_token(vm->parser->last_token));
         return;
     }
+    ct_stack_push(&vm->stack, ct_make_nil());
+}
+
+/* ---- Syntax values, quotations, and macros ---------------- */
+
+static CtValue ct_make_syntax(CtList *list) {
+    CtValue v = {0};
+    v.kind = CT_SYNTAX;
+    v.as.list = list;
+    return v;
+}
+
+static Token token_copy_with(const Token *source, const char *lexeme) {
     Token tok = {0};
-    tok.lexeme = str_dup("");
-    ct_stack_push(&vm->stack, ct_make_token(tok));
+    tok.lexeme = str_dup(lexeme);
+    if (source) {
+        tok.line = source->line;
+        tok.column = source->column;
+    }
+    return tok;
 }
 
-static void ct_intrinsic_inject_lexemes(CompileTimeVM *vm) {
-    CtValue template_v = ct_stack_pop(&vm->stack);
-    CtList *list = ct_pop_list(vm);
-    Token template = {0};
-    if (template_v.kind == CT_TOKEN) {
-        template = template_v.as.token;
+static void ct_list_push_token(CtList *list, Token tok) {
+    VEC_PUSH(&list->items, ct_make_token(tok));
+}
+
+/* Append one `$( )` value to a quotation being built. */
+static void ct_unquote_append(CompileTimeVM *vm, CtList *out, CtValue value, const QuotePart *part) {
+    CtValue single[1];
+    CtValue *items = single;
+    size_t count = 1;
+    single[0] = value;
+    if (value.kind == CT_SYNTAX || value.kind == CT_LIST) {
+        items = value.as.list->items.data;
+        count = value.as.list->items.len;
     }
-    TokenVec injected;
-    VEC_INIT(&injected);
-    int column = template.column > 0 ? template.column : 1;
-    for (size_t i = 0; i < list->items.len; i++) {
-        CtValue v = list->items.data[i];
-        Token tok = {0};
-        if (v.kind == CT_TOKEN) {
-            tok.lexeme = v.as.token.lexeme ? str_dup(v.as.token.lexeme) : str_dup("");
-        } else if (v.kind == CT_STR) {
-            tok.lexeme = v.as.str ? str_dup(v.as.str) : str_dup("");
+    bool pasting = (part->prefix && part->prefix[0]) || (part->suffix && part->suffix[0]);
+    if (pasting && count != 1) {
+        ct_trace_error(vm, "`$( )` pastes text onto its value, which needs exactly one token");
+    }
+    for (size_t i = 0; i < count; i++) {
+        CtValue item = items[i];
+        char numbuf[32];
+        const char *text = NULL;
+        if (item.kind == CT_TOKEN) {
+            text = item.as.token.lexeme;
+        } else if (item.kind == CT_INT) {
+            snprintf(numbuf, sizeof(numbuf), "%lld", (long long)item.as.i64);
+            text = numbuf;
+        } else if (item.kind == CT_STR) {
+            text = item.as.str;
+            bool blank = !text[0];
+            for (const char *c = text; *c; c++) {
+                if (isspace((unsigned char)*c)) blank = true;
+            }
+            if (blank) {
+                ct_trace_error(vm, "an unquoted string must be one non-empty word");
+            }
         } else {
-            tok.lexeme = ct_string_from_value(v);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "cannot unquote a %s; use a token, syntax, string, integer, or a list of them",
+                     ct_kind_name(item.kind));
+            ct_trace_error(vm, msg);
         }
-        tok.line = template.line;
-        tok.column = column;
-        tok.start = template.start;
-        tok.end = template.end;
-        if (tok.lexeme) {
-            column += (int)strlen(tok.lexeme);
-        }
-        VEC_PUSH(&injected, tok);
+        char *lexeme = str_printf("%s%s%s", pasting && part->prefix ? part->prefix : "", text,
+                                  pasting && part->suffix ? part->suffix : "");
+        Token tok = {0};
+        tok.lexeme = lexeme;
+        tok.line = part->line;
+        tok.column = part->column;
+        ct_list_push_token(out, tok);
     }
-    parser_inject_tokens(vm->parser, &injected);
 }
 
+static bool ct_lookup_binding(CompileTimeVM *vm, const char *name, CtValue *out) {
+    for (size_t i = vm->binding_len; i > 0; i--) {
+        if (strcmp(vm->binding_names[i - 1], name) == 0) {
+            *out = vm->binding_values[i - 1];
+            return true;
+        }
+    }
+    return false;
+}
+
+static CtValue ct_eval_quotation(CompileTimeVM *vm, QuoteTemplate *tpl) {
+    CtList *out = ct_list_new();
+    size_t base = vm->unquote_values.len;
+    if (tpl->unquotes) {
+        if (vm->unquote_values.len < tpl->unquotes) {
+            ct_trace_error(vm, "quotation is missing its `$( )` values");
+        }
+        base = vm->unquote_values.len - tpl->unquotes;
+    }
+    size_t next = base;
+    for (size_t i = 0; i < tpl->len; i++) {
+        QuotePart *part = &tpl->parts[i];
+        if (part->kind == 0) {
+            Token tok = {0};
+            tok.lexeme = str_dup(part->lexeme);
+            tok.line = part->line;
+            tok.column = part->column;
+            ct_list_push_token(out, tok);
+        } else if (part->kind == 1) {
+            CtValue value;
+            if (!ct_lookup_binding(vm, part->lexeme, &value)) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "unbound '$%s' in quotation", part->lexeme);
+                ct_trace_error(vm, msg);
+            }
+            if (value.kind == CT_TOKEN) {
+                ct_list_push_token(out, token_copy_with(&value.as.token, value.as.token.lexeme));
+            } else if (value.kind == CT_SYNTAX) {
+                for (size_t j = 0; j < value.as.list->items.len; j++) {
+                    Token *t = &value.as.list->items.data[j].as.token;
+                    ct_list_push_token(out, token_copy_with(t, t->lexeme));
+                }
+            } else {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "'$%s' is a %s; only a token or syntax can be spliced",
+                         part->lexeme, ct_kind_name(value.kind));
+                ct_trace_error(vm, msg);
+            }
+        } else {
+            ct_unquote_append(vm, out, vm->unquote_values.data[next++], part);
+        }
+    }
+    vm->unquote_values.len = base;
+    return ct_make_syntax(out);
+}
+
+static CtList *ct_pop_syntax(CompileTimeVM *vm, const char *word) {
+    CtValue v = ct_pop(vm);
+    if (v.kind != CT_SYNTAX) {
+        ct_value_type_error(vm, word, "a syntax value", v);
+    }
+    return v.as.list;
+}
+
+static void parser_inject_tokens(Parser *parser, TokenVec *injected);
+
+/* emit [* | syntax] -> [*]: add the tokens to the running macro's output, or
+ * (outside a macro) to the input read next. */
+static void ct_intrinsic_emit(CompileTimeVM *vm) {
+    CtList *syntax = ct_pop_syntax(vm, "emit");
+    TokenVec local;
+    VEC_INIT(&local);
+    TokenVec *out = vm->emit_out ? vm->emit_out : &local;
+    for (size_t i = 0; i < syntax->items.len; i++) {
+        Token *t = &syntax->items.data[i].as.token;
+        VEC_PUSH(out, token_copy_with(t, t->lexeme));
+    }
+    if (!vm->emit_out) {
+        parser_inject_tokens(vm->parser, &local);
+    }
+}
+
+static void ct_intrinsic_list_to_syntax(CompileTimeVM *vm) {
+    CtList *list = ct_strict_pop_list(vm, "list>syntax");
+    CtList *out = ct_list_new();
+    for (size_t i = 0; i < list->items.len; i++) {
+        if (list->items.data[i].kind != CT_TOKEN) {
+            ct_value_type_error(vm, "list>syntax", "a list of tokens", list->items.data[i]);
+        }
+        VEC_PUSH(&out->items, list->items.data[i]);
+    }
+    ct_stack_push(&vm->stack, ct_make_syntax(out));
+}
+
+static void ct_intrinsic_syntax_to_list(CompileTimeVM *vm) {
+    CtList *syntax = ct_pop_syntax(vm, "syntax>list");
+    CtList *out = ct_list_new();
+    for (size_t i = 0; i < syntax->items.len; i++) {
+        VEC_PUSH(&out->items, syntax->items.data[i]);
+    }
+    ct_stack_push(&vm->stack, ct_make_list(out));
+}
+
+static void ct_intrinsic_syntax_length(CompileTimeVM *vm) {
+    CtList *syntax = ct_pop_syntax(vm, "syntax-length");
+    ct_stack_push(&vm->stack, ct_make_int((int64_t)syntax->items.len));
+}
+
+#define L2_UNQUOTE_BEGIN "\001unquote-begin"
+#define L2_UNQUOTE_END "\001unquote-end"
+#define L2_QUOTE_MARKER "\001quote:"
+
+static void ct_intrinsic_unquote_begin(CompileTimeVM *vm) {
+    VEC_PUSH(&vm->unquote_depths, (int)vm->stack.len);
+}
+
+/* The value is the top of the stack; the expression may consume one value
+ * below it (net change 0 or +1), as in the Python compiler. */
+static void ct_intrinsic_unquote_end(CompileTimeVM *vm) {
+    int depth = vm->unquote_depths.len ? vm->unquote_depths.data[--vm->unquote_depths.len] : (int)vm->stack.len - 1;
+    long left = (long)vm->stack.len - depth;
+    if ((left != 0 && left != 1) || vm->stack.len == 0) {
+        ct_trace_error(vm, "`$( )` must leave one value: it may consume at most one value and must push one");
+    }
+    VEC_PUSH(&vm->unquote_values, ct_pop(vm));
+}
 
 static Word *register_ct_intrinsic(Dictionary *dict, const char *name, CompileTimeIntrinsic fn) {
     Word *word = dictionary_lookup(dict, name);
@@ -2737,15 +2966,21 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "not", ct_intrinsic_not);
     register_ct_intrinsic(dict, "nil", ct_intrinsic_nil);
     register_ct_intrinsic(dict, "nil?", ct_intrinsic_nilp);
-    register_ct_intrinsic(dict, "string=", ct_intrinsic_string_eq);
+    register_ct_intrinsic(dict, "string-equal?", ct_intrinsic_string_equal);
     register_ct_intrinsic(dict, "string-length", ct_intrinsic_string_length);
     register_ct_intrinsic(dict, "string-append", ct_intrinsic_string_append);
-    register_ct_intrinsic(dict, "string>number", ct_intrinsic_string_to_number);
+    register_ct_intrinsic(dict, "try-string>int", ct_intrinsic_try_string_to_int);
     register_ct_intrinsic(dict, "string-contains?", ct_intrinsic_string_contains);
     register_ct_intrinsic(dict, "string-starts-with?", ct_intrinsic_string_starts_with);
     register_ct_intrinsic(dict, "string-ends-with?", ct_intrinsic_string_ends_with);
     register_ct_intrinsic(dict, "int>string", ct_intrinsic_int_to_string);
     register_ct_intrinsic(dict, "identifier?", ct_intrinsic_identifierp);
+    register_ct_intrinsic(dict, "emit", ct_intrinsic_emit);
+    register_ct_intrinsic(dict, "list>syntax", ct_intrinsic_list_to_syntax);
+    register_ct_intrinsic(dict, "syntax>list", ct_intrinsic_syntax_to_list);
+    register_ct_intrinsic(dict, "syntax-length", ct_intrinsic_syntax_length);
+    register_ct_intrinsic(dict, L2_UNQUOTE_BEGIN, ct_intrinsic_unquote_begin);
+    register_ct_intrinsic(dict, L2_UNQUOTE_END, ct_intrinsic_unquote_end);
     register_ct_intrinsic(dict, "list-new", ct_intrinsic_list_new);
     register_ct_intrinsic(dict, "list-append", ct_intrinsic_list_append);
     register_ct_intrinsic(dict, "list-pop", ct_intrinsic_list_pop);
@@ -2771,37 +3006,28 @@ static void bootstrap_dictionary(Dictionary *dict, Parser *parser, CompileTimeVM
     register_ct_intrinsic(dict, "map-keys", ct_intrinsic_map_keys);
     register_ct_intrinsic(dict, "map-values", ct_intrinsic_map_values);
     register_ct_intrinsic(dict, "token-lexeme", ct_intrinsic_token_lexeme);
-    register_ct_intrinsic(dict, "token-from-lexeme", ct_intrinsic_token_from_lexeme);
+    register_ct_intrinsic(dict, "token-with-lexeme", ct_intrinsic_token_with_lexeme);
     register_ct_intrinsic(dict, "token-line", ct_intrinsic_token_line);
     register_ct_intrinsic(dict, "token-column", ct_intrinsic_token_column);
-    register_ct_intrinsic(dict, "next-token", ct_intrinsic_next_token);
-    register_ct_intrinsic(dict, "peek-token", ct_intrinsic_peek_token);
-    register_ct_intrinsic(dict, "inject-tokens", ct_intrinsic_inject_tokens);
-    register_ct_intrinsic(dict, "inject-lexemes", ct_intrinsic_inject_lexemes);
-    register_ct_intrinsic(dict, "ct-current-token", ct_intrinsic_ct_current_token);
-    register_ct_intrinsic(dict, "data-append", ct_intrinsic_data_append);
-    register_ct_intrinsic(dict, "data-set", ct_intrinsic_data_set);
-    register_ct_intrinsic(dict, "set-token-hook", ct_intrinsic_set_token_hook);
-    register_ct_intrinsic(dict, "clear-token-hook", ct_intrinsic_clear_token_hook);
-    register_ct_intrinsic(dict, "parse-error", ct_intrinsic_parse_error);
-    register_ct_intrinsic(dict, "add-token", ct_intrinsic_add_token);
-    register_ct_intrinsic(dict, "add-token-chars", ct_intrinsic_add_token_chars);
-    register_ct_intrinsic(dict, "prelude-clear", ct_intrinsic_prelude_clear);
-    register_ct_intrinsic(dict, "prelude-append", ct_intrinsic_prelude_append);
-    register_ct_intrinsic(dict, "prelude-set", ct_intrinsic_prelude_set);
-    register_ct_intrinsic(dict, "bss-clear", ct_intrinsic_bss_clear);
-    register_ct_intrinsic(dict, "bss-append", ct_intrinsic_bss_append);
-    register_ct_intrinsic(dict, "bss-set", ct_intrinsic_bss_set);
+    register_ct_intrinsic(dict, "ct-parser-consume", ct_intrinsic_parser_consume);
+    register_ct_intrinsic(dict, "ct-parser-peek", ct_intrinsic_parser_peek);
+    register_ct_intrinsic(dict, "ct-parser-eof?", ct_intrinsic_parser_eof);
+    register_ct_intrinsic(dict, "ct-parser-inject", ct_intrinsic_parser_inject);
+    register_ct_intrinsic(dict, "ct-parser-current", ct_intrinsic_parser_current);
+    register_ct_intrinsic(dict, "ct-output-append-data", ct_intrinsic_output_append_data);
+    register_ct_intrinsic(dict, "ct-output-clear-data", ct_intrinsic_output_clear_data);
+    register_ct_intrinsic(dict, "ct-output-set-data", ct_intrinsic_output_set_data);
+    register_ct_intrinsic(dict, "ct-parser-set-token-hook", ct_intrinsic_set_token_hook);
+    register_ct_intrinsic(dict, "ct-parser-clear-token-hook", ct_intrinsic_clear_token_hook);
+    register_ct_intrinsic(dict, "ct-parser-error", ct_intrinsic_parse_error);
+    register_ct_intrinsic(dict, "ct-output-clear-text-preamble", ct_intrinsic_output_clear_text_preamble);
+    register_ct_intrinsic(dict, "ct-output-append-text-preamble", ct_intrinsic_output_append_text_preamble);
+    register_ct_intrinsic(dict, "ct-output-set-text-preamble", ct_intrinsic_output_set_text_preamble);
+    register_ct_intrinsic(dict, "ct-output-clear-bss", ct_intrinsic_output_clear_bss);
+    register_ct_intrinsic(dict, "ct-output-append-bss", ct_intrinsic_output_append_bss);
+    register_ct_intrinsic(dict, "ct-output-set-bss", ct_intrinsic_output_set_bss);
     register_ct_intrinsic(dict, "eval_program", ct_intrinsic_eval_program);
-    register_ct_intrinsic(dict, "use-l2-ct", ct_intrinsic_use_l2_ct);
-    register_ct_intrinsic(dict, "shunt", ct_intrinsic_shunt);
-    register_ct_intrinsic(dict, "emit-definition", ct_intrinsic_emit_definition);
-    register_ct_intrinsic(dict, "lexer-new", ct_intrinsic_lexer_new);
-    register_ct_intrinsic(dict, "lexer-pop", ct_intrinsic_lexer_pop);
-    register_ct_intrinsic(dict, "lexer-peek", ct_intrinsic_lexer_peek);
-    register_ct_intrinsic(dict, "lexer-expect", ct_intrinsic_lexer_expect);
-    register_ct_intrinsic(dict, "lexer-collect-brace", ct_intrinsic_lexer_collect_brace);
-    register_ct_intrinsic(dict, "lexer-push-back", ct_intrinsic_lexer_push_back);
+    register_ct_intrinsic(dict, "ct-definition-prefer-l2-by-name", ct_intrinsic_definition_prefer_l2_by_name);
 
     Word *ct_word = dictionary_lookup(dict, "CT");
     if (!ct_word) {
@@ -3255,25 +3481,39 @@ static Emission emit_module(Parser *parser, Dictionary *dict, bool debug) {
     ctx.unique_id = 0;
     ctx.debug = debug;
 
-    if (parser->custom_prelude) {
-        for (size_t i = 0; i < parser->custom_prelude->len; i++) {
-            VEC_PUSH(&emission.text, str_dup(parser->custom_prelude->data[i]));
-        }
-    } else if (parser->uses_libc) {
+    if (parser->uses_libc) {
         emit_libc_prelude(&emission);
     } else {
         emit_default_prelude(&emission);
     }
+    /* The CT text preamble follows the runtime prelude; it never replaces it. */
+    if (parser->custom_prelude) {
+        for (size_t i = 0; i < parser->custom_prelude->len; i++) {
+            if (parser->custom_prelude->data[i][0]) {  /* empty fragments emit nothing */
+                VEC_PUSH(&emission.text, str_dup(parser->custom_prelude->data[i]));
+            }
+        }
+    }
 
     VEC_PUSH(&emission.data, str_dup("sys_argc: dq 0"));
     VEC_PUSH(&emission.data, str_dup("sys_argv: dq 0"));
+    if (parser->custom_data) {
+        for (size_t i = 0; i < parser->custom_data->len; i++) {
+            if (parser->custom_data->data[i][0]) {  /* empty fragments emit nothing */
+                VEC_PUSH(&emission.data, str_dup(parser->custom_data->data[i]));
+            }
+        }
+    }
 
+    if (!parser->bss_replaced) {
+        emit_default_bss(&emission);
+    }
     if (parser->custom_bss) {
         for (size_t i = 0; i < parser->custom_bss->len; i++) {
-            VEC_PUSH(&emission.bss, str_dup(parser->custom_bss->data[i]));
+            if (parser->custom_bss->data[i][0]) {  /* empty fragments emit nothing */
+                VEC_PUSH(&emission.bss, str_dup(parser->custom_bss->data[i]));
+            }
         }
-    } else {
-        emit_default_bss(&emission);
     }
 
     for (size_t i = 0; i < parser->module.forms.len; i++) {
@@ -3314,6 +3554,41 @@ static Emission emit_module(Parser *parser, Dictionary *dict, bool debug) {
     return emission;
 }
 
+static bool ends_with_line_terminator(const char *text) {
+    size_t n = strlen(text);
+    return n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r');
+}
+
+/* Join emitted segments with the fragment boundary rule (as the Python
+ * compiler): one LF between two segments only when neither side has a line
+ * terminator there, and a final LF when the last segment lacks one.  Compiler
+ * lines never carry terminators, so for them this is a plain line join. */
+static char *join_segments(char *const *items, size_t count) {
+    size_t total = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (items[i]) total += strlen(items[i]) + 1;
+    }
+    char *out = (char *)xmalloc(total);
+    char *cursor = out;
+    const char *prev = NULL;
+    for (size_t i = 0; i < count; i++) {
+        const char *item = items[i];
+        if (!item) continue;
+        if (prev && !ends_with_line_terminator(prev) && item[0] != '\n' && item[0] != '\r') {
+            *cursor++ = '\n';
+        }
+        size_t n = strlen(item);
+        memcpy(cursor, item, n);
+        cursor += n;
+        prev = item;
+    }
+    if (prev && !ends_with_line_terminator(prev)) {
+        *cursor++ = '\n';
+    }
+    *cursor = '\0';
+    return out;
+}
+
 static char *emission_snapshot(Emission *emission) {
     StrVec parts;
     VEC_INIT(&parts);
@@ -3344,7 +3619,7 @@ static char *emission_snapshot(Emission *emission) {
         }
     }
     VEC_PUSH(&parts, str_dup("section .note.GNU-stack noalloc noexec nowrite"));
-    char *buf = str_join_parts(parts.data, parts.len, NULL, "\n");
+    char *buf = join_segments(parts.data, parts.len);
     return buf;
 }
 
@@ -4068,8 +4343,35 @@ next_definition_asm:
     return best_copy;
 }
 
-const char *l2_get_source_from_embedded(const char *func_name, long *out_len) {
-    return find_embedded_definition_source(func_name, out_len);
+#if defined(__GNUC__)
+extern const unsigned long long l2_source_catalog[] __attribute__((weak));
+#else
+extern const unsigned long long l2_source_catalog[];
+#endif
+
+/* Embedded selected-definition sources (--source-embed): exact-name lookup
+ * in the compiler's catalog of final selected definitions (a count, then
+ * name ptr, name bytes, source ptr, source bytes per record).  Returns NULL
+ * and *out_len = 0 when the name has no selected definition with retained
+ * source or no catalog was embedded; it never scans the program text. */
+const char *l2_source_catalog_lookup(const char *name, long name_len, long *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (&l2_source_catalog == NULL || l2_source_catalog == NULL || name == NULL || name_len < 0) {
+        return NULL;
+    }
+    unsigned long long count = l2_source_catalog[0];
+    const unsigned long long *record = l2_source_catalog + 1;
+    for (unsigned long long i = 0; i < count; i++, record += 4) {
+        if ((long)record[1] == name_len && memcmp((const char *)(uintptr_t)record[0], name, (size_t)name_len) == 0) {
+            if (out_len) {
+                *out_len = (long)record[3];
+            }
+            return (const char *)(uintptr_t)record[2];
+        }
+    }
+    return NULL;
 }
 
 static bool l2_eval_token_candidate(const char *token) {
@@ -4241,6 +4543,24 @@ static char *resolve_import(const char *base_dir, const char *import_path, StrVe
     return NULL;
 }
 
+/* The C compiler supports only the default L2 frontend: a `frontend` header
+ * on the first nonblank line is a clear error rather than source syntax. */
+static void reject_frontend_header(const char *content, const char *label) {
+    const char *p = content;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (strncmp(p, "frontend", 8) != 0) {
+        return;
+    }
+    char next = p[8];
+    if (next == '\0' || next == '"' || next == '#' || isspace((unsigned char)next)) {
+        fprintf(stderr, "[error] [frontend-header-invalid] %s selects a custom frontend; "
+                        "frontend headers are not supported by the C compiler\n", label);
+        exit(1);
+    }
+}
+
 static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visited, FileSpanVec *spans, int *line_counter) {
     if (strmap_has(visited, path)) {
         return str_dup("");
@@ -4251,6 +4571,7 @@ static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visi
         fprintf(stderr, "[error] failed to read %s\n", path);
         exit(1);
     }
+    reject_frontend_header(content, path);
     char *base_dir = path_dirname(path);
     StrVec parts;
     VEC_INIT(&parts);
@@ -4362,6 +4683,7 @@ static char *expand_imports(const char *path, StrVec *include_dirs, StrMap *visi
 }
 
 static char *expand_imports_from_source(const char *content, const char *base_dir, StrVec *include_dirs, StrMap *visited, FileSpanVec *spans, int *line_counter) {
+    reject_frontend_header(content, "source");
     const char *key = "<eval_source>";
     if (strmap_has(visited, key)) {
         return str_dup("");
@@ -4590,6 +4912,9 @@ static void parser_finish_macro(Parser *parser) {
     word->macro_expansion[parser->macro_recording.tokens.len] = NULL;
     dictionary_register(parser->dictionary, word);
     parser->macro_recording.active = false;
+    memset(&parser->macro_body, 0, sizeof(parser->macro_body));
+    parser->pending_quotes = NULL;
+    parser->pending_quote_len = 0;
 }
 
 static void parser_emit_literal(Parser *parser, LiteralKind kind, int64_t i64, double f64, const char *str) {
@@ -4608,19 +4933,36 @@ static void parser_emit_literal(Parser *parser, LiteralKind kind, int64_t i64, d
 
 static void parser_handle_token(Parser *parser, Token token);
 
-static void parse_tokens(Parser *parser, const char *source) {
+/* Parse `source`.  With `continue_state` false this starts a fresh parse
+ * (resetting definition, control, label and hook state).  With it true the
+ * parser keeps that state, so parsing A and then continuing with B behaves
+ * like one parse of A followed by B; the eval warm cache relies on this to
+ * parse stdlib once and then only the user code. */
+static void parser_finish_macro_body(Parser *parser);
+static void parser_parse_quotation(Parser *parser);
+static void parser_emit_syntax(Parser *parser, QuoteTemplate *tpl);
+
+static void parse_tokens_impl(Parser *parser, const char *source, bool continue_state) {
     parser->source = str_dup(source);
     tokenizer_init(&parser->tokenizer, parser->reader, source);
     parser->tokenizer_exhausted = false;
+    /* Drop tokens buffered from a previous source.  Without this, resetting
+     * pos to 0 made a second parse on the same parser replay every token of
+     * the earlier source before reaching the new one. */
+    parser->tokens.len = 0;
     parser->pos = 0;
-    parser->current_def = NULL;
-    parser->control_len = 0;
-    parser->label_counter = 0;
-    parser->token_hook = NULL;
-    parser->has_last_token = false;
-    parser->custom_prelude = NULL;
-    parser->custom_bss = NULL;
-    parser->pending_inline_def = false;
+    if (!continue_state) {
+        parser->current_def = NULL;
+        parser->control_len = 0;
+        parser->label_counter = 0;
+        parser->token_hook = NULL;
+        parser->has_last_token = false;
+        parser->custom_prelude = NULL;
+        parser->custom_data = NULL;
+        parser->custom_bss = NULL;
+        parser->bss_replaced = false;
+        parser->pending_inline_def = false;
+    }
 
     while (!parser_eof(parser)) {
         Token token = parser_next_token(parser);
@@ -4634,6 +4976,33 @@ static void parse_tokens(Parser *parser, const char *source) {
                 VEC_PUSH(&parser->macro_recording.tokens, str_dup(token.lexeme));
             }
             continue;
+        }
+        if (parser->macro_body.active && strcmp(token.lexeme, ";") == 0
+                && parser->control_len == parser->macro_body.control_depth) {
+            parser_finish_macro_body(parser);
+            continue;
+        }
+        if (parser->current_def && strcmp(token.lexeme, "`") == 0) {
+            parser_parse_quotation(parser);
+            continue;
+        }
+        if (strncmp(token.lexeme, L2_QUOTE_MARKER, strlen(L2_QUOTE_MARKER)) == 0) {
+            size_t index = (size_t)strtoul(token.lexeme + strlen(L2_QUOTE_MARKER), NULL, 10);
+            parser_emit_syntax(parser, parser->pending_quotes[index]);
+            continue;
+        }
+        if (parser->macro_body.active && token.lexeme[0] == '$' && token.lexeme[1]) {
+            bool bound = false;
+            for (int i = 0; i < parser->macro_body.param_count && !bound; i++) {
+                if (strcmp(token.lexeme + 1, parser->macro_body.params[i]) == 0) {
+                    Op op = {0};
+                    op.kind = OP_BINDING;
+                    op.data.word = str_dup(token.lexeme + 1);
+                    parser_emit_op(parser, op);
+                    bound = true;
+                }
+            }
+            if (bound) continue;
         }
         if (strcmp(token.lexeme, "[") == 0) {
             Op op = {0};
@@ -4801,7 +5170,7 @@ static void parse_tokens(Parser *parser, const char *source) {
             size_t body_start = (size_t)brace.end;
             size_t body_end = body_start;
             /* Collect the body tokens; used as fallback when the tokens
-             * were injected (via inject-lexemes) and don't carry valid
+             * were injected (via ct-parser-inject) and don't carry valid
              * source positions we can slice from parser->source. */
             StrVec asm_body_toks;
             VEC_INIT(&asm_body_toks);
@@ -4822,7 +5191,7 @@ static void parse_tokens(Parser *parser, const char *source) {
                 memcpy(body, parser->source + body_start, body_len);
                 body[body_len] = '\0';
             } else if (asm_body_toks.len > 0) {
-                /* Reconstruct body from tokens (injected via inject-lexemes). */
+                /* Reconstruct body from tokens (injected via ct-parser-inject). */
                 body = str_join_parts(asm_body_toks.data, asm_body_toks.len, " ", NULL);
             } else {
                 fprintf(stderr, "[error] missing '}' to terminate asm body\n");
@@ -5092,43 +5461,253 @@ static void parse_tokens(Parser *parser, const char *source) {
     }
 }
 
+static void parse_tokens(Parser *parser, const char *source) {
+    parse_tokens_impl(parser, source, false);
+}
 
-static void parser_expand_macro(Parser *parser, Word *word) {
-    int param_count = word->macro_param_count;
-    char **params = NULL;
-    if (param_count > 0) {
-        params = (char **)xmalloc((size_t)param_count * sizeof(char *));
-        for (int i = 0; i < param_count; i++) {
-            Token tok = parser_next_token(parser);
-            if (!tok.lexeme) {
-                fprintf(stderr, "[error] not enough macro parameters for '%s'\n", word->name);
-                exit(1);
+static void parse_tokens_continue(Parser *parser, const char *source) {
+    parse_tokens_impl(parser, source, true);
+}
+
+
+static bool quote_is_separator(const char *lexeme) {
+    static const char *seps[] = {"`", "(", ")", "{", "}", "[", "]", ";", ",", NULL};
+    for (int i = 0; seps[i]; i++) {
+        if (strcmp(lexeme, seps[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool quote_opens_unquote(TokenVec *tokens, size_t index) {
+    const char *lex = tokens->data[index].lexeme;
+    size_t len = strlen(lex);
+    if (!len || lex[len - 1] != '$' || lex[0] == '\\' || index + 1 >= tokens->len) return false;
+    Token *next = &tokens->data[index + 1];
+    return strcmp(next->lexeme, "(") == 0 && next->start == tokens->data[index].end && next->end > 0;
+}
+
+static bool quote_splice_name(const char *lexeme) {
+    if (lexeme[0] != '$' || !lexeme[1]) return false;
+    return l2_is_identifier(lexeme + 1);
+}
+
+static void parser_emit_syntax(Parser *parser, QuoteTemplate *tpl) {
+    Op op = {0};
+    op.kind = OP_SYNTAX;
+    op.data.ptr = tpl;
+    parser_emit_op(parser, op);
+}
+
+/* A backtick quotation in a definition or macro body (the opening backtick
+ * is consumed).  `$( )` expressions are parsed as ordinary code before the
+ * quotation op, each between the unquote begin/end words, as in the Python
+ * compiler. */
+static void parser_parse_quotation(Parser *parser) {
+    TokenVec inner;
+    VEC_INIT(&inner);
+    int depth = 0;
+    for (;;) {
+        Token tok = parser_next_token(parser);
+        if (!tok.lexeme) {
+            fprintf(stderr, "[error] unterminated quotation\n");
+            exit(1);
+        }
+        if (depth == 0 && strcmp(tok.lexeme, "`") == 0) break;
+        VEC_PUSH(&inner, tok);
+        if (depth > 0) {
+            if (strcmp(tok.lexeme, "(") == 0) depth++;
+            else if (strcmp(tok.lexeme, ")") == 0) depth--;
+            continue;
+        }
+        size_t len = strlen(tok.lexeme);
+        if (len && tok.lexeme[len - 1] == '$' && tok.lexeme[0] != '\\') {
+            Token next = parser_peek_token(parser);
+            if (next.lexeme && strcmp(next.lexeme, "(") == 0 && next.start == tok.end && next.end > 0) {
+                VEC_PUSH(&inner, parser_next_token(parser));
+                depth = 1;
             }
-            params[i] = str_dup(tok.lexeme);
         }
     }
+    QuoteTemplate *tpl = (QuoteTemplate *)xmalloc(sizeof(QuoteTemplate));
+    tpl->parts = (QuotePart *)xmalloc((inner.len + 1) * sizeof(QuotePart));
+    tpl->len = 0;
+    tpl->unquotes = 0;
     TokenVec injected;
     VEC_INIT(&injected);
-    for (size_t i = 0; word->macro_expansion && word->macro_expansion[i]; i++) {
-        const char *item = word->macro_expansion[i];
-        if (item && item[0] == '$' && isdigit((unsigned char)item[1])) {
-            int idx = atoi(item + 1) - 1;
-            if (idx >= 0 && idx < param_count) {
-                Token tok = {0};
-                tok.lexeme = str_dup(params[idx]);
-                VEC_PUSH(&injected, tok);
-                continue;
+    for (size_t i = 0; i < inner.len;) {
+        Token *tok = &inner.data[i];
+        QuotePart *part = &tpl->parts[tpl->len++];
+        memset(part, 0, sizeof(*part));
+        part->line = tok->line;
+        part->column = tok->column;
+        if (quote_opens_unquote(&inner, i)) {
+            size_t close = i + 1;
+            int d = 0;
+            for (; close < inner.len; close++) {
+                if (strcmp(inner.data[close].lexeme, "(") == 0) d++;
+                else if (strcmp(inner.data[close].lexeme, ")") == 0 && --d == 0) break;
+            }
+            size_t len = strlen(tok->lexeme);
+            part->kind = 2;
+            part->prefix = (char *)xmalloc(len);
+            memcpy(part->prefix, tok->lexeme, len - 1);
+            part->prefix[len - 1] = '\0';
+            size_t after = close + 1;
+            if (after < inner.len && inner.data[after].start == inner.data[close].end && inner.data[after].end > 0
+                    && !quote_is_separator(inner.data[after].lexeme) && !quote_opens_unquote(&inner, after)) {
+                part->suffix = str_dup(inner.data[after].lexeme);
+                after++;
+            }
+            Token begin = token_copy_with(tok, L2_UNQUOTE_BEGIN);
+            VEC_PUSH(&injected, begin);
+            for (size_t k = i + 2; k < close; k++) VEC_PUSH(&injected, inner.data[k]);
+            VEC_PUSH(&injected, token_copy_with(tok, L2_UNQUOTE_END));
+            tpl->unquotes++;
+            i = after;
+            continue;
+        }
+        const char *lex = tok->lexeme;
+        if (strcmp(lex, "\\`") == 0) {
+            part->lexeme = str_dup("`");
+        } else if (strcmp(lex, "\\\\") == 0) {
+            part->lexeme = str_dup("\\");
+        } else if (lex[0] == '\\' && lex[1] == '$') {
+            part->lexeme = str_dup(lex + 1);
+        } else if (quote_splice_name(lex)) {
+            part->kind = 1;
+            part->lexeme = str_dup(lex + 1);
+        } else {
+            part->lexeme = str_dup(lex);
+        }
+        i++;
+    }
+    if (!tpl->unquotes) {
+        parser_emit_syntax(parser, tpl);
+        return;
+    }
+    parser->pending_quotes = (QuoteTemplate **)xrealloc(parser->pending_quotes,
+                                                        (parser->pending_quote_len + 1) * sizeof(QuoteTemplate *));
+    size_t index = parser->pending_quote_len++;
+    parser->pending_quotes[index] = tpl;
+    Token marker = {0};
+    marker.lexeme = str_printf("%s%zu", L2_QUOTE_MARKER, index);
+    VEC_PUSH(&injected, marker);
+    parser_inject_tokens(parser, &injected);
+}
+
+static void parser_finish_macro_body(Parser *parser) {
+    Word *word = dictionary_lookup(parser->dictionary, parser->macro_body.name);
+    if (!word) {
+        word = (Word *)xmalloc(sizeof(Word));
+        memset(word, 0, sizeof(Word));
+        word->name = str_dup(parser->macro_body.name);
+        dictionary_register(parser->dictionary, word);
+    }
+    word->macro_body = parser->macro_body.def;
+    word->macro_params = parser->macro_body.params;
+    word->macro_param_count = parser->macro_body.param_count;
+    word->macro_expansion = NULL;
+    word->definition = NULL;
+    word->asm_def = NULL;
+    word->immediate = false;
+    parser->current_def = NULL;
+    parser->macro_body.active = false;
+}
+
+/* One macro argument: a single token, or a whole backtick quotation. */
+static TokenVec parser_macro_argument(Parser *parser, const char *macro_name, bool *is_quotation) {
+    TokenVec arg;
+    VEC_INIT(&arg);
+    *is_quotation = false;
+    Token tok = parser_next_token(parser);
+    if (!tok.lexeme) {
+        fprintf(stderr, "[error] not enough macro parameters for '%s'\n", macro_name);
+        exit(1);
+    }
+    if (strcmp(tok.lexeme, "`") != 0) {
+        VEC_PUSH(&arg, tok);
+        return arg;
+    }
+    *is_quotation = true;
+    for (;;) {
+        Token inner = parser_next_token(parser);
+        if (!inner.lexeme) {
+            fprintf(stderr, "[error] unterminated quotation argument for macro '%s'\n", macro_name);
+            exit(1);
+        }
+        if (strcmp(inner.lexeme, "`") == 0) break;
+        VEC_PUSH(&arg, inner);
+    }
+    return arg;
+}
+
+/* Expand `word` at the parser's input, appending its output to `out`. */
+static void parser_macro_expand_into(Parser *parser, Word *word, TokenVec *out) {
+    int param_count = word->macro_param_count;
+    TokenVec *args = param_count > 0 ? (TokenVec *)xmalloc((size_t)param_count * sizeof(TokenVec)) : NULL;
+    bool *quoted = param_count > 0 ? (bool *)xmalloc((size_t)param_count * sizeof(bool)) : NULL;
+    for (int i = 0; i < param_count; i++) {
+        args[i] = parser_macro_argument(parser, word->name, &quoted[i]);
+    }
+    if (word->macro_body) {
+        CompileTimeVM *vm = parser->ct_vm;
+        CtValue *values = param_count > 0 ? (CtValue *)xmalloc((size_t)param_count * sizeof(CtValue)) : NULL;
+        for (int i = 0; i < param_count; i++) {
+            if (quoted[i]) {
+                CtList *list = ct_list_new();
+                for (size_t k = 0; k < args[i].len; k++) ct_list_push_token(list, args[i].data[k]);
+                values[i] = ct_make_syntax(list);
+            } else {
+                values[i] = ct_make_token(args[i].data[0]);
             }
         }
-        Token tok = {0};
-        tok.lexeme = str_dup(item);
-        VEC_PUSH(&injected, tok);
+        /* The body runs on its own data stack with its parameters bound. */
+        CtValueVec saved_stack = vm->stack;
+        char **saved_names = vm->binding_names;
+        CtValue *saved_values = vm->binding_values;
+        size_t saved_len = vm->binding_len;
+        TokenVec *saved_out = vm->emit_out;
+        VEC_INIT(&vm->stack);
+        vm->binding_names = word->macro_params;
+        vm->binding_values = values;
+        vm->binding_len = (size_t)param_count;
+        vm->emit_out = out;
+        VEC_PUSH(&vm->call_stack, word->name);
+        ct_execute_nodes(vm, &word->macro_body->body);
+        vm->call_stack.len--;
+        VEC_FREE(&vm->stack);
+        vm->stack = saved_stack;
+        vm->binding_names = saved_names;
+        vm->binding_values = saved_values;
+        vm->binding_len = saved_len;
+        vm->emit_out = saved_out;
+        free(values);
+    } else {
+        for (size_t i = 0; word->macro_expansion && word->macro_expansion[i]; i++) {
+            const char *item = word->macro_expansion[i];
+            if (item && item[0] == '$' && isdigit((unsigned char)item[1])) {
+                int idx = atoi(item + 1) - 1;
+                if (idx >= 0 && idx < param_count) {
+                    for (size_t k = 0; k < args[idx].len; k++) {
+                        VEC_PUSH(out, token_copy_with(&args[idx].data[k], args[idx].data[k].lexeme));
+                    }
+                    continue;
+                }
+            }
+            Token tok = {0};
+            tok.lexeme = str_dup(item);
+            VEC_PUSH(out, tok);
+        }
     }
+    free(args);
+    free(quoted);
+}
+
+static void parser_expand_macro(Parser *parser, Word *word) {
+    TokenVec injected;
+    VEC_INIT(&injected);
+    parser_macro_expand_into(parser, word, &injected);
     parser_inject_tokens(parser, &injected);
-    for (int i = 0; i < param_count; i++) {
-        free(params[i]);
-    }
-    free(params);
 }
 
 static void parser_handle_struct(Parser *parser) {
@@ -5318,19 +5897,66 @@ static void parser_handle_token(Parser *parser, Token token) {
         }
     }
 
+    if (strcmp(token.lexeme, "const") == 0) {
+        /* `const NAME value` expands NAME to the single token `value`
+         * (the Python compiler creates the macro lazily; here it is eager). */
+        Token name = parser_next_token(parser);
+        Token value = parser_next_token(parser);
+        if (!name.lexeme || !value.lexeme) {
+            fprintf(stderr, "[error] 'const' needs a name and a value: const NAME value\n");
+            exit(1);
+        }
+        parser_start_macro(parser, name.lexeme, 0);
+        VEC_PUSH(&parser->macro_recording.tokens, str_dup(value.lexeme));
+        parser_finish_macro(parser);
+        return;
+    }
+
     if (strcmp(token.lexeme, "macro") == 0) {
+        /* `macro name [(params)] body ;`: the body is compile-time code with
+         * the parameters bound as $name; it ends at `;` at its own top level. */
         Token name = parser_next_token(parser);
         if (!name.lexeme) {
             fprintf(stderr, "[error] macro missing name\n");
             exit(1);
         }
-        int param_count = 0;
-        Token maybe_num = parser_peek_token(parser);
-        if (maybe_num.lexeme && isdigit((unsigned char)maybe_num.lexeme[0])) {
-            parser_next_token(parser);
-            param_count = atoi(maybe_num.lexeme);
+        if (parser->current_def || parser->macro_body.active) {
+            fprintf(stderr, "[error] macro definitions must be top-level forms\n");
+            exit(1);
         }
-        parser_start_macro(parser, name.lexeme, param_count);
+        char **params = NULL;
+        int param_count = 0;
+        int param_cap = 0;
+        Token peek = parser_peek_token(parser);
+        if (peek.lexeme && strcmp(peek.lexeme, "(") == 0) {
+            parser_next_token(parser);
+            for (;;) {
+                Token param = parser_next_token(parser);
+                if (!param.lexeme) {
+                    fprintf(stderr, "[error] unterminated parameter list for macro '%s'\n", name.lexeme);
+                    exit(1);
+                }
+                if (strcmp(param.lexeme, ")") == 0) break;
+                if (param_count + 1 > param_cap) {
+                    param_cap = param_cap ? param_cap * 2 : 4;
+                    params = (char **)xrealloc(params, (size_t)param_cap * sizeof(char *));
+                }
+                params[param_count++] = str_dup(param.lexeme);
+            }
+        }
+        Definition *def = (Definition *)xmalloc(sizeof(Definition));
+        memset(def, 0, sizeof(Definition));
+        def->name = str_dup(name.lexeme);
+        VEC_INIT(&def->body);
+        def->compile_only = true;
+        def->terminator = str_dup(";");
+        parser->current_def = def;
+        parser->macro_body.active = true;
+        parser->macro_body.name = str_dup(name.lexeme);
+        parser->macro_body.params = params;
+        parser->macro_body.param_count = param_count;
+        parser->macro_body.control_depth = parser->control_len;
+        parser->macro_body.def = def;
         return;
     }
 
@@ -5518,12 +6144,28 @@ static void parser_handle_token(Parser *parser, Token token) {
     }
 
     Word *word = dictionary_lookup(parser->dictionary, token.lexeme);
-    if (word && word->macro_expansion) {
+    if (word && (word->macro_expansion || word->macro_body)) {
+        if (parser->macro_body.active) {
+            /* Inside a macro body a macro name is a direct call. */
+            Op op = {0};
+            op.kind = OP_WORD;
+            op.data.word = str_dup(word->name);
+            parser_emit_op(parser, op);
+            return;
+        }
         parser_expand_macro(parser, word);
         return;
     }
     if (word && word->immediate) {
+        /* What an immediate word emits is read right after it, in order. */
+        CompileTimeVM *vm = parser->ct_vm;
+        TokenVec emitted;
+        VEC_INIT(&emitted);
+        TokenVec *saved_out = vm->emit_out;
+        vm->emit_out = &emitted;
         ct_word_call(parser->ct_vm, word);
+        vm->emit_out = saved_out;
+        parser_inject_tokens(parser, &emitted);
         if (parser->current_def && !word->compile_only) {
             Op op = {0};
             op.kind = OP_WORD;
@@ -5764,14 +6406,375 @@ cleanup:
     return result;
 }
 
+/* ---------------------------------------------------------------------------
+ * eval_program warm cache: parse stdlib once per process.
+ *
+ * Every eval_program call forks a child that, on the cold path, expands and
+ * parses the whole program including stdlib.  When a program starts with
+ * imports that all resolve inside the stdlib directory, the parent keeps a
+ * context with exactly that stdlib prefix already parsed; each forked child
+ * inherits it and only parses the user body.  The child's text is padded with
+ * newlines so diagnostics keep the line numbers of the cold-path text.
+ *
+ * The cache is bypassed (cold path, unchanged behavior) when the host program
+ * has embedded source, when any top-level import resolves outside stdlib or
+ * appears after user code, or when the warm parse fails in a probe child.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    char *key;           /* newline-joined resolved top-level import paths */
+    L2EvalContext *ctx;  /* parsed stdlib prefix, or NULL if the warm parse failed */
+    int prefix_lines;    /* lines of the expanded prefix in the cold-path text */
+} L2EvalWarmEntry;
+
+#define L2_EVAL_WARM_MAX 4
+static L2EvalWarmEntry g_eval_warm[L2_EVAL_WARM_MAX];
+static size_t g_eval_warm_len = 0;
+
+/* Same import-directive test as the import expanders.  On success returns
+ * true and sets the path range and the remainder after the path (leading
+ * whitespace skipped). */
+static bool l2_eval_line_import(const char *line, const char **path_start, const char **path_end, const char **remainder) {
+    const char *trim = line;
+    while (*trim && isspace((unsigned char)*trim)) {
+        trim++;
+    }
+    if (!(str_starts_with(trim, "import") && (trim[6] == ' ' || trim[6] == '\t'))) {
+        return false;
+    }
+    trim += 6;
+    while (*trim && isspace((unsigned char)*trim)) {
+        trim++;
+    }
+    const char *end = trim;
+    while (*end && !isspace((unsigned char)*end) && *end != '#') {
+        end++;
+    }
+    if (end == trim) {
+        return false;
+    }
+    const char *rest = end;
+    while (*rest && isspace((unsigned char)*rest)) {
+        rest++;
+    }
+    *path_start = trim;
+    *path_end = end;
+    *remainder = rest;
+    return true;
+}
+
+static int l2_eval_count_newlines(const char *text) {
+    int count = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n') {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Split `source` into a stdlib-only import prefix and the user body.
+ * Returns false when the program does not qualify for the warm cache. */
+static bool l2_eval_split_stdlib_prefix(const char *source, char **out_prefix, char **out_body, char **out_key) {
+    char *root_dir = l2_default_root_dir();
+    char *stdlib_dir = path_join(root_dir, "stdlib");
+    char stdlib_real[PATH_MAX];
+    if (!realpath(stdlib_dir, stdlib_real)) {
+        free(stdlib_dir);
+        free(root_dir);
+        return false;
+    }
+    char *stdlib_prefix = str_printf("%s/", stdlib_real);
+    StrVec include_dirs;
+    VEC_INIT(&include_dirs);
+    VEC_PUSH(&include_dirs, str_dup(root_dir));
+    VEC_PUSH(&include_dirs, str_dup(stdlib_dir));
+
+    StrVec prefix_lines;
+    StrVec keys;
+    VEC_INIT(&prefix_lines);
+    VEC_INIT(&keys);
+    char *body = NULL;
+    bool ok = true;
+
+    const char *cursor = source;
+    while (*cursor) {
+        const char *line_end = strchr(cursor, '\n');
+        size_t len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+        char *line = (char *)xmalloc(len + 1);
+        memcpy(line, cursor, len);
+        line[len] = '\0';
+        const char *next = line_end ? line_end + 1 : cursor + len;
+
+        const char *trim = line;
+        while (*trim && isspace((unsigned char)*trim)) {
+            trim++;
+        }
+        const char *path_start = NULL;
+        const char *path_end = NULL;
+        const char *remainder = NULL;
+        if (*trim == '\0' || *trim == '#') {
+            VEC_PUSH(&prefix_lines, line);
+        } else if (l2_eval_line_import(line, &path_start, &path_end, &remainder)) {
+            size_t path_len = (size_t)(path_end - path_start);
+            char *import_path = (char *)xmalloc(path_len + 1);
+            memcpy(import_path, path_start, path_len);
+            import_path[path_len] = '\0';
+            char *resolved = resolve_import(root_dir, import_path, &include_dirs);
+            free(import_path);
+            /* Compare canonical paths so `../` cannot escape the stdlib
+             * directory while still matching its textual prefix. */
+            char resolved_real[PATH_MAX];
+            if (!resolved || !realpath(resolved, resolved_real) ||
+                !str_starts_with(resolved_real, stdlib_prefix)) {
+                free(resolved);
+                free(line);
+                ok = false;
+                break;
+            }
+            VEC_PUSH(&keys, resolved);
+            size_t head_len = (size_t)(path_end - line);
+            char *head = (char *)xmalloc(head_len + 1);
+            memcpy(head, line, head_len);
+            head[head_len] = '\0';
+            VEC_PUSH(&prefix_lines, head);
+            if (*remainder && *remainder != '#') {
+                body = str_printf("%s\n%s", remainder, next);
+                free(line);
+                break;
+            }
+            free(line);
+        } else {
+            body = str_printf("%s\n%s", line, next);
+            free(line);
+            break;
+        }
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+
+    if (ok && keys.len == 0) {
+        ok = false;
+    }
+    if (ok && body) {
+        /* A later import would change the visited set mid-body; keep those
+         * programs on the cold path. */
+        const char *scan = body;
+        while (*scan) {
+            const char *line_end = strchr(scan, '\n');
+            size_t len = line_end ? (size_t)(line_end - scan) : strlen(scan);
+            char *line = (char *)xmalloc(len + 1);
+            memcpy(line, scan, len);
+            line[len] = '\0';
+            const char *a = NULL, *b = NULL, *c = NULL;
+            bool is_import = l2_eval_line_import(line, &a, &b, &c);
+            free(line);
+            if (is_import) {
+                ok = false;
+                break;
+            }
+            if (!line_end) {
+                break;
+            }
+            scan = line_end + 1;
+        }
+    }
+
+    if (ok) {
+        *out_prefix = str_join_parts(prefix_lines.data, prefix_lines.len, NULL, "\n");
+        *out_body = body ? body : str_dup("");
+        *out_key = str_join_parts(keys.data, keys.len, NULL, "\n");
+        body = NULL;
+    }
+
+    free(body);
+    for (size_t i = 0; i < prefix_lines.len; i++) {
+        free(prefix_lines.data[i]);
+    }
+    VEC_FREE(&prefix_lines);
+    for (size_t i = 0; i < keys.len; i++) {
+        free(keys.data[i]);
+    }
+    VEC_FREE(&keys);
+    for (size_t i = 0; i < include_dirs.len; i++) {
+        free(include_dirs.data[i]);
+    }
+    VEC_FREE(&include_dirs);
+    free(stdlib_prefix);
+    free(stdlib_dir);
+    free(root_dir);
+    return ok;
+}
+
+/* Expand text that contains no imports the way the cold path's second
+ * expansion pass does, returning the text and its file spans. */
+static char *l2_eval_expand_plain(L2EvalContext *ctx, const char *text, FileSpanVec *spans) {
+    StrMap visited;
+    strmap_init(&visited);
+    VEC_INIT(spans);
+    int line_counter = 1;
+    char *out = expand_imports_from_source(text, ctx->root_dir, &ctx->include_dirs, &visited, spans, &line_counter);
+    strmap_free(&visited);
+    return out;
+}
+
+/* Build a context with the stdlib prefix parsed, mirroring the cold path's
+ * setup.  May exit() on a parse error, so the parent only calls it after a
+ * probe child has succeeded. */
+static L2EvalContext *l2_eval_warm_build(const char *prefix_source, int *out_prefix_lines) {
+    L2EvalContext *ctx = (L2EvalContext *)xmalloc(sizeof(L2EvalContext));
+    memset(ctx, 0, sizeof(L2EvalContext));
+    l2_eval_ctx_init(ctx);
+
+    StrMap visited;
+    strmap_init(&visited);
+    FileSpanVec first_spans;
+    VEC_INIT(&first_spans);
+    int line_counter = 1;
+    char *expanded = expand_imports_from_source(prefix_source, ctx->root_dir, &ctx->include_dirs, &visited, &first_spans, &line_counter);
+    strmap_free(&visited);
+
+    FileSpanVec spans;
+    char *text = l2_eval_expand_plain(ctx, expanded, &spans);
+    l2_eval_ctx_prepare_parser(ctx);
+    l2_eval_seed_embedded_program(ctx);
+    ctx->parser.file_spans = spans;
+    ctx->parser.primary_path = str_dup("<eval>");
+    parse_tokens(&ctx->parser, text);
+
+    *out_prefix_lines = l2_eval_count_newlines(text);
+    for (size_t i = 0; i < first_spans.len; i++) {
+        free(first_spans.data[i].path);
+    }
+    VEC_FREE(&first_spans);
+    free(expanded);
+    free(text);
+    return ctx;
+}
+
+/* Find or create the warm entry for `key`.  Returns NULL when the cache is
+ * full; an entry whose ctx is NULL means "use the cold path". */
+static L2EvalWarmEntry *l2_eval_warm_get(const char *key, const char *prefix_source) {
+    for (size_t i = 0; i < g_eval_warm_len; i++) {
+        if (str_equals(g_eval_warm[i].key, key)) {
+            return &g_eval_warm[i];
+        }
+    }
+    if (g_eval_warm_len >= L2_EVAL_WARM_MAX) {
+        return NULL;
+    }
+    L2EvalWarmEntry *entry = &g_eval_warm[g_eval_warm_len++];
+    entry->key = str_dup(key);
+    entry->ctx = NULL;
+    entry->prefix_lines = 0;
+
+    /* Probe: a parse error exits the process, so prove the warm parse
+     * succeeds in a throwaway child before running it in this process. */
+    fflush(stdout);
+    fflush(stderr);
+    pid_t probe = fork();
+    if (probe < 0) {
+        return entry;
+    }
+    if (probe == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        int lines = 0;
+        (void)l2_eval_warm_build(prefix_source, &lines);
+        _exit(0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(probe, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        entry->ctx = l2_eval_warm_build(prefix_source, &entry->prefix_lines);
+    }
+    return entry;
+}
+
+/* Child side: continue the inherited warm parse with only the user body,
+ * then run the top-level forms exactly as l2_eval_inline_with_ctx does. */
+static int l2_eval_run_warm(L2EvalWarmEntry *entry, const char *body) {
+    L2EvalContext *ctx = entry->ctx;
+    FileSpanVec body_spans;
+    char *body_text = l2_eval_expand_plain(ctx, body, &body_spans);
+    for (size_t i = 0; i < body_spans.len; i++) {
+        free(body_spans.data[i].path);
+    }
+    VEC_FREE(&body_spans);
+
+    size_t pad = (size_t)entry->prefix_lines;
+    size_t body_len = strlen(body_text);
+    const char *tail = "\nmain\n";
+    size_t tail_len = strlen(tail);
+    char *program = (char *)xmalloc(pad + body_len + tail_len + 1);
+    memset(program, '\n', pad);
+    memcpy(program + pad, body_text, body_len);
+    memcpy(program + pad + body_len, tail, tail_len + 1);
+    free(body_text);
+
+    FileSpanVec spans;
+    char *text = l2_eval_expand_plain(ctx, program, &spans);
+    free(program);
+    ctx->parser.file_spans = spans;
+    parse_tokens_continue(&ctx->parser, text);
+    free(text);
+
+    for (size_t i = 0; i < ctx->parser.module.forms.len; i++) {
+        Form form = ctx->parser.module.forms.data[i];
+        if (form.kind != FORM_DEF) {
+            continue;
+        }
+        Definition *def = (Definition *)form.ptr;
+        if (def && str_equals(def->name, "<top>")) {
+            ct_execute_nodes(&ctx->vm, &def->body);
+        }
+    }
+    int result = 0;
+    if (ctx->vm.stack.len > 0) {
+        result = (int)ct_value_to_int(ct_stack_peek(&ctx->vm.stack));
+    }
+    return result;
+}
+
 int eval_program(const char *source, long source_len) {
     if (!source || source_len < 0) {
         return eval_program_in_process(source, source_len);
     }
 
+    L2EvalWarmEntry *warm = NULL;
+    char *warm_body = NULL;
+    size_t embed_len = 0;
+    if (getenv("L2_EVAL_NO_WARM") == NULL &&
+        (!l2_eval_get_embedded_source(&embed_len) || embed_len == 0)) {
+        char *owned = (char *)xmalloc((size_t)source_len + 1);
+        memcpy(owned, source, (size_t)source_len);
+        owned[source_len] = '\0';
+        char *prefix = NULL;
+        char *key = NULL;
+        if (l2_eval_split_stdlib_prefix(owned, &prefix, &warm_body, &key)) {
+            warm = l2_eval_warm_get(key, prefix);
+            if (!warm || !warm->ctx) {
+                warm = NULL;
+            }
+            free(prefix);
+            free(key);
+        }
+        free(owned);
+    }
+
     int result_pipe[2];
     if (pipe(result_pipe) != 0) {
         fprintf(stderr, "[error] eval_program pipe failed: %s\n", strerror(errno));
+        free(warm_body);
         return -1;
     }
     fflush(stdout);
@@ -5783,11 +6786,13 @@ int eval_program(const char *source, long source_len) {
         close(result_pipe[0]);
         close(result_pipe[1]);
         fprintf(stderr, "[error] eval_program fork failed: %s\n", strerror(saved_errno));
+        free(warm_body);
         return -1;
     }
     if (child_pid == 0) {
         close(result_pipe[0]);
-        int result = eval_program_in_process(source, source_len);
+        int result = warm ? l2_eval_run_warm(warm, warm_body)
+                          : eval_program_in_process(source, source_len);
         fflush(stdout);
         fflush(stderr);
         ssize_t written;
@@ -5798,6 +6803,7 @@ int eval_program(const char *source, long source_len) {
         _exit(written == (ssize_t)sizeof(result) ? 0 : 1);
     }
 
+    free(warm_body);
     close(result_pipe[1]);
     int result = -1;
     size_t received = 0;
@@ -6434,17 +7440,31 @@ static bool ct_try_asm_jit(CompileTimeVM *vm, Word *word, AsmDefinition *asm_def
     }
     if (!l2_ct_asm_is_jit_safe(asm_def->body)) return false;
 
-    void *fn = asm_jit_cache_lookup(word->name);
+    // Cached by body text: the program's own :asm words (and redefinitions
+    // of stdlib ones) get their own code.
+    void *fn = asm_jit_cache_lookup(asm_def->body);
     if (!fn) {
-        // Compile the word name in the primed context to emit its call target.
-        void *page = NULL;
-        size_t sz = 0;
-        if (l2_compile_try_jit(word->name, (long)strlen(word->name),
-                                &page, &sz) != 0) {
-            return false;
+        // Assemble the body itself as a function (the trampoline sets r12
+        // and calls it).  A body that calls other words cannot be assembled
+        // alone; then compile a call in the primed stdlib context instead.
+        char *text = l2_ct_asm_intelize(str_printf("%s\nret\n", asm_def->body));
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        if (text && l2_ks_assemble_quiet(text, &bytes, &len) == 0 && bytes && len) {
+            fn = l2_jit_install(bytes, len);
         }
-        asm_jit_cache_insert(word->name, page, sz);
-        fn = page;
+        free(bytes);
+        free(text);
+        if (!fn) {
+            void *page = NULL;
+            size_t sz = 0;
+            if (l2_compile_try_jit(word->name, (long)strlen(word->name),
+                                    &page, &sz) != 0) {
+                return false;
+            }
+            fn = page;
+        }
+        asm_jit_cache_insert(asm_def->body, fn, 0);
     }
 
     // Match the L2 stack layout and reserve space for values pushed by the word.
@@ -6791,7 +7811,9 @@ int l2_ks_assemble(const char *asm_src, uint8_t **out_buf, size_t *out_len) {
         int err = g_ks_state.errno_fn ? g_ks_state.errno_fn(g_ks_state.engine) : -1;
         const char *msg = (g_ks_state.strerror_fn && err >= 0)
                           ? g_ks_state.strerror_fn(err) : "unknown";
-        fprintf(stderr, "[error] l2_ks_assemble: keystone error %d: %s\n", err, msg);
+        if (!g_ks_quiet) {
+            fprintf(stderr, "[error] l2_ks_assemble: keystone error %d: %s\n", err, msg);
+        }
         if (encoding) {
             g_ks_state.free_fn(encoding);
         }

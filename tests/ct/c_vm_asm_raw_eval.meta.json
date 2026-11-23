@@ -1,0 +1,4 @@
+{
+  "description": "main.c: :asm bodies are raw text, and a program's own :asm words run at compile time",
+  "use_l2": true
+}

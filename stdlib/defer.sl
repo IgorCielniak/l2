@@ -5,10 +5,10 @@ import hma.sl
 sized_global defer_buf   8
 sized_global defer_count 8
 
-macro cur_frame 0 defer_buf @ defer_count @ 1 - 8 * + ;
+macro cur_frame `defer_buf @ defer_count @ 1 - 8 * +` emit ;
 
-macro func 1 word $0 defer_frame ;
-macro fend 0 run_defers end ;
+macro func (name) `word $name defer_frame` emit ;
+macro fend `run_defers end` emit ;
 
 # defer_frame [*] -> [*]
 word defer_frame

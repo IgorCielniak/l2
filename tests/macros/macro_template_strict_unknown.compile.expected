@@ -1,8 +1,0 @@
-error: macro 'strict_unknown' references argument 'missing_symbol', but the argument is not available
-  --> macro_template_strict_unknown.sl:13:2
-     |
-  13 |   strict_unknown puti cr
-     |  ^^^^^^^^^^^^^^
-     | = note: while parsing definition 'main'
-
-1 error(s) emitted

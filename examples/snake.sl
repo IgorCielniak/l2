@@ -5,42 +5,42 @@ import arr.sl
 import linux.sl
 import time.sl
 
-macro WIDTH 0 20 ;
-macro HEIGHT 0 12 ;
-macro CELLS 0 WIDTH HEIGHT * ;
+macro WIDTH `20` emit ;
+macro HEIGHT `12` emit ;
+macro CELLS `WIDTH HEIGHT *` emit ;
 
-macro CH_W 0 119 ;
-macro CH_A 0 97 ;
-macro CH_S 0 115 ;
-macro CH_D 0 100 ;
-macro CH_Q 0 113 ;
-macro CH_w 0 87 ;
-macro CH_a 0 65 ;
-macro CH_s 0 83 ;
-macro CH_d 0 68 ;
-macro CH_q 0 81 ;
-macro FRAME_DELAY_NS 0 350000000 ;
+macro CH_W `119` emit ;
+macro CH_A `97` emit ;
+macro CH_S `115` emit ;
+macro CH_D `100` emit ;
+macro CH_Q `113` emit ;
+macro CH_w `87` emit ;
+macro CH_a `65` emit ;
+macro CH_s `83` emit ;
+macro CH_d `68` emit ;
+macro CH_q `81` emit ;
+macro FRAME_DELAY_NS `350000000` emit ;
 
-macro TCGETS 0 21505 ;
-macro TCSETS 0 21506 ;
-macro LFLAG_OFF 0 12 ;
-macro ECHO 0 8 ;
-macro ICANON 0 2 ;
+macro TCGETS `21505` emit ;
+macro TCSETS `21506` emit ;
+macro LFLAG_OFF `12` emit ;
+macro ECHO `8` emit ;
+macro ICANON `2` emit ;
 
 # state layout (qwords)
-macro ST_DIR 0 0 ;
-macro ST_LEN 0 8 ;
-macro ST_FOOD_X 0 16 ;
-macro ST_FOOD_Y 0 24 ;
-macro ST_GAME_OVER 0 32 ;
-macro ST_QUIT 0 40 ;
-macro ST_WIN 0 48 ;
+macro ST_DIR `0` emit ;
+macro ST_LEN `8` emit ;
+macro ST_FOOD_X `16` emit ;
+macro ST_FOOD_Y `24` emit ;
+macro ST_GAME_OVER `32` emit ;
+macro ST_QUIT `40` emit ;
+macro ST_WIN `48` emit ;
 
 # direction constants
-macro DIR_RIGHT 0 0 ;
-macro DIR_DOWN 0 1 ;
-macro DIR_LEFT 0 2 ;
-macro DIR_UP 0 3 ;
+macro DIR_RIGHT `0` emit ;
+macro DIR_DOWN `1` emit ;
+macro DIR_LEFT `2` emit ;
+macro DIR_UP `3` emit ;
 
 #xy_idx [*, x | y] -> [* | idx]
 word xy_idx

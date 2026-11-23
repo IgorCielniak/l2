@@ -1,8 +1,8 @@
-error[E1007]: control stack underflow
-  --> control_underflow_diagnostic.sl:2:4
+error[parser-control-underflow]: control stack underflow
+  --> control_underflow_diagnostic.sl:2:5
     |
   2 |     do
-    |    ^^
+    |     ^^
     | = note: a control keyword appeared without a matching opener
     | = note: while parsing definition 'main'
     |

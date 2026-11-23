@@ -1,0 +1,10 @@
+error[ct-parser-error-raised]: value out of range
+  --> parser_error_at.sl:12:3
+     |
+  12 |   0
+     |   ^
+     | = note: compile-time stack: check-it -> ct-parser-error-at
+     | = note: while parsing definition 'main'
+     | = note: raised by compile-time code at: parser_error_at.sl:6:29
+
+1 error(s) emitted

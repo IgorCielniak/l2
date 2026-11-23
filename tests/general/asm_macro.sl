@@ -1,12 +1,12 @@
 import stdlib/stdlib.sl
 
-macro make_push_const 2
-    :asm $0 {
+macro make_push_const (name value) `
+    :asm $name {
         sub r12, 8
-        mov qword [r12], $1
+        mov qword [r12], $value
     }
     ;
-;
+` emit ;
 
 make_push_const push42 42
 

@@ -83,7 +83,7 @@
 # Conversion
 #int>float [* | x] -> [* | xf]
 :asm int>float {
-    cvtsi2sd xmm0, [r12]
+    cvtsi2sd xmm0, qword [r12]
     movq [r12], xmm0
 } ;
 

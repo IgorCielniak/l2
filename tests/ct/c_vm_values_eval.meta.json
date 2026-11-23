@@ -1,0 +1,4 @@
+{
+  "description": "CT data and value words in the C compile-time VM (eval_program): new stack effects, found flags, typed ordered map keys, code-point lengths, identifier rule, try-string>int, and strict errors",
+  "use_l2": true
+}

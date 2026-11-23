@@ -410,45 +410,47 @@ def _run_docs_tui(
     _FILTER_KINDS = ["all", "word", "asm", "py", "macro"]
 
     _L2_MACRO_CANONICAL_TEXT = (
-        "Macro definitions support three styles:\n"
-        "  1. Legacy positional:  macro <name> <count> <tokens...> ;\n"
-        "  2. Named signature:    macro <name> (<params...>) <tokens...> ;\n"
-        "  3. Pattern clauses:    macro <name> ... => ... ; ... ;\n\n"
-        "Compatibility shorthand for generated nested macros:\n"
-        "  macro <name> <value> ;\n"
-        "When emitted by macro expansion, this defines a 0-arg macro whose\n"
-        "body is <value>.\n\n"
-        "Placeholders:\n"
-        "  $0, $1, ...  legacy positional arguments\n"
-        "  $name        named argument\n"
-        "  $*name       splice variadic capture\n"
-        "A bare '$' token is preserved unchanged (for asm-heavy macros).\n\n"
-        "Call styles:\n"
-        "  prefix:  m a b\n"
-        "  call:    m(a, b, expr)\n"
-        "Prefix style consumes fixed args first; variadic tails consume\n"
-        "remaining arguments from the same source line.\n\n"
-        "Pattern macros are enabled when the body contains => clauses and\n"
-        "the definition closes with trailing ';'. Clauses are matched\n"
-        "top-to-bottom and compile into grammar-stage rewrite rules.\n"
-        "Capture forms:\n"
-        "  $x       single-token capture\n"
-        "  $*xs     variadic capture\n"
-        "  $x:int   constrained capture\n"
-        "Repeated capture names enforce equality.\n\n"
-        "Use --macro-preview to trace macro/rewrite steps and --preview to\n"
-        "inspect the final transformed source after macro + CT execution."
+        "A macro is an L2 program run at compile time:\n"
+        "  macro <name> [(<params...>)] <body...> ;\n"
+        "The body ends at `;` at its own top level (not inside a quotation,\n"
+        "a match pattern, or a nested block). A call `name a b` consumes the\n"
+        "macro name and exactly as many input values as it has parameters:\n"
+        "each value is one token, or a whole backtick quotation. Arguments are\n"
+        "taken as written, not evaluated or expanded; commas are ordinary\n"
+        "tokens. Too few values before end of input is\n"
+        "macro-insufficient-arguments and consumes none of them.\n\n"
+        "Parameters are bindings: in the body `$name` pushes the value (a Token\n"
+        "or Syntax) and `$name` inside a quotation splices it. The body runs on\n"
+        "its own CT data stack. `emit` appends Syntax to the expansion's output,\n"
+        "which is inserted only when the body succeeds; a body with no emit\n"
+        "expands to nothing. A macro named in another macro's body is called\n"
+        "directly: it reads its arguments from the input and its output joins\n"
+        "the caller's. `match` dispatches on the following input. A body that\n"
+        "is only a quotation followed by emit is expanded by direct splicing.\n"
+        "At compile time `emit` is always the built-in: a user word named\n"
+        "emit is used only by runtime code.\n\n"
+        "Example:\n"
+        "  macro add (x y) `$x $y +` emit ;\n"
+        "  add 20 22        # becomes 20 22 +\n\n"
+        "Constants: `const <name> <value>` is the short form of\n"
+        "`macro <name> `<value>` emit ;` for one token (a number, character,\n"
+        "string, or word). It is a top-level form; `priority N const ...`\n"
+        "works. The macro is created when the name is first used, so unused\n"
+        "constants cost almost nothing.\n"
+        "  const SYS_WRITE 1"
     )
     _L2_MACRO_LANG_DETAIL = (
         _L2_MACRO_CANONICAL_TEXT
         + "\n\n"
-        + "Example:\n"
-        + "  macro max2 (lhs rhs) $lhs $rhs > if $lhs else $rhs end ;\n"
-        + "  max2(5, 3)   # leaves 5 on stack\n\n"
-        + "Pattern example:\n"
+        + "CT logic and match:\n"
+        + "  macro zero_to_one (x)\n"
+        + "    $x token-lexeme \"0\" string-equal? if `1` emit else `$x` emit end\n"
+        + "  ;\n"
         + "  macro simplify\n"
-        + "    $x:int + 0 => $x ;\n"
-        + "    0 + $x:int => $x ;\n"
+        + "    match\n"
+        + "      [$x:int, +, 0] => `$x` emit\n"
+        + "      [_] =>\n"
+        + "    end\n"
         + "  ;"
     )
     _L2_MACRO_CT_BLOCK = textwrap.indent(_L2_MACRO_CANONICAL_TEXT, "  ") + "\n\n"
@@ -464,7 +466,9 @@ def _run_docs_tui(
             "detail": (
                 "Defines a named word that can be called by other words. "
                 "The body consists of stack operations, literals, and calls to other words. "
-                "Redefinitions overwrite the previous entry with a warning.\n\n"
+                "Defining a name again keeps the earlier definition as a candidate; the "
+                "highest priority wins and the newest wins a tie (a same-priority redefinition "
+                "warns).\n\n"
                 "Example:\n"
                 "  word square dup * end\n"
                 "  word greet \"hello world\" puts end"
@@ -654,26 +658,72 @@ def _run_docs_tui(
             "name": "begin ... again",
             "category": "Control Flow",
             "syntax": "begin <body> again",
-            "summary": "Infinite loop (use `exit` or `goto` to break out).",
+            "summary": "Unconditional loop; leave it with `break`.",
             "detail": (
-                "Creates an unconditional loop. The body repeats forever.\n"
-                "Available only at compile time.\n\n"
+                "Repeats the body forever, at compile time and in runtime code. "
+                "`again` (not `end`) closes it. Leave it with `break`, or return "
+                "from the word with `exit`.\n\n"
                 "Example:\n"
                 "  begin\n"
                 "    read_stdin\n"
-                "    dup 0 == if drop exit end\n"
+                "    dup 0 == if drop break end\n"
                 "    process\n"
                 "  again"
+            ),
+        },
+        {
+            "name": "break",
+            "category": "Control Flow",
+            "syntax": "break",
+            "summary": "Leave the innermost enclosing loop.",
+            "detail": (
+                "Works in `for`, `while ... do ... end`, and `begin ... again`, "
+                "at compile time and in runtime code. Only the innermost loop is "
+                "left. Leaving a `for` loop drops its counter, so the return stack "
+                "and the compile-time loop index `i` stay consistent. Using it "
+                "outside a loop is a parse error "
+                "(parser-loop-control-outside-loop).\n\n"
+                "Example:\n"
+                "  0 10 for 1 + dup 4 == if break end end   # leaves 4"
             ),
         },
         {
             "name": "continue",
             "category": "Control Flow",
             "syntax": "continue",
-            "summary": "Jump to the next iteration of a begin/again loop.",
+            "summary": "Start the next iteration of the innermost loop.",
             "detail": (
-                "Valid only inside `begin ... again`. Emits a jump to the loop head. "
-                "Using it outside a begin/again loop is a parse error."
+                "Works in the same loops as `break`. In a `for` loop it counts the "
+                "iteration (like reaching `end`); in `while` it re-tests the "
+                "condition; in `begin ... again` it jumps to `begin`. Using it "
+                "outside a loop is a parse error."
+            ),
+        },
+        {
+            "name": "match",
+            "category": "Control Flow",
+            "syntax": "match [pattern] => <body> ... [_] => <body> end",
+            "summary": "Compile-time dispatch on the upcoming input tokens.",
+            "detail": (
+                "Tests each clause's pattern against the next input values "
+                "without consuming them; the first match in source order is "
+                "consumed and its body runs. A value is a Token or a whole "
+                "backtick quotation. Pattern elements, separated by commas: a "
+                "literal token, `*` (any one value), `$name` or `$name:type` "
+                "(binds one value; types any, ident, int, float, number, string, "
+                "char, literal, syntax), and `\\x` for the literal x. A repeated "
+                "`$name` must see an equal value. `[_]` is the optional default "
+                "and must be last; an empty default passes the input through. "
+                "Bindings are values in the clause body (`$name` pushes it) and "
+                "splice into quotations. Without a match and without a default "
+                "it is match-no-clause. Compile-time only.\n\n"
+                "Example:\n"
+                "  word add_zero\n"
+                "    match\n"
+                "      [0, +, $x:int] => `$x` emit\n"
+                "      [_] =>\n"
+                "    end\n"
+                "  end immediate compile-only"
             ),
         },
         {
@@ -907,12 +957,12 @@ def _run_docs_tui(
                 "Use `on-event` as a suffix after a word definition. The word is "
                 "marked compile-only and called for matching compiler events; "
                 "patterns support shell-style globs such as `word.compile.*`. "
-                "The event record is pushed onto the compile-time stack, and the "
-                "listener's stack changes are discarded when it returns. Listener "
-                "errors propagate as compilation errors. This is compile-time only.\n\n"
+                "The handler gets its own copy of the event on an otherwise empty "
+                "stack and must consume it (stack effect `event --`). Handler "
+                "errors stop compilation. This is compile-time only.\n\n"
                 "Example:\n"
                 "  word inspect_compile_event\n"
-                "    get-event-type \"compile\" string= static_assert\n"
+                "    event-name \"compile\" string-equal? static-assert\n"
                 "  end on-event compile"
             ),
         },
@@ -922,10 +972,9 @@ def _run_docs_tui(
             "syntax": "emit-event <name>",
             "summary": "Publish a named event during compilation.",
             "detail": (
-                "Publishes a user event with its source location. It does not "
-                "attach a custom payload; use `event-object-create`, "
-                "`event-object-prop-append`, and `event-object-emit` when structured "
-                "event data is needed. Events are available to compile-time "
+                "Publishes a user event whose payload holds the directive's "
+                "SourceOrigin at key `source-origin`. For structured payloads use "
+                "`event-new`, `event-payload-set`, and `ct-event-emit-object`. Events are available to compile-time "
                 "listeners and external compiler tooling.\n\n"
                 "Example:\n"
                 "  emit-event build.started"
@@ -1335,113 +1384,14 @@ def _run_docs_tui(
         "       words remain in the final binary output.\n"
         "\n"
         "  How macros fit into this:\n"
-        "    - Text macros: token substitution (fast syntax shaping).\n"
-        "    - Pattern macros: grammar rewrite clauses with captures/guards.\n"
-        "    - ct-call: bridge from macro templates to CT words with context.\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 0  MACRO TEMPLATE DIRECTIVES\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        "  These directives run during macro-template expansion (parse time).\n"
-        "  They are not runtime words, but they are part of the compile-time\n"
-        "  authoring surface and are indexed here for discoverability.\n"
-        "\n"
-        "  ct-call            [template, ctx | word] -> [template | tokens]\n"
-        "    Invoke compile-time word `word` from a template and splice\n"
-        "    its return value as emitted tokens.\n"
-        "\n"
-        "  ct-if              [template | condition] -> [template]\n"
-        "    Conditional template branch with optional `else`.\n"
-        "\n"
-        "  ct-when            [template | condition] -> [template]\n"
-        "    Single-branch shorthand for `ct-if ... then ... end`.\n"
-        "\n"
-        "  ct-unless          [template | condition] -> [template]\n"
-        "    Negated single-branch conditional template gate.\n"
-        "\n"
-        "  ct-for             [template, capture | name] -> [template]\n"
-        "    Iterate capture values with optional separator clauses.\n"
-        "\n"
-        "  ct-each            [template, capture | name] -> [template]\n"
-        "    Iterate capture values (supports index+value mode).\n"
-        "\n"
-        "  ct-let             [template, expr | name] -> [template]\n"
-        "    Bind local template symbol for the nested template block.\n"
-        "\n"
-        "  ct-fn              [template | name] -> [template]\n"
-        "    Define a template-local helper callable with `ct-call`.\n"
-        "\n"
-        "  ct-switch          [template | expr] -> [template]\n"
-        "    Multi-branch selector over token-sequence expressions.\n"
-        "\n"
-        "  ct-case            [template | expr] -> [template]\n"
-        "    Case clause inside `ct-switch` or `ct-match`.\n"
-        "\n"
-        "  ct-default         [template] -> [template]\n"
-        "    Fallback clause used by selector directives.\n"
-        "\n"
-        "  ct-match           [template | expr] -> [template]\n"
-        "    Expression-style compact selector with `ct-case` arms.\n"
-        "\n"
-        "  ct-fold            [template, capture | acc] -> [template]\n"
-        "    Accumulator-based template reduction over capture groups.\n"
-        "\n"
-        "  ct-break           [template] -> [template]\n"
-        "    Exit current template loop (`ct-for`/`ct-each`/`ct-fold`).\n"
-        "\n"
-        "  ct-continue        [template] -> [template]\n"
-        "    Skip to next iteration of current template loop.\n"
-        "\n"
-        "  ct-include         [template | path] -> [template]\n"
-        "    Splice template nodes loaded from another source file.\n"
-        "\n"
-        "  ct-import          [template | path] -> [template]\n"
-        "    Import template helpers once per expansion scope.\n"
-        "\n"
-        "  ct-comment         [template] -> [template]\n"
-        "    Start nested template comment block; ends at ct-endcomment.\n"
-        "\n"
-        "  ct-endcomment      [template] -> [template]\n"
-        "    Close `ct-comment` block comment region.\n"
-        "\n"
-        "  ct-strict          [template] -> [template]\n"
-        "    Treat unknown template symbols as hard errors.\n"
-        "\n"
-        "  ct-permissive      [template] -> [template]\n"
-        "    Treat unknown template symbols as empty with warning.\n"
-        "\n"
-        "  ct-version         [template | tag] -> [template]\n"
-        "    Attach version marker metadata to the template program.\n"
-        "\n"
-        "  ct-error           [template | message] -> [template]\n"
-        "    Emit template expansion error diagnostic.\n"
-        "\n"
-        "  ct-warning         [template | message] -> [template]\n"
-        "    Emit template expansion warning diagnostic.\n"
-        "\n"
-        "  ct-note            [template | message] -> [template]\n"
-        "    Emit template expansion note diagnostic.\n"
-        "\n"
-        "  emit-list          [template | capture] -> [template | tokens]\n"
-        "    Splice capture/list value as emitted token sequence.\n"
-        "\n"
-        "  ct-emit-list       [template | capture] -> [template | tokens]\n"
-        "    Alias of emit-list for explicit compile-time naming.\n"
-        "\n"
-        "  emit-block         [template | block] -> [template | tokens]\n"
-        "    Emit inline nested template block as token output.\n"
-        "\n"
-        "  ct-emit-block      [template | block] -> [template | tokens]\n"
-        "    Alias of emit-block for explicit compile-time naming.\n"
-        "\n"
-        "  Comment aliases: `ct-#`, `ct-#(`, `ct-#)` are also supported for\n"
-        "  template comments, matching legacy shorthand forms.\n"
+        "    - A macro body is ordinary CT code; quotations build Syntax and\n"
+        "      `emit` inserts it (§ 7C, § 13).\n"
+        "    - `match` dispatches on upcoming input tokens.\n"
         "\n"
         "  Suggested reading order:\n"
         "    - Start with § 1 (execution mode and hooks).\n"
         "    - Then § 6 (token stream + rewrites).\n"
-        "    - Then capture/rewrite sections for advanced macro toolchains.\n"
+        "    - Then § 7C and § 13 for quotations and macros.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1490,107 +1440,149 @@ def _run_docs_tui(
         "\n"
         "      CT puti cr   # prints 1 at compile time and 0 at runtime\n"
         "\n"
-        "  use-l2-ct                           [immediate, compile-only]\n"
-        "    Replace the built-in CT intrinsic of a word with its L2\n"
-        "    definition body. With a name on the stack, targets that\n"
-        "    word; with an empty stack, targets the most recently\n"
-        "    defined word.\n"
-        "\n"
-        "      word 3dup dup dup dup end  use-l2-ct\n"
-        "\n"
-        "  set-token-hook                           [compile-only]\n"
+        "  ct-parser-set-token-hook                 [compile-only]\n"
         "    [* | name] -> [*]\n"
-        "    Register a word as the token hook. Every token the parser\n"
-        "    encounters is pushed onto the CT stack, the hook word is\n"
-        "    invoked, and the result (0 = not handled, 1 = handled)\n"
-        "    tells the parser whether to skip normal processing.\n"
+        "    Install the global token hook: bind the name's selected word\n"
+        "    (not a macro, not a built-in-only name). Each Token the\n"
+        "    parser reads is passed to the hook as `token -- handled?`;\n"
+        "    nonzero consumes the Token. Language packs add more hooks\n"
+        "    with ct-lang-add-token-hook (§ 8).\n"
         "\n"
-        "  clear-token-hook                         [compile-only]\n"
+        "  ct-parser-clear-token-hook               [compile-only]\n"
         "    [*] -> [*]\n"
-        "    Remove the currently active token hook.\n"
+        "    Remove the global token hook (pack hooks stay).\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 1A  COMPILER EVENT BUS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "    `on-event <pattern>` registers the preceding compile-time\n"
-        "    word as a listener. Patterns use shell-style globs such as\n"
-        "    `word.compile.*`, `import.*`, or `*`. The event record is\n"
-        "    pushed onto the CT stack for the handler; its stack changes\n"
-        "    are discarded when it returns. Listeners cannot run in the\n"
-        "    runtime VM.\n"
+        "    Every event is a map {event, timestamp_ns, payload}: a non-empty\n"
+        "    name, an integer publication time (Unix nanoseconds; not an\n"
+        "    ordering key), and a payload map. The payload is copied when the\n"
+        "    event is published, so later changes to the producer's maps do not\n"
+        "    affect what handlers see. Dispatch is synchronous: an event\n"
+        "    published inside a handler is fully dispatched before the outer\n"
+        "    event reaches its next handler.\n"
+        "\n"
+        "    `on-event <pattern>` subscribes the preceding word as a handler.\n"
+        "    Patterns are case-sensitive globs such as `word.compile.*`,\n"
+        "    `import.*`, or `*`. A handler has stack effect `event --`: it gets\n"
+        "    its own copy of the event on an otherwise empty stack and must\n"
+        "    consume it. A failing handler, or one that leaves values, stops\n"
+        "    compilation with event-handler-failed.\n"
         "\n"
         "      word inspect_word_compile_event\n"
-        "        get-event-payload\n"
-        "        \"name\" map-get static_assert\n"
-        "        drop drop\n"
+        "        event-payload \"name\" map-get static-assert drop\n"
         "      end on-event word.compile.begin\n"
         "\n"
-        "    Event records include `event`/`type`, `name`,\n"
-        "    `timestamp_ns`, optional `location`, and `payload`/`data`.\n"
-        "    Read them with `get-event-type`, `get-event-name`,\n"
-        "    `get-event-timestamp`, and `get-event-payload`.\n"
+        "    `emit-event <name>` publishes an event whose payload holds the\n"
+        "    directive's SourceOrigin at key `source-origin`.\n"
         "\n"
-        "    `emit-event <name>` publishes a user event during compilation\n"
-        "    with its source location. For structured payloads, use\n"
-        "    `event-object-create`, `event-object-prop-append`, and\n"
-        "    `event-object-emit`; `event-object-prop-get` reads a field.\n"
-        "    Lower-level `event-subscribe`, `event-unsubscribe`, and\n"
-        "    `event-emit` are available to compiler extensions. Python\n"
-        "    tools can use the same EventBus; `--events-stream PATH`\n"
-        "    writes JSON Lines, and daemon clients can subscribe live.\n"
+        "  ct-event-subscribe  [*, pattern, handler | owner] -> [* | handle]\n"
+        "    Subscribe a handler word (by name) to a pattern. owner is nil (a\n"
+        "    global subscription) or a DefinitionHandle: such a subscription runs\n"
+        "    only while that candidate is live and eligible and is removed with\n"
+        "    it. Each dispatch uses the subscriptions and handler words as they\n"
+        "    were when it started. A failing handler raises a recoverable error\n"
+        "    (its own Diagnostic, or event-handler-failed); the failing\n"
+        "    subscription is left out of that error's dispatch, and if a handler\n"
+        "    resumes it the original dispatch continues.\n"
+        "    While a handler runs, its own word calls' ct.execute.* events are\n"
+        "    not delivered to that subscription (other subscribers get them).\n"
         "\n"
-        "  Compile-error recovery is an opt-in use of `compile.error`.\n"
-        "  Errors raised while processing a parser token and code-emission\n"
-        "  errors are offered as resumable events. Other compile errors may\n"
-        "  also publish `compile.error`, but have `recoverable: false`.\n"
-        "  Their payload includes `recoverable`, `phase`, `message`, `attempt`,\n"
-        "  `attempt_limit`, and `restore_point_id`. A handler must call\n"
-        "  `ct-error-resume`; without\n"
-        "  that request the original compilation error remains fatal. Parser\n"
-        "  recovery retries from the selected token position. Emission recovery\n"
-        "  retries code generation after repair definitions are added.\n"
+        "  ct-event-unsubscribe [* | handle] -> [* | removed]\n"
+        "    Remove a subscription; 0 if it was already removed.\n"
         "\n"
-        "  ct-error-restore-points           [*] -> [* | points]\n"
-        "    List the most recent parser/emission restore-point records.\n"
-        "    Records expose `id`, `stage`, `pos`, `lexeme`, `line`, and `column`.\n"
+        "  ct-event-emit       [*, name | payload] -> [* | 1]\n"
+        "    Publish an event; payload is a map or nil (an empty map).\n"
         "\n"
-        "  ct-error-restore-point            [* | id] -> [* | point]\n"
-        "    Get one restore-point record by id; errors if the id is unavailable.\n"
+        "  event-new           [* | name] -> [* | event]\n"
+        "    A draft event with an empty payload and no timestamp.\n"
         "\n"
-        "  ct-error-jump                     [* | id] -> [*]\n"
-        "    Select a restore point from the current error's phase. For parser\n"
-        "    errors this selects where parsing resumes.\n"
+        "  event-payload-set   [*, event, key | value] -> [* | event]\n"
+        "  event-payload-get   [*, event | key] -> [*, value | found]\n"
+        "    Write or read one payload entry; a missing key pushes nil 0.\n"
         "\n"
-        "  ct-error-resume                   [*] -> [* | 1]\n"
-        "    Explicitly request recovery from the active `compile.error` handler.\n"
+        "  ct-event-emit-object [* | event] -> [* | 1]\n"
+        "    Publish a draft or received event with a fresh timestamp. Only the\n"
+        "    keys event, timestamp_ns, and payload are allowed. A draft can be\n"
+        "    published again; each publication is a separate copy.\n"
         "\n"
-        "  ct-error-define                   [* | source] -> [* | count]\n"
-        "    Parse source as a top-level fragment containing only `word` or\n"
-        "    `:asm` definitions, then add those definitions to the active module.\n"
-        "    It uses the current dictionary, macro signatures, token hook, and\n"
-        "    rewrite configuration. It is valid only during error recovery.\n"
+        "  event-name          [* | event] -> [* | name]\n"
+        "  event-timestamp     [* | event] -> [*, timestamp | found]\n"
+        "  event-payload       [* | event] -> [* | payload]\n"
+        "    Read the event fields; a draft has no timestamp (nil 0).\n"
         "\n"
-        "  ct-error-get-retry-limit          [*] -> [* | limit]\n"
-        "    Read the active compile's retry limit (default 8).\n"
+        "  ct-event-enabled?   [*] -> [* | flag]\n"
+        "  ct-event-set-enabled [* | flag] -> [* | previous]\n"
+        "    Turn event publication off or on for later events. While events\n"
+        "    are off, emitting or subscribing is an error. `--no-events`\n"
+        "    disables events (and error recovery) for the whole compilation.\n"
         "\n"
-        "  ct-error-set-retry-limit          [* | limit] -> [* | previous]\n"
-        "    Set the active limit from 1 through 1024 and return the old value.\n"
-        "    The limit applies to retries of the same error at the same location.\n"
+        "  ct-event-stream-enabled?    [*] -> [* | flag]\n"
+        "  ct-event-stream-set-enabled [* | flag] -> [* | previous]\n"
+        "    Pause or resume writes to the `--events-stream PATH` JSON Lines\n"
+        "    file (compiler values become objects tagged with a `kind` field).\n"
+        "    Enabling without a configured stream is an error. A value that\n"
+        "    cannot be written raises a recoverable event-stream-output-failed;\n"
+        "    JSONL output is skipped while that error is dispatched, and if a\n"
+        "    handler resumes it publication continues. `--no-events-json` turns\n"
+        "    off the JSONL file only. Python tools use the same EventBus, and\n"
+        "    daemon clients can subscribe live.\n"
+        "\n"
+        "  Every compiler error is published twice with the same payload:\n"
+        "  first as compiler.error.<category> (for example\n"
+        "  compiler.error.parser_error), then as compiler.error. The payload\n"
+        "  holds the Diagnostic (key diagnostic) and recoverable. Errors met\n"
+        "  while parsing a token or emitting code are recoverable: their\n"
+        "  payload also has recovery {attempt, limit} and restore-point-id. A\n"
+        "  handler repairs the problem and calls ct-recovery-resume to retry\n"
+        "  the failed operation; without that the error stands.\n"
+        "\n"
+        "  A retry that fails again continues the same chain (attempt 2, 3,\n"
+        "  ...). Each chain keeps the retry limit it started with (default 8).\n"
+        "  When the last allowed attempt fails, the error is published once\n"
+        "  more with recoverable 0 and terminal 1 and cannot be resumed.\n"
+        "  compile.recovery.start is published before the first retry and\n"
+        "  compile.recovery.end (outcome success or error) when the chain\n"
+        "  ends. Every attempt stays in ct-diagnostic-list; compilation stops\n"
+        "  after 20 unresolved errors, and recovered attempts do not count.\n"
+        "\n"
+        "  ct-recovery-list-restore-points [*] -> [* | points]\n"
+        "    The current restore points as maps with id, stage, pos, lexeme,\n"
+        "    line, and column. Works outside handlers too.\n"
+        "\n"
+        "  ct-recovery-get-restore-point [* | id] -> [* | point]\n"
+        "    One restore point; an unknown id raises recovery-restore-point-invalid.\n"
+        "\n"
+        "  ct-recovery-jump    [* | id] -> [*]\n"
+        "    Choose where the retry starts (a point of the same stage). The\n"
+        "    last valid jump wins; an invalid one changes nothing.\n"
+        "\n"
+        "  ct-recovery-resume  [*] -> [* | 1]\n"
+        "    Ask to retry the error being dispatched. Outside a recoverable\n"
+        "    dispatch, jump and resume raise recovery-operation-unavailable.\n"
+        "\n"
+        "  To supply missing definitions, a handler calls\n"
+        "  ct-definition-register-source (see § 11B) before resuming.\n"
+        "\n"
+        "  ct-recovery-get-retry-limit [*] -> [* | limit]\n"
+        "  ct-recovery-set-retry-limit [* | limit] -> [* | previous]\n"
+        "    Read or set the retry limit (any positive integer) for chains\n"
+        "    that start later.\n"
         "\n"
         "  Example repair handler:\n"
         "    word repair_missing\n"
-        "      get-event-payload \"restore_point_id\" map-get drop swap drop\n"
-        "      dup ct-error-restore-point drop\n"
-        "      ct-error-jump\n"
-        "      \"word missing_word 42 end\" ct-error-define drop\n"
-        "      ct-error-resume\n"
-        "    end on-event compile.error\n"
+        "      event-payload dup \"recoverable\" map-get drop if\n"
+        "        \"word missing_word 42 end\" ct-definition-register-source drop\n"
+        "        ct-recovery-resume drop\n"
+        "      end drop\n"
+        "    end on-event compiler.error\n"
         "\n"
         "  Restore points save parser position/location, not arbitrary CT state.\n"
         "  Side effects are not rolled back, so handlers should be idempotent.\n"
-        "  Tokenization/import loading and external assembler/linker failures are\n"
-        "  outside this recovery mechanism.\n"
+        "  Errors outside parsing and emission (tokenizing, imports, the\n"
+        "  assembler and linker) are published but are not recoverable.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1600,29 +1592,67 @@ def _run_docs_tui(
         "  Lists are dynamic arrays that live in the CT VM. They hold\n"
         "  integers, strings, tokens, other lists, maps, or nil.\n"
         "\n"
-        "  list-new          [*] -> [* | list]\n"
+        "  Conventions for all list, map, and string words: reads consume\n"
+        "  their subject; mutations return the subject first, then any\n"
+        "  results. Indexes are Python-like (negative counts from the end) and\n"
+        "  must be integers, not booleans. Wrong types, invalid indexes, and\n"
+        "  unsupported map keys are CT errors raised before any mutation.\n"
+        "\n"
+        "  list-new            [*] -> [* | list]\n"
         "    Create a new empty list.\n"
         "\n"
-        "  list-clone         [* | list] -> [* | copy]\n"
-        "    Shallow-copy a list.\n"
+        "  list-clone          [* | list] -> [* | copy]\n"
+        "    Shallow copy: nested lists and maps are shared.\n"
         "\n"
-        "  list-append        [*, list | value] -> [* | list]\n"
+        "  list-deep-clone     [* | list] -> [* | copy]\n"
+        "    Recursive copy of nested lists and maps. Shared references and\n"
+        "    cycles inside the copied graph are preserved; immutable\n"
+        "    compiler-provided maps become ordinary mutable maps.\n"
+        "\n"
+        "  list-append         [*, list | value] -> [* | list]\n"
         "    Append value to the end of list (mutates in place).\n"
-        "\n"
-        "  list-pop            [* | list] -> [*, list | value]\n"
-        "    Remove and return the last element.\n"
-        "\n"
-        "  list-pop-front      [* | list] -> [*, list | value]\n"
-        "    Remove and return the first element.\n"
-        "\n"
-        "  list-peek-front     [* | list] -> [*, list | value]\n"
-        "    Return the first element without removing it.\n"
         "\n"
         "  list-push-front     [*, list | value] -> [* | list]\n"
         "    Insert value at the beginning of list.\n"
         "\n"
+        "  list-pop            [* | list] -> [*, list, value | found]\n"
+        "    Remove the last element. On an empty list pushes the unchanged\n"
+        "    list, nil, and 0.\n"
+        "\n"
+        "  list-pop-front      [* | list] -> [*, list, value | found]\n"
+        "    Remove the first element. On an empty list pushes the unchanged\n"
+        "    list, nil, and 0.\n"
+        "\n"
+        "  list-peek-front     [* | list] -> [* | value]\n"
+        "    Push the first element without removing it. Errors on an empty\n"
+        "    list.\n"
+        "\n"
+        "  list-last           [* | list] -> [* | value]\n"
+        "    Push the last element without removing it. Errors on an empty\n"
+        "    list.\n"
+        "\n"
+        "  list-get            [*, list | index] -> [* | value]\n"
+        "    Get the element at index. Errors outside the valid range.\n"
+        "\n"
+        "  list-set            [*, list, index | value] -> [* | list]\n"
+        "    Replace the element at index. Errors outside the valid range.\n"
+        "\n"
+        "  list-insert         [*, list, index | value] -> [* | list]\n"
+        "    Insert value at index. Valid indexes are -length..length\n"
+        "    inclusive; length appends.\n"
+        "\n"
+        "  list-remove         [*, list | index] -> [*, list | value]\n"
+        "    Remove and push the element at index.\n"
+        "\n"
         "  list-reverse        [* | list] -> [* | list]\n"
         "    Reverse the list in place.\n"
+        "\n"
+        "  list-clear          [* | list] -> [* | list]\n"
+        "    Remove all elements from the list.\n"
+        "\n"
+        "  list-extend         [*, target | source] -> [* | target]\n"
+        "    Append the elements of source to target. Extending a list with\n"
+        "    itself appends one snapshot of its elements.\n"
         "\n"
         "  list-length         [* | list] -> [* | n]\n"
         "    Push the number of elements.\n"
@@ -1630,45 +1660,26 @@ def _run_docs_tui(
         "  list-empty?         [* | list] -> [* | flag]\n"
         "    Push 1 if the list is empty, 0 otherwise.\n"
         "\n"
-        "  list-get            [*, list | index] -> [* | value]\n"
-        "    Get element at index (0-based). Errors on out-of-range.\n"
-        "\n"
-        "  list-set            [*, list, index | value] -> [* | list]\n"
-        "    Set element at index. Errors on out-of-range.\n"
-        "\n"
-        "  list-clear          [* | list] -> [* | list]\n"
-        "    Remove all elements from the list.\n"
-        "\n"
-        "  list-extend         [*, target | source] -> [* | target]\n"
-        "    Append all elements of source to target.\n"
-        "\n"
-        "  list-last           [* | list] -> [* | value]\n"
-        "    Push the last element without removing it.\n"
-        "\n"
-        "  list-insert         [*, list, index | value] -> [* | list]\n"
-        "    Insert value at index, shifting following elements right.\n"
-        "\n"
-        "  list-remove         [*, list | index] -> [*, list | value]\n"
-        "    Remove and return element at index.\n"
-        "\n"
         "  list-slice          [*, list, start | end] -> [* | sublist]\n"
-        "    Push a new list with list[start:end].\n"
+        "    Push a new list with list[start:end] (Python slice bounds).\n"
         "\n"
         "  list-find           [*, list | value] -> [*, index | found]\n"
-        "    Search list for value. Returns (index, 1) or (-1, 0).\n"
+        "    First structurally equal element: (index, 1) or (-1, 0).\n"
         "\n"
         "  list-contains?      [*, list | value] -> [* | flag]\n"
-        "    Push 1 if value exists in list, 0 otherwise.\n"
-        "\n"
-        "  list-join           [*, list | separator] -> [* | str]\n"
-        "    Join list elements (string-compatible) with separator.\n"
+        "    Push 1 if a structurally equal element exists, else 0.\n"
+        "    Equality compares lists and maps recursively (cycle-safe, map\n"
+        "    order ignored), tokens by lexeme, and numbers by value\n"
+        "    (true equals 1); other compiler objects compare by identity.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 3  MAP OPERATIONS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  Maps are string-keyed dictionaries in the CT VM.\n"
+        "  Maps are insertion-ordered. Keys are strings, integers, booleans,\n"
+        "  or nil; true and 1 (false and 0) address the same entry. Updating\n"
+        "  an existing key keeps its stored key and position.\n"
         "\n"
         "  map-new             [*] -> [* | map]\n"
         "    Create a new empty map.\n"
@@ -1676,15 +1687,15 @@ def _run_docs_tui(
         "  map-set             [*, map, key | value] -> [* | map]\n"
         "    Set key to value in the map (mutates in place).\n"
         "\n"
-        "  map-get             [*, map | key] -> [*, map, value | flag]\n"
-        "    Look up key. Pushes the map back, then the value\n"
-        "    (or nil if absent), then 1 if found or 0 if not.\n"
+        "  map-get             [*, map | key] -> [*, value | found]\n"
+        "    Look up key: (value, 1) when present, (nil, 0) when absent.\n"
+        "    A present key whose value is nil gives (nil, 1).\n"
         "\n"
-        "  map-has?            [*, map | key] -> [*, map | flag]\n"
+        "  map-has?            [*, map | key] -> [* | flag]\n"
         "    Push 1 if the key exists in the map, 0 otherwise.\n"
         "\n"
-        "  map-delete          [*, map | key] -> [*, map | flag]\n"
-        "    Delete key if present. Returns 1 when deleted, else 0.\n"
+        "  map-delete          [*, map | key] -> [*, map | found]\n"
+        "    Delete key if present. Pushes the map, then 1 if deleted, else 0.\n"
         "\n"
         "  map-clear           [* | map] -> [* | map]\n"
         "    Remove all entries from the map.\n"
@@ -1696,16 +1707,19 @@ def _run_docs_tui(
         "    Push 1 if map has no entries, 0 otherwise.\n"
         "\n"
         "  map-keys            [* | map] -> [* | list]\n"
-        "    Push a list of map keys.\n"
+        "    Push a list of map keys in insertion order.\n"
         "\n"
         "  map-values          [* | map] -> [* | list]\n"
-        "    Push a list of map values.\n"
+        "    Push a list of map values in insertion order.\n"
         "\n"
         "  map-clone           [* | map] -> [* | copy]\n"
-        "    Shallow-copy a map.\n"
+        "    Shallow copy into a new ordinary mutable map.\n"
         "\n"
-        "  map-update          [*, target | source] -> [* | target]\n"
-        "    Merge source entries into target (mutates target).\n"
+        "  map-merge           [*, target | source] -> [* | target]\n"
+        "    Copy source entries into target; source values win. Existing\n"
+        "    keys keep their position, new keys append in source order. All\n"
+        "    source keys are validated first; merging a map with itself is a\n"
+        "    no-op.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1723,31 +1737,43 @@ def _run_docs_tui(
         "  § 5  STRING OPERATIONS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  Strings in the CT VM are immutable sequences of characters.\n"
+        "  Strings are immutable sequences of Unicode code points. String\n"
+        "  inputs are strict: integers and tokens are not converted. Character\n"
+        "  classes are fixed by L2, not by the host: whitespace is the 25\n"
+        "  Unicode White_Space code points, and case mapping is ASCII-only.\n"
         "\n"
-        "  string=             [*, a | b] -> [* | flag]\n"
-        "    Push 1 if strings a and b are equal, 0 otherwise.\n"
+        "  string-equal?       [*, a | b] -> [* | flag]\n"
+        "    Push 1 if a and b are the same code-point sequence (no\n"
+        "    normalization or case folding), 0 otherwise.\n"
         "\n"
         "  string-length       [* | str] -> [* | n]\n"
-        "    Push the length of the string.\n"
+        "    Push the number of code points (not UTF-8 bytes).\n"
+        "\n"
+        "  string-utf8-length  [* | str] -> [* | n]\n"
+        "    Push the number of UTF-8 bytes.\n"
         "\n"
         "  string-append       [*, left | right] -> [* | result]\n"
         "    Concatenate two strings.\n"
         "\n"
-        "  string>number       [* | str] -> [*, value | flag]\n"
-        "    Parse an integer from the string (supports 0x, 0b, 0o\n"
-        "    prefixes). Pushes (value, 1) on success or (0, 0) on\n"
-        "    failure.\n"
+        "  try-string>int      [* | str] -> [*, value | found]\n"
+        "    Parse a signed integer: surrounding whitespace allowed, ASCII\n"
+        "    digits, optional 0x/0b/0o prefix (case-insensitive) after an\n"
+        "    optional sign, underscores only between digits. Pushes\n"
+        "    (value, 1) on success or (0, 0) on failure.\n"
         "\n"
         "  int>string          [* | n] -> [* | str]\n"
-        "    Convert an integer to its decimal string representation.\n"
+        "    Decimal string of an integer; booleans give \"0\"/\"1\". Floats and\n"
+        "    other types are errors.\n"
         "\n"
         "  identifier?         [* | value] -> [* | flag]\n"
-        "    Push 1 if the value is a valid L2 identifier string,\n"
-        "    0 otherwise. Also accepts token objects.\n"
+        "    Push 1 for a string or token whose text is an L2 identifier: the\n"
+        "    first code point is an ASCII letter, _, or any code point at or\n"
+        "    above U+0080, and later ones may also be ASCII digits. Other\n"
+        "    values give 0.\n"
         "\n"
         "  string-contains?    [*, haystack | needle] -> [* | flag]\n"
-        "    Push 1 if needle occurs inside haystack, else 0.\n"
+        "    Push 1 if needle occurs inside haystack, else 0. An empty needle\n"
+        "    matches.\n"
         "\n"
         "  string-starts-with? [*, text | prefix] -> [* | flag]\n"
         "    Push 1 if text starts with prefix, else 0.\n"
@@ -1756,900 +1782,570 @@ def _run_docs_tui(
         "    Push 1 if text ends with suffix, else 0.\n"
         "\n"
         "  string-split        [*, text | sep] -> [* | list]\n"
-        "    Split text by non-empty separator and return list of parts.\n"
+        "    Split text by a non-empty separator, keeping empty fields.\n"
         "\n"
         "  string-join         [*, list | sep] -> [* | str]\n"
-        "    Join string-compatible list items with separator.\n"
+        "    Join a list of strings with sep. Non-string elements are errors\n"
+        "    (convert integers with int>string).\n"
         "\n"
         "  string-strip        [* | text] -> [* | stripped]\n"
-        "    Trim leading/trailing whitespace.\n"
+        "    Trim leading and trailing whitespace.\n"
         "\n"
         "  string-replace      [*, text, old | new] -> [* | replaced]\n"
-        "    Replace all old substrings with new.\n"
+        "    Replace every non-overlapping occurrence of a non-empty old\n"
+        "    substring, left to right. new may be empty.\n"
         "\n"
         "  string-upper        [* | text] -> [* | upper]\n"
-        "    Uppercase conversion.\n"
+        "    Map a-z to A-Z; other code points are unchanged.\n"
         "\n"
         "  string-lower        [* | text] -> [* | lower]\n"
-        "    Lowercase conversion.\n"
+        "    Map A-Z to a-z; other code points are unchanged.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 6  TOKEN STREAM MANIPULATION\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  These words give compile-time code direct control over\n"
-        "  the token stream the parser reads from.\n"
+        "  These words build and inspect Token values and configure how the\n"
+        "  parser's token stream is produced. The live parser cursor itself\n"
+        "  is covered in § 7.\n"
         "\n"
-        "  next-token          [*] -> [* | token]\n"
-        "    Consume and push the next token from the parser.\n"
-        "\n"
-        "  peek-token          [*] -> [* | token]\n"
-        "    Push the next token without consuming it.\n"
+        "  Tokens are immutable values. Each has a primary SourceOrigin (the\n"
+        "  span in its original file) and an expansion chain of ExpansionFrames\n"
+        "  recording the transformations that produced it, outermost first.\n"
+        "  Rewrites, token hooks, and macro expansions append a frame; new tokens\n"
+        "  are built from an explicit origin or an existing token, never from a\n"
+        "  bare lexeme.\n"
         "\n"
         "  token-lexeme        [* | token] -> [* | str]\n"
-        "    Extract the lexeme (text) from a token or string.\n"
+        "    Push the token's lexeme. Non-token values are errors.\n"
         "\n"
-        "  token-from-lexeme   [*, lexeme | template] -> [* | token]\n"
-        "    Create a new token with the given lexeme, using source\n"
-        "    location from the template token.\n"
+        "  token-from-origin   [*, lexeme | origin] -> [* | token]\n"
+        "    New token with a non-empty lexeme, anchored at a SourceOrigin, with\n"
+        "    an empty expansion chain.\n"
+        "\n"
+        "  ct-definition-set-effect [*, name, inputs | outputs] -> [* | ok]\n"
+        "  ct-definition-effect     [* | name] -> [*, inputs, outputs | found]\n"
+        "    Declare / read a word's stack effect in cells (nil: unknown).\n"
+        "    A declared effect is checked by the stack checker (calls and the\n"
+        "    body's final depth); effect comments count items, not cells, and\n"
+        "    are not used for that. `stack-effect NAME IN OUT` (core.sl)\n"
+        "    declares one in source; fn declares its functions'.\n"
+        "\n"
+        "  token-slice         [*, token, start | end] -> [* | token]\n"
+        "    The code points [start, end) of the lexeme as a new token. A token\n"
+        "    read from source gets the exact sub-span as its origin; otherwise\n"
+        "    the origin is kept. The expansion chain is kept.\n"
+        "\n"
+        "  lexeme              [* | token-or-string] -> [* | string]\n"
+        "    A token's lexeme, or the string itself.\n"
+        "\n"
+        "  token?              [* | value] -> [* | flag]\n"
+        "    1 when the value is a token.\n"
         "\n"
         "  token-with-lexeme   [*, token | lexeme] -> [* | token]\n"
-        "    Clone token metadata and replace only the lexeme text.\n"
+        "    New token with a non-empty lexeme that keeps the template token's\n"
+        "    origin and expansion chain. The template is not changed.\n"
         "\n"
-        "  token-clone         [* | token] -> [* | token]\n"
-        "    Return a shallow clone of token metadata and lexeme.\n"
+        "  token-origin        [* | token] -> [* | origin]\n"
+        "    Push the token's SourceOrigin.\n"
         "\n"
-        "  token-shift-column  [*, token | delta] -> [* | token]\n"
-        "    Clone token with shifted source column/start/end offsets.\n"
+        "  token-expansion-chain [* | token] -> [* | frames]\n"
+        "    Push the token's ExpansionFrames as a list, outermost first.\n"
         "\n"
         "  token-line          [* | token] -> [* | line]\n"
-        "    Return token source line number.\n"
+        "    1-based line of the token's origin in its file.\n"
         "\n"
         "  token-column        [* | token] -> [* | column]\n"
-        "    Return token source column number.\n"
+        "    1-based column (in code points, tabs count as one) of the token's\n"
+        "    origin.\n"
         "\n"
-        "  inject-tokens       [* | list-of-tokens] -> [*]\n"
-        "    Insert a list of token objects at the current parser\n"
-        "    position. The parser will read them before continuing\n"
-        "    with the original stream.\n"
+        "  A SourceOrigin is an immutable span: canonical path, 0-based\n"
+        "  half-open code-point offsets into the original file, and 1-based\n"
+        "  start/end line and column (the end is one past the last character).\n"
+        "  LF, CRLF, and lone CR each end one line.\n"
         "\n"
-        "  inject-lexemes      [*, list-of-lexemes | template-token] -> [*]\n"
-        "    Build token objects from lexeme strings (or token values)\n"
-        "    using template source location, then inject them at the\n"
-        "    current parser position.\n"
+        "  source-origin-path         [* | origin] -> [* | path]\n"
+        "  source-origin-start        [* | origin] -> [* | offset]\n"
+        "  source-origin-end          [* | origin] -> [* | offset]\n"
+        "  source-origin-start-line   [* | origin] -> [* | line]\n"
+        "  source-origin-start-column [* | origin] -> [* | column]\n"
+        "  source-origin-end-line     [* | origin] -> [* | line]\n"
+        "  source-origin-end-column   [* | origin] -> [* | column]\n"
+        "    Read one field of a SourceOrigin.\n"
         "\n"
-        "  add-token           [* | str] -> [*]\n"
-        "    Register a single-character string as a token separator\n"
-        "    recognized by the reader.\n"
+        "  An ExpansionFrame records one transformation: its kind (for example\n"
+        "  macro, reader, grammar, or token-hook), the rule or word name, the\n"
+        "  SourceOrigin of the triggering token, and, for macros, the macro's\n"
+        "  definition origin when known.\n"
         "\n"
-        "  add-token-chars     [* | str] -> [*]\n"
-        "    Register each character of the string as a token\n"
-        "    separator character.\n"
+        "  expansion-frame-kind              [* | frame] -> [* | kind]\n"
+        "  expansion-frame-name              [* | frame] -> [* | name]\n"
+        "  expansion-frame-call-site         [* | frame] -> [* | origin]\n"
+        "  expansion-frame-definition-origin [* | frame] -> [* | origin-or-nil]\n"
+        "    Read one field of an ExpansionFrame.\n"
         "\n"
-        "  ct-add-reader-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
-        "    Install a reader-stage rewrite rule. Pattern/replacement\n"
-        "    are token-lexeme lists. Supports captures:\n"
-        "      $x / $0        single-token capture\n"
-        "      $*xs           variadic capture\n"
-        "      $x:int         constrained capture\n"
-        "    Repeated capture names enforce equality across matches.\n"
+        "  Tokenizer separators are configured with ct-tokenizer-set-config\n"
+        "  (§ 7A); a change affects later tokenization only.\n"
         "\n"
-        "  ct-add-grammar-rewrite [*, pattern-list | replacement-list] -> [* | name]\n"
-        "    Install a grammar-stage rewrite rule (runs after token hook\n"
-        "    and before normal token handling).\n"
-        "    Reader rewrites are tokenization-adjacent; grammar rewrites\n"
-        "    are syntax-shaping and usually safer for language extensions.\n"
+        "  ── Rewrites\n"
         "\n"
-        "  ct-add-reader-rewrite-named  [*, name, pattern | replacement] -> [* | name]\n"
+        "  A rewrite rule replaces a token sequence matched by a pattern list\n"
+        "  with a replacement list. Reader rules run first on each Token, then\n"
+        "  the token hooks, then grammar rules. Eligible rules (enabled, on an\n"
+        "  active pipeline, owning pack active) are tried in one fixed order:\n"
+        "  priority descending, then earlier registration. After a rewrite the\n"
+        "  parser retries at the replacement start; consumed input is never\n"
+        "  revisited.\n"
         "\n"
-        "  ct-add-grammar-rewrite-named [*, name, pattern | replacement] -> [* | name]\n"
-        "    Named variants that replace any existing rule with the same\n"
-        "    name (idempotent upsert behavior).\n"
+        "  Pattern elements: a literal; `\\x` (the literal x: `\\*`, `\\$x`,\n"
+        "  `\\!y`, `\\\\`); `*` (any one token); `$name[:constraint]` (one\n"
+        "  token); `$*name[:constraint]` (zero or more); `!piece` (one token\n"
+        "  that does not match piece); and a `?`, `*`, or `+` suffix on a\n"
+        "  literal or `$name` capture. Constraints: any ident int float number\n"
+        "  string char literal. Replacement elements are literals, `\\x`\n"
+        "  escapes, `$name` (a single-token capture), or `$*name` (a sequence\n"
+        "  capture). Everything is validated at registration.\n"
         "\n"
-        "    Example (grammar alias):\n"
-        "      # rewrite: kw -> 42\n"
+        "  ct-rewrite-add-reader        [*, pattern | replacement] -> [* | handle]\n"
+        "  ct-rewrite-add-reader-named  [*, name, pattern | replacement] -> [* | handle]\n"
+        "  ct-rewrite-add-grammar       [*, pattern | replacement] -> [* | handle]\n"
+        "  ct-rewrite-add-grammar-named [*, name, pattern | replacement] -> [* | handle]\n"
+        "    Register a rule (priority 0, enabled, pipeline \"default\", no\n"
+        "    guard) and push its RewriteHandle. Names need not be unique;\n"
+        "    unnamed rules get a generated name. Example:\n"
         "      list-new \"kw\" list-append\n"
         "      list-new \"42\" list-append\n"
-        "      ct-add-grammar-rewrite drop\n"
-        "\n"
-        "  ct-remove-reader-rewrite   [* | name] -> [* | flag]\n"
-        "    Remove a single reader-stage rewrite rule by exact name.\n"
-        "    Returns 1 when a rule was found and deleted, else 0.\n"
-        "    Use this for idempotent cleanup in setup code.\n"
-        "\n"
-        "  ct-remove-grammar-rewrite  [* | name] -> [* | flag]\n"
-        "    Remove one grammar-stage rewrite rule by exact name.\n"
-        "    Returns 1 when removed, or 0 when the name does not exist.\n"
-        "    Useful when replacing generated syntax rules dynamically.\n"
-        "\n"
-        "  ct-clear-reader-rewrites   [*] -> [* | count]\n"
-        "    Delete all reader-stage rewrite rules at once.\n"
-        "    Returns the number of rules removed so callers can assert\n"
-        "    expected cleanup behavior in compile-time tests.\n"
-        "\n"
-        "  ct-clear-grammar-rewrites  [*] -> [* | count]\n"
-        "    Delete all grammar-stage rewrite rules and invalidate\n"
-        "    matcher indexes immediately. Returns removed rule count.\n"
-        "\n"
-        "  ct-list-reader-rewrites    [*] -> [* | list]\n"
-        "    Return rule names for the reader stage in active evaluation\n"
-        "    order (priority first, then insertion order tie-break).\n"
-        "\n"
-        "  ct-list-grammar-rewrites   [*] -> [* | list]\n"
-        "    Return grammar-stage rule names in current execution order.\n"
-        "    Use with get/set priority helpers to inspect final ordering.\n"
-        "\n"
-        "  ct-add-reader-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
-        "\n"
-        "  ct-add-grammar-rewrite-priority [*, priority, pattern | replacement] -> [* | name]\n"
-        "    Install rewrite rules with explicit priority. Higher priority\n"
-        "    rules are tried first. Ties preserve insertion order.\n"
-        "\n"
-        "  ct-set-reader-rewrite-enabled  [*, name | flag] -> [* | ok]\n"
-        "\n"
-        "  ct-set-grammar-rewrite-enabled [*, name | flag] -> [* | ok]\n"
-        "\n"
-        "  ct-get-reader-rewrite-enabled  [* | name] -> [*, flag | found]\n"
-        "\n"
-        "  ct-get-grammar-rewrite-enabled [* | name] -> [*, flag | found]\n"
-        "    Enable/disable rules and query rule status. get-* returns\n"
-        "    [flag found] so missing names are distinguishable from false.\n"
-        "\n"
-        "  ct-set-reader-rewrite-priority  [*, name | priority] -> [* | ok]\n"
-        "\n"
-        "  ct-set-grammar-rewrite-priority [*, name | priority] -> [* | ok]\n"
-        "\n"
-        "  ct-get-reader-rewrite-priority  [* | name] -> [*, priority | found]\n"
-        "\n"
-        "  ct-get-grammar-rewrite-priority [* | name] -> [*, priority | found]\n"
-        "    Adjust/query rewrite priority after registration.\n"
-        "\n"
-        "  ct-current-token      [*] -> [* | token]\n"
-        "    Return most recently consumed token (or nil before any\n"
-        "    parser consumption in current compile-time flow).\n"
-        "\n"
-        "  ct-parser-pos         [*] -> [* | n]\n"
-        "    Return absolute parser cursor index within current token\n"
-        "    stream (0-based, inclusive start position).\n"
-        "\n"
-        "  ct-predef-all        [*] -> [*]\n"
-        "    Predeclare all later top-level word definitions in the current\n"
-        "    parse stream so compile-time code can call them before they are\n"
-        "    defined. This is useful for forward compile-time references\n"
-        "    without an explicit earlier stub: the parser marks each later\n"
-        "    word name as available immediately for the rest of the compile\n"
-        "    phase.\n"
-        "\n"
-        "  ct-parser-remaining   [*] -> [* | n]\n"
-        "    Return remaining token count from current cursor to stream\n"
-        "    end (never negative).\n"
-        "\n"
-        "  ct-parser-eof?        [*] -> [* | flag]\n"
-        "    Push 1 when parser cursor is at/after end-of-stream,\n"
-        "    otherwise 0.\n"
-        "\n"
-        "  ct-parser-peek        [* | n] -> [* | token]\n"
-        "    Non-consuming lookahead by offset n from current cursor.\n"
-        "    n must be >= 0; out-of-range returns nil.\n"
-        "\n"
-        "  ct-parser-set-pos     [* | n] -> [* | old-n]\n"
-        "    Move cursor to absolute position n (0 <= n <= len(tokens)).\n"
-        "    Returns previous cursor; updates ct-current-token coherently.\n"
-        "\n"
-        "  ct-parser-checkpoint  [*] -> [* | checkpoint-map]\n"
-        "    Snapshot parser cursor state for speculative parsing.\n"
-        "    Map includes pos, last_token, and remaining keys.\n"
-        "\n"
-        "  ct-parser-restore     [* | checkpoint] -> [* | flag]\n"
-        "    Restore cursor from checkpoint map or raw integer position.\n"
-        "    Returns 1 on successful restore; validates bounds/types.\n"
-        "\n"
-        "  ct-parser-tail        [*] -> [* | list-of-tokens]\n"
-        "    Return copy of remaining token objects from current cursor.\n"
-        "    Useful for diagnostics and custom parser lookahead.\n"
-        "\n"
-        "  ct-parser-session-begin [*] -> [* | depth]\n"
-        "    Push full parser state snapshot (tokens, pos, last_token)\n"
-        "    onto nested session stack and return new depth.\n"
-        "\n"
-        "  ct-parser-session-commit [*] -> [* | flag]\n"
-        "    Commit top session (discard snapshot) and keep current\n"
-        "    parser state. Returns 1 when session existed, else 0.\n"
-        "\n"
-        "  ct-parser-session-rollback [*] -> [* | flag]\n"
-        "    Restore parser to top session snapshot and pop it.\n"
-        "    Returns 1 when restored, else 0 if no active session.\n"
-        "\n"
-        "  ct-parser-collect-until [* | delimiter] -> [* | tokens found]\n"
-        "    Consume tokens until delimiter lexeme is encountered.\n"
-        "    Delimiter is consumed; output excludes delimiter token.\n"
-        "\n"
-        "  ct-parser-collect-balanced [*, open | close] -> [* | tokens found]\n"
-        "    Consume balanced token region for open/close delimiters.\n"
-        "    Tracks nested open tokens; closing token at depth 0 ends read.\n"
-        "\n"
-        "  ct-parser-mark [* | name] -> [*, prev-pos | had-prev]\n"
-        "    Save current cursor under string mark name. Returns previous\n"
-        "    position and had-prev flag (0 when mark was newly created).\n"
-        "\n"
-        "  ct-parser-diff [*, start | end] -> [* | map]\n"
-        "    Compare two parser positions/marks/checkpoints and return map\n"
-        "    with start,end,delta,forward,count,lexemes fields.\n"
-        "\n"
-        "  ct-parser-expected [* | expected] -> [* | token]\n"
-        "    Validate next token lexeme against expected value(s).\n"
-        "    expected can be string/token or list of strings/tokens;\n"
-        "    raises parse-error on mismatch and returns matched token.\n"
-        "\n"
-        "  ct-set-macro-expansion-limit [* | n] -> [*]\n"
-        "\n"
-        "  ct-get-macro-expansion-limit [*] -> [* | n]\n"
-        "    Configure/query parser macro+rewrite expansion guard limit.\n"
-        "\n"
-        "  ct-set-macro-preview   [* | flag] -> [*]\n"
-        "\n"
-        "  ct-get-macro-preview   [*] -> [* | flag]\n"
-        "    Enable/query preview tracing for macro+rewrite expansions.\n"
-        "    Preview output includes the expanded token stream and a\n"
-        "    source-context window around the expansion site.\n"
-        "\n"
-        "  ct-register-text-macro [*, name, params | expansion-list] -> [*]\n"
-        "    Programmatically register a text macro from compile-time code.\n"
-        "\n"
-        "  ct-register-text-macro-signature [*, name, param-spec | expansion-list] -> [*]\n"
-        "    Register a text macro with explicit parameter names.\n"
-        "    `param-spec` is a list of identifiers. Prefix one with\n"
-        "    `*` or `...` to mark it variadic (must be last).\n"
-        "\n"
-        "  ct-register-pattern-macro  [*, name | clauses] -> [*]\n"
-        "    Register a pattern macro from compile-time data. Existing\n"
-        "    rules under the same macro name are replaced first.\n"
-        "    `clauses` accepts:\n"
-        "      [pattern replacement]\n"
-        "      [pattern replacement guard]\n"
-        "      {pattern, replacement, guard?, group?, scope?, metadata?}\n"
-        "    Internally each clause becomes grammar rewrite rule\n"
-        "    pattern-macro:<name>:<index> with provenance metadata.\n"
-        "\n"
-        "  ct-unregister-pattern-macro  [* | name] -> [* | removed]\n"
-        "    Remove all generated rewrite rules for a pattern macro and\n"
-        "    clear associated grouping/scope bookkeeping. Returns 1 when\n"
-        "    any rule was removed, else 0.\n"
-        "\n"
-        "  ct-word-is-text-macro    [* | name] -> [* | flag]\n"
-        "    Return 1 when `name` resolves to a text macro\n"
-        "    (word with macro expansion tokens), else 0.\n"
-        "\n"
-        "  ct-word-is-pattern-macro  [* | name] -> [* | flag]\n"
-        "    Return 1 when `name` has registered pattern-macro rewrite\n"
-        "    clauses, else 0.\n"
-        "\n"
-        "  ct-get-macro-signature   [* | name] -> [*, params, variadic | found]\n"
-        "    Query text-macro parameter shape. On success pushes:\n"
-        "      - params: ordered parameter-name list\n"
-        "      - variadic: variadic parameter name or nil\n"
-        "      - found: 1\n"
-        "    For legacy count-based macros, params are synthesized as\n"
-        "    [\"0\", \"1\", ...]. Missing/non-text macro returns nil nil 0.\n"
-        "\n"
-        "  ct-get-macro-expansion   [* | name] -> [*, expansion | found]\n"
-        "    Return text-macro expansion token list and found flag.\n"
-        "    Missing macro returns nil 0.\n"
-        "\n"
-        "  ct-set-macro-expansion   [*, name | expansion] -> [* | ok]\n"
-        "    Replace expansion token list for an existing text macro.\n"
-        "    Also resets cached template AST/program and profiling state\n"
-        "    so future expansions recompile with new content.\n"
-        "\n"
-        "  ct-clone-macro           [*, source | target] -> [* | ok]\n"
-        "    Clone macro behavior from source to target. Text and pattern\n"
-        "    macros are supported, including docs/attrs/schema/taint and\n"
-        "    ct-call contract metadata when present. Returns 0 on conflicts.\n"
-        "\n"
-        "  ct-rename-macro          [*, source | target] -> [* | ok]\n"
-        "    Rename by cloning then removing source macro state.\n"
-        "    If source was active token hook, hook binding is cleared.\n"
-        "\n"
-        "  ct-macro-doc-get         [* | name] -> [*, doc | found]\n"
-        "    Read optional free-form documentation text attached to macro.\n"
-        "    Returns nil 0 when no doc exists.\n"
-        "\n"
-        "  ct-macro-doc-set         [*, name | doc-or-nil] -> [* | ok]\n"
-        "    Attach or remove macro documentation. Passing nil deletes\n"
-        "    existing doc entry. Returns 1 on success, 0 when macro missing.\n"
-        "\n"
-        "  ct-macro-attrs-get       [* | name] -> [*, attrs | found]\n"
-        "    Read structured attribute map attached to macro. Returned map\n"
-        "    is deep-cloned to avoid accidental shared mutable state.\n"
-        "\n"
-        "  ct-macro-attrs-set       [*, name | attrs-or-nil] -> [* | ok]\n"
-        "    Attach or remove macro attribute map. Keys are normalized to\n"
-        "    strings and values are deep-cloned for isolation.\n"
-        "\n"
-        "  ct-get-macro-template-mode  [* | name] -> [*, mode | found]\n"
-        "    Introspect compiled template mode for text macros using\n"
-        "    directives (strict/permissive). Triggers lazy template parse\n"
-        "    if needed. Missing macro returns nil 0.\n"
-        "\n"
-        "  ct-get-macro-template-version  [* | name] -> [*, version-or-nil | found]\n"
-        "    Return optional ct-version marker captured from macro template.\n"
-        "    Missing macro returns nil 0.\n"
-        "\n"
-        "  ct-get-macro-template-program-size  [* | name] -> [*, count | found]\n"
-        "    Return top-level node count for precompiled template program.\n"
-        "    Useful for complexity checks and tooling diagnostics.\n"
-        "\n"
-        "  ct-set-ct-call-contract  [*, word | map-or-nil] -> [* | ok]\n"
-        "    Set ABI/shape contract for template `ct-call` target `word`.\n"
-        "    Passing nil removes the contract. Returns 0 when target word\n"
-        "    does not exist in dictionary.\n"
-        "\n"
-        "  ct-get-ct-call-contract  [* | word] -> [*, map | found]\n"
-        "    Read ct-call contract map for word (deep copy). Returns nil 0\n"
-        "    when no contract is configured.\n"
-        "\n"
-        "  ct-set-ct-call-exception-policy  [* | policy] -> [*]\n"
-        "    Set ct-call failure behavior. Allowed values:\n"
-        "      - raise: propagate as parse error\n"
-        "      - warn: emit warning and continue\n"
-        "      - empty: treat failure as empty expansion\n"
-        "      - ignore: synonym for empty behavior\n"
-        "\n"
-        "  ct-get-ct-call-exception-policy  [*] -> [* | policy]\n"
-        "    Return current ct-call exception policy string.\n"
-        "\n"
-        "  ct-set-ct-call-sandbox-mode  [* | mode] -> [*]\n"
-        "    Set ct-call execution sandbox mode:\n"
-        "      - off: no restrictions\n"
-        "      - allowlist: only names in sandbox allowlist\n"
-        "      - compile-only: only compile-only target words\n"
-        "\n"
-        "  ct-get-ct-call-sandbox-mode  [*] -> [* | mode]\n"
-        "    Return active sandbox mode string.\n"
-        "\n"
-        "  ct-set-ct-call-sandbox-allowlist  [* | words] -> [* | count]\n"
-        "    Replace allowlist set from lexeme list. Duplicates are removed\n"
-        "    by set semantics. Returns resulting unique word count.\n"
-        "\n"
-        "  ct-get-ct-call-sandbox-allowlist  [*] -> [* | words]\n"
-        "    Return sorted list of allowlisted ct-call target names.\n"
-        "\n"
-        "  ct-ctrand-seed           [* | seed] -> [*]\n"
-        "    Seed deterministic compile-time RNG used by ct-ctrand-* APIs.\n"
-        "\n"
-        "  ct-ctrand-int            [* | bound] -> [* | n]\n"
-        "    Return random integer n in range [0, bound). Requires bound > 0.\n"
-        "\n"
-        "  ct-ctrand-range          [*, lo | hi] -> [* | n]\n"
-        "    Return random integer n in inclusive range [lo, hi].\n"
-        "    Raises parse error when hi < lo.\n"
-        "\n"
-        "  ct-set-ct-call-memo      [* | flag] -> [*]\n"
-        "    Enable/disable ct-call memoization cache lookups and writes.\n"
-        "    This toggles behavior only; existing cache entries are not\n"
-        "    automatically cleared. Use ct-clear-ct-call-memo for reset.\n"
-        "\n"
-        "  ct-get-ct-call-memo      [*] -> [* | flag]\n"
-        "    Return 1 when ct-call memoization is enabled, else 0.\n"
-        "\n"
-        "  ct-clear-ct-call-memo    [*] -> [* | count]\n"
-        "    Clear all memoized ct-call entries and return removed count.\n"
-        "\n"
-        "  ct-get-ct-call-memo-size [*] -> [* | n]\n"
-        "    Return the current number of entries in ct-call memo cache.\n"
-        "\n"
-        "  ct-set-ct-call-side-effects [* | flag] -> [*]\n"
-        "    Enable/disable side-effect tracking for ct-call execution.\n"
-        "    When enabled, ct-call emits structured log entries.\n"
-        "\n"
-        "  ct-get-ct-call-side-effects [*] -> [* | flag]\n"
-        "    Return 1 when ct-call side-effect tracking is enabled, else 0.\n"
-        "\n"
-        "  ct-get-ct-call-side-effect-log [*] -> [* | list]\n"
-        "    Return deep-copied side-effect log entries collected from\n"
-        "    ct-call execution.\n"
-        "\n"
-        "  ct-clear-ct-call-side-effect-log [*] -> [* | count]\n"
-        "    Clear side-effect log and return number of removed entries.\n"
-        "\n"
-        "  ct-set-ct-call-recursion-limit [* | n] -> [*]\n"
-        "    Set recursion guard for nested ct-call expansion.\n"
-        "    Requires n >= 1 (otherwise parse error).\n"
-        "\n"
-        "  ct-get-ct-call-recursion-limit [*] -> [* | n]\n"
-        "    Return current ct-call recursion guard limit.\n"
-        "\n"
-        "  ct-set-ct-call-timeout-ms [* | ms] -> [*]\n"
-        "    Set per-ct-call timeout budget in milliseconds.\n"
-        "    Use 0 to disable timeout checks.\n"
-        "\n"
-        "  ct-get-ct-call-timeout-ms [*] -> [* | ms]\n"
-        "    Return current ct-call timeout budget (ms).\n"
-        "\n"
-        "  ct-gensym                [* | prefix] -> [* | symbol]\n"
-        "    Hygienic name generator for macro pipelines. Prefix is\n"
-        "    sanitized to identifier-safe text and a counter suffix is\n"
-        "    incremented until dictionary name collision is avoided.\n"
-        "\n"
-        "  ct-capture-args          [* | ctx] -> [* | map]\n"
-        "    Return deep-cloned capture `args` namespace from context.\n"
-        "\n"
-        "  ct-capture-locals        [* | ctx] -> [* | map]\n"
-        "    Return deep-cloned capture `locals` namespace from context.\n"
-        "\n"
-        "  ct-capture-globals       [* | ctx] -> [* | map]\n"
-        "    Return deep-cloned capture `globals` namespace from context.\n"
-        "\n"
-        "  ct-capture-get           [*, ctx | name] -> [*, value | found]\n"
-        "    Lookup capture by name from ctx.captures. Missing capture\n"
-        "    returns nil 0.\n"
-        "\n"
-        "  ct-capture-has?          [*, ctx | name] -> [* | flag]\n"
-        "    Return 1 when capture exists in ctx.captures, else 0.\n"
-        "\n"
-        "  ct-capture-shape         [* | value] -> [* | shape]\n"
-        "    Return normalized shape tag: none/single/tokens/multi/scalar.\n"
-        "\n"
-        "  ct-capture-assert-shape  [*, value | shape] -> [*]\n"
-        "    Assert expected shape against ct-capture-shape result and\n"
-        "    raise parse error on mismatch.\n"
-        "\n"
-        "  ct-capture-count         [* | value] -> [* | n]\n"
-        "    Return element/group count for list/group-list captures.\n"
-        "    Nil yields 0; scalar values raise parse error.\n"
-        "\n"
-        "  ct-capture-slice         [*, value, start | end] -> [* | sliced]\n"
-        "    Slice list/group-list using Python-style [start:end].\n"
-        "    Nil yields empty list.\n"
-        "\n"
-        "  ct-capture-map           [*, value | op] -> [* | value]\n"
-        "    Apply token transform op over capture values. Supported ops:\n"
-        "    upper, lower, strip, int, int-normalize.\n"
-        "\n"
-        "  ct-capture-filter        [*, value | predicate] -> [* | value]\n"
-        "    Filter token values by predicate (`nonempty`, `ident`, `int`,\n"
-        "    `number`, `string`, `char`, or rewrite-constraint names).\n"
-        "\n"
-        "  ct-capture-separate      [*, value | sep] -> [* | tokens]\n"
-        "    Flatten value into token list; for variadic group-lists\n"
-        "    inserts separator token between groups.\n"
-        "\n"
-        "  ct-capture-join          [*, value | sep] -> [* | text]\n"
-        "    Join capture tokens/groups into a string with separator.\n"
-        "\n"
-        "  ct-capture-equal?        [*, left | right] -> [* | flag]\n"
-        "    Deep equality over normalized capture values (1/0).\n"
-        "\n"
-        "  ct-capture-normalize     [* | value] -> [* | normalized]\n"
-        "    Convert capture value into stable plain data form\n"
-        "    (tokens to lexemes, map keys to strings, tuples to lists).\n"
-        "\n"
-        "  ct-capture-pretty        [* | value] -> [* | json]\n"
-        "    Pretty-print normalized capture value as indented JSON text.\n"
-        "\n"
-        "  ct-capture-clone         [* | value] -> [* | value]\n"
-        "    Deep clone capture value to avoid aliasing/mutation leaks.\n"
-        "\n"
-        "  ct-capture-coerce-tokens [* | value] -> [* | tokens]\n"
-        "    Coerce value into flat token-lexeme list.\n"
-        "\n"
-        "  ct-capture-coerce-string [* | value] -> [* | text]\n"
-        "    Coerce value into string. Existing strings pass through;\n"
-        "    other values are flattened and joined with spaces.\n"
-        "\n"
-        "  ct-capture-coerce-number [* | value] -> [*, n | found]\n"
-        "    Coerce bool/int/token/string/single-token capture into int.\n"
-        "    On failure returns 0 0.\n"
-        "\n"
-        "  ct-capture-origin        [* | ctx] -> [* | map]\n"
-        "    Return deep-cloned origin metadata map from capture context.\n"
-        "\n"
-        "  ct-capture-lifetime      [* | ctx] -> [* | id]\n"
-        "    Return integer lifetime identifier recorded in context.\n"
-        "\n"
-        "  ct-capture-lifetime-live? [* | ctx] -> [* | flag]\n"
-        "    Return 1 when context lifetime matches active parser lifetime.\n"
-        "\n"
-        "  ct-capture-lifetime-assert [* | ctx] -> [*]\n"
-        "    Raise parse error when context lifetime is stale or missing.\n"
-        "\n"
-        "  ct-capture-lint          [* | ctx] -> [* | warnings]\n"
-        "    Return lint warnings for suspicious capture context content\n"
-        "    (invalid names, empty groups, taint, stale lifetime).\n"
-        "\n"
-        "  ct-capture-global-set    [*, name | value] -> [*]\n"
-        "    Set parser-global capture value under name (deep-cloned).\n"
-        "\n"
-        "  ct-capture-global-get    [* | name] -> [*, value | found]\n"
-        "    Read parser-global capture value by name; missing -> nil 0.\n"
-        "\n"
-        "  ct-capture-global-delete [* | name] -> [* | removed]\n"
-        "    Delete parser-global capture value and return removed flag.\n"
-        "\n"
-        "  ct-capture-global-clear  [*] -> [* | count]\n"
-        "    Clear all parser-global capture values and return removed count.\n"
-        "\n"
-        "  ct-capture-freeze        [*, macro | name] -> [*]\n"
-        "    Freeze capture mutability for (macro, name).\n"
-        "\n"
-        "  ct-capture-thaw          [*, macro | name] -> [* | removed]\n"
-        "    Remove frozen mutability entry for (macro, name).\n"
-        "\n"
-        "  ct-capture-mutable?      [*, macro | name] -> [* | flag]\n"
-        "    Return 1 when capture is mutable, 0 when frozen.\n"
-        "\n"
-        "  ct-capture-schema-put    [*, macro, name, shape, type | required] -> [*]\n"
-        "    Define capture schema rule for macro capture name.\n"
-        "    Shape must be any/single/tokens/multi/none/scalar.\n"
-        "\n"
-        "  ct-capture-schema-get    [* | macro] -> [*, schema | found]\n"
-        "    Fetch deep-cloned capture schema for macro. Missing -> nil 0.\n"
-        "\n"
-        "  ct-capture-schema-validate [* | ctx] -> [* | ok]\n"
-        "    Validate context captures against registered schema for ctx.macro.\n"
-        "    Pushes 1 on success; parse error on violations.\n"
-        "\n"
-        "  ct-capture-taint-set     [*, macro, name | flag] -> [*]\n"
-        "    Set taint flag for named capture under macro scope.\n"
-        "\n"
-        "  ct-capture-taint-get     [*, macro | name] -> [*, flag | found]\n"
-        "    Read taint flag for (macro, capture). Missing -> 0 0.\n"
-        "\n"
-        "  ct-capture-tainted?      [*, ctx | name] -> [* | flag]\n"
-        "    Read taint state directly from context taint map.\n"
-        "\n"
-        "  ct-capture-serialize     [* | value] -> [* | json]\n"
-        "    Serialize normalized value to canonical compact JSON.\n"
-        "\n"
-        "  ct-capture-deserialize   [* | json] -> [* | value]\n"
-        "    Parse JSON payload into compile-time value (parse error on invalid).\n"
-        "\n"
-        "  ct-capture-compress      [* | text] -> [* | blob]\n"
-        "    Compress UTF-8 text with zlib and encode as base64 ASCII blob.\n"
-        "\n"
-        "  ct-capture-decompress    [* | blob] -> [* | text]\n"
-        "    Decode base64 + zlib blob and return UTF-8 text.\n"
-        "    Invalid payload raises parse error.\n"
-        "\n"
-        "  ct-capture-hash          [* | value] -> [* | sha256]\n"
-        "    SHA-256 hash of canonical serialized normalized value.\n"
-        "\n"
-        "  ct-capture-diff          [*, left | right] -> [* | list]\n"
-        "    Return deep structural diff list with path-qualified mismatch text.\n"
-        "\n"
-        "  ct-capture-replay-log    [*] -> [* | list]\n"
-        "    Return deep-cloned capture replay log entries.\n"
-        "\n"
-        "  ct-capture-replay-clear  [*] -> [* | count]\n"
-        "    Clear capture replay log and return removed entry count.\n"
-        "\n"
-        "  ct-list-pattern-macros   [*] -> [* | names]\n"
-        "    Return sorted list of pattern macro names with registered clauses.\n"
-        "\n"
-        "  ct-set-pattern-macro-enabled  [*, name | flag] -> [* | ok]\n"
-        "    Enable/disable named pattern macro. Returns 0 when missing.\n"
-        "\n"
-        "  ct-get-pattern-macro-enabled  [* | name] -> [*, flag | found]\n"
-        "    Read enabled flag for named pattern macro. Missing -> 0 0.\n"
-        "\n"
-        "  ct-set-pattern-macro-priority [*, name | priority] -> [* | ok]\n"
-        "    Set numeric clause-priority bias for pattern macro.\n"
-        "\n"
-        "  ct-get-pattern-macro-priority [* | name] -> [*, priority | found]\n"
-        "    Read pattern macro priority. Missing -> 0 0.\n"
-        "\n"
-        "  ct-get-pattern-macro-clauses  [* | name] -> [*, clauses | found]\n"
-        "    Return simplified clause payload as list of\n"
-        "    [pattern-list replacement-list] pairs.\n"
-        "\n"
-        "  ct-get-pattern-macro-clause-details [* | name] -> [*, details | found]\n"
-        "    Return full clause detail maps (guards/group/scope/metadata).\n"
-        "\n"
-        "  ct-set-pattern-macro-group [*, name | group] -> [* | ok]\n"
-        "    Assign macro to activation group. Returns 0 when missing.\n"
-        "\n"
-        "  ct-get-pattern-macro-group [* | name] -> [*, group | found]\n"
-        "    Read pattern macro group label. Missing -> nil 0.\n"
-        "\n"
-        "  ct-set-pattern-macro-scope [*, name | scope] -> [* | ok]\n"
-        "    Assign activation scope label to pattern macro.\n"
-        "\n"
-        "  ct-get-pattern-macro-scope [* | name] -> [*, scope | found]\n"
-        "    Read pattern macro scope label. Missing -> nil 0.\n"
-        "\n"
-        "  ct-set-pattern-group-active [*, group | flag] -> [* | ok]\n"
-        "    Enable/disable entire pattern group for rewrite matching.\n"
-        "\n"
-        "  ct-set-pattern-scope-active [*, scope | flag] -> [* | ok]\n"
-        "    Enable/disable entire pattern scope for rewrite matching.\n"
-        "\n"
-        "  ct-list-active-pattern-groups [*] -> [* | groups]\n"
-        "    List currently enabled pattern groups.\n"
-        "\n"
-        "  ct-list-active-pattern-scopes [*] -> [* | scopes]\n"
-        "    List currently enabled pattern scopes.\n"
-        "\n"
-        "  ct-set-pattern-macro-clause-guard [*, name, idx | guard-or-nil] -> [* | ok]\n"
-        "    Set/clear guard for clause index (0-based) in named pattern macro.\n"
-        "    Returns 0 for invalid macro/index.\n"
-        "\n"
-        "  ct-detect-pattern-conflicts [*] -> [* | conflicts]\n"
-        "    Detect conflicting pattern clauses across all macros.\n"
-        "\n"
-        "  ct-detect-pattern-conflicts-named [* | name] -> [* | conflicts]\n"
-        "    Detect conflicts only for named pattern macro.\n"
-        "\n"
-        "  ct-get-rewrite-specificity [*, stage | name] -> [*, score | found]\n"
-        "    Query computed rewrite specificity score for stage/rule name.\n"
-        "    Missing rule returns 0 0.\n"
-        "\n"
-        "  ct-set-rewrite-pipeline [*, stage, name | pipeline] -> [* | ok]\n"
-        "    Assign named rewrite rule to pipeline bucket within stage.\n"
-        "\n"
-        "  ct-get-rewrite-pipeline [*, stage | name] -> [*, pipeline | found]\n"
-        "    Read pipeline assignment for rewrite rule. Missing -> nil 0.\n"
-        "\n"
-        "  ct-set-rewrite-pipeline-active [*, stage, pipeline | flag] -> [*]\n"
-        "    Enable/disable pipeline for a stage.\n"
-        "\n"
-        "  ct-list-rewrite-active-pipelines [* | stage] -> [* | pipelines]\n"
-        "    List active pipeline names for stage.\n"
-        "\n"
-        "  ct-rebuild-rewrite-index [* | stage] -> [* | size]\n"
-        "    Rebuild rewrite stage index caches and return indexed-rule count\n"
-        "    (keyed + wildcard).\n"
-        "\n"
-        "  ct-get-rewrite-index-stats [* | stage] -> [* | map]\n"
-        "    Return index statistics map: {stage, keys, keyed_rules,\n"
-        "    wildcard_rules}.\n"
-        "\n"
-        "  ct-rewrite-txn-begin [*] -> [* | depth]\n"
-        "    Begin rewrite transaction scope and return nesting depth.\n"
-        "\n"
-        "  ct-rewrite-txn-commit [*] -> [* | ok]\n"
-        "    Commit top rewrite transaction snapshot.\n"
-        "\n"
-        "  ct-rewrite-txn-rollback [*] -> [* | ok]\n"
-        "    Roll back top rewrite transaction snapshot.\n"
-        "\n"
-        "  ct-export-rewrite-pack [*] -> [* | pack]\n"
-        "    Export all rewrite configuration/rules into portable pack map.\n"
-        "\n"
-        "  ct-import-rewrite-pack [* | pack] -> [* | count]\n"
-        "    Import rewrite pack entries (merge mode) and return imported count.\n"
-        "\n"
-        "  ct-import-rewrite-pack-replace [* | pack] -> [* | count]\n"
-        "    Import rewrite pack entries with replacement semantics and\n"
-        "    return imported count.\n"
-        "\n"
-        "  ct-get-rewrite-provenance [*, stage | name] -> [*, map | found]\n"
-        "    Read provenance metadata for rewrite rule. Missing -> nil 0.\n"
-        "\n"
-        "  ct-rewrite-dry-run [*, stage, tokens | max-steps] -> [*, tokens | patches]\n"
-        "    Simulate rewrite pass without mutating parser state. Returns\n"
-        "    final tokens and patch trace list.\n"
-        "\n"
-        "  ct-rewrite-generate-fixture [*, stage, tokens | max-steps] -> [* | fixture-map]\n"
-        "    Build fixture map {stage,input,output,patches} from dry-run result.\n"
-        "\n"
-        "  ct-set-rewrite-saturation [* | strategy] -> [*]\n"
-        "    Set saturation strategy: first, specificity, or single-pass.\n"
-        "\n"
-        "  ct-get-rewrite-saturation [*] -> [* | strategy]\n"
-        "    Return active rewrite saturation strategy.\n"
-        "\n"
-        "  ct-set-rewrite-max-steps [* | n] -> [*]\n"
-        "    Set max rewrite-step budget (n >= 1).\n"
-        "\n"
-        "  ct-get-rewrite-max-steps [*] -> [* | n]\n"
-        "    Return configured rewrite-step budget.\n"
-        "\n"
-        "  ct-set-rewrite-loop-detection [* | flag] -> [*]\n"
-        "    Enable/disable loop-detection checks in rewrite engine.\n"
-        "\n"
-        "  ct-get-rewrite-loop-detection [*] -> [* | flag]\n"
-        "    Return loop-detection enabled flag (1/0).\n"
-        "\n"
-        "  ct-get-rewrite-loop-reports [*] -> [* | reports]\n"
-        "    Return captured rewrite loop report entries.\n"
-        "\n"
-        "  ct-clear-rewrite-loop-reports [*] -> [* | count]\n"
-        "    Clear loop report list and return removed count.\n"
-        "\n"
-        "  ct-set-rewrite-trace [* | flag] -> [*]\n"
-        "    Enable/disable rewrite trace logging.\n"
-        "\n"
-        "  ct-get-rewrite-trace [*] -> [* | flag]\n"
-        "    Return rewrite trace enabled flag (1/0).\n"
-        "\n"
-        "  ct-get-rewrite-trace-log [*] -> [* | list]\n"
-        "    Return rewrite trace event log list.\n"
-        "\n"
-        "  ct-clear-rewrite-trace-log [*] -> [* | count]\n"
-        "    Clear rewrite trace log and return removed count.\n"
-        "\n"
-        "  ct-get-rewrite-profile [*] -> [* | map]\n"
-        "    Return rewrite profile snapshot map (counters/timings).\n"
-        "\n"
-        "  ct-clear-rewrite-profile [*] -> [*]\n"
-        "    Reset rewrite profiler counters and timings.\n"
-        "\n"
-        "  ct-rewrite-compatibility-matrix [* | stage] -> [* | matrix]\n"
-        "    Build stage compatibility matrix for rewrite rules/constraints.\n"
+        "      ct-rewrite-add-grammar drop\n"
+        "\n"
+        "  ct-rewrite-remove [* | handle] -> [* | removed]\n"
+        "    Remove the rule a handle identifies (either stage). A stale\n"
+        "    handle pushes 0.\n"
+        "\n"
+        "  ct-rewrite-clear-reader  [*] -> [* | count]\n"
+        "  ct-rewrite-clear-grammar [*] -> [* | count]\n"
+        "    Remove every rule of the stage that no language pack owns.\n"
+        "\n"
+        "  ct-rewrite-list-reader  [*] -> [* | list]\n"
+        "  ct-rewrite-list-grammar [*] -> [* | list]\n"
+        "    One {handle, name} map per registration, in registration order,\n"
+        "    including disabled rules and rules of inactive packs.\n"
+        "\n"
+        "  ct-rewrite-rule-set-priority [*, handle | priority] -> [* | found]\n"
+        "  ct-rewrite-rule-set-enabled  [*, handle | flag] -> [* | found]\n"
+        "  ct-rewrite-rule-set-pipeline [*, handle | pipeline] -> [* | found]\n"
+        "  ct-rewrite-rule-set-guard    [*, handle | name-or-nil] -> [* | found]\n"
+        "    Change one property of a rule; 0 for a stale handle.\n"
+        "\n"
+        "  ct-rewrite-rule-get-priority [* | handle] -> [*, priority | found]\n"
+        "  ct-rewrite-rule-get-enabled  [* | handle] -> [*, flag | found]\n"
+        "  ct-rewrite-rule-get-pipeline [* | handle] -> [*, pipeline | found]\n"
+        "  ct-rewrite-rule-get-guard    [* | handle] -> [*, name-or-nil | found]\n"
+        "    Read one property; also accepts `stage name` for a name unique in\n"
+        "    the stage (an ambiguous name is an error). Missing -> nil 0.\n"
+        "\n"
+        "  A guard is a CT word `payload -- applies?` called when its rule\n"
+        "  matches; payload has stage, handle, rule, start, end, pattern,\n"
+        "  replacement, and captures. 0 skips the rule.\n"
+        "\n"
+        "  ct-rewrite-set-pipeline-active   [*, stage, pipeline | flag] -> [*]\n"
+        "  ct-rewrite-list-active-pipelines [* | stage] -> [* | pipelines]\n"
+        "    Activate/deactivate a pipeline; list active ones (sorted).\n"
         "\n"
         "  ct-rewrite-scope-push [*] -> [* | depth]\n"
-        "    Push current rewrite activation snapshot (pipelines, groups,\n"
-        "    scopes) onto CT scope stack.\n"
+        "  ct-rewrite-scope-pop  [*] -> [* | restored]\n"
+        "    Save/restore the active pipeline sets.\n"
         "\n"
-        "  ct-rewrite-scope-pop [*] -> [* | flag]\n"
-        "    Restore top rewrite activation snapshot. Returns 0 when\n"
-        "    scope stack is empty.\n"
+        "  ct-rewrite-set-max-steps [* | limit] -> [*]\n"
+        "  ct-rewrite-get-max-steps [*] -> [* | limit]\n"
+        "    Rewrite applications allowed per parse, shared by both stages\n"
+        "    (default 100000; 0 allows none).\n"
         "\n"
-        "  ct-rewrite-run-on-list [*, stage | tokens] -> [*, tokens | patches]\n"
-        "    Run rewrite engine on explicit token-lexeme list using current\n"
-        "    stage activation/saturation settings, without mutating parser\n"
-        "    token stream.\n"
+        "  ct-rewrite-set-loop-detection [* | flag] -> [*]\n"
+        "  ct-rewrite-loop-detection?    [*] -> [* | flag]\n"
+        "    Reject a rewrite that would repeat an earlier token sequence of\n"
+        "    the stage (default on).\n"
         "\n"
-        "    Template helper introspection: see ct-get-macro-template-mode,\n"
-        "    ct-get-macro-template-version, and\n"
-        "    ct-get-macro-template-program-size above.\n"
+        "  ct-rewrite-get-loop-reports   [*] -> [* | reports]\n"
+        "  ct-rewrite-clear-loop-reports [*] -> [* | count]\n"
+        "    Read/clear the reports of detected loops.\n"
         "\n"
-        "  ct-list-words        [*] -> [* | list]\n"
-        "    Return sorted list of all currently registered dictionary words.\n"
+        "  ct-rewrite-run-on-list [*, stage | lexemes] -> [*, lexemes | patches]\n"
+        "  ct-rewrite-dry-run     [*, stage, lexemes | max-steps] -> [*, lexemes | patches]\n"
+        "    Apply the stage's rules to a lexeme list (the input is not\n"
+        "    changed) and push the result plus one patch map per application\n"
+        "    (stage, handle, rule, start, end, before, after, priority). Live\n"
+        "    rewrites publish the same patch as a rewrite.applied event.\n"
         "\n"
-        "  ct-unregister-word    [* | name] -> [* | flag]\n"
-        "    Remove named word/macro definition from dictionary.\n"
-        "    Returns 1 when removal occurred, else 0.\n"
+        "  ct-expansion-set-depth-limit [* | limit] -> [*]\n"
         "\n"
-        "  ct-word-exists?       [* | name] -> [* | flag]\n"
-        "    Return 1 when dictionary contains named word, else 0.\n"
+        "  ct-expansion-get-depth-limit [*] -> [* | limit]\n"
+        "    Set/read the nesting limit shared by macro and rewrite\n"
+        "    expansion (default 256; positive integers only).\n"
         "\n"
-        "  ct-get-word-body      [* | name] -> [* | body-or-nil]\n"
-        "    Introspect high-level word body as op maps, or macro body as\n"
-        "    expansion token list. Missing/unavailable returns nil.\n"
+        "  ── Deterministic random numbers\n"
         "\n"
-        "  ct-get-word-asm       [* | name] -> [* | asm-or-nil]\n"
-        "    Return raw asm body string for :asm-defined words.\n"
-        "    Non-asm/missing words return nil.\n"
+        "  One pseudo-random stream per compilation, starting from seed\n"
+        "  0x1A2B3C4D; imports and CT code draw from it in execution order and\n"
+        "  error recovery does not rewind it. Arguments are integers (booleans\n"
+        "  are rejected). Sequences are reproducible for the same Python\n"
+        "  version, seed, and draws, but not across Python versions; the\n"
+        "  stream is not suitable for secrets.\n"
         "\n"
-        "  emit-definition     [*, name | body-list] -> [*]\n"
-        "    Emit a word definition dynamically. `name` is a token or\n"
-        "    string; `body-list` is a list of tokens/strings that form\n"
-        "    the word body. Injects the equivalent of\n"
-        "      word <name> <body...> end\n"
-        "    into the parser's token stream.\n"
+        "  ct-rng-seed  [* | seed] -> [*]\n"
+        "    Reset the stream; the seed is reduced modulo 2^64.\n"
         "\n"
-        "  ── Control-frame helpers (for custom control structures)\n"
+        "  ct-rng-int   [* | bound] -> [* | n]\n"
+        "    n in [0, bound); bound must be > 0.\n"
+        "\n"
+        "  ct-rng-range [*, lo | hi] -> [* | n]\n"
+        "    n in [lo, hi] (inclusive); lo must be <= hi.\n"
+        "\n"
+        "  ── Control frames, operations, and labels\n"
+        "\n"
+        "  Control frames are ordinary maps on the parser's control stack\n"
+        "  (shared with built-in control parsing; explicit pushes and pops are\n"
+        "  not undone if parsing later fails). Push, peek, and pop copy the\n"
+        "  top-level map only; nested lists and maps stay shared. The parser\n"
+        "  may add `line`/`column` fields.\n"
         "\n"
         "  ct-control-frame-new [* | type] -> [* | frame]\n"
-        "    Create a control frame map with a `type` field.\n"
+        "    A map with `type` set.\n"
         "\n"
-        "  ct-control-get       [*, frame | key] -> [* | value]\n"
-        "    Read key from a control frame map.\n"
+        "  ct-control-get       [*, frame | key] -> [*, value | found]\n"
+        "    The key's value and 1, or nil 0 when absent (nil 1 for a stored nil).\n"
+        "\n"
+        "  ct-control-get?      [*, frame | key] -> [* | value]\n"
+        "    The key's value, or nil when absent (no found flag).\n"
         "\n"
         "  ct-control-set       [*, frame, key | value] -> [* | frame]\n"
-        "    Write key/value into a control frame map.\n"
+        "    Store a value in the map and return that same map.\n"
         "\n"
         "  ct-control-push      [* | frame] -> [*]\n"
-        "    Push a frame onto the parser control stack.\n"
-        "\n"
         "  ct-control-pop       [*] -> [* | frame]\n"
-        "    Pop and return the top parser control frame.\n"
-        "\n"
-        "  ct-control-peek      [*] -> [* | frame] || [* | nil]\n"
-        "    Return the top parser control frame without popping.\n"
-        "\n"
+        "  ct-control-peek      [*] -> [* | frame-or-nil]\n"
         "  ct-control-depth     [*] -> [* | n]\n"
-        "    Return parser control-stack depth.\n"
+        "    Stack operations; pop on an empty stack is an error and changes\n"
+        "    nothing.\n"
         "\n"
         "  ct-control-add-close-op [*, frame, op | data] -> [* | frame]\n"
-        "    Append a close operation descriptor to frame.close_ops.\n"
+        "    Append the descriptor {op, data} to frame.close_ops. When `end`\n"
+        "    closes the frame, every descriptor is validated first (exactly the\n"
+        "    keys op and data, op a nonempty string); a bad one leaves the frame\n"
+        "    on the stack and emits nothing. Otherwise the frame is popped and\n"
+        "    each op is appended in order. `data` is kept by reference.\n"
         "\n"
-        "  ct-new-label         [* | prefix] -> [* | label]\n"
-        "    Allocate a fresh internal label with the given prefix.\n"
+        "  ct-op-emit           [*, op | data] -> [*]\n"
+        "    Append an internal operation to the current body; `data` is kept\n"
+        "    by reference. Unsupported operations fail later, at emission.\n"
         "\n"
-        "  ct-emit-op           [*, op | data] -> [*]\n"
-        "    Emit an internal op node directly into the current body.\n"
+        "  ct-label-new         [* | prefix] -> [* | label]\n"
+        "    A fresh `L_<prefix>_<n>` label; the prefix must match\n"
+        "    [A-Za-z_][A-Za-z0-9_]*. Unique only among allocated labels.\n"
         "\n"
-        "  ct-last-token-line   [*] -> [* | line]\n"
-        "    Return line number of the last parser token (or 0).\n"
+        "  ct-parser-last-line  [*] -> [* | line]\n"
+        "    Line of the last parser token, or 0.\n"
         "\n"
-        "  ct-register-block-opener [* | name] -> [*]\n"
-        "    Mark a word name as a block opener for `with` nesting.\n"
+        "  ct-parser-register-block-opener   [* | name] -> [*]\n"
+        "  ct-parser-unregister-block-opener [* | name] -> [*]\n"
+        "    Edit the lexemes counted as block openers by `with` nesting and\n"
+        "    predeclaration scans (default: word with for while begin). This\n"
+        "    never disables a built-in construct.\n"
         "\n"
-        "  ct-unregister-block-opener [* | name] -> [*]\n"
-        "    Remove a word name from block opener registration.\n"
-        "\n"
-        "  ct-register-control-override [* | name] -> [*]\n"
-        "    Register a control word override so parser can delegate\n"
-        "    built-in control handling to custom compile-time words.\n"
-        "\n"
-        "  ct-unregister-control-override [* | name] -> [*]\n"
-        "    Remove a control word override registration.\n"
+        "  ct-control-register-override   [* | name] -> [*]\n"
+        "  ct-control-unregister-override [* | name] -> [*]\n"
+        "    Route if, else, for, while, or do (only these) to the immediate\n"
+        "    word of that name. While registered, a missing, runtime-only, or\n"
+        "    non-immediate handler is an error; it never falls back to the\n"
+        "    built-in.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 7  LEXER OBJECTS\n"
+        "  § 7  PARSER STREAM\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  Lexer objects provide structured token parsing with custom\n"
-        "  separator characters. They wrap the main parser and let\n"
-        "  macros build mini-DSLs that tokenize differently.\n"
+        "  Compile-time words can read, rewind, and extend the live token\n"
+        "  stream while the parser runs. Positions are token indexes in\n"
+        "  [0, token-count]. Injected tokens are read next and go through the\n"
+        "  normal stages again (reader rewrites, token hook, macros, grammar\n"
+        "  rewrites); they are never turned back into source text.\n"
         "\n"
-        "  lexer-new           [* | separators] -> [* | lexer]\n"
-        "    Create a lexer object with the given separator characters\n"
-        "    (e.g. \",;\" to split on commas and semicolons).\n"
+        "  ct-parser-consume     [*] -> [* | token]\n"
+        "    Consume the next token. Raises a parse error at end of input;\n"
+        "    check ct-parser-eof? first when input may be exhausted.\n"
         "\n"
-        "  lexer-pop           [* | lexer] -> [*, lexer | token]\n"
-        "    Consume and return the next token from the lexer.\n"
+        "  ct-parser-peek        [* | offset] -> [* | token-or-nil]\n"
+        "    Look ahead without consuming; 0 is the next token. The offset\n"
+        "    must be a non-negative integer; past the end pushes nil.\n"
         "\n"
-        "  lexer-peek          [* | lexer] -> [*, lexer | token]\n"
-        "    Return the next token without consuming it.\n"
+        "  ct-parser-current     [*] -> [* | token-or-nil]\n"
+        "    The most recently consumed token, or nil. Consuming and\n"
+        "    collecting update it; peeking and injecting do not. While an\n"
+        "    immediate word runs it starts as the word's own token, so read it\n"
+        "    before consuming if it should anchor generated tokens.\n"
         "\n"
-        "  lexer-expect        [*, lexer | str] -> [*, lexer | token]\n"
-        "    Consume the next token and assert its lexeme matches str.\n"
-        "    Raises a parse error on mismatch.\n"
+        "  ct-parser-get-pos     [*] -> [* | position]\n"
+        "  ct-parser-remaining   [*] -> [* | count]\n"
+        "  ct-parser-eof?        [*] -> [* | flag]\n"
+        "  ct-parser-tail        [*] -> [* | tokens]\n"
+        "    Inspect the cursor, the number of tokens left, the end-of-input\n"
+        "    state, and a copy of the remaining tokens. None of them consume.\n"
         "\n"
-        "  lexer-collect-brace [* | lexer] -> [*, lexer | list]\n"
-        "    Collect all tokens between matching { } braces into a\n"
-        "    list. The opening { must be the next token.\n"
+        "  ct-parser-set-pos     [* | position] -> [* | old-position]\n"
+        "    Move the cursor; the current token becomes the token before the\n"
+        "    new position (nil at 0). Out-of-range positions are errors.\n"
         "\n"
-        "  lexer-push-back     [* | lexer] -> [* | lexer]\n"
-        "    Push the most recently consumed token back onto the\n"
-        "    lexer's stream.\n"
+        "  ct-parser-slice       [*, start | end] -> [* | tokens]\n"
+        "    The tokens between two positions, in stream order (the smaller\n"
+        "    position first), without moving the cursor.\n"
+        "\n"
+        "  ct-parser-inject      [* | tokens] -> [*]\n"
+        "    Insert a list of tokens at the cursor, in list order, without\n"
+        "    moving it. Every element must be a token. Build tokens with\n"
+        "    token-with-lexeme or token-from-origin.\n"
+        "\n"
+        "  ct-parser-collect-until [* | delimiter] -> [*, tokens | found]\n"
+        "    Consume up to and including the delimiter and return the tokens\n"
+        "    before it. At end of input pushes the tokens read and 0. The\n"
+        "    delimiter must be non-empty.\n"
+        "\n"
+        "  ct-parser-collect-balanced [*, open | close] -> [*, tokens | found]\n"
+        "    Call after consuming the outer opener. Returns the interior,\n"
+        "    nested pairs included, and consumes the matching close. When open\n"
+        "    and close are equal the first match closes (no nesting).\n"
+        "\n"
+        "  ct-parser-expected    [* | expected] -> [*, token-or-nil | matched]\n"
+        "    Non-consuming check of the next token against a lexeme, a token,\n"
+        "    or a non-empty list of them. Pushes the token and 1 on a match,\n"
+        "    or nil and 0 on a mismatch or at end of input.\n"
+        "\n"
+        "  ct-parser-checkpoint  [*] -> [* | checkpoint]\n"
+        "  ct-parser-restore     [* | checkpoint] -> [* | restored]\n"
+        "    A checkpoint is an immutable opaque value holding the cursor and\n"
+        "    current token. Restoring pushes 1, or 0 without changing anything\n"
+        "    when the checkpoint belongs to another parser or its position no\n"
+        "    longer fits the stream. It does not undo injected tokens.\n"
+        "\n"
+        "  ct-parser-session-begin    [*] -> [* | session]\n"
+        "  ct-parser-session-commit   [* | session] -> [* | committed]\n"
+        "  ct-parser-session-rollback [* | session] -> [* | rolled-back]\n"
+        "    A session saves the token list, cursor, and current token, so a\n"
+        "    rollback also undoes injected tokens. Sessions nest in strict\n"
+        "    LIFO order: commit and rollback push 1 for the open topmost\n"
+        "    session and 0, changing nothing, for any other session. They do\n"
+        "    not undo definitions, rewrites, or other side effects.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 7A  TOKENIZER AND SOURCE CURSOR\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  The default L2 tokenizer splits text at whitespace (the 25 fixed\n"
+        "  Unicode White_Space code points) and at configured separators.\n"
+        "  String literals, character literals, and # comments are fixed\n"
+        "  rules. A backtick ` is always a token of its own, and \\` is one\n"
+        "  escaped-backtick token; both end a word in progress. At each\n"
+        "  position the longest matching separator wins over word text, so\n"
+        "  with ; configured, ;end is ; then end.\n"
+        "\n"
+        "  ct-tokenizer-get-config [*] -> [* | config]\n"
+        "    A detached copy of the configuration map. Its only key is\n"
+        "    separators, a list of non-empty strings, initially\n"
+        "    ( ) { } ; , [ ].\n"
+        "\n"
+        "  ct-tokenizer-set-config [* | config] -> [*]\n"
+        "    Validate the complete map and replace the configuration. The\n"
+        "    separators key is required; unknown keys, empty strings, and\n"
+        "    separators containing whitespace, a quote, a backtick, or # are\n"
+        "    errors that leave the configuration unchanged. The setting\n"
+        "    lasts for the rest of the compilation and affects only later\n"
+        "    tokenization: source already read is not split again.\n"
+        "\n"
+        "  ct-tokenizer-run    [*, text | path] -> [* | tokens]\n"
+        "    Tokenize text with the current configuration. Each token's\n"
+        "    origin names path (used as given) and its exact span in text.\n"
+        "    No rewrites, hooks, or macros are applied. Unterminated or\n"
+        "    malformed literals are errors at their source span.\n"
+        "\n"
+        "  A source cursor reads raw text one code point at a time, for\n"
+        "  frontends with their own lexical rules. It is a mutable handle:\n"
+        "  every reference to it sees the same position. Offsets are 0-based\n"
+        "  code-point indexes; LF, CRLF, and lone CR each end one line.\n"
+        "\n"
+        "  source-cursor-new   [*, text | path] -> [* | cursor]\n"
+        "    New cursor at offset 0. path is used as given, without lookup.\n"
+        "\n"
+        "  source-cursor-peek  [* | cursor] -> [* | codepoint]\n"
+        "  source-cursor-read  [* | cursor] -> [*, cursor | codepoint]\n"
+        "    The next code point as an integer; read also advances. At end\n"
+        "    of text both raise source-cursor-eof without moving.\n"
+        "\n"
+        "  source-cursor-eof?  [* | cursor] -> [* | flag]\n"
+        "  source-cursor-pos   [* | cursor] -> [* | offset]\n"
+        "  source-cursor-set-pos [*, cursor | offset] -> [* | cursor]\n"
+        "    Inspect or move the cursor; set-pos accepts [0, length].\n"
+        "\n"
+        "  source-cursor-slice [*, cursor, start | end] -> [* | str]\n"
+        "  source-cursor-span  [*, cursor, start | end] -> [* | origin]\n"
+        "    The text, or a SourceOrigin with line and column, of the range\n"
+        "    [start, end), without moving the cursor. Bad offsets or ranges\n"
+        "    raise source-cursor-invalid-argument.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 7B  IMPORTS AND CUSTOM FRONTENDS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  An import request is the token import followed by a string\n"
+        "  literal path. A line `import path` in L2 source is that request.\n"
+        "  The parser loads the file when it reaches the request, so CT code\n"
+        "  that ran earlier (for example ct-tokenizer-set-config) applies to\n"
+        "  it. Each file is loaded once; relative paths resolve against the\n"
+        "  importing file's directory, then the include paths. A request that\n"
+        "  is not followed by a string literal raises import-malformed; a\n"
+        "  missing file raises import-unresolved.\n"
+        "\n"
+        "  A file selects a custom frontend with a header on its first\n"
+        "  nonblank line:\n"
+        "\n"
+        "    frontend \"libs/my_lang.sl\" entry-word   # entry optional\n"
+        "\n"
+        "  The implementation is ordinary L2 source, imported once per\n"
+        "  compilation with the default frontend. Its entry word (default\n"
+        "  frontend-parse) runs at compile time for each file that uses the\n"
+        "  frontend:\n"
+        "\n"
+        "    entry               [*, text | path] -> [* | tokens]\n"
+        "\n"
+        "  text is the file's exact content, header included (skip it, but\n"
+        "  keep offsets into the full text); path is its canonical path. It\n"
+        "  must leave exactly one list of tokens. The tokens are parsed as\n"
+        "  they are: reader rewrites, the token hook, and grammar rewrites do\n"
+        "  not apply to them. Each gets an outer expansion frame of kind\n"
+        "  frontend naming the entry word. The frontend owns import syntax and\n"
+        "  lowers imports to import \"path\" requests; files imported without a\n"
+        "  header use the same frontend. Errors use frontend-header-invalid,\n"
+        "  frontend-implementation-unavailable, frontend-entry-unavailable,\n"
+        "  frontend-invalid-result, and frontend-entry-failed.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 7C  QUOTATIONS AND SYNTAX\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Backticks quote source as a compile-time value: `1 2 +` is an\n"
+        "  immutable Syntax value holding those Tokens. Nothing inside runs\n"
+        "  when the value is built. Contents use the ordinary tokenizer\n"
+        "  (strings are atomic, comments are dropped); quotations do not\n"
+        "  nest. Inside a quotation, \\$name gives the token $name, \\` a\n"
+        "  backtick, and \\\\ a backslash; any other escape is an error\n"
+        "  (syntax-escape-invalid). $name splices a macro parameter or match\n"
+        "  binding (a Token, or all Tokens of a Syntax); an unbound $name is\n"
+        "  an error when the quotation is evaluated. A quotation without a\n"
+        "  closing backtick is syntax-unterminated-quotation. Quotations are\n"
+        "  compile-time only: one reached from runtime code is\n"
+        "  syntax-quotation-runtime, so words holding them are compile-only.\n"
+        "  Literal Tokens keep their source origin.\n"
+        "\n"
+        "  $( code ) runs compile-time code and splices its value: a Token\n"
+        "  or Syntax as is, a string as one word, an integer as a literal,\n"
+        "  a list element by element. The value is the top of the stack\n"
+        "  afterwards; the code may consume one value below it, so $( )\n"
+        "  splices (and consumes) the top value and $(dup) a copy. Earlier\n"
+        "  $( ) values are already taken off the stack. Text written against it is\n"
+        "  pasted on: get-$(name) and $(name)-x form one token. Quotations\n"
+        "  may appear inside $( ). Quotations do not nest: a macro that\n"
+        "  generates a macro writes the inner quotation with \\` and \\$name\n"
+        "  escapes (e.g. `macro $name (x) \\` \\$x $n + \\` emit ;` emit).\n"
+        "  Unique names come from gensym:\n"
+        "\n"
+        "      `word $(\"tmp\" gensym) 1 end`\n"
+        "\n"
+        "  syntax-length  [* | syntax] -> [* | count]\n"
+        "  syntax-get     [*, syntax | index] -> [* | token]\n"
+        "    Checked read; negative indices count from the end.\n"
+        "  syntax-slice   [*, syntax, start | end] -> [* | syntax]\n"
+        "  syntax-concat  [*, left | right] -> [* | syntax]\n"
+        "  syntax>list    [* | syntax] -> [* | tokens]\n"
+        "  list>syntax    [* | tokens] -> [* | syntax]\n"
+        "    Only a list of Tokens is accepted.\n"
+        "\n"
+        "  emit  [* | syntax] -> [*]\n"
+        "    Insert the Syntax's Tokens at the current position of the input\n"
+        "    being compiled, so the parser reads them next. Outside a parse it\n"
+        "    raises emit-no-input.\n"
+        "\n"
+        "      word define_answer `word answer 42 end` emit end\n"
+        "      compile-time define_answer   # answer is defined here\n"
+        "\n"
+        "  match [pattern] => body ... end\n"
+        "    Compile-time dispatch on the upcoming input values (Tokens, or a\n"
+        "    whole quotation as one Syntax value). Clauses are tested in order\n"
+        "    without consuming; the first match is consumed and its body runs\n"
+        "    with its $name bindings. Elements: literal, `*`, `$name`,\n"
+        "    `$name:type`, `\\x`. `[_]` is the default (last; an empty body\n"
+        "    passes input through). The rewrite-only forms $*name, x?, x*,\n"
+        "    x+ and !x are rejected (escape them for literals). Exact duplicate\n"
+        "    patterns warn (match-duplicate-pattern). Bad patterns are\n"
+        "    match-pattern-invalid; no fitting clause is match-no-clause.\n"
+        "    Repetition: `$( elements )*` (zero or more) or `$( ... )+` (one\n"
+        "    or more), with an optional separator written against the\n"
+        "    quantifier (`$( $k, =, $v ),*`). It is greedy and gives back\n"
+        "    iterations the rest of the pattern needs; each name inside binds\n"
+        "    to a list. In a quotation, `$( ... )*` repeats its tokens once per\n"
+        "    element of the repeated names it uses (all of equal length), with\n"
+        "    the separator between: `$( word $k $v end )*`.\n"
+        "\n"
+        "  gensym  [* | prefix] -> [* | name]\n"
+        "    A fresh identifier: the prefix reduced to [A-Za-z0-9_] (`g` if\n"
+        "    empty, `g_` prepended before a digit), then `_N` from a counter\n"
+        "    that only grows, skipping names that are already defined.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 8  ASSEMBLY OUTPUT CONTROL\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  These words let compile-time code modify the generated\n"
-        "  assembly: the prelude (code inside _start), custom\n"
-        "  .data lines, and the BSS section (uninitialized data).\n"
+        "  These compile-only words add trusted assembler fragments to the\n"
+        "  output of the current compilation. Fragments are strings emitted\n"
+        "  verbatim (no parsing or normalization); between a fragment and its\n"
+        "  neighbour one LF is inserted only when neither side already has a\n"
+        "  line break there, and empty fragments emit nothing. Set validates\n"
+        "  the whole list before changing the buffer.\n"
         "\n"
-        "  prelude-clear       [*] -> [*]\n"
-        "    Discard the entire custom prelude.\n"
+        "  ct-output-append-text-preamble [* | fragment] -> [*]\n"
+        "  ct-output-set-text-preamble    [* | fragment-list] -> [*]\n"
+        "  ct-output-clear-text-preamble  [*] -> [*]\n"
+        "    The .text preamble: emitted after the runtime prelude and before\n"
+        "    word definitions. It never owns the entry point: a program with\n"
+        "    its own `_start` uses `:asm _start { ... } ;`.\n"
         "\n"
-        "  prelude-append      [* | line] -> [*]\n"
-        "    Append a line of assembly to the custom prelude.\n"
+        "  ct-output-append-data [* | fragment] -> [*]\n"
+        "  ct-output-set-data    [* | fragment-list] -> [*]\n"
+        "  ct-output-clear-data  [*] -> [*]\n"
+        "    CT .data fragments, emitted after definition data (string\n"
+        "    literals) and before variable storage. Set and clear affect only\n"
+        "    these fragments, never compiler-generated data.\n"
         "\n"
-        "  prelude-set         [* | list-of-strings] -> [*]\n"
-        "    Replace the custom prelude with the given list of\n"
-        "    assembly lines.\n"
-        "\n"
-        "  data-clear          [*] -> [*]\n"
-        "    Discard all custom .data section additions.\n"
-        "\n"
-        "  data-append         [* | line] -> [*]\n"
-        "    Append a line to the custom .data section additions.\n"
-        "\n"
-        "  data-set            [* | list-of-strings] -> [*]\n"
-        "    Replace custom .data additions with the given list\n"
-        "    of lines.\n"
-        "\n"
-        "  bss-clear           [*] -> [*]\n"
-        "    Discard all custom BSS declarations.\n"
-        "\n"
-        "  bss-append          [* | line] -> [*]\n"
-        "    Append a line to the custom BSS section.\n"
-        "\n"
-        "  bss-set             [* | list-of-strings] -> [*]\n"
-        "    Replace the custom BSS with the given list of lines.\n"
+        "  ct-output-append-bss [* | fragment] -> [*]\n"
+        "  ct-output-set-bss    [* | fragment-list] -> [*]\n"
+        "  ct-output-clear-bss  [*] -> [*]\n"
+        "    The runtime BSS buffer, which starts as the standard runtime\n"
+        "    layout (dstack, rstack, print_buf, persistent, list_capture_*).\n"
+        "    Append adds to it; set replaces all of it and clear empties it,\n"
+        "    so a replacement must provide those runtime symbols itself.\n"
+        "    Compiler-generated BSS (for example bss lists) is always emitted\n"
+        "    after the buffer.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  § 9  EXPRESSION HELPER\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  shunt               [* | token-list] -> [* | postfix-list]\n"
-        "    Shunting-yard algorithm. Takes a list of infix token\n"
-        "    strings (numbers, identifiers, +, -, *, /, %, parentheses)\n"
-        "    and returns the equivalent postfix (RPN) token list.\n"
-        "    Useful for building expression-based DSLs.\n"
-        "\n"
-        "      [\"3\" \"+\" \"4\" \"*\" \"2\"] shunt\n"
-        "      # => [\"3\" \"4\" \"2\" \"*\" \"+\"]\n"
+        "  The infix-to-postfix converter is not a built-in: libs/fn.sl\n"
+        "  provides it as fn-infix>postfix (+ - below * / %, all\n"
+        "  left-associative, parentheses grouped; it checks only that elements\n"
+        "  are strings and parentheses balance).\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2665,12 +2361,173 @@ def _run_docs_tui(
         "  § 11  ASSERTIONS & ERRORS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "  static_assert       [* | condition] -> [*]\n"
-        "    If condition is zero or false, abort compilation with a\n"
-        "    static assertion failure (includes source location).\n"
+        "  static-assert       [* | condition] -> [*]\n"
+        "    The condition must be a boolean or an integer (other types are a\n"
+        "    type error). False or zero raises static-assertion-failed\n"
+        "    (ct_execution_error) at the call site.\n"
         "\n"
-        "  parse-error         [* | message] -> (aborts)\n"
-        "    Abort compilation with the given error message.\n"
+        "  ct-parser-error         [* | message] -> (aborts)\n"
+        "    Abort compilation with the given error message. The error is\n"
+        "    located at the parser's current input (the user code being\n"
+        "    processed); the raising CT code is shown as a related note.\n"
+        "\n"
+        "  ct-parser-error-at      [* | message line column] -> (aborts)\n"
+        "    Like ct-parser-error, at a 1-based line and column of the file\n"
+        "    the parser is currently reading.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 11A  DIAGNOSTICS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Every compiler error is a Diagnostic: an immutable value with a\n"
+        "  severity (error, warning, or note), a stable code, a category\n"
+        "  (errors only, lowercase snake_case), an optional phase, a message,\n"
+        "  a primary SourceOrigin, and ordered related records. Codes and\n"
+        "  categories are stable; message text is not. Built-in codes map to\n"
+        "  categories, for example lexer-unterminated-string -> lexer_error,\n"
+        "  import-unresolved -> import_error, static-assertion-failed ->\n"
+        "  ct_execution_error, emission-unknown-word -> emission_error.\n"
+        "\n"
+        "  diagnostic-new [*, severity, code, category, phase, message, primary | related] -> [* | diagnostic]\n"
+        "    Build a Diagnostic. An error needs a category; a warning or note\n"
+        "    needs nil. phase is a string or nil, primary a SourceOrigin, and\n"
+        "    related a list of maps with keys kind, optional message, origin.\n"
+        "\n"
+        "  diagnostic-severity [* | diagnostic] -> [* | severity]\n"
+        "  diagnostic-code     [* | diagnostic] -> [* | code]\n"
+        "  diagnostic-category [* | diagnostic] -> [* | category-or-nil]\n"
+        "  diagnostic-phase    [* | diagnostic] -> [* | phase-or-nil]\n"
+        "  diagnostic-message  [* | diagnostic] -> [* | message]\n"
+        "  diagnostic-primary  [* | diagnostic] -> [* | origin]\n"
+        "  diagnostic-related  [* | diagnostic] -> [* | records]\n"
+        "    Read one field. related returns fresh maps.\n"
+        "\n"
+        "  ct-diagnostic-raise [* | diagnostic] -> (raises)\n"
+        "    Raise an error Diagnostic through normal error handling, keeping\n"
+        "    all its fields. Custom frontends report syntax errors this way.\n"
+        "\n"
+        "  ct-diagnostic-error    [* | message] -> (raises)\n"
+        "  ct-diagnostic-error-at [* | message line column] -> (raises)\n"
+        "    Raise ct-diagnostic-raised (category ct_diagnostic) at the\n"
+        "    parser's current input, or at the given 1-based line and column\n"
+        "    of the file being read; the raising CT code is a related note.\n"
+        "\n"
+        "  ct-diagnostic-warning [* | message] -> [*]\n"
+        "  ct-diagnostic-note    [* | message] -> [*]\n"
+        "    Report at the calling CT code's location. The warning and\n"
+        "    note are recorded (codes ct-warning-raised, ct-note-raised) and\n"
+        "    published as compile.diagnostic events.\n"
+        "\n"
+        "  ct-diagnostic-list  [*] -> [* | maps]\n"
+        "    The recorded diagnostics in order, as maps with keys severity,\n"
+        "    code, category, phase, message, primary, and related.\n"
+        "\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  § 11B  DEFINITIONS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "  Definitions share one global namespace. A name keeps every\n"
+        "  definition registered for it (its candidates). The selected\n"
+        "  candidate has the highest priority; equal priorities go to the\n"
+        "  newest registration. `priority <int>` sets the next definition's\n"
+        "  priority (default 0, no bounds). An equal-priority redefinition\n"
+        "  warns; a lower one is kept as a shadowed fallback with a note.\n"
+        "  Removing the selected candidate reveals the next one. Built-in\n"
+        "  handlers (compile-time, runtime-mode CT, and emission intrinsics)\n"
+        "  are per-name baselines, not candidates, so a built-in-only name\n"
+        "  has no candidates.\n"
+        "\n"
+        "  A source definition becomes a candidate only when its body is\n"
+        "  complete; CT code cannot see it while it is being parsed. A CT\n"
+        "  call keeps the candidate it started with; later lookups see the\n"
+        "  current selection. CT invocation and runtime emission both use the\n"
+        "  selected candidate: a selected runtime-only candidate cannot run\n"
+        "  at compile time and never falls back to a lower one. Emission takes\n"
+        "  one snapshot of the selected definitions per attempt.\n"
+        "\n"
+        "  Each candidate has an opaque DefinitionHandle. Copies compare\n"
+        "  equal, handles have no order and are not map keys, and a removed\n"
+        "  candidate's handle goes stale forever. With a stale handle,\n"
+        "  getters push nil 0 and setters push 0. Name-based reads use the\n"
+        "  selected candidate; name-based changes need exactly one unowned\n"
+        "  candidate (else 0). Candidates owned by a language pack can be\n"
+        "  read but not changed by these words (definition-owned).\n"
+        "  Argument errors use category definition_error.\n"
+        "\n"
+        "  ct-definition-candidates [* | name] -> [* | records]\n"
+        "    Immutable DefinitionCandidate maps, highest priority first then\n"
+        "    newest, with keys handle, name, owner, eligible?, priority,\n"
+        "    selected?, kind (l2, assembly, external, macro, python),\n"
+        "    source-origin, immediate?, compile-only?, runtime-only?,\n"
+        "    inline?, preserve?, prefer-l2?, compile-time-intrinsic?,\n"
+        "    runtime-intrinsic?, and emission-intrinsic?.\n"
+        "\n"
+        "  ct-definition-exists?            [* | name] -> [* | flag]\n"
+        "  ct-definition-list-names         [*] -> [* | names]\n"
+        "  ct-definition-list-names-prefix  [* | prefix] -> [* | names]\n"
+        "    Names backed by a candidate or a built-in, each once, sorted.\n"
+        "\n"
+        "  ct-definition-get          [* | handle] -> [*, record | found]\n"
+        "  ct-definition-get-by-name  [* | name] -> [*, record | found]\n"
+        "  ct-definition-body             [* | handle] -> [*, body | found]\n"
+        "  ct-definition-body-by-name     [* | name] -> [*, body | found]\n"
+        "  ct-definition-asm              [* | handle] -> [*, asm | found]\n"
+        "  ct-definition-asm-by-name      [* | name] -> [*, asm | found]\n"
+        "  ct-definition-source           [* | handle] -> [*, source | found]\n"
+        "  ct-definition-source-by-name   [* | name] -> [*, source | found]\n"
+        "    Detached snapshots. body is a word's op maps (or a text macro's\n"
+        "    expansion); asm is an :asm body; source is the declaration's\n"
+        "    exact original text, kept across body edits and by clones, and\n"
+        "    unavailable for generated or built-in definitions.\n"
+        "\n"
+        "  ct-definition-set-priority          [*, handle | priority] -> [* | ok]\n"
+        "  ct-definition-set-priority-by-name  [*, name | priority] -> [* | ok]\n"
+        "  ct-definition-set-flags             [*, handle | patch] -> [* | ok]\n"
+        "  ct-definition-set-flags-by-name     [*, name | patch] -> [* | ok]\n"
+        "  ct-definition-set-asm               [*, handle | source] -> [* | ok]\n"
+        "  ct-definition-set-asm-by-name       [*, name | source] -> [* | ok]\n"
+        "    A flag patch holds any of immediate, compile-only, runtime-only,\n"
+        "    inline, preserve. set-asm needs an assembly candidate. Unchanged\n"
+        "    values succeed silently; invalid values change nothing.\n"
+        "\n"
+        "  ct-definition-rename          [*, handle | new-name] -> [* | ok]\n"
+        "  ct-definition-rename-by-name  [*, name | new-name] -> [* | ok]\n"
+        "    Move one candidate to another name, where it becomes the newest\n"
+        "    registration; its handle is kept.\n"
+        "\n"
+        "  ct-definition-clone          [*, handle | new-name] -> [*, handle | created]\n"
+        "  ct-definition-clone-by-name  [*, name | new-name] -> [*, handle | created]\n"
+        "    Copy a candidate under a name with its priority, a new handle,\n"
+        "    and a new registration position. Built-in handlers are not copied.\n"
+        "\n"
+        "  ct-definition-unregister          [* | handle] -> [* | removed]\n"
+        "  ct-definition-unregister-by-name  [* | name] -> [* | removed]\n"
+        "\n"
+        "  ct-definition-prefer-l2          [* | handle] -> [* | ok]\n"
+        "  ct-definition-prefer-l2-by-name  [* | name] -> [* | ok]\n"
+        "    Mark a candidate to run its L2 body at compile time instead of\n"
+        "    the name's compile-time intrinsic while it is selected. The\n"
+        "    by-name form marks the selected candidate.\n"
+        "\n"
+        "  ct-definition-register-source [* | source] -> [* | handles]\n"
+        "    Parse a fragment of word and :asm definitions and register\n"
+        "    them in order, returning their handles. Nothing is registered\n"
+        "    when the fragment fails to parse. Needs an active compilation.\n"
+        "\n"
+        "  ct-definition-predeclare-all  [*] -> [*]            [immediate]\n"
+        "    Register every later top-level `word` in the parse stream now,\n"
+        "    so CT code can call them early. When parsing reaches one, it\n"
+        "    completes the same candidate.\n"
+        "\n"
+        "  Events: definition.candidates.changed (operation: register,\n"
+        "  unregister, rename, set_priority, clone, update) carries the\n"
+        "  candidate handle, candidate-before/candidate-after records, and\n"
+        "  the previous and current selected handles. It is followed by\n"
+        "  definition.selection.changed (name, previous-handle,\n"
+        "  selected-handle, cause) for each name whose selection changed.\n"
+        "  A source definition publishes them after word.compile.end.\n"
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2687,10 +2544,46 @@ def _run_docs_tui(
         "\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  § 13  MACRO & TEXT MACRO DEFINITION\n"
+        "  § 13  MACROS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         + _L2_MACRO_CT_BLOCK
+        + "  ct-macro-context  [*] -> [* | map]\n"
+        "    While a macro body runs (also inside helpers it calls): a fresh\n"
+        "    map with macro, definition-origin, call-site, and expansion-trace\n"
+        "    (maps with the same three keys, outermost first). Elsewhere it is\n"
+        "    macro-context-unavailable.\n"
+        "\n"
+        "  ct-macro-get          [* | handle] -> [*, record | found]\n"
+        "  ct-macro-get-by-name  [* | name] -> [*, record | found]\n"
+        "    A detached record with parameters (list of names), body (the\n"
+        "    body's Syntax), and metadata (a user map); nil 0 when the\n"
+        "    candidate is stale or not a macro.\n"
+        "\n"
+        "  ct-macro-set          [*, handle | patch] -> [* | ok]\n"
+        "  ct-macro-set-by-name  [*, name | patch] -> [* | ok]\n"
+        "    Update any of parameters, body, and metadata in place (handle,\n"
+        "    priority, and position kept). The patch is validated and the\n"
+        "    body parsed before anything changes; the body is not run. A\n"
+        "    change publishes a definition update event. The by-name form\n"
+        "    needs exactly one unowned candidate.\n"
+        "\n"
+        "  ct-definition-set-body          [*, handle | syntax] -> [* | ok]\n"
+        "  ct-definition-set-body-by-name  [*, name | syntax] -> [* | ok]\n"
+        "    Replace an L2 word's body with Syntax parsed as a body (not run);\n"
+        "    flags and source provenance are kept. Calls already running keep\n"
+        "    the old body. Macros use ct-macro-set.\n"
+        "\n"
+        "  ct-lang-register-macro  [*, language | name] -> [* | ok]\n"
+        "    Adopt the selected unowned macro into a language pack; it is\n"
+        "    then eligible only while the pack is active. 0 when there is no\n"
+        "    such macro.\n"
+        "\n"
+        "  Events: each finished expansion publishes macro.expansion with\n"
+        "  macro, call-site, depth (0 at top level), attempt, and status;\n"
+        "  success adds the emitted tokens, failure the diagnostic code and\n"
+        "  phase. Nothing is built unless something subscribes.\n"
+        "\n"
         + "  :py { ... }\n"
         "    Embed a Python code block that runs at compile time.\n"
         "    The block receives a `ctx` (MacroContext) variable and\n"
@@ -2758,126 +2651,73 @@ def _run_docs_tui(
         "  CT  [*] -> [* | flag]\n"
         "    Push 1 in CT execution and 0 in emitted runtime code.\n"
         "\n"
-        "  use-l2-ct  [* | name] -> [*] || [*] -> [*]\n"
-        "    The named form consumes a word name; the empty-stack form\n"
-        "    targets the most recently defined word. Neither form pushes.\n"
+        "  ct-parser-set-token-hook  [* | name] -> [*]\n"
+        "  ct-parser-clear-token-hook  [*] -> [*]\n"
+        "    Install/remove the global token hook (§ 1).\n"
         "\n"
-        "  set-token-hook  [* | name] -> [*]\n"
-        "    Install the named token hook; compilation fails if the hook\n"
-        "    cannot be used when a token is processed.\n"
+        "  ── Language packs\n"
         "\n"
-        "  clear-token-hook  [*] -> [*]\n"
-        "    Clear the parser's current token hook.\n"
+        "  A pack owns token hooks, word and macro candidates, and rewrite\n"
+        "  rules. They take part in parsing only while the pack is active;\n"
+        "  registering does not activate. Pack names are exact strings; an\n"
+        "  unknown pack is an error except for the queries noted below.\n"
         "\n"
-        "  ct-lang-create  [* | name] -> [* | created]\n"
-        "    Create a pack record if absent; return 1 only when newly created.\n"
+        "  ct-lang-create      [* | name] -> [* | created]\n"
+        "  ct-lang-remove      [* | name] -> [* | removed]\n"
+        "    Create an inactive pack (0 if it exists); remove a pack and all\n"
+        "    its resources (0 if absent).\n"
         "\n"
-        "  ct-lang-exists?  [* | name] -> [* | exists]\n"
-        "    Test whether the named pack record exists.\n"
+        "  ct-lang-activate    [* | name] -> [* | changed]\n"
+        "  ct-lang-deactivate  [* | name] -> [* | changed]\n"
+        "    Turn the pack's resources on or off; 0 when already in that state.\n"
         "\n"
-        "  ct-lang-list  [*] -> [* | names]\n"
-        "    Return all registered pack names in sorted order.\n"
+        "  ct-lang-exists?     [* | name] -> [* | flag]\n"
+        "  ct-lang-active?     [* | name] -> [* | flag]\n"
+        "  ct-lang-list        [*] -> [* | names]\n"
+        "  ct-lang-list-active [*] -> [* | names]\n"
+        "    Queries; 0 for an unknown pack. Lists are sorted.\n"
         "\n"
-        "  ct-lang-activate  [* | name] -> [* | ok]\n"
-        "    Add an existing pack to the active-pack selection; this does\n"
-        "    not enable its hooks, rewrites, or macros.\n"
+        "  ct-lang-set-meta    [*, name | metadata] -> [* | ok]\n"
+        "  ct-lang-get-meta    [* | name] -> [*, metadata | found]\n"
+        "    Store/read a detached string-keyed map of portable data (nil,\n"
+        "    integers, numbers, strings, lists, maps); nil clears it.\n"
         "\n"
-        "  ct-lang-deactivate  [* | name] -> [* | ok]\n"
-        "    Remove an existing pack from active-pack selection only.\n"
+        "  ct-lang-status      [* | name] -> [*, status | found]\n"
+        "    Map with name, active, metadata, token_hooks (handle, handler,\n"
+        "    priority, enabled?, active?; dispatch order), words, macros,\n"
+        "    reader_rewrites and grammar_rewrites ({handle, name}).\n"
         "\n"
-        "  ct-lang-active?  [* | name] -> [* | active]\n"
-        "    Test active-pack selection, not resource enablement.\n"
+        "  ct-lang-add-token-hook          [*, name | handler] -> [* | handle]\n"
+        "  ct-lang-set-token-hook-priority [*, handle | priority] -> [* | found]\n"
+        "  ct-lang-set-token-hook-enabled  [*, handle | flag] -> [* | found]\n"
+        "  ct-lang-remove-token-hook       [* | handle] -> [* | removed]\n"
+        "    Pack hooks run while their pack is active and they are enabled:\n"
+        "    higher priority first, later registration first on ties. The\n"
+        "    handler name is resolved at each dispatch. Tokens injected by\n"
+        "    several hooks keep dispatch order.\n"
         "\n"
-        "  ct-lang-active-list  [*] -> [* | names]\n"
-        "    Return active pack names in sorted order.\n"
+        "  ct-lang-register-word           [*, name | word] -> [* | ok]\n"
+        "  ct-lang-set-resource-priority   [*, name, resource | priority] -> [* | found]\n"
+        "  ct-lang-get-resource-priority   [*, name | resource] -> [*, priority | found]\n"
+        "  ct-lang-unregister-resource     [*, name | resource] -> [* | removed]\n"
+        "    Adopt the selected unowned word into the pack (replacing the\n"
+        "    pack's earlier candidate of that name), and manage owned words\n"
+        "    and macros. Generic definition words cannot change them.\n"
         "\n"
-        "  ct-lang-meta-set  [*, name | metadata] -> [* | ok]\n"
-        "    Store a copied metadata map, or clear metadata with nil.\n"
+        "  ct-lang-add-reader-rewrite-named  [*, name, rule, pattern | replacement] -> [* | handle]\n"
+        "  ct-lang-add-grammar-rewrite-named [*, name, rule, pattern | replacement] -> [* | handle]\n"
+        "    Register a pack-owned rewrite (§ 6); it matches while the pack is\n"
+        "    active and the rule is enabled.\n"
         "\n"
-        "  ct-lang-meta-get  [* | name] -> [*, metadata | found]\n"
-        "    Return the copied metadata map and whether the pack exists.\n"
+        "  repr  [* | value] -> [* | text]\n"
+        "    A readable debug representation of any CT value. Not a stable\n"
+        "    format: do not parse it or base decisions on it.\n"
         "\n"
-        "  ct-lang-set-auto-validate  [*, name | enabled] -> [* | ok]\n"
-        "    Set automatic validator policy for an existing pack.\n"
-        "\n"
-        "  ct-lang-get-auto-validate  [* | name] -> [*, enabled | found]\n"
-        "    Return the policy flag and whether the pack exists.\n"
-        "\n"
-        "  ct-lang-add-validator  [*, name | validator] -> [* | count]\n"
-        "    Associate a validator word name with a pack; duplicate names\n"
-        "    are not added twice.\n"
-        "\n"
-        "  ct-lang-run-validators  [* | name] -> [* | count]\n"
-        "    Run the named pack's validators and return the executed count.\n"
-        "\n"
-        "  ct-lang-run-active-validators  [*] -> [* | count]\n"
-        "    Run validators selected by the active-pack set.\n"
-        "\n"
-        "  ct-lang-set-token-hook  [*, name | hook-or-nil] -> [*, previous]\n"
-        "    Set or clear the parser hook and return the previously installed\n"
-        "    hook name (or nil). Registration takes effect immediately.\n"
-        "\n"
-        "  ct-lang-add-reader-rewrite-named  [* | pack, name, pattern, replacement] -> [* | rule-name]\n"
-        "    Register a reader-stage rewrite immediately and return its name.\n"
-        "\n"
-        "  ct-lang-add-grammar-rewrite-named  [* | pack, name, pattern, replacement] -> [* | rule-name]\n"
-        "    Register a grammar-stage rewrite immediately and return its name.\n"
-        "\n"
-        "  ct-lang-register-text-macro-signature  [* | pack, name, params, expansion] -> [* | macro-name]\n"
-        "    Register a text macro immediately and return its macro name.\n"
-        "\n"
-        "  ct-lang-register-pattern-macro  [* | pack, name, clauses] -> [* | macro-name]\n"
-        "    Register pattern-macro clauses immediately and return the name.\n"
-        "\n"
-        "  ct-lang-status  [* | name] -> [*, status | found]\n"
-        "    Return the pack status map and whether the pack exists.\n"
-        "\n"
-        "  ct-lang-remove  [* | name] -> [* | removed]\n"
-        "    Remove the pack record and, by default, clean its owned resources.\n"
-        "\n"
-        "  ct-list-words-prefix  [* | prefix] -> [* | names]\n"
-        "    Return sorted registered word names beginning with the prefix.\n"
-        "\n"
-        "  ct-repr  [* | value] -> [* | representation]\n"
-        "    Return a readable serialization for diagnostics and metadata.\n"
-        "\n"
-        "  ct-runtime-get-source  [* | name] -> [*, source | source_len]\n"
-        "    Return a definition's source text and its length; unavailable\n"
-        "    source is represented by an empty result.\n"
-        "\n"
-        "  event-emit  [*, event | payload] -> [* | emitted]\n"
-        "    Synchronously publish a CT map or nil payload; return 0 if no\n"
-        "    event bus is attached, otherwise 1.\n"
-        "\n"
-        "  event-object-create  [* | type] -> [* | event]\n"
-        "    Create an event record with an empty payload map.\n"
-        "\n"
-        "  event-object-prop-append  [*, event, key | value] -> [* | event]\n"
-        "    Store a payload property and return the same event record.\n"
-        "\n"
-        "  event-object-prop-get  [*, event | key] -> [*, event, value | found]\n"
-        "    Return the event, property value (or nil), and a found flag.\n"
-        "\n"
-        "  event-subscribe  [*, pattern | callback] -> [* | handle]\n"
-        "    Subscribe a callback word to a pattern; no bus returns handle 0.\n"
-        "\n"
-        "  event-unsubscribe  [* | handle] -> [* | removed]\n"
-        "    Remove a subscription by handle and report whether it existed.\n"
-        "\n"
-        "  event-object-emit  [* | event] -> [* | emitted]\n"
-        "    Synchronously dispatch an event record; no bus returns 0.\n"
-        "\n"
-        "  get-event-type  [* | event] -> [*, event | type]\n"
-        "    Return the event record and its type string.\n"
-        "\n"
-        "  get-event-name  [* | event] -> [*, event | name]\n"
-        "    Return the event record and its name string.\n"
-        "\n"
-        "  get-event-timestamp  [* | event] -> [*, event | timestamp]\n"
-        "    Return the event record and its timestamp_ns integer.\n"
-        "\n"
-        "  get-event-payload  [* | event] -> [*, event | payload]\n"
-        "    Return the event record and its payload map.\n"
+        "  Source of a definition: ct-definition-source-by-name gives the\n"
+        "  selected definition's exact source; meta.sl's meta-runtime-get-source\n"
+        "  returns it with its UTF-8 byte length at compile time and, at\n"
+        "  runtime, from the catalog --source-embed adds (\"\" 0 / 0 0 when\n"
+        "  unavailable; shadowed definitions are never returned).\n"
         "\n"
     )
 
@@ -3248,11 +3088,20 @@ def _run_docs_tui(
         "      the stack. Pointers, booleans, characters — all\n"
         "      just numbers. Type safety is your responsibility.\n"
         "\n"
+        "    - and / or / not are logical (nonzero is true, result\n"
+        "      0 or 1). Bitwise: band bor bxor bnot shl shr sar.\n"
+        "\n"
+        "    - Integer division by zero (and INT64_MIN -1 /) raises\n"
+        "      SIGFPE at runtime, as in C. At compile time it is a\n"
+        "      diagnostic.\n"
+        "\n"
         "    - Macro expansion depth: macros can expand macros,\n"
         "      but there's a limit (default 256, configurable via\n"
         "      --macro-expansion-limit).\n"
-        "      Use --macro-preview to trace each expansion and --preview\n"
-        "      to print the final transformed source.\n"
+        "      Use --macro-preview to print each macro expansion and\n"
+        "      rewrite with its file:line:column (rewrites also show the\n"
+        "      surrounding source), and --preview to print the final\n"
+        "      transformed source.\n"
         "\n"
         "    - :py blocks: Python code embedded in :py { ... }\n"
         "      runs in the compiler's Python process. It has full\n"
@@ -5189,6 +5038,13 @@ def _collect_docs_for_runtime(
         include_macros=include_macros,
         include_libs=include_libs,
     )
+    compiled = _definition_metadata_entries(
+        _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs),
+        include_undocumented=include_undocumented, include_private=include_private)
+    if compiled:
+        by_name = {entry.name: entry for entry in compiled}
+        entries = [entry for entry in entries if entry.name not in by_name] + list(by_name.values())
+        entries.sort(key=lambda item: (item.name.lower(), str(item.path), item.line))
 
     # Scan extra roots directly, bypassing _iter_doc_files skip filters.
     # Always include undocumented entries from user-added paths.
@@ -6361,7 +6217,7 @@ def extract_ct_ref_entry_details(
 
 def _name_phrase(word_name: str) -> str:
     phrase = word_name
-    for prefix in ("ct-", "list-", "map-", "string-", "token-", "lexer-", "prelude-", "data-", "bss-"):
+    for prefix in ("ct-", "list-", "map-", "string-", "token-", "prelude-", "data-", "bss-"):
         if phrase.startswith(prefix):
             phrase = phrase[len(prefix):]
             break
@@ -6434,27 +6290,15 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
     if (
         word_name.startswith("token-")
         or word_name.startswith("ct-parser-")
-        or word_name
-        in {
-            "next-token",
-            "peek-token",
-            "inject-tokens",
-            "inject-lexemes",
-            "add-token",
-            "add-token-chars",
-            "ct-current-token",
-        }
+        or word_name.startswith("ct-tokenizer-")
+        or word_name.startswith("source-cursor-")
     ):
         target = _name_phrase(word_name)
         return f"Token-stream helper for {target}; reads, inspects, or injects parser tokens during compile time."
 
-    if word_name.startswith("lexer-"):
-        target = _target_phrase(word_name, "lexer-")
-        return f"Lexer-object helper for {target}; supports mini-DSL parsing with custom separators and lookahead."
-
-    if word_name.startswith("prelude-") or word_name.startswith("data-") or word_name.startswith("bss-"):
+    if word_name.startswith("ct-output-"):
         target = _name_phrase(word_name)
-        return f"Assembly emission helper for {target}; updates generated prelude/data/BSS sections before final code emission."
+        return f"Assembly output helper for {target}; changes the text-preamble, data, or runtime BSS buffer of the current compilation."
 
     if word_name in {"nil", "nil?"}:
         return "Nil sentinel helper used for optional values and missing-key semantics in CT list/map workflows."
@@ -6468,46 +6312,42 @@ def _semantic_overview_from_name(word_name: str, category: str, stack_effect: st
 
 
 def _usage_guidance_for_word(word_name: str, category: str) -> str:
-    if word_name == "ct-emit-op":
+    if word_name == "ct-op-emit":
         return "Supply the internal operation name followed by its data; this appends directly to the active compiled body instead of parsing tokens."
-    if word_name == "ct-get-word-asm":
-        return "Pass the name of an existing :asm definition; a high-level word or unknown name returns nil."
-    if word_name == "ct-new-label":
-        return "Pass a readable prefix and use the returned unique label in emitted branch/label operations."
-    if word_name in {"ct-register-block-opener", "ct-unregister-block-opener", "ct-register-control-override", "ct-unregister-control-override"}:
+    if word_name.startswith("ct-definition-"):
+        return "By-name reads use the selected candidate and by-name changes need exactly one unowned candidate; handle forms address one exact candidate, and a stale handle gives nil 0 or 0."
+    if word_name == "ct-label-new":
+        return "Pass a readable identifier prefix and use the returned unique label in emitted branch/label operations."
+    if word_name in {"ct-parser-register-block-opener", "ct-parser-unregister-block-opener", "ct-control-register-override", "ct-control-unregister-override"}:
         return "Use the exact control word lexeme that the parser should recognize; registrations affect later parsing in the current compilation."
     if word_name == "i":
         return "Call it only inside an active compile-time for loop; the index is zero-based and belongs to the innermost loop."
-    if category == "Capture":
-        if word_name.startswith("ct-capture-global-"):
-            return "Use these operations for compile-local state shared across macro expansions; values are copied at the API boundary."
-        if "schema" in word_name or "taint" in word_name or word_name in {"ct-capture-freeze", "ct-capture-thaw", "ct-capture-mutable?"}:
-            return "Pass the macro name and capture name in that order; check the returned status before relying on the metadata change."
-        if word_name in {"ct-capture-args", "ct-capture-locals", "ct-capture-globals", "ct-capture-origin", "ct-capture-lifetime", "ct-capture-lifetime-live?", "ct-capture-lifetime-assert", "ct-capture-lint"}:
-            return "Call it with the active macro context (`ctx`); cloned results are safe to inspect without mutating the original capture."
-        return "Pass the capture value explicitly and consume the returned value; these helpers do not implicitly read a macro's capture context."
     if category in {"List", "Map", "String", "Nil"}:
-        if word_name.startswith(("list-set", "list-insert", "list-remove", "list-pop", "list-clear", "list-reverse", "map-set", "map-delete", "map-update", "map-clear")):
+        if word_name.startswith(("list-set", "list-insert", "list-remove", "list-pop", "list-clear", "list-reverse", "map-set", "map-delete", "map-merge", "map-clear")):
             return "These operations mutate the supplied collection; retain the returned collection when chaining further work."
         if word_name.startswith(("list-get", "list-find", "list-peek", "list-last", "map-get", "map-has", "map-keys", "map-values")):
-            return "Inspect the documented result order carefully; lookup operations may return the original collection together with a value and found flag."
+            return "Lookups consume the collection; checked reads error on a missing element, while map-get and list-find push a value with a found flag."
         return "Build inputs with the matching list/map/string constructors, then pass arguments in the order shown by the stack effect."
-    if category in {"Token", "Lexer"}:
-        if word_name in {"next-token", "peek-token", "ct-current-token", "inject-tokens", "inject-lexemes", "add-token", "add-token-chars"}:
-            return "Use it while the parser is processing source; consumption or injection affects the live token cursor, while reader separators affect future tokenization only."
-        return "Pass the lexer or token object returned by the matching constructor/read operation; token metadata retains its source coordinates unless explicitly changed."
+    if category == "Token":
+        if word_name.startswith("ct-parser-"):
+            return "Use it while the parser is processing source; consumption or injection affects the live token cursor."
+        if word_name.startswith("ct-tokenizer-"):
+            return "Edit the map from ct-tokenizer-get-config and install it whole; the configuration affects later tokenization only, never tokens already read."
+        if word_name.startswith("source-cursor-"):
+            return "Create one cursor per source text and keep the handle; reads advance it in place, and slices or spans never move it."
+        return "Pass the token, SourceOrigin, or ExpansionFrame value the matching operation returned; these values are immutable and may be shared."
     if category == "Control":
         return "Use control frames within the active parser flow; push/pop operations mutate the parser's control stack, while frame key operations act on the supplied map."
     if category == "Rewrite":
-        if word_name.startswith(("ct-get-", "ct-list-", "ct-export-", "ct-rewrite-dry-run", "ct-rewrite-run-on-list", "ct-rewrite-compatibility")):
-            return "Use the returned snapshot for inspection before changing live rewrite state; dry-run/list operations do not register rules."
-        return "Choose the reader or grammar stage explicitly and keep rule names stable so you can inspect, disable, and remove the registration later."
+        if word_name.startswith(("ct-rewrite-list-", "ct-rewrite-get-", "ct-rewrite-rule-get-", "ct-rewrite-dry-run", "ct-rewrite-run-on-list", "ct-rewrite-loop-detection?")):
+            return "Use the returned values for inspection; listing, reading, and list simulations never register or change rules."
+        return "Keep the RewriteHandle a registration returns: per-rule changes and removal take the handle, since rule names need not be unique."
     if category == "Pattern":
         return "Use the pattern macro's registered name consistently; group/scope activation and enabled state jointly determine whether its clauses can match."
     if category == "Language":
         return "Most operations take the pack name first; resources registered through the pack APIs are owned by that pack and are cleaned up when it is removed."
-    if category == "CT-Call":
-        return "Configure this before the relevant ct-call expansion; getter results describe the current CT VM policy, not runtime execution."
+    if category == "RNG":
+        return "Seed once with ct-rng-seed when a run must be reproducible; every draw advances the one stream shared by the whole compilation."
     if category == "Macro":
         return "Use the registered macro name; query functions return presence/status separately so missing macros can be handled without guessing."
     if category == "Assembly":
@@ -6516,10 +6356,10 @@ def _usage_guidance_for_word(word_name: str, category: str) -> str:
         return "Use it to stop compilation at the point a compile-time invariant fails rather than allowing invalid generated code to proceed."
     if category == "Template":
         return "Use it inside a macro template; it controls template expansion and does not emit a runtime instruction by itself."
-    if category in {"Event", "Events"} or word_name.startswith(("event-", "get-event-")):
+    if category in {"Event", "Events"} or word_name.startswith(("event-", "ct-event-")):
         return "Event helpers operate on the current compile-time event bus; dispatch is synchronous and subscribers receive the event record."
-    if word_name.startswith("ct-error-"):
-        return "Call recovery helpers only from a recoverable compile.error handler; use restore-point IDs from that error and explicitly request retry."
+    if word_name.startswith(("ct-error-", "ct-recovery-")):
+        return "Call recovery helpers only from a recoverable compiler.error handler; repair the problem, then request a retry with ct-recovery-resume."
     if word_name.startswith(("ct-parser-", "ct-predef-")):
         return "Use it during parsing against the live token stream; checkpoints restore parser position, not arbitrary compiler or external state."
     if word_name.startswith(("ct-get-", "ct-list-")):
@@ -6540,42 +6380,26 @@ def category_for_word(word_name: str) -> str:
         return "List"
     if word_name.startswith("map-"):
         return "Map"
-    if word_name.startswith("string-") or word_name in ("int>string", "string>number", "identifier?"):
+    if word_name.startswith("string-") or word_name in ("int>string", "try-string>int", "identifier?"):
         return "String"
-    if word_name.startswith("token-") or word_name.startswith("ct-parser-") or word_name in (
-        "next-token",
-        "peek-token",
-        "inject-tokens",
-        "inject-lexemes",
-        "add-token",
-        "add-token-chars",
-        "emit-definition",
-        "ct-current-token",
-    ):
+    if word_name.startswith(("token-", "ct-parser-", "ct-tokenizer-", "source-cursor-")):
         return "Token"
-    if word_name.startswith("lexer-"):
-        return "Lexer"
     if word_name.startswith("ct-control-") or word_name in (
-        "ct-new-label",
-        "ct-emit-op",
-        "ct-last-token-line",
-        "ct-register-block-opener",
-        "ct-unregister-block-opener",
-        "ct-register-control-override",
-        "ct-unregister-control-override",
+        "ct-label-new",
+        "ct-op-emit",
+        "ct-parser-last-line",
+        "ct-parser-register-block-opener",
+        "ct-parser-unregister-block-opener",
     ):
         return "Control"
-    if word_name.startswith("prelude-") or word_name.startswith("data-") or word_name.startswith("bss-"):
+    if word_name.startswith("ct-output-"):
         return "Assembly"
-    if word_name.startswith("ct-capture-") or word_name == "ct-gensym":
+    if word_name.startswith("ct-capture-"):
         return "Capture"
     if (
-        word_name.startswith("ct-set-ct-call-")
-        or word_name.startswith("ct-get-ct-call-")
-        or word_name.startswith("ct-clear-ct-call-")
-        or word_name.startswith("ct-ctrand-")
+        word_name.startswith("ct-rng-")
     ):
-        return "CT-Call"
+        return "RNG"
     if word_name.startswith("ct-lang-"):
         return "Language"
     if (
@@ -6586,27 +6410,19 @@ def category_for_word(word_name: str) -> str:
     ):
         return "Pattern"
     if (
-        word_name.startswith("ct-set-rewrite-")
-        or word_name.startswith("ct-get-rewrite-")
-        or word_name.startswith("ct-list-rewrite-")
-        or word_name.startswith("ct-rewrite-")
-        or word_name.startswith("ct-import-rewrite-")
-        or word_name.startswith("ct-export-rewrite-")
+        word_name.startswith("ct-rewrite-")
     ):
         return "Rewrite"
     if (
         word_name.startswith("ct-register-")
         or word_name.startswith("ct-unregister-")
-        or word_name.startswith("ct-word-is-")
-        or word_name.startswith("ct-get-macro-")
-        or word_name.startswith("ct-set-macro-")
-        or word_name.startswith("ct-clone-macro")
-        or word_name.startswith("ct-rename-macro")
+        or word_name.startswith("ct-macro-")
+        or word_name in ("ct-lang-register-macro",)
     ):
         return "Macro"
-    if word_name in ("set-token-hook", "clear-token-hook", "compile-time", "compile-only", "immediate", "runtime", "runtime-only", "use-l2-ct", "CT"):
+    if word_name in ("ct-parser-set-token-hook", "ct-parser-clear-token-hook", "compile-time", "compile-only", "immediate", "runtime", "runtime-only", "CT"):
         return "Hook"
-    if word_name in ("static_assert", "parse-error"):
+    if word_name in ("static-assert", "ct-parser-error", "ct-parser-error-at"):
         return "Assert"
     if word_name == "eval":
         return "Eval"
@@ -6615,37 +6431,8 @@ def category_for_word(word_name: str) -> str:
     return "Meta"
 
 
-_CT_TEMPLATE_DIRECTIVE_METADATA: Tuple[Dict[str, Any], ...] = (
-    {"name": "ct-call", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-if", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-when", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-unless", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-for", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-each", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-let", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-fn", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-switch", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-case", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-default", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-match", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-fold", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-break", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-continue", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-include", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-import", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-comment", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-endcomment", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-strict", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-permissive", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-version", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-error", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-warning", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-note", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "emit-list", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-emit-list", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "emit-block", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-    {"name": "ct-emit-block", "compile_only": True, "immediate": False, "runtime_only": False, "has_runtime_intrinsic": False},
-)
+# The macro-template directives were retired with unified macros.
+_CT_TEMPLATE_DIRECTIVE_METADATA: Tuple[Dict[str, Any], ...] = ()
 
 _CT_TEMPLATE_DIRECTIVE_NAMES = frozenset(
     str(item.get("name", "")).strip() for item in _CT_TEMPLATE_DIRECTIVE_METADATA
@@ -6665,32 +6452,41 @@ def _scope_for_word(meta: Dict[str, Any]) -> str:
 
 
 _OVERVIEW_OVERRIDES: Dict[str, str] = {
+    "ct-recovery-list-restore-points": "Returns the current error restore points as maps with id, stage, pos, lexeme, line, and column. It works outside error handlers; the records are metadata, not snapshots of compiler state.",
+    "ct-recovery-get-restore-point": "Returns one restore point by id; an unknown id raises recovery-restore-point-invalid.",
+    "ct-recovery-jump": "Selects the restore point a resumed retry starts from. Only valid while a recoverable error is being dispatched, and only for a point of the same stage; an invalid id leaves the earlier selection unchanged.",
+    "ct-recovery-resume": "Requests a retry of the error being dispatched and pushes 1. Outside a recoverable dispatch it raises recovery-operation-unavailable.",
+    "ct-recovery-get-retry-limit": "Pushes the retry limit that new recovery chains will use (default 8).",
+    "ct-recovery-set-retry-limit": "Sets the retry limit for recovery chains that start later and pushes the previous value. Any positive integer is accepted; a running chain keeps its limit.",
+    "ct-event-subscribe": "Subscribes a CT handler word, given by name, to an event-name pattern (owner nil, or a DefinitionHandle that scopes it) and returns an opaque subscription handle. Each dispatch snapshots matching subscriptions and resolves handler words when it starts; the handler gets its own copy of the event and must consume it.",
+    "ct-event-unsubscribe": "Removes a subscription by its handle and returns 1, or 0 when it was already removed. A dispatch that is already running still finishes with its snapshot.",
+    "ct-event-emit": "Publishes an event with a map payload (nil means an empty map) and returns 1. The payload is copied at publication; handlers run before ct-event-emit returns.",
+    "ct-event-emit-object": "Publishes an event map built with event-new and event-payload-set (or one received by a handler) with a fresh timestamp and returns 1. Only the keys event, timestamp_ns, and payload are allowed.",
+    "event-new": "Creates a draft event map with the given name and an empty payload. Drafts have no timestamp until they are published.",
+    "event-payload-set": "Stores a value in the event's payload and returns the event for chaining. It never changes the event name or timestamp.",
+    "event-payload-get": "Reads one payload entry, pushing the value and 1, or nil and 0 when the key is absent.",
+    "event-name": "Consumes an event map and pushes its name.",
+    "event-timestamp": "Consumes an event map and pushes its publication timestamp and 1, or nil and 0 for an unpublished draft.",
+    "event-payload": "Consumes an event map and pushes its payload map.",
+    "ct-event-enabled?": "Pushes 1 when event publication is enabled, otherwise 0 (always 0 under --no-events).",
+    "ct-event-set-enabled": "Enables or disables event publication for later events and pushes the previous state. Under --no-events, disabling returns 0 and enabling is an error.",
     "CT": "Pushes 1 when running inside compile-time execution and 0 in emitted runtime code, so words can branch explicitly on execution mode.",
-    "ct-capture-shape": "Returns normalized shape tag for capture values: none, single, tokens, multi, or scalar.",
-    "ct-capture-assert-shape": "Asserts expected shape against ct-capture-shape and raises parse error when they differ.",
-    "ct-capture-count": "Returns element/group count for list and variadic group-list captures; nil returns 0 and scalar input is rejected.",
-    "ct-capture-slice": "Slices list/group-list capture values using Python-style [start:end] semantics.",
-    "ct-capture-map": "Applies a named transform over capture tokens (upper, lower, strip, int, int-normalize).",
-    "ct-capture-filter": "Filters capture tokens by built-in predicates or rewrite-constraint predicate names.",
-    "ct-capture-separate": "Flattens capture values into a token list and inserts separator token between variadic groups.",
     "ct-parser-eof?": "Returns 1 when parser cursor is at or beyond end-of-stream and 0 otherwise, enabling safe loop termination in custom parser macros.",
     "ct-parser-peek": "Performs non-consuming lookahead by offset from current parser cursor; out-of-range reads return nil instead of raising.",
-    "ct-parser-set-pos": "Repositions parser cursor to an absolute token index, returns previous position, and keeps ct-current-token state consistent.",
-    "ct-predef-all": "Predeclares all following top-level word definitions in the current compile-time parse stream so forward compile-time calls resolve before later definitions appear.",
-    "ct-parser-checkpoint": "Captures parser cursor snapshot map (pos, last_token, remaining) for speculative parsing and branch rollback.",
-    "ct-parser-restore": "Restores parser cursor from checkpoint map or raw position with bounds/type validation and returns success flag.",
+    "ct-parser-set-pos": "Moves the parser cursor to an absolute token index and returns the previous position; the current token becomes the token before the new position.",
+    "ct-parser-checkpoint": "Returns an immutable opaque checkpoint holding the parser cursor and current token, for cheap lookahead and backtracking.",
+    "ct-parser-restore": "Restores a checkpoint and pushes 1, or pushes 0 without changing state when the checkpoint is from another parser or no longer fits the stream.",
     "ct-parser-tail": "Returns a copy of remaining token objects from current parser cursor for diagnostics, lookahead, or external analyzers.",
-    "ct-parser-session-begin": "Pushes full parser snapshot (tokens, pos, last_token) onto nested session stack and returns session depth.",
-    "ct-parser-session-commit": "Commits top parser session by discarding snapshot while preserving current parser state; returns 0 when stack is empty.",
-    "ct-parser-session-rollback": "Rolls back parser to top session snapshot and pops it, restoring tokens/cursor atomically for safe speculative parsing.",
-    "ct-parser-collect-until": "Consumes tokens until delimiter lexeme appears, returning collected token list and found flag while consuming delimiter itself.",
-    "ct-parser-collect-balanced": "Consumes nested balanced open/close regions, returning collected tokens and found flag when outer close delimiter is reached.",
-    "ct-parser-mark": "Stores current parser cursor under a named mark and returns previous mark position plus had-previous flag.",
-    "ct-parser-diff": "Builds parser position diff map (start/end/delta/count/lexemes/forward) between marks, checkpoints, or explicit indices.",
-    "ct-parser-expected": "Asserts next token lexeme is in expected set (string/token/list forms), raising detailed parse errors on mismatch.",
-    "token-clone": "Clones token object preserving lexeme and source coordinates, useful when edits require immutable-style token workflows.",
-    "token-with-lexeme": "Clones token metadata but substitutes lexeme text, preserving source anchors while retokenizing generated constructs.",
-    "token-shift-column": "Clones token and shifts column/start/end coordinates by delta, helping synthetic tokens keep stable relative source spans.",
+    "ct-parser-session-begin": "Starts a speculative parsing session that saves the token list, cursor, and current token; returns an opaque session handle.",
+    "ct-parser-session-commit": "Closes the open topmost session and keeps the current parser state; pushes 0 without changes for any other session.",
+    "ct-parser-session-rollback": "Restores the token list, cursor, and current token saved by the open topmost session; pushes 0 without changes for any other session.",
+    "ct-parser-slice": "Returns the tokens between two stream positions in source order without moving the cursor.",
+    "token-with-lexeme": "Builds a new token with different text that keeps the template token's source origin and expansion chain, so generated code still points at real source.",
+    "ct-definition-set-effect": "Declares a definition's stack effect in cells (inputs and outputs, nil for unknown); the stack checker then verifies calls to it and its body's final depth.",
+    "ct-definition-effect": "Pushes a definition's declared inputs and outputs (nil when unknown) and a found flag.",
+    "token-slice": "Takes part of a token's text as a new token; for a token read from source the new token's origin is exactly that part, so code generated from pieces of a token (for example `a+b` split into three) points at the right columns.",
+    "lexeme": "Pushes a token's lexeme, or a string unchanged, so a helper can accept either.",
+    "token?": "Pushes 1 when the value is a token and 0 otherwise.",
     "ct-rewrite-scope-push": "Pushes active rewrite pipeline/group/scope activation snapshot so temporary DSL rewrites can be scoped safely.",
     "ct-rewrite-scope-pop": "Restores rewrite activation snapshot from scope stack, preventing temporary rewrite settings from leaking globally.",
     "ct-rewrite-run-on-list": "Runs rewrite engine against explicit lexeme list using current stage settings and returns rewritten output plus patch trace.",
@@ -6700,104 +6496,26 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-lang-activate": "Marks a named language pack active. This controls active-pack queries and active-validator selection; it does not automatically enable or disable the pack's registered macros, rewrites, or token hook.",
     "ct-lang-deactivate": "Marks a language pack inactive without removing or disabling its registered macros, rewrites, or token hook. Use the explicit rule/hook controls when those resources themselves must stop affecting parsing.",
     "ct-lang-active?": "Returns 1 when a named language-extension pack is active.",
-    "ct-lang-active-list": "Returns sorted list of currently active language-extension pack names.",
-    "ct-lang-meta-set": "Stores metadata map for a language-extension pack; nil clears metadata.",
-    "ct-lang-meta-get": "Returns metadata map and found flag for a language-extension pack.",
-    "ct-lang-set-auto-validate": "Enables or disables automatic validator runs for a language-extension pack.",
-    "ct-lang-get-auto-validate": "Returns auto-validate flag and found flag for a language-extension pack.",
-    "ct-lang-add-validator": "Registers a validator word name on a language-extension pack and returns validator count.",
-    "ct-lang-run-validators": "Runs validators for one language-extension pack and returns executed count.",
-    "ct-lang-run-active-validators": "Runs validators across active language-extension packs and returns total executed count.",
-    "ct-lang-set-token-hook": "Sets or clears token hook ownership for a language-extension pack.",
     "ct-lang-add-reader-rewrite-named": "Registers a named reader-stage rewrite under a language-extension pack.",
     "ct-lang-add-grammar-rewrite-named": "Registers a named grammar-stage rewrite under a language-extension pack.",
-    "ct-lang-register-text-macro-signature": "Registers a text macro signature and tracks ownership in a language-extension pack.",
-    "ct-lang-register-pattern-macro": "Registers a pattern macro and tracks ownership in a language-extension pack.",
     "ct-lang-status": "Returns status map for a language-extension pack (active state, resources, counts, metadata).",
     "ct-lang-remove": "Removes a language-extension pack and cleans owned rewrites/macros/hooks.",
+    "ct-parser-collect-until": "Consumes tokens through a non-empty delimiter lexeme and returns the tokens before it with a found flag (0 at end of input).",
+    "ct-parser-collect-balanced": "After the outer opener was consumed, returns the interior of a balanced region (nested pairs included) and consumes the matching close; equal delimiters do not nest.",
+    "ct-parser-expected": "Non-consuming check of the next token against a lexeme, token, or list of them; pushes the token and 1 on a match, or nil and 0.",
+    "ct-parser-consume": "Consumes and returns the next token; raises a parse error at end of input.",
+    "ct-parser-current": "Returns the most recently consumed token, or nil.",
+    "ct-parser-get-pos": "Returns the parser cursor as a token index in [0, token-count].",
+    "ct-parser-inject": "Inserts a list of tokens at the cursor in list order without moving it; every element must be a token.",
 }
 
 _OVERVIEW_OVERRIDES.update({
-    "clear-token-hook": "Clears the active compile-time token hook. Use it when a hook should only transform a bounded part of a source file; it has no effect on separators or tokens that were already produced.",
-    "ct-add-reader-rewrite-named": "Registers a named rewrite in the reader stage, before grammar parsing. Supply the rule name, a list of input lexemes, and a list of replacement lexemes; use the name later to inspect, reprioritize, disable, or remove this rule.",
-    "ct-add-reader-rewrite-priority": "Registers a reader-stage rewrite with an explicit priority. Higher-priority rules are considered before lower-priority rules; use a stable priority when several rules can match the same token sequence.",
-    "ct-error-define": "Parses a source string during a recoverable compile.error callback and appends its word or assembly definitions to the active module. The fragment must contain definitions only; it is not a rollback mechanism, so use it to supply missing definitions before requesting a retry.",
-    "ct-error-get-retry-limit": "Returns the maximum number of attempts allowed for a recoverable compile error. Read this when a handler needs to report or preserve the compiler's current retry policy.",
-    "ct-error-jump": "Selects a restore-point ID for the current compile.error callback. Use an ID from that error's payload; only a point from the same parser or emission phase is accepted, and the callback must also request resumption.",
-    "ct-error-restore-point": "Looks up one restore-point snapshot by ID and returns its public fields without the internal token objects. Call it from a recovery handler with an ID taken from the current error payload.",
-    "ct-error-restore-points": "Returns the compiler's available error restore points as a list of public metadata maps. Recovery handlers use these records to choose a compatible parser or emission restart location; they are metadata, not transactional snapshots.",
-    "ct-error-resume": "Marks the active compile.error callback as willing to retry and returns 1. A retry occurs only when the handler also selects a valid restore point with ct-error-jump.",
-    "ct-error-set-retry-limit": "Sets the recoverable-error retry budget to an integer from 1 through 1024 and returns the previous value. Configure it before triggering errors; increasing the limit does not make non-recoverable errors recoverable.",
-    "ct-get-reader-rewrite-enabled": "Returns whether the named reader rewrite is enabled. Pair it with ct-set-reader-rewrite-enabled when temporarily changing a rule, and check whether the rule exists before relying on its state.",
-    "ct-get-reader-rewrite-priority": "Returns the priority of a named reader-stage rewrite. Use it to inspect the ordering that resolves overlapping rules before changing that order.",
-    "ct-lang-active-list": "Returns the names of all currently active language-extension packs in sorted order. Use this snapshot for diagnostics or to restore the caller's intended active-pack set.",
     "ct-lang-add-grammar-rewrite-named": "Immediately registers a named grammar-stage rewrite and records it as owned by a language pack. Pass the pack name, rule name, input-pattern list, and replacement list; pack activation does not gate the rule, while removing the pack cleans it up.",
     "ct-lang-add-reader-rewrite-named": "Immediately registers a named reader-stage rewrite and records it as owned by a language pack. Pass the pack name, rule name, input-pattern list, and replacement list; pack activation does not gate the rule, while removing the pack cleans it up.",
-    "ct-lang-add-validator": "Associates a named CT validator word with a language pack and returns the resulting validator count. Validators run only when requested or when that pack's auto-validation policy invokes them.",
     "ct-lang-create": "Creates an inactive language-extension pack record when the name is new; an existing record is left in place. Returns 1 only for a newly created pack. Create it before setting metadata or activating it.",
     "ct-lang-exists?": "Tests whether a language-extension pack record exists and returns 1 or 0. This does not tell you whether the pack is active; use ct-lang-active? for that.",
-    "ct-lang-get-auto-validate": "Returns the pack's auto-validation setting and a found flag. A missing pack is distinct from an existing pack whose setting is disabled.",
-    "ct-lang-list": "Returns all registered language-extension pack names in sorted order, including inactive packs. Use ct-lang-active-list when you only need currently enabled extensions.",
-    "ct-lang-meta-get": "Looks up a pack's metadata map and returns the map plus a found flag. The flag distinguishes a missing pack from an existing pack whose metadata is empty or nil.",
-    "ct-lang-meta-set": "Stores a copied metadata map on a language pack; passing nil clears its metadata. Use this for extension-owned descriptive/configuration data rather than registering executable hooks.",
-    "ct-lang-register-pattern-macro": "Immediately registers pattern-macro clauses and records ownership under a language pack so removal can clean up generated rewrite rules. The macro name and clauses use the same shapes as ct-register-pattern-macro; activation does not gate matching.",
-    "ct-lang-register-text-macro-signature": "Immediately registers a text macro with an explicit parameter specification and expansion, then tracks it under the language pack for cleanup. Activation does not gate macro expansion.",
-    "ct-lang-run-active-validators": "Runs validators for active packs and returns the total number executed. Unlike automatic validation, this explicit call includes active packs regardless of their auto-validation setting.",
-    "ct-lang-run-validators": "Runs the registered validators for one named pack immediately and returns the number executed. Use this after changing pack metadata or rules when validation should happen now.",
-    "ct-lang-set-auto-validate": "Enables or disables automatic validator execution for a named pack and returns success. This affects automatic validation policy, not explicit calls to ct-lang-run-validators.",
-    "ct-lang-set-token-hook": "Sets the parser's active token-hook word immediately and records its owning language pack for status and cleanup; passing nil clears the association. Pack activation does not defer or gate the hook.",
+    "ct-lang-list": "Returns all registered language-extension pack names in sorted order, including inactive packs. Use ct-lang-list-active when you only need active packs.",
     "ct-lang-status": "Returns a status map and found flag for a pack. Inspect it to report activation, owned resources, and metadata without separately querying each resource list.",
-    "ct-list-words-prefix": "Returns the sorted names of currently registered words that begin with the supplied prefix. Use it to discover a family of compiler words without copying or filtering the full dictionary yourself.",
-    "ct-repr": "Serializes a CT value to a readable representation string. Use it for diagnostics or generated metadata; it is a representation, not a promise that every host object can be reconstructed from the text.",
-    "ct-runtime-get-source": "Looks up the source fragment for a named definition and returns the source text with its length. Use it for CT introspection or runtime metadata; an unknown or source-less word yields no source.",
-    "ct-set-grammar-rewrite-enabled": "Enables or disables a named grammar-stage rewrite. Use this to scope a rule to a particular compilation context, and re-enable it when that context ends.",
-    "ct-set-grammar-rewrite-priority": "Sets the priority for a named grammar-stage rewrite. Higher priorities are considered first; use ct-list-grammar-rewrites to inspect the resulting evaluation order.",
-    "ct-set-macro-expansion-limit": "Sets the maximum expansion-work budget used to stop runaway macro and rewrite expansion. Choose a finite limit appropriate to the source; this is a safety bound, not a per-macro iteration count.",
-    "ct-set-macro-preview": "Enables or disables macro-expansion preview recording. Turn it on before an expansion you want to inspect, then read the preview with ct-get-macro-preview.",
-    "ct-set-reader-rewrite-enabled": "Enables or disables a named reader-stage rewrite without removing its registration. Use this for temporary language modes where the rule should remain available for later reuse.",
-    "ct-set-reader-rewrite-priority": "Sets the priority of a named reader-stage rewrite. Use explicit priorities to make overlapping reader rules deterministic and inspect the final order with ct-list-reader-rewrites.",
-    "event-emit": "Publishes an event name and a CT map (or nil payload) to the current synchronous compile-time event bus. Subscribers run during this call, so handler side effects and exceptions occur before event-emit returns.",
-    "event-object-create": "Creates a mutable event record with its event/type/name fields, timestamp, and an initially empty payload map. Add fields with event-object-prop-append, then dispatch the record with event-object-emit.",
-    "event-object-emit": "Publishes an event record created or modified with the event-object helpers. Subscribers receive that record synchronously; if no event bus is attached the operation reports failure.",
-    "event-object-prop-append": "Stores a value in an event record's payload and returns the same record for chaining. Reserved keys such as type, event, name, timestamp_ns, and location also update the corresponding top-level event field.",
-    "event-object-prop-get": "Looks up a property on an event record, returning the record, value (or nil), and a found flag. The event record remains on the stack so successive property reads can be chained.",
-    "event-subscribe": "Registers a callback word for an event-name pattern and returns a subscription handle. A named CT word receives the event map on its stack; dispatch is synchronous and handler errors propagate to the publisher.",
-    "event-unsubscribe": "Removes an event subscription by the handle returned from event-subscribe and returns whether it was removed. Keep the handle if a subscription should be temporary.",
-    "get-event-name": "Reads the event's name field and returns the event record followed by that name. Use it inside a named event callback, where the event map is supplied on the stack.",
-    "get-event-payload": "Reads the payload map from an event record and returns the record plus that map. Use it in a subscribed CT callback to inspect event-specific fields.",
-    "get-event-timestamp": "Reads the event's timestamp_ns field and returns the event record plus the integer timestamp. The timestamp is metadata for ordering/diagnostics, not a source location.",
-    "get-event-type": "Reads the type field from an event record and returns the record plus the type string. Use it in a shared callback that handles more than one event pattern.",
-    "set-token-hook": "Sets the active compile-time token-hook word by name. The hook is consulted as tokens are processed; define the hook before installing it and use clear-token-hook to stop applying it.",
-    "use-l2-ct": "Marks the following definition for execution by the L2 CT VM rather than the alternate CT implementation. Use it when a metaprogram depends on L2 stack semantics or compiler CT built-ins.",
-    "ct-call": "Calls a named CT word from a macro template with the current capture context and splices the returned token sequence into the expansion. Define the CT word before the macro is expanded and return tokens/lexemes in the form expected by the template.",
-    "ct-if": "Evaluates a template condition and expands only the selected then/else branch. Use it when a macro's emitted token structure depends on a capture or compile-time predicate.",
-    "ct-when": "Expands its body only when its template condition is true. It is the single-branch form of ct-if; use ct-if when a false branch must emit alternate tokens.",
-    "ct-unless": "Expands its body only when its template condition is false. Use it for an optional clause that should be omitted when its capture/condition is present.",
-    "ct-for": "Iterates the named capture's values and expands the body once per item, substituting the loop variable each time. Use it for explicit capture traversal when separators or per-item logic are needed.",
-    "ct-each": "Iterates a capture with the template's compact each binding, including index/value mode where requested. Use it for straightforward repeated expansion; choose ct-for when the body needs more control.",
-    "ct-let": "Evaluates a template expression and binds its result to a local template name for the nested body. Use it to avoid repeating a computed capture or token sequence.",
-    "ct-fn": "Defines a helper local to a macro template; invoke it with ct-call from that template. Use it to share template logic without registering a global CT word.",
-    "ct-switch": "Starts a multi-branch template selector over a compile-time expression. Pair it with ct-case and optionally ct-default; use ct-match for the compact expression-style form.",
-    "ct-case": "Declares one matching branch inside ct-switch or ct-match. Its body is expanded only when the selector matches the case value.",
-    "ct-default": "Declares the fallback branch of ct-switch or ct-match. It runs only when no earlier case matches and should appear at most once per selector.",
-    "ct-match": "Selects a template branch from an expression using ct-case/ct-default clauses. Use it when the choice is a direct match rather than a sequence of independent conditions.",
-    "ct-fold": "Reduces a capture sequence by carrying an accumulator through each item and the fold body. Supply an initial accumulator and use the bound accumulator/item names to compute the next value.",
-    "ct-break": "Stops the innermost active ct-for/ct-each iteration immediately. Use it after a match when later captured items must not contribute.",
-    "ct-continue": "Skips the remainder of the current ct-for/ct-each iteration and advances to the next item. Put it inside a conditional when some captures should be ignored.",
-    "ct-include": "Loads another template fragment from the named file during macro expansion. Use it to share template text; the path is resolved by the compiler's include rules.",
-    "ct-import": "Imports a macro/template pack during template expansion so its definitions are available to the current expansion. Use ordinary source imports when definitions must also participate in the surrounding compilation.",
-    "ct-comment": "Begins a template comment region whose contents are discarded from expansion. Close it with ct-endcomment; nested comment regions are supported.",
-    "ct-endcomment": "Closes the current ct-comment region. It is a structural delimiter, not an emitted token or a standalone comment.",
-    "ct-strict": "Switches the current template to strict expansion checks. Use it when unknown or invalid template constructs should fail rather than be silently passed through.",
-    "ct-permissive": "Switches the current template to permissive expansion behavior. Use it for deliberate token passthrough; strict mode is safer when template typos must be caught.",
-    "ct-version": "Attaches a version marker to a macro template for introspection and tooling. Read it later with ct-get-macro-template-version; it does not select a compiler version.",
-    "ct-error": "Aborts the current macro expansion with the supplied diagnostic message. Use it when a compile-time precondition fails and continuing would emit invalid tokens.",
-    "ct-warning": "Emits a non-fatal diagnostic from a macro template and continues expansion. Use it to flag suspicious usage while preserving compilation.",
-    "ct-note": "Emits an informational diagnostic from a macro template without stopping expansion. Use it for actionable compile-time notices rather than errors.",
-    "emit-list": "Emits a captured list of tokens from a template into the expansion. Use it to splice an already-built token list without treating it as a single value.",
-    "ct-emit-list": "Emits a captured list explicitly through the CT template path. Use it when the list was produced by compile-time logic and must be expanded as a sequence of tokens.",
-    "emit-block": "Emits the enclosed template block as a token sequence. Use it when a macro needs to capture a syntactic block and output that block later.",
-    "ct-emit-block": "Emits the enclosed block after CT template processing. Use it for blocks assembled or selected by compile-time logic rather than literal passthrough.",
 })
 
 
@@ -6835,6 +6553,24 @@ def _compose_overview(
 
 
 _EXAMPLE_OVERRIDES: Dict[str, str] = {
+    "ct-recovery-list-restore-points": "ct-recovery-list-restore-points list-length puti cr",
+    "ct-recovery-get-restore-point": "ct-recovery-list-restore-points 0 list-get \"id\" map-get drop ct-recovery-get-restore-point \"stage\" map-get drop puts",
+    "ct-recovery-jump": "event-payload \"restore-point-id\" map-get drop ct-recovery-jump ct-recovery-resume drop",
+    "ct-recovery-resume": "event-payload \"recoverable\" map-get drop if ct-recovery-resume drop end",
+    "ct-recovery-get-retry-limit": "ct-recovery-get-retry-limit puti cr",
+    "ct-recovery-set-retry-limit": "3 ct-recovery-set-retry-limit drop",
+    "ct-event-subscribe": "word on_build event-name puts end \"build.begin\" \"on_build\" nil ct-event-subscribe drop",
+    "ct-event-unsubscribe": "word on_build drop end \"build.begin\" \"on_build\" nil ct-event-subscribe ct-event-unsubscribe static-assert",
+    "ct-event-emit": "\"build.note\" map-new ct-event-emit static-assert",
+    "ct-event-emit-object": "\"build.note\" event-new \"source\" \"generator\" event-payload-set ct-event-emit-object static-assert",
+    "event-new": "\"build.note\" event-new event-name puts",
+    "event-payload-set": "\"build.note\" event-new \"source\" \"generator\" event-payload-set event-payload map-length puti cr",
+    "event-payload-get": "\"build.note\" event-new \"source\" \"generator\" event-payload-set \"source\" event-payload-get drop puts",
+    "event-name": "\"build.note\" event-new event-name puts",
+    "event-timestamp": "\"build.note\" event-new event-timestamp nip puti cr",
+    "event-payload": "\"build.note\" event-new event-payload map-length puti cr",
+    "ct-event-enabled?": "ct-event-enabled? puti cr",
+    "ct-event-set-enabled": "0 ct-event-set-enabled ct-event-set-enabled drop",
     "CT": "CT puti cr   # prints 1 at compile time and 0 at runtime",
     "compile-time": "word build_only 1 puti cr end  compile-time build_only",
     "immediate": "word stamp 99 puti cr end immediate",
@@ -6843,441 +6579,517 @@ _EXAMPLE_OVERRIDES: Dict[str, str] = {
     "runtime-only": "word runtime_word 7 end runtime-only",
     "inline": "inline word inc 1 + end",
     "preserve": "inline preserve word retained 1 + end",
-    "use-l2-ct": "word dup2 dup dup end use-l2-ct",
-    "set-token-hook": '"trace_hook" set-token-hook',
-    "clear-token-hook": '"trace_hook" set-token-hook clear-token-hook',
-    "add-token": '"@" add-token',
-    "add-token-chars": '",;" add-token-chars',
+    "ct-tokenizer-get-config": 'ct-tokenizer-get-config "separators" map-get drop "," string-join puts',
+    "ct-tokenizer-set-config": 'ct-tokenizer-get-config dup "separators" map-get drop "=>" list-append "separators" swap map-set ct-tokenizer-set-config',
+    "ct-tokenizer-run": '"a (b) c" "<example>" ct-tokenizer-run list-length puti cr',
+    "source-cursor-new": '"abc" "<example>" source-cursor-new source-cursor-read puti cr drop',
+    "diagnostic-new": "\"error\" \"my-code\" \"my_error\" nil \"bad input\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-code puts",
+    "diagnostic-severity": "\"note\" \"n\" nil nil \"fyi\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-severity puts",
+    "diagnostic-code": "\"error\" \"my-code\" \"my_error\" nil \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-code puts",
+    "diagnostic-category": "\"error\" \"c\" \"my_error\" nil \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-category puts",
+    "diagnostic-phase": "\"error\" \"c\" \"my_error\" \"my-phase\" \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-phase puts",
+    "diagnostic-message": "\"error\" \"c\" \"my_error\" nil \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-message puts",
+    "diagnostic-primary": "\"error\" \"c\" \"my_error\" nil \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-primary source-origin-start-line puti cr",
+    "diagnostic-related": "\"error\" \"c\" \"my_error\" nil \"bad\" 0 ct-parser-peek token-origin list-new diagnostic-new diagnostic-related list-length puti cr",
+    "ct-diagnostic-raise": "\"error\" \"my-code\" \"my_error\" nil \"bad input\" 0 ct-parser-peek token-origin list-new diagnostic-new ct-diagnostic-raise",
+    "ct-diagnostic-list": "\"heads up\" ct-diagnostic-warning ct-diagnostic-list list-length puti cr",
+    "ct-diagnostic-error": "\"unsupported target\" ct-diagnostic-error",
+    "ct-diagnostic-error-at": "\"unsupported target\" 1 1 ct-diagnostic-error-at",
+    "ct-parser-error-at": "\"bad value\" 1 1 ct-parser-error-at",
+    "ct-diagnostic-warning": "\"deprecated option\" ct-diagnostic-warning",
+    "ct-diagnostic-note": "\"using defaults\" ct-diagnostic-note",
+    "source-cursor-peek": '"abc" "<example>" source-cursor-new source-cursor-peek puti cr',
+    "source-cursor-read": '"abc" "<example>" source-cursor-new source-cursor-read swap source-cursor-read nip + puti cr',
+    "source-cursor-eof?": '"" "<example>" source-cursor-new source-cursor-eof? puti cr',
+    "source-cursor-pos": '"abc" "<example>" source-cursor-new source-cursor-read drop source-cursor-pos puti cr',
+    "source-cursor-set-pos": '"abc" "<example>" source-cursor-new 2 source-cursor-set-pos source-cursor-peek puti cr',
+    "source-cursor-slice": '"hello" "<example>" source-cursor-new 1 4 source-cursor-slice puts',
+    "source-cursor-span": '"a\\nbc" "<example>" source-cursor-new 2 4 source-cursor-span source-origin-start-line puti cr',
 
-    "ct-call": "macro bridge 1 ct-call emit-from-capture ;",
-    "ct-if": "macro maybe (x) ct-if has x then $x else 0 end ;",
-    "ct-when": "macro only_when (x) ct-when has x $x end ;",
-    "ct-unless": "macro only_unless (x) ct-unless has x 0 end ;",
-    "ct-for": "macro sum_tail (head *tail) $head ct-for item in tail do $item + end ;",
-    "ct-each": "macro emit_each (*xs) ct-each x in xs do $x end ;",
-    "ct-let": "macro bind_tmp 1 ct-let t $0 do $t $t + end ;",
-    "ct-fn": "macro local_helper 0 ct-fn twice do $0 $0 end ct-call twice ;",
-    "ct-switch": "macro choose (x) ct-switch $x do ct-case 0 do 0 end ct-default do 1 end end ;",
-    "ct-case": "macro classify (x) ct-switch $x do ct-case 1 do 11 end ct-default do 0 end end ;",
-    "ct-default": "macro classify_default (x) ct-switch $x do ct-default do 99 end end ;",
-    "ct-match": "macro map_bool (x) ct-match $x do ct-case 0 then 0 ct-default then 1 end ;",
-    "ct-fold": "macro fold_plus (*xs) ct-fold acc item in xs with 0 do $acc $item + end ;",
-    "ct-break": "macro first_only (*xs) ct-for x in xs do $x ct-break end ;",
-    "ct-continue": "macro skip_zero (*xs) ct-for x in xs do ct-if $x 0 == then ct-continue end $x end ;",
-    "ct-include": 'macro use_shared 0 ct-include "shared_template.sl" ;',
-    "ct-import": 'macro use_pack 0 ct-import "macro_pack.sl" ;',
-    "ct-comment": "macro clean 0 ct-comment ignored tokens ct-endcomment 1 ;",
-    "ct-endcomment": "macro clean_end 0 ct-comment nested ct-endcomment 1 ;",
-    "ct-strict": "macro strict_mode 0 ct-strict 1 ;",
-    "ct-permissive": "macro permissive_mode 0 ct-permissive 1 ;",
-    "ct-version": 'macro ver 0 ct-version "1.0" 1 ;',
-    "ct-error": 'macro fail_now 0 ct-error "bad expansion" ;',
-    "ct-warning": 'macro warn_now 0 ct-warning "check this" ;',
-    "ct-note": 'macro note_now 0 ct-note "info" ;',
-    "emit-list": "macro emit_tail (*xs) emit-list xs ;",
-    "ct-emit-list": "macro emit_tail_ct (*xs) ct-emit-list xs ;",
-    "emit-block": "macro block_out 0 emit-block do 1 2 + end ;",
-    "ct-emit-block": "macro block_out_ct 0 ct-emit-block do 1 2 + end ;",
 
     "ct-control-frame-new": '"if" ct-control-frame-new ct-control-push',
-    "ct-control-add-close-op": '"if" ct-control-frame-new dup "false" "if_false" ct-new-label ct-control-set dup "false" ct-control-get "label" swap ct-control-add-close-op',
-    "ct-register-block-opener": "next-token token-lexeme ct-register-block-opener",
-    "ct-unregister-block-opener": '"if" ct-unregister-block-opener',
-    "ct-register-control-override": "next-token token-lexeme ct-register-control-override",
-    "ct-unregister-control-override": '"if" ct-unregister-control-override',
-    "ct-detect-pattern-conflicts": "ct-detect-pattern-conflicts list-length",
-    "ct-set-macro-expansion-limit": "256 ct-set-macro-expansion-limit ct-get-macro-expansion-limit 256 == static_assert",
-    "ct-set-rewrite-saturation": '"specificity" ct-set-rewrite-saturation ct-get-rewrite-saturation "specificity" string= static_assert',
-    "ct-set-rewrite-max-steps": "64 ct-set-rewrite-max-steps ct-get-rewrite-max-steps 64 == static_assert",
-    "ct-set-rewrite-loop-detection": "1 ct-set-rewrite-loop-detection ct-get-rewrite-loop-detection static_assert",
-    "ct-set-rewrite-trace": "1 ct-set-rewrite-trace ct-get-rewrite-trace static_assert",
-    "string-starts-with?": '"alpha:beta:gamma" "alpha:" string-starts-with? static_assert',
+    "string-starts-with?": '"alpha:beta:gamma" "alpha:" string-starts-with? static-assert',
 
-    "ct-capture-shape": 'list-new "x" list-append ct-capture-shape',
-    "ct-capture-assert-shape": 'list-new "x" list-append "tokens" ct-capture-assert-shape',
-    "ct-capture-count": 'list-new "a" list-append "b" list-append ct-capture-count',
-    "ct-capture-slice": 'list-new "a" list-append "b" list-append "c" list-append 0 2 ct-capture-slice',
-    "ct-capture-map": 'list-new "aa" list-append "bb" list-append "upper" ct-capture-map',
-    "ct-capture-filter": 'list-new "x" list-append "1" list-append "identifier" ct-capture-filter',
-    "ct-capture-separate": 'list-new list-new "x" list-append list-append list-new "y" list-append list-append "|" ct-capture-separate',
-    "ct-capture-coerce-tokens": 'list-new "x" list-append ct-capture-coerce-tokens',
-    "ct-capture-coerce-string": 'list-new "x" list-append "y" list-append ct-capture-coerce-string',
-    "ct-capture-coerce-number": '"123" ct-capture-coerce-number',
-    "ct-capture-args": 'ctx ct-capture-args map-length 0 >= static_assert',
-    "ct-capture-locals": 'ctx ct-capture-locals map-length 0 >= static_assert',
-    "ct-capture-globals": 'ctx ct-capture-globals map-length 0 >= static_assert',
-    "ct-capture-get": 'ctx "x" ct-capture-get swap drop drop',
-    "ct-capture-has?": 'ctx "x" ct-capture-has? static_assert',
-    "ct-capture-origin": 'ctx ct-capture-origin',
-    "ct-capture-lifetime": 'ctx ct-capture-lifetime',
-    "ct-capture-lifetime-live?": 'ctx ct-capture-lifetime-live? static_assert',
-    "ct-capture-lifetime-assert": 'ctx ct-capture-lifetime-assert',
-    "ct-capture-lint": 'ctx ct-capture-lint list-length 0 >= static_assert',
-    "ct-capture-schema-validate": 'ctx ct-capture-schema-validate static_assert',
-    "ct-capture-tainted?": 'ctx "x" ct-capture-tainted?',
-    "ct-capture-global-set": '"scratch" list-new "x" list-append ct-capture-global-set',
-    "ct-capture-global-get": '"scratch" ct-capture-global-get',
-    "ct-capture-global-delete": '"scratch" ct-capture-global-delete',
-    "ct-capture-global-clear": 'ct-capture-global-clear drop',
-    "ct-capture-schema-put": '"my_macro" "x" "single" "int" 1 ct-capture-schema-put',
-    "ct-capture-schema-get": '"my_macro" ct-capture-schema-get',
-    "ct-capture-taint-set": '"my_macro" "x" 1 ct-capture-taint-set',
-    "ct-capture-taint-get": '"my_macro" "x" ct-capture-taint-get',
-    "ct-capture-serialize": 'list-new "x" list-append ct-capture-serialize',
-    "ct-capture-deserialize": '"[\"x\",\"y\"]" ct-capture-deserialize',
-    "ct-capture-compress": '"payload text" ct-capture-compress',
-    "ct-capture-decompress": '"eJyrVkrLz1eyUkpKLFKqBQAQKQXK" ct-capture-decompress',
-    "ct-capture-hash": 'list-new "x" list-append ct-capture-hash',
-    "ct-capture-diff": 'list-new "x" list-append list-new "y" list-append ct-capture-diff',
-    "ct-capture-replay-log": 'ct-capture-replay-log list-length',
-    "ct-capture-replay-clear": 'ct-capture-replay-clear drop',
-    "ct-macro-doc-get": '"my_macro" ct-macro-doc-get',
-    "ct-macro-doc-set": '"my_macro" "One-line macro documentation" ct-macro-doc-set',
-    "ct-macro-attrs-get": '"my_macro" ct-macro-attrs-get',
-    "ct-macro-attrs-set": '"my_macro" map-new ct-macro-attrs-set',
-    "ct-register-text-macro": '"m" 2 list-new ct-register-text-macro',
-    "ct-register-text-macro-signature": '"m" list-new list-new ct-register-text-macro-signature',
-    "ct-register-pattern-macro": '"pm_rule" list-new ct-register-pattern-macro',
-    "ct-gensym": '"tmp" ct-gensym',
     "ct-rewrite-dry-run": '"grammar" list-new 64 ct-rewrite-dry-run',
-    "ct-ctrand-seed": "12345 ct-ctrand-seed 10 ct-ctrand-int drop",
-    "ct-ctrand-int": "100 ct-ctrand-int",
-    "ct-ctrand-range": "1 10 ct-ctrand-range",
-    "ct-import-rewrite-pack": "ct-export-rewrite-pack ct-import-rewrite-pack drop",
-    "ct-import-rewrite-pack-replace": "ct-export-rewrite-pack ct-import-rewrite-pack-replace drop",
     "list-new": "list-new 1 list-append 2 list-append",
     "map-new": 'map-new "key" 42 map-set',
-    "next-token": "next-token token-lexeme",
-    "peek-token": "peek-token token-lexeme",
-    "token-with-lexeme": 'peek-token "renamed" token-with-lexeme token-lexeme',
-    "token-clone": "peek-token token-clone token-lexeme",
-    "token-shift-column": "peek-token 2 token-shift-column token-column",
-    "inject-lexemes": 'list-new "tmp_word" list-append ct-current-token inject-lexemes',
+    "ct-parser-consume": "ct-parser-consume token-lexeme puts",
+    "token-with-lexeme": '0 ct-parser-peek "renamed" token-with-lexeme token-lexeme',
+    "ct-definition-set-effect": '"main" 0 0 ct-definition-set-effect drop',
+    "ct-definition-effect": '"main" ct-definition-effect drop drop drop',
+    "token-slice": '0 ct-parser-peek 0 1 token-slice token-lexeme',
+    "lexeme": '"text" lexeme puts',
+    "token?": '0 ct-parser-peek token? puti cr',
+    "source-origin-path": "0 ct-parser-peek token-origin source-origin-path puts",
+    "source-origin-start": "0 ct-parser-peek token-origin source-origin-start puti cr",
+    "source-origin-end": "0 ct-parser-peek token-origin source-origin-end puti cr",
+    "source-origin-start-line": "0 ct-parser-peek token-origin source-origin-start-line puti cr",
+    "source-origin-start-column": "0 ct-parser-peek token-origin source-origin-start-column puti cr",
+    "source-origin-end-line": "0 ct-parser-peek token-origin source-origin-end-line puti cr",
+    "source-origin-end-column": "0 ct-parser-peek token-origin source-origin-end-column puti cr",
+    "expansion-frame-kind": "0 ct-parser-peek token-expansion-chain dup list-empty? if drop else list-last expansion-frame-kind puts end",
+    "expansion-frame-name": "0 ct-parser-peek token-expansion-chain dup list-empty? if drop else list-last expansion-frame-name puts end",
+    "expansion-frame-call-site": "0 ct-parser-peek token-expansion-chain dup list-empty? if drop else list-last expansion-frame-call-site source-origin-start-line puti cr end",
+    "expansion-frame-definition-origin": "0 ct-parser-peek token-expansion-chain dup list-empty? if drop else list-last expansion-frame-definition-origin nil? puti cr end",
     "ct-parser-eof?": "ct-parser-eof?",
     "ct-parser-peek": "0 ct-parser-peek token-lexeme",
-    "ct-parser-set-pos": "ct-parser-pos ct-parser-set-pos drop",
-    "ct-parser-checkpoint": "ct-parser-checkpoint map-length",
-    "ct-parser-restore": "ct-parser-checkpoint ct-parser-restore static_assert",
+    "ct-parser-set-pos": "ct-parser-get-pos ct-parser-set-pos drop",
+    "ct-parser-checkpoint": "ct-parser-checkpoint ct-parser-restore static-assert",
+    "ct-parser-restore": "ct-parser-checkpoint ct-parser-restore static-assert",
     "ct-parser-tail": "ct-parser-tail list-length",
-    "ct-parser-session-begin": "ct-parser-session-begin 0 > static_assert",
-    "ct-parser-session-commit": "ct-parser-session-begin drop ct-parser-session-commit static_assert",
-    "ct-parser-session-rollback": "ct-parser-session-begin drop ct-parser-session-rollback static_assert",
-    "ct-parser-collect-until": '"end" ct-parser-collect-until swap drop',
-    "ct-parser-collect-balanced": '"(" ")" ct-parser-collect-balanced swap drop',
-    "ct-parser-mark": '"m0" ct-parser-mark swap drop drop',
-    "ct-parser-diff": '"m0" ct-parser-mark drop drop "m0" ct-parser-pos ct-parser-diff map-length',
-    "ct-parser-expected": 'list-new "word" list-append ct-parser-expected token-lexeme',
-    "ct-rewrite-scope-push": "ct-rewrite-scope-push 0 > static_assert",
-    "ct-rewrite-scope-pop": "ct-rewrite-scope-push drop ct-rewrite-scope-pop static_assert",
+    "ct-parser-session-begin": "ct-parser-session-begin ct-parser-session-commit static-assert",
+    "ct-parser-session-commit": "ct-parser-session-begin ct-parser-session-commit static-assert",
+    "ct-parser-session-rollback": "ct-parser-session-begin ct-parser-session-rollback static-assert",
+    "ct-parser-collect-until": '"end" ct-parser-collect-until drop list-length puti cr',
+    "ct-parser-collect-balanced": '"(" ")" ct-parser-collect-balanced drop list-length puti cr',
+    "ct-parser-slice": "ct-parser-get-pos dup ct-parser-slice list-length puti cr",
+    "ct-parser-expected": '"word" ct-parser-expected puti cr drop',
+    "ct-rewrite-scope-push": "ct-rewrite-scope-push 0 > static-assert",
+    "ct-rewrite-scope-pop": "ct-rewrite-scope-push drop ct-rewrite-scope-pop static-assert",
     "ct-rewrite-run-on-list": '"grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop',
     "ct-lang-create": '"demo.lang" ct-lang-create drop',
-    "ct-lang-exists?": '"demo.lang" ct-lang-exists? static_assert',
-    "ct-lang-list": "ct-lang-list list-length 0 >= static_assert",
-    "ct-lang-activate": '"demo.lang" ct-lang-activate static_assert',
-    "ct-lang-deactivate": '"demo.lang" ct-lang-deactivate static_assert',
-    "ct-lang-active?": '"demo.lang" ct-lang-active? static_assert',
-    "ct-lang-active-list": "ct-lang-active-list list-length 0 >= static_assert",
-    "ct-lang-meta-set": '"demo.lang" map-new ct-lang-meta-set static_assert',
-    "ct-lang-meta-get": '"demo.lang" ct-lang-meta-get swap drop',
-    "ct-lang-set-auto-validate": '"demo.lang" 1 ct-lang-set-auto-validate static_assert',
-    "ct-lang-get-auto-validate": '"demo.lang" ct-lang-get-auto-validate swap drop',
-    "ct-lang-add-validator": '"demo.lang" "demo-validator" ct-lang-add-validator drop',
-    "ct-lang-run-validators": '"demo.lang" ct-lang-run-validators drop',
-    "ct-lang-run-active-validators": "ct-lang-run-active-validators drop",
-    "ct-lang-set-token-hook": '"demo.lang" "demo-hook" ct-lang-set-token-hook drop',
+    "ct-lang-exists?": '"demo.lang" ct-lang-exists? static-assert',
+    "ct-lang-list": "ct-lang-list list-length 0 >= static-assert",
+    "ct-lang-activate": '"demo.lang" ct-lang-activate static-assert',
+    "ct-lang-deactivate": '"demo.lang" ct-lang-deactivate static-assert',
+    "ct-lang-active?": '"demo.lang" ct-lang-active? static-assert',
     "ct-lang-add-reader-rewrite-named": '"demo.lang" "r" list-new list-new ct-lang-add-reader-rewrite-named drop',
     "ct-lang-add-grammar-rewrite-named": '"demo.lang" "g" list-new list-new ct-lang-add-grammar-rewrite-named drop',
-    "ct-lang-register-text-macro-signature": '"demo.lang" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
-    "ct-lang-register-pattern-macro": '"demo.lang" "pm" list-new ct-lang-register-pattern-macro drop',
     "ct-lang-status": '"demo.lang" ct-lang-status swap drop',
     "ct-lang-remove": '"demo.lang" ct-lang-remove drop',
 }
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-capture-clone": 'list-new "node" list-append ct-capture-clone list-length puti cr',
-    "ct-capture-equal?": 'list-new "x" list-append list-new "x" list-append ct-capture-equal? static_assert',
-    "ct-capture-freeze": '"sum" "left" ct-capture-freeze',
-    "ct-capture-join": 'list-new "red" list-append "blue" list-append ", " ct-capture-join puts',
-    "ct-capture-lifetime-assert": 'ctx ct-capture-lifetime-assert',
-    "ct-capture-mutable?": '"sum" "left" ct-capture-mutable? static_assert',
-    "ct-capture-normalize": 'list-new "x" list-append ct-capture-normalize list-length puti cr',
-    "ct-capture-pretty": 'map-new "count" 2 map-set ct-capture-pretty puts',
-    "ct-capture-replay-log": "ct-capture-replay-log list-length puti cr",
-    "ct-capture-schema-put": '"sum" "left" "single" "int" 1 ct-capture-schema-put',
-    "ct-capture-taint-set": '"sum" "left" 1 ct-capture-taint-set',
-    "ct-capture-thaw": '"sum" "left" ct-capture-thaw static_assert',
-    "ct-clear-grammar-rewrites": "ct-clear-grammar-rewrites puti cr",
-    "ct-clear-reader-rewrites": "ct-clear-reader-rewrites puti cr",
-    "ct-clone-macro": '"sum" "sum_copy" ct-clone-macro static_assert',
     "ct-control-depth": "ct-control-depth puti cr",
-    "ct-control-get": '"if" ct-control-frame-new dup "false" "L_false" ct-control-set drop "false" ct-control-get puts',
     "ct-control-peek": '"if" ct-control-frame-new ct-control-push ct-control-peek ct-control-pop drop',
     "ct-control-pop": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
     "ct-control-push": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
     "ct-control-set": '"if" ct-control-frame-new "false" "L_false" ct-control-set drop',
-    "ct-current-token": "ct-current-token token-lexeme puts",
-    "ct-error-define": '"word recovered 42 end" ct-error-define drop',
-    "ct-error-get-retry-limit": "ct-error-get-retry-limit puti cr",
-    "ct-error-jump": "1 ct-error-jump",
-    "ct-error-restore-point": "1 ct-error-restore-point map-length puti cr",
-    "ct-error-restore-points": "ct-error-restore-points list-length puti cr",
-    "ct-error-resume": "ct-error-resume drop",
-    "ct-error-set-retry-limit": "3 ct-error-set-retry-limit drop",
-    "ct-get-ct-call-memo-size": "ct-get-ct-call-memo-size puti cr",
-    "ct-get-ct-call-recursion-limit": "ct-get-ct-call-recursion-limit puti cr",
-    "ct-get-ct-call-side-effect-log": "ct-get-ct-call-side-effect-log list-length puti cr",
-    "ct-get-macro-expansion": '"twice" ct-get-macro-expansion drop drop',
-    "ct-get-macro-signature": '"twice" ct-get-macro-signature drop drop drop',
-    "ct-get-macro-template-mode": '"twice" ct-get-macro-template-mode swap drop puts',
-    "ct-get-macro-template-program-size": '"twice" ct-get-macro-template-program-size swap drop puti cr',
-    "ct-get-macro-template-version": '"twice" ct-get-macro-template-version swap drop puts',
-    "ct-get-rewrite-max-steps": "ct-get-rewrite-max-steps puti cr",
-    "ct-get-rewrite-profile": "ct-get-rewrite-profile map-length puti cr",
-    "ct-get-rewrite-saturation": "ct-get-rewrite-saturation puts",
-    "ct-get-rewrite-trace-log": "ct-get-rewrite-trace-log list-length puti cr",
-    "ct-get-word-asm": '"puti" ct-get-word-asm puts',
-    "ct-get-word-body": '"puti" ct-get-word-body list-length puti cr',
-    "ct-last-token-line": "ct-last-token-line puti cr",
-    "ct-list-active-pattern-groups": "ct-list-active-pattern-groups list-length puti cr",
-    "ct-list-grammar-rewrites": "ct-list-grammar-rewrites list-length puti cr",
-    "ct-list-reader-rewrites": "ct-list-reader-rewrites list-length puti cr",
-    "ct-list-words": "ct-list-words list-length puti cr",
-    "ct-list-words-prefix": '"ct-" ct-list-words-prefix list-length puti cr',
-    "ct-new-label": '"loop_done" ct-new-label puts',
-    "ct-parser-checkpoint": "ct-parser-checkpoint map-length puti cr",
-    "ct-parser-pos": "ct-parser-pos puti cr",
+    "ct-parser-current": "ct-parser-current token-lexeme puts",
+    "ct-parser-checkpoint": "ct-parser-checkpoint ct-parser-restore static-assert",
+    "ct-parser-get-pos": "ct-parser-get-pos puti cr",
     "ct-parser-remaining": "ct-parser-remaining puti cr",
     "ct-parser-tail": "ct-parser-tail list-length puti cr",
-    "ct-predef-all": "ct-predef-all",
-    "ct-rename-macro": '"sum" "sum_v2" ct-rename-macro static_assert',
-    "ct-repr": 'list-new "token" list-append ct-repr puts',
-    "ct-rewrite-txn-begin": "ct-rewrite-txn-begin puti cr",
-    "ct-runtime-get-source": '"main" ct-runtime-get-source swap drop puts',
-    "ct-set-ct-call-memo": "1 ct-set-ct-call-memo",
-    "ct-set-ct-call-side-effects": "1 ct-set-ct-call-side-effects",
-    "ct-set-macro-expansion": '"sum" list-new "42" list-append ct-set-macro-expansion static_assert',
-    "ct-set-macro-preview": "1 ct-set-macro-preview",
-    "ct-unregister-pattern-macro": '"old_rule" ct-unregister-pattern-macro static_assert',
-    "ct-unregister-word": '"temporary_word" ct-unregister-word static_assert',
-    "ct-word-exists?": '"main" ct-word-exists? static_assert',
-    "ct-word-is-pattern-macro": '"sum" ct-word-is-pattern-macro static_assert',
-    "ct-word-is-text-macro": '"sum" ct-word-is-text-macro static_assert',
-    "event-emit": '"build.note" map-new event-emit static_assert',
-    "event-object-create": '"build.note" event-object-create get-event-type puts drop',
-    "event-object-emit": '"build.note" event-object-create event-object-emit static_assert',
-    "event-object-prop-append": '"build.note" event-object-create "source" "generator" event-object-prop-append drop',
-    "event-object-prop-get": '"build.note" event-object-create "source" "generator" event-object-prop-append "source" event-object-prop-get drop swap drop puts',
-    "event-subscribe": 'word on_build get-event-type puts end "build.begin" "on_build" event-subscribe drop',
-    "event-unsubscribe": 'word on_build get-event-type puts end "build.begin" "on_build" event-subscribe event-unsubscribe static_assert',
-    "get-event-name": '"build.note" event-object-create get-event-name puts drop',
-    "get-event-payload": '"build.note" event-object-create get-event-payload map-length puti cr drop',
-    "get-event-timestamp": '"build.note" event-object-create get-event-timestamp puti cr drop',
-    "get-event-type": '"build.note" event-object-create get-event-type puts drop',
-    "identifier?": '"valid_name2" identifier? static_assert',
-    "inject-tokens": 'list-new "temporary_word" list-append inject-tokens',
+    "identifier?": '"valid_name2" identifier? static-assert',
+    "ct-parser-inject": 'list-new 0 ct-parser-peek "temporary_word" token-with-lexeme list-append ct-parser-inject',
     "int>string": "42 int>string puts",
     "list-append": 'list-new "first" list-append "second" list-append list-length puti cr',
-    "list-clear": 'list-new "temporary" list-append list-clear list-empty? static_assert',
+    "list-clear": 'list-new "temporary" list-append list-clear list-empty? static-assert',
     "list-clone": 'list-new "kept" list-append list-clone list-length puti cr',
-    "list-contains?": 'list-new "red" list-append "red" list-contains? static_assert',
-    "list-empty?": "list-new list-empty? static_assert",
+    "list-deep-clone": 'list-new list-new "inner" list-append list-append list-deep-clone 0 list-get list-length puti cr',
+    "list-contains?": 'list-new "red" list-append "red" list-contains? static-assert',
+    "list-empty?": "list-new list-empty? static-assert",
     "list-extend": 'list-new "left" list-append list-new "right" list-append list-extend list-length puti cr',
-    "list-find": 'list-new "red" list-append "blue" list-append "blue" list-find dup static_assert drop puti cr',
+    "list-find": 'list-new "red" list-append "blue" list-append "blue" list-find dup static-assert drop puti cr',
     "list-get": 'list-new "first" list-append "second" list-append 1 list-get puts',
     "list-insert": 'list-new "a" list-append "c" list-append 1 "b" list-insert list-length puti cr',
-    "list-join": 'list-new "red" list-append "blue" list-append ", " list-join puts',
     "list-last": 'list-new "first" list-append "last" list-append list-last puts',
-    "list-peek-front": 'list-new "first" list-append "last" list-append list-peek-front swap drop puts',
-    "list-pop": 'list-new "first" list-append "last" list-append list-pop swap drop puts',
-    "list-pop-front": 'list-new "first" list-append "last" list-append list-pop-front swap drop puts',
+    "list-peek-front": 'list-new "first" list-append "last" list-append list-peek-front puts',
+    "list-pop": 'list-new "first" list-append "last" list-append list-pop drop swap drop puts',
+    "list-pop-front": 'list-new "first" list-append "last" list-append list-pop-front drop swap drop puts',
     "list-push-front": 'list-new "last" list-append "first" list-push-front list-length puti cr',
     "list-remove": 'list-new "keep" list-append "remove" list-append 1 list-remove swap drop puts',
     "list-reverse": 'list-new "first" list-append "last" list-append list-reverse list-get 0 puts',
     "list-set": 'list-new "old" list-append 0 "new" list-set 0 list-get puts',
     "list-slice": 'list-new "a" list-append "b" list-append "c" list-append 1 3 list-slice list-length puti cr',
-    "map-clear": 'map-new "temporary" 1 map-set map-clear map-empty? static_assert',
+    "map-clear": 'map-new "temporary" 1 map-set map-clear map-empty? static-assert',
     "map-clone": 'map-new "name" "L2" map-set map-clone map-length puti cr',
-    "map-delete": 'map-new "temporary" 1 map-set "temporary" map-delete swap drop static_assert',
-    "map-empty?": "map-new map-empty? static_assert",
-    "map-get": 'map-new "name" "L2" map-set "name" map-get drop swap drop puts',
-    "map-has?": 'map-new "name" "L2" map-set "name" map-has? swap drop static_assert',
+    "map-delete": 'map-new "temporary" 1 map-set "temporary" map-delete swap drop static-assert',
+    "map-empty?": "map-new map-empty? static-assert",
+    "map-get": 'map-new "name" "L2" map-set "name" map-get drop puts',
+    "map-has?": 'map-new "name" "L2" map-set "name" map-has? static-assert',
     "map-keys": 'map-new "name" "L2" map-set map-keys list-length puti cr',
     "map-length": 'map-new "name" "L2" map-set map-length puti cr',
     "map-set": 'map-new "name" "L2" map-set "name" map-get drop swap drop puts',
-    "map-update": 'map-new "left" 1 map-set map-new "right" 2 map-set map-update map-length puti cr',
+    "map-merge": 'map-new "left" 1 map-set map-new "right" 2 map-set map-merge map-length puti cr',
     "map-values": 'map-new "name" "L2" map-set map-values list-length puti cr',
-    "nil": "nil nil? static_assert",
-    "nil?": "nil nil? static_assert",
+    "nil": "nil nil? static-assert",
+    "nil?": "nil nil? static-assert",
     "string-append": '"compile" "-" string-append puts',
-    "string-contains?": '"compile-time" "time" string-contains? static_assert',
-    "string-ends-with?": '"compile-time" "time" string-ends-with? static_assert',
+    "string-contains?": '"compile-time" "time" string-contains? static-assert',
+    "string-ends-with?": '"compile-time" "time" string-ends-with? static-assert',
     "string-join": 'list-new "reader" list-append "parser" list-append " -> " string-join puts',
     "string-length": '"compile-time" string-length puti cr',
     "string-lower": '"CT-VM" string-lower puts',
     "string-replace": '"red,red" "," ";" string-replace puts',
     "string-split": '"reader,parser,emitter" "," string-split list-length puti cr',
-    "string-starts-with?": '"compile-time" "compile" string-starts-with? static_assert',
+    "string-starts-with?": '"compile-time" "compile" string-starts-with? static-assert',
     "string-upper": '"compile-time" string-upper puts',
-    "string=": '"same" "same" string= static_assert',
-    "string>number": '"0x2a" string>number drop 42 == static_assert',
-    "token-from-lexeme": 'peek-token "generated_name" token-from-lexeme token-lexeme puts',
-    "token-lexeme": "peek-token token-lexeme puts",
+    "string-equal?": '"same" "same" string-equal? static-assert',
+    "try-string>int": '"0x2a" try-string>int drop 42 == static-assert',
+    "token-from-origin": '0 ct-parser-peek token-origin "generated_name" swap token-from-origin token-lexeme puts',
+    "token-origin": "0 ct-parser-peek token-origin source-origin-start-line puti cr",
+    "token-expansion-chain": "0 ct-parser-peek token-expansion-chain list-length puti cr",
+    "token-lexeme": "0 ct-parser-peek token-lexeme puts",
 })
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-capture-lifetime-assert": "ctx ct-capture-lifetime-assert",
-    "ct-clear-grammar-rewrites": "ct-clear-grammar-rewrites puti cr",
-    "ct-clear-reader-rewrites": "ct-clear-reader-rewrites puti cr",
     "ct-control-depth": "ct-control-depth puti cr",
-    "ct-emit-op": '"literal" 42 ct-emit-op',
-    "ct-get-ct-call-memo-size": "ct-get-ct-call-memo-size puti cr",
-    "ct-get-ct-call-recursion-limit": "ct-get-ct-call-recursion-limit puti cr",
-    "ct-get-macro-expansion-limit": "ct-get-macro-expansion-limit puti cr",
-    "ct-get-rewrite-max-steps": "ct-get-rewrite-max-steps puti cr",
-    "ct-get-rewrite-saturation": "ct-get-rewrite-saturation puts",
-    "ct-last-token-line": "ct-last-token-line puti cr",
-    "ct-parser-pos": "ct-parser-pos puti cr",
+    "ct-parser-get-pos": "ct-parser-get-pos puti cr",
     "ct-parser-remaining": "ct-parser-remaining puti cr",
-    "ct-predef-all": "ct-predef-all",
-    "ct-set-ct-call-memo": "1 ct-set-ct-call-memo",
-    "ct-set-ct-call-side-effects": "1 ct-set-ct-call-side-effects",
-    "ct-set-macro-preview": "1 ct-set-macro-preview",
     "list-length": 'list-new "first" list-append "second" list-append list-length puti cr',
-    "next-token": "next-token token-lexeme puts",
-    "peek-token": "peek-token token-lexeme puts",
+    "ct-parser-consume": "ct-parser-consume token-lexeme puts",
     "string-strip": '"  compile-time  " string-strip puts',
-    "token-column": "peek-token token-column puti cr",
-    "token-line": "peek-token token-line puti cr",
+    "token-column": "0 ct-parser-peek token-column puti cr",
+    "token-line": "0 ct-parser-peek token-line puti cr",
 })
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-capture-mutable?": '"sum" "left" ct-capture-freeze "sum" "left" ct-capture-mutable? 0 == static_assert',
-    "ct-capture-thaw": '"sum" "left" ct-capture-freeze "sum" "left" ct-capture-thaw static_assert',
-    "ct-error-define": '"word recovered 42 end" ct-error-define drop get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
-    "ct-error-jump": 'get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
-    "ct-error-restore-point": 'get-event-payload "restore_point_id" map-get drop ct-error-restore-point map-length puti cr',
-    "ct-error-resume": 'get-event-payload "restore_point_id" map-get drop ct-error-jump ct-error-resume drop',
-    "ct-get-macro-expansion": 'macro twice (x) $x $x ; "twice" ct-get-macro-expansion drop list-length puti cr',
-    "ct-get-macro-signature": 'macro twice (x) $x $x ; "twice" ct-get-macro-signature drop drop list-length puti cr',
-    "ct-get-macro-template-mode": 'macro twice (x) $x $x ; "twice" ct-get-macro-template-mode drop puts',
-    "ct-get-macro-template-program-size": 'macro twice (x) $x $x ; "twice" ct-get-macro-template-program-size drop puti cr',
-    "ct-get-macro-template-version": 'macro versioned (x) ct-version "1.0" $x ; "versioned" ct-get-macro-template-version drop puts',
-    "ct-get-word-asm": ':asm example_asm { nop }; "example_asm" ct-get-word-asm puts',
-    "ct-get-word-body": 'word example_word 1 2 + end "example_word" ct-get-word-body list-length puti cr',
-    "ct-runtime-get-source": 'word source_demo 42 end "source_demo" ct-runtime-get-source drop puts',
-    "ct-word-exists?": '"puti" ct-word-exists? static_assert',
-    "ct-word-is-pattern-macro": '"not_a_pattern_macro" ct-word-is-pattern-macro 0 == static_assert',
-    "ct-word-is-text-macro": '"not_a_text_macro" ct-word-is-text-macro 0 == static_assert',
-    "ct-unregister-pattern-macro": '"old_rule" ct-unregister-pattern-macro drop',
-    "ct-unregister-word": '"temporary_word" ct-unregister-word drop',
     "ct-control-peek": '"if" ct-control-frame-new ct-control-push ct-control-peek drop ct-control-pop drop',
     "ct-control-pop": '"if" ct-control-frame-new ct-control-push ct-control-pop drop',
-    "event-object-prop-get": '"build.note" event-object-create "source" "generator" event-object-prop-append "source" event-object-prop-get drop swap drop puts',
     "list-reverse": 'list-new "first" list-append "last" list-append list-reverse 0 list-get puts',
 })
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-lang-create": '"demo.lang" ct-lang-create static_assert',
+    "ct-lang-create": '"demo.lang" ct-lang-create static-assert',
     "ct-lang-list": '"demo.lang" ct-lang-create drop ct-lang-list list-length puti cr',
-    "ct-lang-active-list": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop ct-lang-active-list list-length puti cr',
-    "ct-lang-run-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-run-validators puti cr',
-    "ct-lang-run-active-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-activate drop ct-lang-run-active-validators puti cr',
-    "ct-lang-set-token-hook": 'word demo_hook end "demo.lang" ct-lang-create drop "demo.lang" "demo_hook" ct-lang-set-token-hook drop',
-    "ct-get-reader-rewrite-enabled": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" ct-get-reader-rewrite-enabled drop static_assert',
-    "ct-get-reader-rewrite-priority": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" ct-get-reader-rewrite-priority drop puti cr',
-    "ct-set-reader-rewrite-enabled": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" 0 ct-set-reader-rewrite-enabled static_assert',
-    "ct-set-reader-rewrite-priority": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-add-reader-rewrite-named drop "rule_kw" 50 ct-set-reader-rewrite-priority static_assert',
-    "ct-lang-activate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate static_assert',
-    "ct-lang-active?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-active? static_assert',
+    "ct-lang-activate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate static-assert',
+    "ct-lang-active?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-active? static-assert',
     "ct-lang-add-grammar-rewrite-named": '"demo.lang" ct-lang-create drop "demo.lang" "g" list-new "kw" list-append list-new "42" list-append ct-lang-add-grammar-rewrite-named drop',
     "ct-lang-add-reader-rewrite-named": '"demo.lang" ct-lang-create drop "demo.lang" "r" list-new "kw" list-append list-new "42" list-append ct-lang-add-reader-rewrite-named drop',
-    "ct-lang-add-validator": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator puti cr',
-    "ct-lang-deactivate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-deactivate static_assert',
-    "ct-lang-exists?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-exists? static_assert',
-    "ct-lang-get-auto-validate": '"demo.lang" ct-lang-create drop "demo.lang" 1 ct-lang-set-auto-validate drop "demo.lang" ct-lang-get-auto-validate drop static_assert',
-    "ct-lang-meta-get": '"demo.lang" ct-lang-create drop "demo.lang" map-new "version" "1" map-set ct-lang-meta-set drop "demo.lang" ct-lang-meta-get drop "version" map-get drop swap drop puts',
-    "ct-lang-meta-set": '"demo.lang" ct-lang-create drop "demo.lang" map-new "version" "1" map-set ct-lang-meta-set static_assert',
-    "ct-lang-register-pattern-macro": '"demo.lang" ct-lang-create drop "demo.lang" "pm" list-new list-new list-new "kw" list-append list-append list-new "42" list-append list-append list-append ct-lang-register-pattern-macro drop',
-    "ct-lang-register-text-macro-signature": '"demo.lang" ct-lang-create drop "demo.lang" "id" list-new "x" list-append list-new "$x" list-append ct-lang-register-text-macro-signature drop',
-    "ct-lang-remove": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-remove static_assert',
-    "ct-lang-run-validators": 'word validate_demo 1 static_assert end "demo.lang" ct-lang-create drop "demo.lang" "validate_demo" ct-lang-add-validator drop "demo.lang" ct-lang-run-validators puti cr',
-    "ct-lang-set-auto-validate": '"demo.lang" ct-lang-create drop "demo.lang" 1 ct-lang-set-auto-validate static_assert',
-    "ct-lang-set-token-hook": 'word demo_hook end "demo.lang" ct-lang-create drop "demo.lang" "demo_hook" ct-lang-set-token-hook drop',
+    "ct-lang-deactivate": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-activate drop "demo.lang" ct-lang-deactivate static-assert',
+    "ct-lang-exists?": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-exists? static-assert',
+    "ct-lang-remove": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-remove static-assert',
     "ct-lang-status": '"demo.lang" ct-lang-create drop "demo.lang" ct-lang-status drop map-length puti cr',
 })
 
-_PATTERN_MACRO_EXAMPLE_SETUP = (
-    '"pm_rule" list-new list-new list-new "x" list-append list-append '
-    'list-new "1" list-append list-append list-append ct-register-pattern-macro'
-)
-_READER_REWRITE_EXAMPLE_SETUP = (
-    '"rule_kw" list-new "kw" list-append list-new "42" list-append '
-    'ct-add-reader-rewrite-named drop'
-)
 _GRAMMAR_REWRITE_EXAMPLE_SETUP = (
     '"rule_kw" list-new "kw" list-append list-new "42" list-append '
-    'ct-add-grammar-rewrite-named drop'
+    'ct-rewrite-add-grammar-named'
 )
 _TEXT_MACRO_EXAMPLE_SETUP = "macro twice (x) $x $x ;"
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-get-grammar-rewrite-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-get-grammar-rewrite-enabled drop static_assert',
-    "ct-get-grammar-rewrite-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-get-grammar-rewrite-priority drop puti cr',
-    "ct-set-grammar-rewrite-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" 0 ct-set-grammar-rewrite-enabled static_assert',
-    "ct-set-grammar-rewrite-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" 50 ct-set-grammar-rewrite-priority static_assert',
-    "ct-get-pattern-macro-clause-details": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-clause-details drop list-length puti cr',
-    "ct-get-pattern-macro-clauses": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-clauses drop list-length puti cr',
-    "ct-get-pattern-macro-enabled": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-get-pattern-macro-enabled drop static_assert',
-    "ct-get-pattern-macro-group": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group drop "pm_rule" ct-get-pattern-macro-group drop puts',
-    "ct-get-pattern-macro-priority": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 10 ct-set-pattern-macro-priority drop "pm_rule" ct-get-pattern-macro-priority drop puti cr',
-    "ct-get-pattern-macro-scope": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope drop "pm_rule" ct-get-pattern-macro-scope drop puts',
-    "ct-set-pattern-group-active": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group drop "arith" 1 ct-set-pattern-group-active static_assert',
-    "ct-set-pattern-macro-clause-guard": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 0 "guard_nonzero" ct-set-pattern-macro-clause-guard static_assert',
-    "ct-set-pattern-macro-enabled": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 0 ct-set-pattern-macro-enabled static_assert',
-    "ct-set-pattern-macro-group": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "arith" ct-set-pattern-macro-group static_assert',
-    "ct-set-pattern-macro-priority": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" 10 ct-set-pattern-macro-priority static_assert',
-    "ct-set-pattern-macro-scope": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope static_assert',
-    "ct-set-pattern-scope-active": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" "expressions" ct-set-pattern-macro-scope drop "expressions" 1 ct-set-pattern-scope-active static_assert',
-    "ct-detect-pattern-conflicts-named": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-detect-pattern-conflicts-named list-length puti cr',
-    "ct-detect-pattern-conflicts": f'{_PATTERN_MACRO_EXAMPLE_SETUP} ct-detect-pattern-conflicts list-length puti cr',
-    "ct-list-pattern-macros": f'{_PATTERN_MACRO_EXAMPLE_SETUP} ct-list-pattern-macros list-length puti cr',
-    "ct-register-pattern-macro": _PATTERN_MACRO_EXAMPLE_SETUP,
-    "ct-unregister-pattern-macro": f'{_PATTERN_MACRO_EXAMPLE_SETUP} "pm_rule" ct-unregister-pattern-macro static_assert',
-    "ct-get-rewrite-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" "optimized" ct-set-rewrite-pipeline drop "grammar" "rule_kw" ct-get-rewrite-pipeline drop puts',
-    "ct-get-rewrite-provenance": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" ct-get-rewrite-provenance drop map-length puti cr',
-    "ct-get-rewrite-specificity": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" ct-get-rewrite-specificity drop puti cr',
-    "ct-list-rewrite-active-pipelines": '"grammar" "default" 1 ct-set-rewrite-pipeline-active ct-list-rewrite-active-pipelines list-length puti cr',
-    "ct-set-rewrite-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" "rule_kw" "optimized" ct-set-rewrite-pipeline static_assert',
-    "ct-set-rewrite-pipeline-active": '"grammar" "default" 1 ct-set-rewrite-pipeline-active ct-list-rewrite-active-pipelines list-length puti cr',
 })
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-capture-global-clear": '"scratch" list-new "x" list-append ct-capture-global-set ct-capture-global-clear 0 > static_assert',
-    "ct-capture-global-delete": '"scratch" list-new "x" list-append ct-capture-global-set "scratch" ct-capture-global-delete static_assert',
-    "ct-capture-global-get": '"scratch" list-new "x" list-append ct-capture-global-set "scratch" ct-capture-global-get drop list-length puti cr',
-    "ct-capture-schema-get": '"sum" "left" "single" "int" 1 ct-capture-schema-put "sum" ct-capture-schema-get drop map-length puti cr',
-    "ct-capture-taint-get": '"sum" "left" 1 ct-capture-taint-set "sum" "left" ct-capture-taint-get drop static_assert',
-    "ct-clone-macro": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "twice_copy" ct-clone-macro static_assert',
-    "ct-rename-macro": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "twice_v2" ct-rename-macro static_assert',
-    "ct-set-macro-expansion": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" list-new "42" list-append ct-set-macro-expansion static_assert',
-    "ct-macro-doc-get": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "Duplicates its argument." ct-macro-doc-set drop "twice" ct-macro-doc-get drop puts',
-    "ct-macro-doc-set": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" "Duplicates its argument." ct-macro-doc-set static_assert',
-    "ct-macro-attrs-get": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" map-new "category" "arithmetic" map-set ct-macro-attrs-set drop "twice" ct-macro-attrs-get drop map-length puti cr',
-    "ct-macro-attrs-set": f'{_TEXT_MACRO_EXAMPLE_SETUP} "twice" map-new "category" "arithmetic" map-set ct-macro-attrs-set static_assert',
-    "ct-register-text-macro": '"m" 1 list-new "42" list-append ct-register-text-macro',
-    "ct-register-text-macro-signature": '"identity" list-new "x" list-append list-new "$x" list-append ct-register-text-macro-signature',
-    "ct-set-ct-call-contract": 'word my_ct_word 42 end "my_ct_word" map-new "arg_kind" "map" map-set "result_kind" "scalar" map-set ct-set-ct-call-contract static_assert',
-    "ct-get-ct-call-contract": 'word my_ct_word 42 end "my_ct_word" map-new "arg_kind" "map" map-set ct-set-ct-call-contract drop "my_ct_word" ct-get-ct-call-contract drop map-length puti cr',
 })
 
 _EXAMPLE_OVERRIDES.update({
-    "ct-remove-reader-rewrite": f'{_READER_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-remove-reader-rewrite static_assert',
-    "ct-remove-grammar-rewrite": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "rule_kw" ct-remove-grammar-rewrite static_assert',
-    "ct-list-reader-rewrites": f'{_READER_REWRITE_EXAMPLE_SETUP} ct-list-reader-rewrites list-length puti cr',
-    "ct-list-grammar-rewrites": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-list-grammar-rewrites list-length puti cr',
     "ct-rewrite-dry-run": '"grammar" list-new "kw" list-append 64 ct-rewrite-dry-run swap drop list-length puti cr',
-    "ct-rewrite-generate-fixture": '"grammar" list-new "kw" list-append 64 ct-rewrite-generate-fixture map-length puti cr',
     "ct-rewrite-run-on-list": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "grammar" list-new "kw" list-append ct-rewrite-run-on-list swap drop list-length puti cr',
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-definition-candidates": "Returns immutable DefinitionCandidate maps for every candidate registered under a name, highest priority first and newest first within a priority, including inactive pack-owned ones. A missing or built-in-only name gives an empty list.",
+    "ct-definition-exists?": "Pushes 1 when the name has a registered candidate (including inactive pack-owned ones) or a built-in handler, else 0.",
+    "ct-definition-list-names": "Returns the sorted names that have a candidate or a built-in handler, each once.",
+    "ct-definition-list-names-prefix": "Returns the sorted names that have a candidate or a built-in handler and start with the prefix.",
+    "ct-definition-get": "Pushes the current DefinitionCandidate map for a handle and 1, or nil and 0 when the handle is stale.",
+    "ct-definition-get-by-name": "Pushes the selected eligible candidate's map and 1, or nil and 0 when no candidate is eligible.",
+    "ct-definition-body": "Pushes a detached copy of the candidate's body (op maps for a word, expansion tokens for a text macro) and 1, or nil and 0.",
+    "ct-definition-body-by-name": "Like ct-definition-body for the selected candidate of a name.",
+    "ct-definition-asm": "Pushes an assembly candidate's current body and 1, or nil and 0 for other kinds or a stale handle.",
+    "ct-definition-asm-by-name": "Like ct-definition-asm for the selected candidate of a name.",
+    "ct-definition-source": "Pushes the exact original source text of the candidate's declaration and 1, or nil and 0 when it has none (generated or built-in definitions).",
+    "ct-definition-source-by-name": "Like ct-definition-source for the selected candidate of a name.",
+    "ct-definition-set-priority": "Sets one candidate's priority (any integer, not a boolean) and pushes 1, or 0 for a stale handle. Selection is recomputed; registration order is kept.",
+    "ct-definition-set-priority-by-name": "Sets the priority of a name's only candidate; pushes 0 when the name has none or several.",
+    "ct-definition-set-flags": "Applies a flag patch map (immediate, compile-only, runtime-only, inline, preserve; integers or booleans) to one candidate. Invalid keys or combinations raise and change nothing.",
+    "ct-definition-set-flags-by-name": "Applies a flag patch to a name's only candidate; pushes 0 when the name has none or several.",
+    "ct-definition-set-asm": "Replaces an assembly candidate's body without running it; symbols are resolved at emission. The declaration source is kept.",
+    "ct-definition-set-asm-by-name": "Replaces the body of a name's only candidate, which must be an assembly definition.",
+    "ct-definition-rename": "Moves one candidate to another name, where it becomes the newest registration and keeps its handle. The old name falls back to its next candidate.",
+    "ct-definition-rename-by-name": "Renames a name's only candidate; pushes 0 when the name has none or several.",
+    "ct-definition-clone": "Registers a copy of one candidate under a name with the same priority, a new handle, and a new registration position. Built-in handlers are not copied.",
+    "ct-definition-clone-by-name": "Clones a name's only candidate; pushes nil 0 when the name has none or several.",
+    "ct-definition-unregister": "Removes one exact candidate and pushes 1, or 0 for a stale handle. Its handle stays stale; the name falls back to its next candidate.",
+    "ct-definition-unregister-by-name": "Removes a name's only unowned candidate; pushes 0 when the name has none or several.",
+    "ct-definition-prefer-l2": "Marks a candidate to run its L2 definition at compile time instead of the name's compile-time intrinsic while it is selected. Runtime-only candidates cannot be marked.",
+    "ct-definition-prefer-l2-by-name": "Marks the selected candidate of a name to run its L2 definition at compile time instead of the compile-time intrinsic; pushes 0 when nothing is selected.",
+    "ct-definition-register-source": "Parses a source fragment of word and :asm definitions and registers each in order, returning their handles. A fragment that fails to parse registers nothing. Needs an active compilation.",
+    "ct-definition-predeclare-all": "Registers every later top-level word definition in the parse stream now, so compile-time code can call it early; the normal parse later completes the same candidate.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-definition-candidates": '"main" ct-definition-candidates list-length puti cr',
+    "ct-definition-exists?": '"puti" ct-definition-exists? static-assert',
+    "ct-definition-list-names": "ct-definition-list-names list-length puti cr",
+    "ct-definition-list-names-prefix": '"ct-" ct-definition-list-names-prefix list-length puti cr',
+    "ct-definition-get": '"puti" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-get drop "priority" map-get drop puti cr',
+    "ct-definition-get-by-name": '"puti" ct-definition-get-by-name drop "kind" map-get drop puts',
+    "ct-definition-body": '"puti" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-body drop list-length puti cr',
+    "ct-definition-body-by-name": 'word example_word 1 2 + end "example_word" ct-definition-body-by-name drop list-length puti cr',
+    "ct-definition-asm": ':asm example_asm { nop }; "example_asm" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-asm drop puts',
+    "ct-definition-asm-by-name": ':asm example_asm { nop }; "example_asm" ct-definition-asm-by-name drop puts',
+    "ct-definition-source": 'word example_word 42 end "example_word" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-source drop puts',
+    "ct-definition-source-by-name": 'word example_word 42 end "example_word" ct-definition-source-by-name drop puts',
+    "ct-definition-set-priority": '"example_word" ct-definition-candidates 0 list-get "handle" map-get drop 10 ct-definition-set-priority static-assert',
+    "ct-definition-set-priority-by-name": '"example_word" 10 ct-definition-set-priority-by-name drop',
+    "ct-definition-set-flags": '"example_word" ct-definition-candidates 0 list-get "handle" map-get drop map-new "compile-only" 1 map-set ct-definition-set-flags drop',
+    "ct-definition-set-flags-by-name": '"example_word" map-new "inline" 1 map-set ct-definition-set-flags-by-name drop',
+    "ct-definition-set-asm": '"example_asm" ct-definition-candidates 0 list-get "handle" map-get drop "nop" ct-definition-set-asm drop',
+    "ct-definition-set-asm-by-name": '"example_asm" "nop" ct-definition-set-asm-by-name drop',
+    "ct-definition-rename": '"old_name" ct-definition-candidates 0 list-get "handle" map-get drop "new_name" ct-definition-rename drop',
+    "ct-definition-rename-by-name": '"old_name" "new_name" ct-definition-rename-by-name drop',
+    "ct-definition-clone": '"example_word" ct-definition-candidates 0 list-get "handle" map-get drop "example_copy" ct-definition-clone drop drop',
+    "ct-definition-clone-by-name": '"example_word" "example_copy" ct-definition-clone-by-name drop drop',
+    "ct-definition-unregister": '"temporary_word" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-unregister drop',
+    "ct-definition-unregister-by-name": '"temporary_word" ct-definition-unregister-by-name drop',
+    "ct-definition-prefer-l2": '"dup" ct-definition-candidates 0 list-get "handle" map-get drop ct-definition-prefer-l2 drop',
+    "ct-definition-prefer-l2-by-name": '"dup" ct-definition-prefer-l2-by-name drop',
+    "ct-definition-register-source": '"word recovered 42 end" ct-definition-register-source drop',
+    "ct-definition-predeclare-all": "ct-definition-predeclare-all",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "syntax-length": "Pushes the number of Tokens in a Syntax value.",
+    "syntax-get": "Pushes the Token at an index of a Syntax value; negative indices count from the end and an out-of-range index raises.",
+    "syntax-slice": "Pushes a new Syntax value with the Tokens from start up to end, using list slice bounds.",
+    "syntax-concat": "Pushes a new Syntax value with the left value's Tokens followed by the right value's.",
+    "syntax>list": "Pushes a fresh list of the Syntax value's Tokens, which keep their provenance.",
+    "list>syntax": "Builds a Syntax value from a list that must contain only Tokens.",
+    "emit": "Inserts a Syntax value's Tokens at the current position of the input being compiled; the parser reads them next.",
+    "gensym": "Returns a fresh identifier from a prefix: sanitized to [A-Za-z0-9_], then suffixed with a counter that skips names already defined.",
+    "ct-expansion-set-depth-limit": "Sets the nesting limit shared by macro and rewrite expansion; only positive integers are accepted.",
+    "ct-expansion-get-depth-limit": "Pushes the nesting limit shared by macro and rewrite expansion (default 256).",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "syntax-length": "`1 2 +` syntax-length puti cr",
+    "syntax-get": "`1 2 +` -1 syntax-get token-lexeme puts",
+    "syntax-slice": "`1 2 +` 0 2 syntax-slice syntax-length puti cr",
+    "syntax-concat": "`1` `2 +` syntax-concat syntax-length puti cr",
+    "syntax>list": "`1 2 +` syntax>list list-length puti cr",
+    "list>syntax": "`1 2 +` syntax>list list>syntax syntax-length puti cr",
+    "emit": "`word answer 42 end` emit",
+    "gensym": '"tmp" gensym puts',
+    "ct-expansion-set-depth-limit": "128 ct-expansion-set-depth-limit",
+    "ct-expansion-get-depth-limit": "ct-expansion-get-depth-limit puti cr",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-macro-get": "Pushes a detached record (parameters, body, metadata) for an exact macro candidate and 1, or nil and 0 when the handle is stale or not a macro.",
+    "ct-macro-get-by-name": "Like ct-macro-get for the selected candidate of a name; nil and 0 when it is not a macro.",
+    "ct-macro-set": "Updates a macro's parameters, body, or metadata in place from a patch map. Everything is validated, and the body parsed, before anything changes; the body is not run.",
+    "ct-macro-set-by-name": "Applies a macro patch to a name's only unowned candidate; pushes 0 when the name has none or several.",
+    "ct-macro-context": "While a macro body runs, pushes a fresh map with the macro name, its definition origin, the call site, and the expansion trace.",
+    "ct-definition-set-body": "Replaces an L2 word's body with Syntax parsed as a word body (not run); flags and source provenance are kept.",
+    "ct-definition-set-body-by-name": "Replaces the body of a name's only unowned L2 candidate; pushes 0 when the name has none or several.",
+    "ct-lang-register-macro": "Adopts the selected unowned macro into a language pack, which then owns it; pushes 0 when there is no such macro.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-macro-get": '"add" ct-definition-candidates 0 list-get "handle" map-get drop ct-macro-get drop "parameters" map-get drop list-length puti cr',
+    "ct-macro-get-by-name": '"add" ct-macro-get-by-name drop "body" map-get drop syntax-length puti cr',
+    "ct-macro-set": '"add" ct-definition-candidates 0 list-get "handle" map-get drop map-new "metadata" map-new "doc" "adds" map-set map-set ct-macro-set drop',
+    "ct-macro-set-by-name": '"add" map-new "body" `\\` \\$x \\$y * \\` emit` map-set ct-macro-set-by-name drop',
+    "ct-macro-context": 'ct-macro-context "macro" map-get drop puts',
+    "ct-definition-set-body": '"value" ct-definition-candidates 0 list-get "handle" map-get drop `40 2 +` ct-definition-set-body drop',
+    "ct-definition-set-body-by-name": '"value" `40 2 +` ct-definition-set-body-by-name drop',
+    "ct-lang-register-macro": '"demo.lang" ct-lang-create drop "demo.lang" "add" ct-lang-register-macro drop',
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-rewrite-add-reader": "Registers an unnamed reader-stage rule (pattern and replacement lexeme lists) and pushes its RewriteHandle; the rule gets a generated name.",
+    "ct-rewrite-add-reader-named": "Registers a named reader-stage rule and pushes its RewriteHandle; names need not be unique.",
+    "ct-rewrite-add-grammar": "Registers an unnamed grammar-stage rule (pattern and replacement lexeme lists) and pushes its RewriteHandle.",
+    "ct-rewrite-add-grammar-named": "Registers a named grammar-stage rule and pushes its RewriteHandle; names need not be unique.",
+    "ct-rewrite-remove": "Removes the rule a RewriteHandle identifies, in either stage; pushes 0 for a stale handle.",
+    "ct-rewrite-clear-reader": "Removes every reader-stage rule that no language pack owns and pushes how many were removed.",
+    "ct-rewrite-clear-grammar": "Removes every grammar-stage rule that no language pack owns and pushes how many were removed.",
+    "ct-rewrite-list-reader": "Pushes one {handle, name} map per reader-stage registration, in registration order, including disabled and inactive-pack rules.",
+    "ct-rewrite-list-grammar": "Pushes one {handle, name} map per grammar-stage registration, in registration order, including disabled and inactive-pack rules.",
+    "ct-rewrite-set-loop-detection": "Turns exact-state loop detection on or off (integer or boolean); a detected loop is rejected before the rewrite is committed.",
+    "ct-rewrite-loop-detection?": "Pushes 1 when rewrite loop detection is on (the default), else 0.",
+    "ct-rewrite-get-loop-reports": "Pushes a detached list of the detected-loop reports (stage, rule, steps, and the repeated lexeme sequence).",
+    "ct-rewrite-clear-loop-reports": "Clears the loop reports and pushes how many were removed.",
+    "ct-rewrite-set-max-steps": "Sets the number of rewrite applications allowed per parse across both stages; 0 allows none, negative values are rejected.",
+    "ct-rewrite-get-max-steps": "Pushes the rewrite application budget (default 100000).",
+    "ct-rewrite-set-pipeline-active": "Activates or deactivates a pipeline for a stage; rules on an inactive pipeline do not match.",
+    "ct-rewrite-list-active-pipelines": "Pushes the sorted names of the stage's active pipelines.",
+    "ct-rewrite-scope-push": "Saves the active pipeline sets of both stages and pushes the new scope depth.",
+    "ct-rewrite-scope-pop": "Restores the most recently saved pipeline sets and pushes 1, or 0 when nothing is saved.",
+    "ct-rewrite-run-on-list": "Applies the stage's eligible rules to a lexeme list (the input is unchanged) using the configured step budget; pushes the result and the patch list.",
+    "ct-rewrite-dry-run": "Like ct-rewrite-run-on-list with an explicit nonnegative step budget.",
+    "ct-rewrite-rule-set-priority": "Sets a rule's priority (any integer); higher priorities are tried first and the registration order is kept.",
+    "ct-rewrite-rule-get-priority": "Pushes a rule's priority and 1, or nil and 0; takes a RewriteHandle or a stage and a unique rule name.",
+    "ct-rewrite-rule-set-enabled": "Enables or disables a rule (integer or boolean) without removing it.",
+    "ct-rewrite-rule-get-enabled": "Pushes 1 or 0 for a rule's enabled flag and 1, or nil and 0; takes a RewriteHandle or a stage and a unique rule name.",
+    "ct-rewrite-rule-set-pipeline": "Moves a rule to a pipeline (a nonempty name); the rule matches only while that pipeline is active.",
+    "ct-rewrite-rule-get-pipeline": "Pushes a rule's pipeline name and 1, or nil and 0; takes a RewriteHandle or a stage and a unique rule name.",
+    "ct-rewrite-rule-set-guard": "Sets a rule's guard word (`payload -- applies?`, resolved when the rule matches) or nil for none.",
+    "ct-rewrite-rule-get-guard": "Pushes a rule's guard name (or nil) and 1, or nil and 0; takes a RewriteHandle or a stage and a unique rule name.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-rewrite-add-reader": 'list-new "kw" list-append list-new "42" list-append ct-rewrite-add-reader drop',
+    "ct-rewrite-add-reader-named": '"rule_kw" list-new "kw" list-append list-new "42" list-append ct-rewrite-add-reader-named drop',
+    "ct-rewrite-add-grammar": 'list-new "kw" list-append list-new "42" list-append ct-rewrite-add-grammar drop',
+    "ct-rewrite-add-grammar-named": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop',
+    "ct-rewrite-remove": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-rewrite-remove static-assert',
+    "ct-rewrite-clear-reader": 'ct-rewrite-clear-reader puti cr',
+    "ct-rewrite-clear-grammar": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop ct-rewrite-clear-grammar puti cr',
+    "ct-rewrite-list-reader": 'ct-rewrite-list-reader list-length puti cr',
+    "ct-rewrite-list-grammar": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop ct-rewrite-list-grammar list-length puti cr',
+    "ct-rewrite-set-loop-detection": '0 ct-rewrite-set-loop-detection',
+    "ct-rewrite-loop-detection?": 'ct-rewrite-loop-detection? puti cr',
+    "ct-rewrite-get-loop-reports": 'ct-rewrite-get-loop-reports list-length puti cr',
+    "ct-rewrite-clear-loop-reports": 'ct-rewrite-clear-loop-reports puti cr',
+    "ct-rewrite-set-max-steps": '4096 ct-rewrite-set-max-steps',
+    "ct-rewrite-get-max-steps": 'ct-rewrite-get-max-steps puti cr',
+    "ct-rewrite-set-pipeline-active": '"grammar" "optimized" 1 ct-rewrite-set-pipeline-active',
+    "ct-rewrite-list-active-pipelines": '"grammar" ct-rewrite-list-active-pipelines list-length puti cr',
+    "ct-rewrite-scope-push": 'ct-rewrite-scope-push puti cr',
+    "ct-rewrite-scope-pop": 'ct-rewrite-scope-push drop ct-rewrite-scope-pop static-assert',
+    "ct-rewrite-run-on-list": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop "grammar" list-new "kw" list-append ct-rewrite-run-on-list drop 0 list-get puts',
+    "ct-rewrite-dry-run": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop "grammar" list-new "kw" list-append 8 ct-rewrite-dry-run list-length puti cr drop',
+    "ct-rewrite-rule-set-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} 10 ct-rewrite-rule-set-priority static-assert',
+    "ct-rewrite-rule-get-priority": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-rewrite-rule-get-priority drop puti cr',
+    "ct-rewrite-rule-set-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} 0 ct-rewrite-rule-set-enabled static-assert',
+    "ct-rewrite-rule-get-enabled": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} drop "grammar" "rule_kw" ct-rewrite-rule-get-enabled drop puti cr',
+    "ct-rewrite-rule-set-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "optimized" ct-rewrite-rule-set-pipeline static-assert',
+    "ct-rewrite-rule-get-pipeline": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-rewrite-rule-get-pipeline drop puts',
+    "ct-rewrite-rule-set-guard": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} "keep_rule" ct-rewrite-rule-set-guard static-assert',
+    "ct-rewrite-rule-get-guard": f'{_GRAMMAR_REWRITE_EXAMPLE_SETUP} ct-rewrite-rule-get-guard drop nil? puti cr',
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-parser-set-token-hook": "Installs the global token hook: binds the name's selected word, which then sees each Token as `token -- handled?`; a nonzero result consumes the Token.",
+    "ct-parser-clear-token-hook": "Removes the global token hook; hooks owned by language packs are not affected.",
+    "ct-lang-create": "Creates an inactive language pack and pushes 1, or pushes 0 when the name already exists (its state is left unchanged).",
+    "ct-lang-exists?": "Pushes 1 when the language pack exists, else 0.",
+    "ct-lang-list": "Pushes the sorted names of all language packs, active or not.",
+    "ct-lang-list-active": "Pushes the sorted names of the active language packs.",
+    "ct-lang-activate": "Activates a pack, enabling its hooks, rewrites, words, and macros; pushes 0 when it was already active.",
+    "ct-lang-deactivate": "Deactivates a pack without unregistering its resources; pushes 0 when it was already inactive.",
+    "ct-lang-active?": "Pushes 1 when the language pack exists and is active, else 0.",
+    "ct-lang-set-meta": "Stores a detached copy of a string-keyed map of portable CT data as the pack's metadata; nil clears it.",
+    "ct-lang-get-meta": "Pushes a detached copy of the pack's metadata and 1, or nil and 0 for an unknown pack.",
+    "ct-lang-status": "Pushes a detached status map (name, active, metadata, token_hooks, words, macros, reader_rewrites, grammar_rewrites) and 1, or nil and 0.",
+    "ct-lang-remove": "Removes a pack and every resource it owns and pushes 1, or 0 when the pack does not exist.",
+    "ct-lang-add-reader-rewrite-named": "Registers a reader-stage rewrite owned by the pack and pushes its RewriteHandle; it matches while the pack is active.",
+    "ct-lang-add-grammar-rewrite-named": "Registers a grammar-stage rewrite owned by the pack and pushes its RewriteHandle; it matches while the pack is active.",
+    "ct-lang-add-token-hook": "Adds an enabled priority-0 token hook to the pack and pushes its TokenHookHandle; the handler name is resolved at each dispatch.",
+    "ct-lang-set-token-hook-priority": "Sets a pack hook's priority (higher runs first) and pushes 1, or 0 for a stale handle.",
+    "ct-lang-set-token-hook-enabled": "Enables or disables a pack hook and pushes 1, or 0 for a stale handle.",
+    "ct-lang-remove-token-hook": "Removes a pack hook and pushes 1, or 0 for a stale handle.",
+    "ct-lang-register-word": "Adopts the selected unowned word into the pack (keeping its handle and priority) and pushes 1, or 0 when there is none.",
+    "ct-lang-register-macro": "Adopts the selected unowned macro into the pack (keeping its handle and priority) and pushes 1, or 0 when there is none.",
+    "ct-lang-set-resource-priority": "Sets the priority of the pack's word or macro of that name and pushes 1, or 0 when the pack owns none.",
+    "ct-lang-get-resource-priority": "Pushes the priority of the pack's word or macro of that name and 1, or nil and 0.",
+    "ct-lang-unregister-resource": "Removes the pack's word or macro of that name and pushes 1, or 0 when the pack owns none; the next eligible candidate takes over.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-parser-set-token-hook": "word my_hook drop 0 end \"my_hook\" ct-parser-set-token-hook",
+    "ct-parser-clear-token-hook": "ct-parser-clear-token-hook",
+    "ct-lang-create": "\"demo.lang\" ct-lang-create static-assert",
+    "ct-lang-exists?": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-exists? static-assert",
+    "ct-lang-list": "\"demo.lang\" ct-lang-create drop ct-lang-list list-length puti cr",
+    "ct-lang-list-active": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop ct-lang-list-active list-length puti cr",
+    "ct-lang-activate": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate static-assert",
+    "ct-lang-deactivate": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" ct-lang-deactivate static-assert",
+    "ct-lang-active?": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" ct-lang-active? static-assert",
+    "ct-lang-set-meta": "\"demo.lang\" ct-lang-create drop \"demo.lang\" map-new \"version\" 1 map-set ct-lang-set-meta static-assert",
+    "ct-lang-get-meta": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-get-meta drop map-length puti cr",
+    "ct-lang-status": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-status drop \"active\" map-get drop puti cr",
+    "ct-lang-remove": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-remove static-assert",
+    "ct-lang-add-reader-rewrite-named": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"r\" list-new \"kw\" list-append list-new \"42\" list-append ct-lang-add-reader-rewrite-named drop",
+    "ct-lang-add-grammar-rewrite-named": "\"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"g\" list-new \"kw\" list-append list-new \"42\" list-append ct-lang-add-grammar-rewrite-named drop",
+    "ct-lang-add-token-hook": "word demo_hook drop 0 end \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"demo_hook\" ct-lang-add-token-hook drop",
+    "ct-lang-set-token-hook-priority": "\"demo.lang\" ct-lang-create drop \"demo.lang\" \"demo_hook\" ct-lang-add-token-hook 10 ct-lang-set-token-hook-priority static-assert",
+    "ct-lang-set-token-hook-enabled": "\"demo.lang\" ct-lang-create drop \"demo.lang\" \"demo_hook\" ct-lang-add-token-hook 0 ct-lang-set-token-hook-enabled static-assert",
+    "ct-lang-remove-token-hook": "\"demo.lang\" ct-lang-create drop \"demo.lang\" \"demo_hook\" ct-lang-add-token-hook ct-lang-remove-token-hook static-assert",
+    "ct-lang-register-word": "word helper 1 end \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"helper\" ct-lang-register-word static-assert",
+    "ct-lang-register-macro": "macro add (x y) `$x $y +` emit ; \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"add\" ct-lang-register-macro static-assert",
+    "ct-lang-set-resource-priority": "word helper 1 end \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"helper\" ct-lang-register-word drop \"demo.lang\" \"helper\" 5 ct-lang-set-resource-priority static-assert",
+    "ct-lang-get-resource-priority": "word helper 1 end \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"helper\" ct-lang-register-word drop \"demo.lang\" \"helper\" ct-lang-get-resource-priority drop puti cr",
+    "ct-lang-unregister-resource": "word helper 1 end \"demo.lang\" ct-lang-create drop \"demo.lang\" ct-lang-activate drop \"demo.lang\" \"helper\" ct-lang-register-word drop \"demo.lang\" \"helper\" ct-lang-unregister-resource static-assert",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-output-append-text-preamble": "Appends one raw fragment to the .text preamble, which is emitted after the runtime prelude and before word definitions.",
+    "ct-output-set-text-preamble": "Replaces the .text preamble with a copy of a list of string fragments; the whole list is checked before anything changes.",
+    "ct-output-clear-text-preamble": "Removes every .text preamble fragment.",
+    "ct-output-append-data": "Appends one raw .data fragment; CT fragments come after definition data and before variable storage.",
+    "ct-output-set-data": "Replaces the CT .data fragments with a copy of a list of strings; compiler-generated data is not affected.",
+    "ct-output-clear-data": "Removes every CT .data fragment; compiler-generated data is not affected.",
+    "ct-output-append-bss": "Appends one raw fragment to the runtime BSS buffer, which starts as the standard runtime layout.",
+    "ct-output-set-bss": "Replaces the whole runtime BSS buffer, standard layout included, with a copy of a list of strings; the replacement must define the runtime symbols.",
+    "ct-output-clear-bss": "Empties the runtime BSS buffer, standard layout included; later appends build on the empty buffer. Compiler-generated BSS is still emitted.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-output-append-text-preamble": "\"; generated by CT code\" ct-output-append-text-preamble",
+    "ct-output-set-text-preamble": "list-new \"; first\" list-append \"; second\" list-append ct-output-set-text-preamble",
+    "ct-output-clear-text-preamble": "\"; temporary\" ct-output-append-text-preamble ct-output-clear-text-preamble",
+    "ct-output-append-data": "\"scratch_dq: dq 42\" ct-output-append-data",
+    "ct-output-set-data": "list-new \"scratch_dq: dq 42\" list-append ct-output-set-data",
+    "ct-output-clear-data": "\"scratch_dq: dq 42\" ct-output-append-data ct-output-clear-data",
+    "ct-output-append-bss": "\"scratch: resb 64\" ct-output-append-bss",
+    "ct-output-set-bss": "list-new \"dstack: resb DSTK_BYTES\" list-append \"dstack_top:\" list-append ct-output-set-bss",
+    "ct-output-clear-bss": "ct-output-clear-bss \"rstack: resb RSTK_BYTES\" ct-output-append-bss",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-rng-seed": "Resets the compilation's random stream from an integer seed (reduced modulo 2**64); later draws repeat for the same seed and Python version.",
+    "ct-rng-int": "Pushes a pseudo-random integer in [0, bound); bound must be a positive integer.",
+    "ct-rng-range": "Pushes a pseudo-random integer in the inclusive range [lo, hi]; lo must not exceed hi.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-rng-seed": "12345 ct-rng-seed 10 ct-rng-int puti cr",
+    "ct-rng-int": "6 ct-rng-int 1 + puti cr",
+    "ct-rng-range": "1 6 ct-rng-range puti cr",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-control-get": "Pushes the frame's value for a key and 1, or nil and 0 when the key is absent; a key holding nil gives nil and 1.",
+    "ct-control-get?": "Pushes the frame's value for a key, or nil when the key is absent (no found flag; use ct-control-get to tell a missing key from a nil value).",
+    "ct-control-add-close-op": "Appends an {op, data} close descriptor to the frame; `end` validates every descriptor before popping the frame, so a bad one changes nothing.",
+    "ct-op-emit": "Appends an internal operation to the active body, keeping its data by reference; unsupported operations fail later during emission.",
+    "ct-label-new": "Allocates a fresh L_<prefix>_<n> label; the prefix must be an ASCII identifier.",
+    "ct-parser-last-line": "Pushes the line of the last token the parser read, or 0 before any token.",
+    "ct-parser-register-block-opener": "Adds a lexeme to the block openers counted by `with` nesting and predeclaration scans.",
+    "ct-parser-unregister-block-opener": "Removes a lexeme from the block openers; built-in constructs keep working.",
+    "ct-control-register-override": "Routes if, else, for, while, or do to the immediate word of that name; a missing or non-immediate handler is then an error.",
+    "ct-control-unregister-override": "Removes a control override so the built-in parser handles that control word again.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-control-get": "\"if\" ct-control-frame-new \"false\" \"L_false\" ct-control-set \"false\" ct-control-get drop puts",
+    "ct-control-get?": "\"if\" ct-control-frame-new \"false\" \"L_false\" ct-control-set \"false\" ct-control-get? puts",
+    "ct-control-add-close-op": "\"if\" ct-control-frame-new \"label\" \"if_false\" ct-label-new ct-control-add-close-op ct-control-push",
+    "ct-op-emit": "\"literal\" 42 ct-op-emit",
+    "ct-label-new": "\"loop_done\" ct-label-new puts",
+    "ct-parser-last-line": "ct-parser-last-line puti cr",
+    "ct-parser-register-block-opener": "\"unless\" ct-parser-register-block-opener",
+    "ct-parser-unregister-block-opener": "\"unless\" ct-parser-unregister-block-opener",
+    "ct-control-register-override": "\"if\" ct-control-register-override",
+    "ct-control-unregister-override": "\"if\" ct-control-unregister-override",
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "repr": "Pushes a readable debug representation of any CT value; the text is not a stable format.",
+    "static-assert": "Raises static-assertion-failed at the call site when the condition (a boolean or integer) is false or zero; other types are a type error.",
+    "string-utf8-length": "Pushes the number of UTF-8 bytes in a string.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "repr": 'list-new "token" list-append repr puts',
+    "static-assert": "1 1 + 2 == static-assert",
+    "string-utf8-length": '"h\u00e9" string-utf8-length puti cr',
+})
+
+
+_OVERVIEW_OVERRIDES.update({
+    "ct-event-stream-enabled?": "Pushes 1 while a configured --events-stream JSONL file is being written, else 0.",
+    "ct-event-stream-set-enabled": "Pauses (0) or resumes writes to the configured --events-stream file and pushes the previous state; enabling without a stream is an error.",
+})
+
+_EXAMPLE_OVERRIDES.update({
+    "ct-event-stream-enabled?": "ct-event-stream-enabled? puti cr",
+    "ct-event-stream-set-enabled": "0 ct-event-stream-set-enabled drop",
 })
 
 
@@ -7290,189 +7102,13 @@ def _curated_example_for_word(word_name: str) -> str:
     if override is not None:
         return override
 
-    if word_name in {"ct-add-reader-rewrite", "ct-add-grammar-rewrite"}:
-        return f'list-new "kw" list-append list-new "42" list-append {word_name}'
-    if word_name in {"ct-add-reader-rewrite-named", "ct-add-grammar-rewrite-named"}:
-        return f'"rule_kw" list-new "kw" list-append list-new "42" list-append {word_name}'
-    if word_name in {"ct-add-reader-rewrite-priority", "ct-add-grammar-rewrite-priority"}:
-        return f'10 list-new "kw" list-append list-new "42" list-append {word_name}'
-    if word_name in {"ct-remove-reader-rewrite", "ct-remove-grammar-rewrite"}:
-        return f'"rule_kw" {word_name}'
-    if word_name in {"ct-list-reader-rewrites", "ct-list-grammar-rewrites"}:
-        return f"{word_name} list-length"
-    if word_name in {"ct-set-reader-rewrite-enabled", "ct-set-grammar-rewrite-enabled"}:
-        return f'"rule_kw" 1 {word_name}'
-    if word_name in {"ct-get-reader-rewrite-enabled", "ct-get-grammar-rewrite-enabled"}:
-        return f'"rule_kw" {word_name}'
-    if word_name in {"ct-set-reader-rewrite-priority", "ct-set-grammar-rewrite-priority"}:
-        return f'"rule_kw" 50 {word_name}'
-    if word_name in {"ct-get-reader-rewrite-priority", "ct-get-grammar-rewrite-priority"}:
-        return f'"rule_kw" {word_name}'
-
-    if word_name == "ct-set-rewrite-pipeline":
-        return '"grammar" "rule_kw" "default" ct-set-rewrite-pipeline'
-    if word_name == "ct-get-rewrite-pipeline":
-        return '"grammar" "rule_kw" ct-get-rewrite-pipeline'
-    if word_name == "ct-set-rewrite-pipeline-active":
-        return '"grammar" "default" 1 ct-set-rewrite-pipeline-active'
-    if word_name == "ct-list-rewrite-active-pipelines":
-        return '"grammar" ct-list-rewrite-active-pipelines'
-    if word_name == "ct-rebuild-rewrite-index":
-        return '"grammar" ct-rebuild-rewrite-index'
-    if word_name == "ct-get-rewrite-index-stats":
-        return '"grammar" ct-get-rewrite-index-stats'
-    contextual_noarg_examples: Dict[str, str] = {
-        "ct-export-rewrite-pack": "ct-export-rewrite-pack map-length",
-        "ct-rewrite-txn-begin": "ct-rewrite-txn-begin drop",
-        "ct-rewrite-txn-commit": "ct-rewrite-txn-commit drop",
-        "ct-rewrite-txn-rollback": "ct-rewrite-txn-rollback drop",
-        "ct-get-rewrite-loop-reports": "ct-get-rewrite-loop-reports list-length",
-        "ct-clear-rewrite-loop-reports": "ct-clear-rewrite-loop-reports drop",
-        "ct-get-rewrite-trace-log": "ct-get-rewrite-trace-log list-length",
-        "ct-clear-rewrite-trace-log": "ct-clear-rewrite-trace-log drop",
-        "ct-get-rewrite-profile": "ct-get-rewrite-profile map-length",
-        "ct-clear-rewrite-profile": "ct-clear-rewrite-profile ct-get-rewrite-profile drop",
-        "ct-list-pattern-macros": "ct-list-pattern-macros list-length",
-        "ct-list-active-pattern-groups": "ct-list-active-pattern-groups list-length",
-        "ct-list-active-pattern-scopes": "ct-list-active-pattern-scopes list-length",
-        "ct-list-words": "ct-list-words list-length",
-        "ct-clear-ct-call-memo": "ct-clear-ct-call-memo drop",
-        "ct-get-ct-call-memo-size": "ct-get-ct-call-memo-size puti cr",
-        "ct-get-ct-call-side-effect-log": "ct-get-ct-call-side-effect-log list-length",
-        "ct-clear-ct-call-side-effect-log": "ct-clear-ct-call-side-effect-log drop",
-        "ct-get-ct-call-side-effects": "ct-get-ct-call-side-effects puti cr",
-        "ct-get-ct-call-memo": "ct-get-ct-call-memo puti cr",
-        "ct-get-macro-preview": "ct-get-macro-preview puti cr",
-        "ct-get-macro-expansion-limit": "ct-get-macro-expansion-limit puti cr",
-        "ct-get-ct-call-recursion-limit": "ct-get-ct-call-recursion-limit puti cr",
-        "ct-get-ct-call-timeout-ms": "ct-get-ct-call-timeout-ms puti cr",
-        "ct-get-ct-call-exception-policy": "ct-get-ct-call-exception-policy puts",
-        "ct-get-ct-call-sandbox-mode": "ct-get-ct-call-sandbox-mode puts",
-        "ct-get-ct-call-sandbox-allowlist": "ct-get-ct-call-sandbox-allowlist list-length",
-        "ct-get-rewrite-saturation": "ct-get-rewrite-saturation puts",
-        "ct-get-rewrite-max-steps": "ct-get-rewrite-max-steps puti cr",
-        "ct-get-rewrite-loop-detection": "ct-get-rewrite-loop-detection puti cr",
-        "ct-get-rewrite-trace": "ct-get-rewrite-trace puti cr",
-        "ct-capture-global-clear": "ct-capture-global-clear drop",
-        "ct-capture-replay-clear": "ct-capture-replay-clear drop",
-        "ct-capture-replay-log": "ct-capture-replay-log list-length",
-    }
-    if word_name in contextual_noarg_examples:
-        return contextual_noarg_examples[word_name]
-
-    if word_name == "ct-import-rewrite-pack":
-        return "map-new ct-import-rewrite-pack"
-    if word_name == "ct-import-rewrite-pack-replace":
-        return "map-new ct-import-rewrite-pack-replace"
-    if word_name == "ct-get-rewrite-provenance":
-        return '"grammar" "rule_kw" ct-get-rewrite-provenance'
-    if word_name == "ct-get-rewrite-specificity":
-        return '"grammar" "rule_kw" ct-get-rewrite-specificity'
-    if word_name == "ct-rewrite-generate-fixture":
-        return '"grammar" list-new "kw" list-append 64 ct-rewrite-generate-fixture'
-    if word_name == "ct-rewrite-compatibility-matrix":
-        return '"grammar" ct-rewrite-compatibility-matrix'
-
-    if word_name == "ct-set-pattern-macro-enabled":
-        return '"pm_rule" 1 ct-set-pattern-macro-enabled'
-    if word_name == "ct-get-pattern-macro-enabled":
-        return '"pm_rule" ct-get-pattern-macro-enabled'
-    if word_name == "ct-set-pattern-macro-priority":
-        return '"pm_rule" 10 ct-set-pattern-macro-priority'
-    if word_name == "ct-get-pattern-macro-priority":
-        return '"pm_rule" ct-get-pattern-macro-priority'
-    if word_name == "ct-get-pattern-macro-clauses":
-        return '"pm_rule" ct-get-pattern-macro-clauses'
-    if word_name == "ct-get-pattern-macro-clause-details":
-        return '"pm_rule" ct-get-pattern-macro-clause-details'
-    if word_name == "ct-set-pattern-macro-group":
-        return '"pm_rule" "arith" ct-set-pattern-macro-group'
-    if word_name == "ct-get-pattern-macro-group":
-        return '"pm_rule" ct-get-pattern-macro-group'
-    if word_name == "ct-set-pattern-macro-scope":
-        return '"pm_rule" "scope_a" ct-set-pattern-macro-scope'
-    if word_name == "ct-get-pattern-macro-scope":
-        return '"pm_rule" ct-get-pattern-macro-scope'
-    if word_name == "ct-set-pattern-group-active":
-        return '"arith" 1 ct-set-pattern-group-active'
-    if word_name == "ct-set-pattern-scope-active":
-        return '"scope_a" 1 ct-set-pattern-scope-active'
-    if word_name == "ct-set-pattern-macro-clause-guard":
-        return '"pm_rule" 0 "guard_nonzero" ct-set-pattern-macro-clause-guard'
-    if word_name == "ct-detect-pattern-conflicts-named":
-        return '"pm_rule" ct-detect-pattern-conflicts-named'
-
-    if word_name == "ct-set-ct-call-contract":
-        return '"my_ct_word" map-new ct-set-ct-call-contract'
-    if word_name == "ct-get-ct-call-contract":
-        return '"my_ct_word" ct-get-ct-call-contract'
-    if word_name == "ct-set-ct-call-exception-policy":
-        return '"warn" ct-set-ct-call-exception-policy'
-    if word_name == "ct-set-ct-call-sandbox-mode":
-        return '"allowlist" ct-set-ct-call-sandbox-mode'
-    if word_name == "ct-set-ct-call-sandbox-allowlist":
-        return 'list-new "safe_word" list-append ct-set-ct-call-sandbox-allowlist'
-    if word_name == "ct-set-ct-call-memo":
-        return '1 ct-set-ct-call-memo'
-    if word_name == "ct-set-ct-call-side-effects":
-        return '1 ct-set-ct-call-side-effects'
-    if word_name == "ct-set-ct-call-recursion-limit":
-        return '8 ct-set-ct-call-recursion-limit'
-    if word_name == "ct-set-ct-call-timeout-ms":
-        return '50 ct-set-ct-call-timeout-ms'
-
-    if word_name.startswith("lexer-"):
-        if word_name == "lexer-new":
-            return '",;" lexer-new'
-        if word_name == "lexer-pop":
-            return '",;" lexer-new lexer-pop'
-        if word_name == "lexer-peek":
-            return '",;" lexer-new lexer-peek'
-        if word_name == "lexer-expect":
-            return '",;" lexer-new "{" lexer-expect'
-        if word_name == "lexer-collect-brace":
-            return '",;" lexer-new lexer-collect-brace'
-        if word_name == "lexer-push-back":
-            return '",;" lexer-new lexer-push-back'
-
-    if word_name.startswith("prelude-"):
-        if word_name == "prelude-clear":
-            return 'prelude-clear "mov rax, 60" prelude-append'
-        if word_name == "prelude-append":
-            return '"mov rax, 60" prelude-append'
-        if word_name == "prelude-set":
-            return 'list-new "mov rax, 60" list-append prelude-set'
-    if word_name.startswith("data-"):
-        if word_name == "data-clear":
-            return 'data-clear "scratch_dq: dq 42" data-append'
-        if word_name == "data-append":
-            return '"scratch_dq: dq 42" data-append'
-        if word_name == "data-set":
-            return 'list-new "scratch_dq: dq 42" list-append data-set'
-    if word_name.startswith("bss-"):
-        if word_name == "bss-clear":
-            return 'bss-clear "scratch: resb 64" bss-append'
-        if word_name == "bss-append":
-            return '"scratch: resb 64" bss-append'
-        if word_name == "bss-set":
-            return 'list-new "scratch: resb 64" list-append bss-set'
-
-    if word_name in {"set-token-hook", "clear-token-hook", "emit-definition"}:
-        if word_name == "emit-definition":
-            return '"dyn_word" list-new "1" list-append emit-definition'
-        if word_name == "set-token-hook":
-            return '"hook_word" set-token-hook'
-        return '"hook_word" set-token-hook clear-token-hook'
-
-    if word_name in {"shunt", "eval", "parse-error", "static_assert", "here", "i"}:
-        if word_name == "shunt":
-            return 'list-new "3" list-append "+" list-append "4" list-append shunt'
+    if word_name in {"eval", "ct-parser-error", "static-assert", "here", "i"}:
         if word_name == "eval":
             return '"1 2 +" eval'
-        if word_name == "parse-error":
-            return '"build failed" parse-error'
-        if word_name == "static_assert":
-            return "1 static_assert"
+        if word_name == "ct-parser-error":
+            return '"build failed" ct-parser-error'
+        if word_name == "static-assert":
+            return "1 static-assert"
         if word_name == "here":
             return "here"
         return "10 for i puti cr end"
@@ -7728,6 +7364,54 @@ def build_ct_detail_lines(entry: Dict[str, Any], width: int) -> List[str]:
 
 
 _CT_WORD_METADATA_PROVIDER: Optional[Callable[[], List[Dict[str, Any]]]] = None
+
+
+# The compiler supplies the macros and constants each file defines (from
+# a parse: parameters, `doc` metadata, declaration source), so the explorer
+# lists them with what the compiler knows, not what a regex finds.
+_DEFINITION_METADATA_PROVIDER: Optional[Callable[[Sequence[Path]], List[Dict[str, Any]]]] = None
+
+
+def configure_definition_metadata(provider: Optional[Callable[[Sequence[Path]], List[Dict[str, Any]]]]) -> None:
+    global _DEFINITION_METADATA_PROVIDER
+    _DEFINITION_METADATA_PROVIDER = provider
+
+
+def _definition_metadata_entries(files: Sequence[Path], *, include_undocumented: bool,
+                                 include_private: bool) -> List[DocEntry]:
+    """DocEntries for the macros and constants defined in `files`: the
+    description is the `doc` metadata, else the leading comment block."""
+    provider = _DEFINITION_METADATA_PROVIDER
+    if provider is None or not files:
+        return []
+    try:
+        rows = provider(files)
+    except Exception:
+        return []
+    lines_by_path: Dict[str, List[str]] = {}
+    entries: List[DocEntry] = []
+    for row in rows:
+        name = str(row.get("name", ""))
+        if not _is_doc_symbol_name(name, include_private=include_private):
+            continue
+        path = str(row.get("path", ""))
+        line = int(row.get("line", 0) or 0)
+        description = str(row.get("doc") or "")
+        if not description and line > 0:
+            lines = lines_by_path.get(path)
+            if lines is None:
+                try:
+                    lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    lines = []
+                lines_by_path[path] = lines
+            _effect, description = _collect_leading_doc_comments(lines, line - 1, name)
+        if not include_undocumented and not description:
+            continue
+        entries.append(DocEntry(name=name, stack_effect=str(row.get("stack_effect", "")),
+                                description=description, kind=str(row.get("kind", "macro")),
+                                path=Path(path), line=line))
+    return entries
 
 
 def configure_runtime(*, ct_word_metadata_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> None:

@@ -1,8 +1,9 @@
-error: intentional listener failure
-  --> event_listener_error.sl:2:33
+error[ct-parser-error-raised]: intentional listener failure
+  --> event_listener_error.sl:5:1
     |
-  2 |   "intentional listener failure" parse-error
-    |                                 ^
-    | = note: compile-time stack: reject_compile_event -> parse-error
+  5 | word main
+    | ^^^^
+    | = note: compile-time stack: reject_compile_event -> ct-parser-error
+    | = note: raised by compile-time code at: event_listener_error.sl:2:34
 
 1 error(s) emitted

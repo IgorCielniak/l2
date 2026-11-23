@@ -1,8 +1,8 @@
 import stdlib/stdlib.sl
 
 word repair_compile_error
-    "word nested_missing_word 42 end" ct-error-define ct-error-resume
-end on-event compile.error
+    drop "word nested_missing_word 42 end" ct-definition-register-source drop ct-recovery-resume drop
+end on-event compiler.error
 
 word compile_time_caller
     nested_missing_word

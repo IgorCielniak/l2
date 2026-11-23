@@ -3,24 +3,24 @@
 # if/else/for/while/do instead of the built-in Python parser behavior.
 
 word ct-if-open
-	"if_false" ct-new-label
-	dup "branch_zero" swap ct-emit-op
+	"if_false" ct-label-new
+	dup "branch_zero" swap ct-op-emit
 	"if" ct-control-frame-new
 	swap "false" swap ct-control-set
 	nil "end" swap ct-control-set
-	dup "false" ct-control-get "label" swap ct-control-add-close-op
+	dup "false" ct-control-get? "label" swap ct-control-add-close-op
 	ct-control-push
 end
 compile-only
 
 word ct-if-open-with-end
-	"if_false" ct-new-label
-	dup "branch_zero" swap ct-emit-op
+	"if_false" ct-label-new
+	dup "branch_zero" swap ct-op-emit
 	"if" ct-control-frame-new
 	swap "false" swap ct-control-set
 	swap "end" swap ct-control-set
-	dup "false" ct-control-get "label" swap ct-control-add-close-op
-	dup "end" ct-control-get "label" swap ct-control-add-close-op
+	dup "false" ct-control-get? "label" swap ct-control-add-close-op
+	dup "end" ct-control-get? "label" swap ct-control-add-close-op
 	ct-control-push
 end
 compile-only
@@ -32,12 +32,12 @@ compile-only
 word if
 	ct-control-depth 0 > if-base
 		ct-control-peek
-		dup "type" ct-control-get "else" string= if-base
-			dup "line" ct-control-get ct-last-token-line == if-base
+		dup "type" ct-control-get? "else" string-equal? if-base
+			dup "line" ct-control-get? ct-parser-last-line == if-base
 				drop
 				ct-control-pop >r
-				r@ "end" ct-control-get dup nil? if-base
-					drop "if_end" ct-new-label
+				r@ "end" ct-control-get? dup nil? if-base
+					drop "if_end" ct-label-new
 				end
 				ct-if-open-with-end
 				r> drop
@@ -53,14 +53,14 @@ compile-only
 
 word else
 	ct-control-pop >r
-	r@ "end" ct-control-get dup nil? if-base
-		drop "if_end" ct-new-label
+	r@ "end" ct-control-get? dup nil? if-base
+		drop "if_end" ct-label-new
 	end
-	dup "jump" swap ct-emit-op
-	r@ "false" ct-control-get "label" swap ct-emit-op
+	dup "jump" swap ct-op-emit
+	r@ "false" ct-control-get? "label" swap ct-op-emit
 	"else" ct-control-frame-new
 	swap "end" swap ct-control-set
-	dup "end" ct-control-get "label" swap ct-control-add-close-op
+	dup "end" ct-control-get? "label" swap ct-control-add-close-op
 	ct-control-push
 	r> drop
 end
@@ -68,17 +68,17 @@ immediate
 compile-only
 
 word for
-	"for_loop" ct-new-label
-	"for_end" ct-new-label
+	"for_loop" ct-label-new
+	"for_end" ct-label-new
 	map-new
 	"loop" 3 pick map-set
 	"end" 2 pick map-set
-	"for_begin" swap ct-emit-op
+	"for_begin" swap ct-op-emit
 	"for" ct-control-frame-new
 	swap "end" swap ct-control-set
 	swap "loop" swap ct-control-set
-	dup "end" ct-control-get >r
-	dup "loop" ct-control-get >r
+	dup "end" ct-control-get? >r
+	dup "loop" ct-control-get? >r
 	map-new
 	"loop" r> map-set
 	"end" r> map-set
@@ -89,9 +89,9 @@ immediate
 compile-only
 
 word while
-	"begin" ct-new-label
-	"end" ct-new-label
-	over "label" swap ct-emit-op
+	"begin" ct-label-new
+	"end" ct-label-new
+	over "label" swap ct-op-emit
 	"while_open" ct-control-frame-new
 	swap "end" swap ct-control-set
 	swap "begin" swap ct-control-set
@@ -102,12 +102,12 @@ compile-only
 
 word do
 	ct-control-pop >r
-	r@ "end" ct-control-get "branch_zero" swap ct-emit-op
+	r@ "end" ct-control-get? "branch_zero" swap ct-op-emit
 	"while" ct-control-frame-new
-	r@ "begin" ct-control-get "begin" swap ct-control-set
-	r@ "end" ct-control-get "end" swap ct-control-set
-	dup "begin" ct-control-get "jump" swap ct-control-add-close-op
-	dup "end" ct-control-get "label" swap ct-control-add-close-op
+	r@ "begin" ct-control-get? "begin" swap ct-control-set
+	r@ "end" ct-control-get? "end" swap ct-control-set
+	dup "begin" ct-control-get? "jump" swap ct-control-add-close-op
+	dup "end" ct-control-get? "label" swap ct-control-add-close-op
 	r> drop
 	ct-control-push
 end
@@ -115,13 +115,13 @@ immediate
 compile-only
 
 word block-opener
-	next-token token-lexeme ct-register-block-opener
+	ct-parser-consume token-lexeme ct-parser-register-block-opener
 end
 immediate
 compile-only
 
 word control-override
-	next-token token-lexeme ct-register-control-override
+	ct-parser-consume token-lexeme ct-control-register-override
 end
 immediate
 compile-only

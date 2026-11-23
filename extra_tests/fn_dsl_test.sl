@@ -2,6 +2,18 @@ import stdlib/stdlib.sl
 import stdlib/io.sl
 import libs/fn.sl
 
+# fn-dsl-test-tokens [*, lexemes | template] -> [* | tokens]
+word fn-dsl-test-tokens
+    >r list-new swap
+    begin
+        dup list-empty? if drop rdrop exit end
+        list-pop-front drop
+        r@ swap token-with-lexeme
+        rot swap list-append swap
+    again
+end
+compile-only
+
 use-fn-dsl
 
 fun inc1(number x){
@@ -76,134 +88,94 @@ defn vars_chain(number x){
 }
 
 word fn_dsl_compile_checks
-    fn-dsl-active? static_assert
+    fn-dsl-active? static-assert
 
-    fn-dsl-lang-name ct-lang-exists? static_assert
-    fn-dsl-lang-name ct-lang-active? static_assert
+    fn-dsl-lang-name ct-lang-exists? static-assert
+    fn-dsl-lang-name ct-lang-active? static-assert
     fn-dsl-lang-name ct-lang-status
-    dup static_assert
+    dup static-assert
     drop
-    dup "name" map-get static_assert "fn.dsl" string= static_assert
-    dup "active" map-get static_assert static_assert
+    dup "name" map-get static-assert "fn.dsl" string-equal? static-assert
+    dup "active" map-get static-assert static-assert
     drop
 
-    fn-dsl-stats
-    dup "stage" map-get static_assert
-    swap drop
-    "grammar" string= static_assert
-
-    fn-dsl-compat
-    dup list-length 1 >= static_assert
-    drop
+    # The pack owns its aliases and operators; reinstalling replaces them.
+    fn-dsl-lang-name ct-lang-status drop "grammar_rewrites" map-get drop
+    list-length 13 == static-assert
+    fn-dsl-install-rewrites
+    fn-dsl-lang-name ct-lang-status drop "grammar_rewrites" map-get drop
+    list-length 13 == static-assert
 
     fn-dsl-mode-fast
-    ct-get-rewrite-saturation "first" string= static_assert
-    ct-get-rewrite-max-steps 4096 == static_assert
-    ct-get-rewrite-loop-detection 0 == static_assert
+    ct-rewrite-get-max-steps 4096 == static-assert
+    ct-rewrite-loop-detection? 0 == static-assert
 
     fn-dsl-mode-safe
-    ct-get-rewrite-saturation "specificity" string= static_assert
-    ct-get-rewrite-max-steps 100000 == static_assert
-    ct-get-rewrite-loop-detection static_assert
+    ct-rewrite-get-max-steps 100000 == static-assert
+    ct-rewrite-loop-detection? static-assert
 
-    fn-dsl-pack-export
-    dup map-length 1 >= static_assert
-    dup fn-dsl-pack-import dup 1 >= static_assert drop
-    dup fn-dsl-pack-replace dup 1 >= static_assert drop
-    drop
-
-    fn-dsl-trace-on
-    fn-dsl-trace-off
-
-    "ct-list-words" fn-dsl-words-prefix "ct-list-words-prefix" list-contains? static_assert
+    "ct-definition-list-names" ct-definition-list-names-prefix "ct-definition-list-names-prefix" list-contains? static-assert
 
     fn-dsl-ct-capabilities
-    dup "ct_total" map-get static_assert 50 >= static_assert
-    dup "ct_capture" map-get static_assert 8 >= static_assert
-    dup "ct_parser" map-get static_assert 5 >= static_assert
-    dup "ct_rewrite" map-get static_assert 5 >= static_assert
+    dup "ct_total" map-get static-assert 50 >= static-assert
+    dup "ct_parser" map-get static-assert 5 >= static-assert
+    dup "ct_rewrite" map-get static-assert 5 >= static-assert
     drop
 
-    fn-dsl-pattern-enabled
-    swap static_assert
-    static_assert
+    # fn_simplify is a unified macro adopted by the fn.dsl pack
+    "fn_simplify" ct-macro-get-by-name static-assert
+    "parameters" map-get drop list-length 0 == static-assert
 
-    fn-dsl-pattern-clauses
-    static_assert
-    dup list-length 8 == static_assert
-    drop
 
-    fn-dsl-pattern-conflicts
-    dup list-length 0 >= static_assert
-    drop
+    ct-parser-session-begin
+    ct-parser-session-rollback static-assert
 
-    fn-dsl-ct-call-policy-safe
-    fn-dsl-ct-call-status
-    dup "sandbox_mode" map-get static_assert "compile-only" string= static_assert
-    dup "exception_policy" map-get static_assert "raise" string= static_assert
-    dup "memo_enabled" map-get static_assert static_assert
-    dup "side_effects_enabled" map-get static_assert static_assert
-    dup "sandbox_allowlist_size" map-get static_assert 8 >= static_assert
-    dup "recursion_limit" map-get static_assert 64 == static_assert
-    dup "timeout_ms" map-get static_assert 250 == static_assert
-    drop
-    fn-dsl-ct-call-reset
-    fn-dsl-ct-call-policy-open
-
-    fn-dsl-parser-session-begin drop
-    fn-dsl-parser-session-rollback static_assert
-
-    fn-dsl-parser-session-begin drop
+    ct-parser-session-begin >r
     list-new "(" list-append
     "1" list-append
     "(" list-append
     "2" list-append
     ")" list-append
     ")" list-append
-    ct-current-token inject-lexemes
-    next-token drop
-    "(" ")" fn-dsl-parser-collect-balanced
-    dup static_assert
-    swap
-    dup list-length 4 == static_assert
-    drop
-    drop
-    fn-dsl-parser-session-rollback static_assert
+    0 ct-parser-peek fn-dsl-test-tokens ct-parser-inject
+    ct-parser-consume drop
+    "(" ")" ct-parser-collect-balanced
+    static-assert
+    list-length 4 == static-assert
+    r> ct-parser-session-rollback static-assert
 
-    fn-dsl-parser-session-begin drop
+    ct-parser-session-begin >r
     list-new "word" list-append
     "tmp_fn_token" list-append
     "99" list-append
     "end" list-append
-    ct-current-token inject-lexemes
-    0 ct-parser-peek dup token-lexeme swap fn-dsl-token-clone token-lexeme string= static_assert
-    0 ct-parser-peek "renamed" fn-dsl-token-rename token-lexeme "renamed" string= static_assert
+    0 ct-parser-peek fn-dsl-test-tokens ct-parser-inject
+    0 ct-parser-peek "renamed" token-with-lexeme token-lexeme "renamed" string-equal? static-assert
     0 ct-parser-peek token-column
-    0 ct-parser-peek 2 fn-dsl-token-shift-column token-column
-    swap 2 + == static_assert
-    fn-dsl-parser-session-rollback static_assert
+    0 ct-parser-peek "renamed" token-with-lexeme token-column
+    == static-assert
+    r> ct-parser-session-rollback static-assert
 
-    fn-dsl-rewrite-scope-push drop
+    ct-rewrite-scope-push drop
     "fn.dsl.test.inline"
     list-new "kwdsl" list-append
     list-new "77" list-append
-    ct-add-grammar-rewrite-named drop
-    "grammar" "fn.dsl.test.inline" "fn.dsl.test.pipeline" ct-set-rewrite-pipeline drop
-    "grammar" "fn.dsl.test.pipeline" 1 ct-set-rewrite-pipeline-active
-    "grammar" ct-rebuild-rewrite-index drop
+    ct-rewrite-add-grammar-named
+    "fn.dsl.test.pipeline" ct-rewrite-rule-set-pipeline static-assert
+    "grammar" "fn.dsl.test.pipeline" 1 ct-rewrite-set-pipeline-active
 
-    "grammar" list-new "kwdsl" list-append fn-dsl-rewrite-run
-    dup list-length 1 >= static_assert
+    "grammar" list-new "kwdsl" list-append ct-rewrite-run-on-list
+    dup list-length 1 >= static-assert
     drop
-    dup 0 list-get "77" string= static_assert
+    dup 0 list-get "77" string-equal? static-assert
     drop
 
     "grammar" list-new "kwdsl" list-append fn-dsl-rewrite-run-scoped
-    dup list-length 1 >= static_assert
+    dup list-length 1 >= static-assert
     drop
-    dup 0 list-get "77" string= static_assert
+    dup 0 list-get "77" string-equal? static-assert
     drop
-    fn-dsl-rewrite-scope-pop static_assert
+    ct-rewrite-scope-pop static-assert
 end
 compile-time fn_dsl_compile_checks
 
@@ -228,7 +200,7 @@ word main
     juxt3 inc1 square cube 3 + + puti cr
     flip2 sub2 2 10 puti cr
     guard(0, 33, 44) puti cr
-    when-not(0, 55) puti cr
+    when-not 0 55 puti cr
     thrush(9, inc1) puti cr
 
     ifelse(1, 9, 2) puti cr
@@ -248,13 +220,13 @@ word main
     ident(8) puti cr
 
     identity(42) puti cr
-    pipe-if(4, 1, inc1) puti cr
-    pipe-if(4, 0, inc1) puti cr
-    pipe-unless(4, 1, inc1) puti cr
-    pipe-unless(4, 0, inc1) puti cr
-    pipe-last2(3, 4, add) puti cr
-    pipe-last3(2, 3, 4, mix) puti cr
-    pipe-last4(1, 2, 3, 4, sum4) puti cr
+    pipe-if 4 1 inc1 puti cr
+    pipe-if 4 0 inc1 puti cr
+    pipe-unless 4 1 inc1 puti cr
+    pipe-unless 4 0 inc1 puti cr
+    pipe-last2 3 4 add puti cr
+    pipe-last3 2 3 4 mix puti cr
+    pipe-last4 1 2 3 4 sum4 puti cr
     apply6 sum6 1 2 3 4 5 6 puti cr
     pipe6(1, 2, 3, 4, 5, 6, sum6) puti cr
     compose6 inc1 inc1 inc1 inc1 inc1 inc1 0 puti cr
@@ -265,8 +237,8 @@ word main
     fn_simplify 0 * 99 puti cr
     fn_simplify 7 * 1 puti cr
 
-    when-do(1, 66 puti cr)
-    unless-do(0, 67 puti cr)
+    when-do 1 `66 puti cr`
+    unless-do 0 `67 puti cr`
 
     add(2, 5) puti cr
     mix(2, 3, 4) puti cr

@@ -1,20 +1,20 @@
 import stdlib.sl
 
 word inspect_word_compile_event
-  dup get-event-payload
-  "name" map-get static_assert
-  drop drop
+  event-payload
+  "name" map-get static-assert
+  drop
 end on-event word.compile.begin
 
 word print_debug_payload
-  get-event-payload ct-repr puts
+  event-payload repr puts
 end on-event debug.payload
 
 word emit_debug_payload
-  "debug.payload" event-object-create
-  "answer" 42 event-object-prop-append
-  "source" "compile-time" event-object-prop-append
-  event-object-emit
+  "debug.payload" event-new
+  "answer" 42 event-payload-set
+  "source" "compile-time" event-payload-set
+  ct-event-emit-object drop
 end
 compile-time emit_debug_payload
 

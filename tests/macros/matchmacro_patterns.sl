@@ -1,13 +1,17 @@
 import stdlib.sl
 
 macro simplify
-  $x:int + 0 => $x ;
-  0 + $x:int => $x ;
-  $x:int + $x:int => $x 2 * ;
+  match
+    [$x:int, +, 0] => `$x` emit
+    [0, +, $x:int] => `$x` emit
+    [$x:int, +, $x] => `$x 2 *` emit
+  end
 ;
 
 macro unwrap
-  ( $x $*rest ) => $x $*rest ;
+  match
+    [(, $a, $b, $c, $d, )] => `$a $b $c $d` emit
+  end
 ;
 
 word main

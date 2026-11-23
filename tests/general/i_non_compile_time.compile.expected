@@ -1,8 +1,8 @@
-error[E2002]: word 'i' is compile-time only and cannot be used at runtime
-  --> i_non_compile_time.sl:6:8
+error[emission-compile-only-word]: word 'i' is compile-time only and cannot be used at runtime
+  --> i_non_compile_time.sl:6:9
     |
   6 |         i puti cr
-    |        ^
+    |         ^
     | = note: compile-time-only words cannot be emitted into runtime code
     | = note: while emitting 'main'
     |

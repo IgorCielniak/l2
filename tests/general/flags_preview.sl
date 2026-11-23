@@ -2,7 +2,7 @@ flags "--preview --no-artifact"
 
 import stdlib/stdlib.sl
 
-macro a 0 7;
+macro a `7` emit ;
 
 word main
     a puti 0

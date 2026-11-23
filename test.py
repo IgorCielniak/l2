@@ -321,6 +321,15 @@ def _extract_documentation_examples(root: Path, main_py_path: Path) -> List[Tupl
     return indexed
 
 
+def _stdin_kwargs(data):
+    """subprocess.run stdin arguments: the case's input, or /dev/null so a
+    child that reads stdin (for example a compile mode that runs `main`)
+    never inherits and blocks on the test runner's own stdin."""
+    if data is None:
+        return {"stdin": subprocess.DEVNULL}
+    return {"input": data}
+
+
 @dataclass
 class TestCaseConfig:
     description: Optional[str] = None
@@ -927,8 +936,8 @@ class TestRunner:
                 capture_output=True,
                 text=True,
                 env=self._env_for(case),
-                input=stdin_data,
                 timeout=timeout,
+                **_stdin_kwargs(stdin_data),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
@@ -985,8 +994,8 @@ class TestRunner:
             cwd=self.root,
             capture_output=True,
             text=True,
-            input=compile_input,
             env=self._env_for(case),
+            **_stdin_kwargs(compile_input),
         )
 
     def _compile_doc_example_fallback(
@@ -1134,8 +1143,8 @@ class TestRunner:
                 cwd=self.root,
                 capture_output=True,
                 env=self._env_for(case),
-                input=stdin_data.encode("utf-8") if stdin_data is not None else None,
                 timeout=timeout,
+                **_stdin_kwargs(stdin_data.encode("utf-8") if stdin_data is not None else None),
             )
         except subprocess.TimeoutExpired as exc:
             stdout_text: str

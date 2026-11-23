@@ -1,8 +1,8 @@
 import stdlib.sl
 
 word a
-    ct-predef-all
-    b 42 == static_assert
+    ct-definition-predeclare-all
+    b 42 == static-assert
 end compile-time a
 
 word b

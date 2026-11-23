@@ -1,0 +1,4 @@
+{
+  "description": "Live parser-stream words in the C compile-time VM (eval_program): ct-parser-consume, ct-parser-current, ct-parser-peek, ct-parser-eof?, ct-parser-inject, and their errors",
+  "use_l2": true
+}

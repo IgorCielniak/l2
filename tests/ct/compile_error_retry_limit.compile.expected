@@ -1,1 +1,9 @@
-[error] compile error recovery retry limit (8) exceeded after 8 attempts at restore point 16
+error[ct-word-unavailable]: unknown word 'missing_ct_word' during compile-time execution
+  --> compile_error_retry_limit.sl:10:1
+     |
+  10 | compile-time trigger_ct
+     | ^^^^^^^^^^^^
+     | = note: compile-time stack: trigger_ct
+     | = note: error recovery retry limit (8) reached
+
+1 error(s) emitted

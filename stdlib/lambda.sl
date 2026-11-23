@@ -9,66 +9,43 @@
 #   - emit word pointer for generated lambdaN symbol at call site
 #   - append generated top-level definition at end of token stream
 
-word lambda-token-list->lexeme-list
-    list-new swap
-begin
-    dup list-empty? if
-        drop
-        exit
-    end
-    list-pop-front
-    token-lexeme
-    swap >r
-    list-append
-    r>
-again
-end
-compile-only
-
 word lambda-append-generated-definition
     # name body_tokens template --
+    # Appends `word <name> <body> end` at the end of the token stream. The
+    # body keeps its own tokens; the name is anchored at the 'lambda' token.
+    >r swap r> swap token-with-lexeme           # body nameTok
+    `word $(dup) $(over) end` syntax>list       # body nameTok tokens
+    nip nip
+    ct-parser-get-pos ct-parser-remaining + ct-parser-set-pos
     >r
-    lambda-token-list->lexeme-list
-    list-new
-    "word" list-append
-    2 pick list-append
-    swap list-extend
-    "end" list-append
-    swap drop
-    r>
-    ct-parser-pos ct-parser-remaining + ct-parser-set-pos
-    >r
-    inject-lexemes
+    ct-parser-inject
     r> ct-parser-set-pos drop
 end
 compile-only
 
 word lambda
-    ct-current-token >r
+    ct-parser-current >r
 
-    next-token dup nil? if
-        drop
+    ct-parser-eof? if
         rdrop
-        "lambda requires '(...)' body" parse-error
+        "lambda requires '(...)' body" ct-parser-error
     end
-    dup token-lexeme "(" string= 0 == if
-        drop
+    ct-parser-consume token-lexeme "(" string-equal? 0 == if
         rdrop
-        "lambda expects '(' after keyword" parse-error
+        "lambda expects '(' after keyword" ct-parser-error
     end
-    drop
 
     "(" ")" ct-parser-collect-balanced
     dup 0 == if
         drop drop
         rdrop
-        "unterminated lambda body: missing ')'" parse-error
+        "unterminated lambda body: missing ')'" ct-parser-error
     end
     drop
 
-    "lambda" ct-gensym
+    "lambda" gensym
     "_" "" string-replace
-    dup "word_ptr" swap ct-emit-op
+    dup "word_ptr" swap ct-op-emit
 
     swap r>
     lambda-append-generated-definition

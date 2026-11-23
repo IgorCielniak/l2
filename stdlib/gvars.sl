@@ -1,75 +1,38 @@
 import stdlib.sl
 
+# gvars-accessor [*, nameTok | label] -> [*]
+# Emits `:asm <name> { lea rax, [rel <label>] sub r12, 8 mov [r12], rax } ;`
+# The `:asm`, name, and label tokens are made from the user's name token,
+# so the definition is located at the user's declaration.
+word gvars-accessor
+    over swap token-with-lexeme             # nameTok labelTok
+    over ":asm" token-with-lexeme           # nameTok labelTok asmTok
+    list-new swap list-append 2 pick list-append list>syntax   # nameTok labelTok head
+    `{ lea rax, [rel` syntax-concat
+    swap list-new swap list-append list>syntax syntax-concat
+    `] sub r12, 8 mov [r12], rax } ;` syntax-concat
+    nip emit
+end
+compile-only
+
+# global <name>: an 8-byte zeroed variable; <name> pushes its address.
 word global
-    next-token token-lexeme
-    dup "_global" string-append
-    dup ": dq 0" string-append data-append
+    ct-parser-consume                       # nameTok
+    dup token-lexeme "_global" string-append    # nameTok label
+    dup ": dq 0" string-append ct-output-append-data
+    gvars-accessor
+end
+immediate
+compile-only
 
-    list-new
-    ":asm" list-append
-    2 pick list-append
-    "{" list-append
-    "lea" list-append
-    "rax" list-append
-    "," list-append
-    "[" list-append
-    "rel" list-append
-    1 pick list-append
-    "]" list-append
-    "sub" list-append
-    "r12" list-append
-    "," list-append
-    "8" list-append
-    "mov" list-append
-    "[" list-append
-    "r12" list-append
-    "]" list-append
-    "," list-append
-    "rax" list-append
-    "}" list-append
-    ";" list-append
-
-    ct-current-token inject-lexemes
-    drop
-    drop
-end immediate
-
+# sized_global <name> <bytes>: a zeroed variable of <bytes> bytes.
 word sized_global
-    next-token token-lexeme
-    dup "_global" string-append
-    next-token token-lexeme
-
-    1 pick
-    ": times " string-append
-    swap string-append
-    " db 0" string-append
-    data-append
-
-    list-new
-    ":asm" list-append
-    2 pick list-append
-    "{" list-append
-    "lea" list-append
-    "rax" list-append
-    "," list-append
-    "[" list-append
-    "rel" list-append
-    1 pick list-append
-    "]" list-append
-    "sub" list-append
-    "r12" list-append
-    "," list-append
-    "8" list-append
-    "mov" list-append
-    "[" list-append
-    "r12" list-append
-    "]" list-append
-    "," list-append
-    "rax" list-append
-    "}" list-append
-    ";" list-append
-
-    ct-current-token inject-lexemes
-    drop
-    drop
-end immediate
+    ct-parser-consume                       # nameTok
+    dup token-lexeme "_global" string-append    # nameTok label
+    ct-parser-consume token-lexeme          # nameTok label size
+    over ": times " string-append swap string-append " db 0" string-append
+    ct-output-append-data
+    gvars-accessor
+end
+immediate
+compile-only

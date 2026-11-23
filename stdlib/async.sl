@@ -34,12 +34,12 @@ import mem.sl
 # ── Constants ─────────────────────────────────────────────────
 
 # Default per-task stack size: 8 KiB
-macro ASYNC_STACK_SIZE 0 8192 ;
+const ASYNC_STACK_SIZE 8192
 
 # Task status values
-macro TASK_READY   0 0 ;
-macro TASK_RUNNING 0 1 ;
-macro TASK_DONE    0 2 ;
+const TASK_READY 0
+const TASK_RUNNING 1
+const TASK_DONE 2
 
 # ── Task accessors ────────────────────────────────────────────
 
@@ -232,7 +232,7 @@ end
     ; Save r12 into task.data_sp
     mov [rdx + 8], r12
 
-    ; Save return address: caller's return is on the x86 stack
+    ; Save return address: the return address of the caller is on the x86 stack
     ; We pop it and save it in task.ret_sp
     pop rsi                    ; return address
     mov [rdx + 16], rsi
@@ -282,7 +282,7 @@ end
 
 .first_run:
     ; First run: set up data stack and call entry function
-    mov r12, [r10 + 8]        ; task's data stack
+    mov r12, [r10 + 8]        ; data stack of the task
 
     ; Save our scheduler info so the task can find it
     ; The task entry function needs no args — it uses the stack.
@@ -321,7 +321,7 @@ end
     mov r11, [r10]
     cmp r11, 0                 ; TASK_READY?
     je .found_task2
-    cmp r11, 1                 ; TASK_RUNNING? (shouldn't happen)
+    cmp r11, 1                 ; TASK_RUNNING? (should not happen)
     je .found_task2
     jmp .find_next2
 
@@ -389,7 +389,7 @@ end
 .start:
     mov [rax + 8], r9          ; set current_idx
     mov qword [r10], 1         ; TASK_RUNNING
-    mov r12, [r10 + 8]         ; task's data stack
+    mov r12, [r10 + 8]         ; data stack of the task
 
     mov rdi, [r10 + 40]        ; entry function
     lea rsi, [rel .task_finished]

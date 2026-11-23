@@ -1,5 +1,7 @@
+import stdlib/stdlib.sl
 word observe_compile_error
-end on-event compile.error
+    drop
+end on-event compiler.error
 
 word main
     missing_without_repair

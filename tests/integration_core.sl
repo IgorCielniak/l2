@@ -8,21 +8,19 @@ import ../stdlib/io.sl
 }
 ;
 
-macro square
-    dup *
-;
+macro square `dup *` emit ;
 
-macro defconst 2
-    word $0
-        $1
+macro defconst (name value) `
+    word $name
+        $value
     end
-;
+` emit ;
 
-macro defadder 3
-    word $0
-        $1 $2 +
+macro defadder (name a b) `
+    word $name
+        $a $b +
     end
-;
+` emit ;
 
 defconst MAGIC 99
 defadder add13 5 8

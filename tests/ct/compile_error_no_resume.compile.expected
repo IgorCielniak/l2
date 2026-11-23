@@ -1,8 +1,8 @@
-error[E2001]: unknown word 'missing_without_repair'
-  --> compile_error_no_resume.sl:5:4
+error[emission-unknown-word]: unknown word 'missing_without_repair'
+  --> compile_error_no_resume.sl:7:5
     |
-  5 |     missing_without_repair
-    |    ^
+  7 |     missing_without_repair
+    |     ^
     | = note: runtime emission could not resolve the referenced word
     | = note: while emitting 'main'
     |

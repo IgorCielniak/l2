@@ -55,7 +55,7 @@ If you've used **Forth** or **Factor**, L2 will feel familiar. If you've hand-wr
 
 **Required:**
 
-- Python 3.7+
+- Python 3.12+
 - NASM (Netwide Assembler)
 - GNU binutils (`ld`)
 - Linux x86-64
@@ -126,9 +126,24 @@ word main
 end
 ```
 
+#### Arithmetic, logic and bits
+
+All values are 64-bit integers with wrapping arithmetic (`+ - * / %`, with `/` and
+`%` truncating toward zero). Integer division by zero, and `INT64_MIN -1 /`, raise
+the CPU's divide error (SIGFPE), as in C; the compiler does not add checks.
+
+`and`, `or` and `not` are *logical*: they treat any nonzero value as true and return
+0 or 1. The bitwise operations are separate words:
+
+| Word | Effect |
+|------|--------|
+| `band` `bor` `bxor` | bitwise AND, OR, XOR |
+| `bnot` | bitwise complement |
+| `shl` `shr` `sar` | shift left, logical shift right, arithmetic shift right |
+
 ### Definitions & Control Flow
 
-Define reusable words with `word ... end`. Control flow uses `if`/`else`, `for` loops, and conditionals:
+Define reusable words with `word ... end`. Control flow uses `if`/`else`, counted `for` loops, `while ... do ... end`, and `begin ... again`; `break` leaves and `continue` restarts the innermost loop:
 
 ```
 import stdlib.sl
@@ -146,6 +161,20 @@ word main
   0
 end
 ```
+
+All definitions share one namespace across imported files. Defining a name
+again does not discard the earlier definition: every definition stays as a
+candidate, and the one with the highest `priority` is used, with the newest
+winning a tie. A redefinition at the same priority prints a warning. Use
+`priority` to override a standard-library word deliberately:
+
+```
+priority 1
+word puti "custom puti" puts drop end   # used instead of stdlib's puti
+```
+
+Compile-time code can inspect and change candidates with the
+`ct-definition-*` words (see `docs.py`, § 11B).
 
 ### Inline Assembly (`:asm` blocks)
 
@@ -214,6 +243,25 @@ word main
 end
 ```
 
+Each file is imported once, at the point where the parser reaches its
+`import` line, so compile-time code that runs earlier (for example a
+tokenizer change) applies to files imported later.
+
+### Custom Frontends
+
+A file can hand its whole syntax to a frontend written in L2 by starting
+with a header:
+
+```
+frontend "libs/my_lang.sl" my-lang-parse
+```
+
+The implementation is loaded once per compilation; its entry point (default
+`frontend-parse`, stack effect `text path -- tokens`) runs at compile time
+for each file that selects it and returns the canonical L2 tokens to parse.
+Imported files without a header use the importing file's frontend. Frontends
+are supported by the Python compiler only.
+
 ---
 
 ## Compile-Time Metaprogramming
@@ -228,40 +276,55 @@ L2's killer feature is its **compile-time virtual machine**. Run arbitrary L2 co
 
 All with **zero runtime cost**.
 
-### Text Macros
+### Macros
 
-The simplest metaprogramming: parametrized text replacement:
+A macro is a small L2 program that runs at compile time. It consumes its
+arguments (the next tokens after its name, or a whole backtick quotation per
+argument) and `emit`s replacement code:
 
 ```
 import stdlib.sl
 
-macro double-all (n)
-  $n $n +
-;
+macro double (n) `$n $n +` emit ;
 
-macro sum3 (a b c)
-  $a $b + $c +
-;
+macro sum3 (a b c) `$a $b + $c +` emit ;
 
 word main
-  sum3(1, 2, 3) puti cr    # prints: 6
+  sum3 1 2 3 puti cr      # prints: 6
+  double 21 puti cr       # prints: 42
   0
 end
 ```
 
-Use compile-time control flow inside macros:
+A constant is a one-token macro, written with `const`:
+
+```
+const BUFFER_SIZE 4096
+const NEWLINE '\n'
+```
+
+`const` is cheap: the macro is created only when the name is first used, so the
+stdlib's ~870 syscall and flag constants cost almost nothing when unused.
+
+The body is ordinary compile-time code, so it can use `if`, loops, helper
+words, and the Syntax words to decide what to emit:
 
 ```
 import stdlib.sl
 
-macro emit-all (*items)
-  ct-for item in items do
-    $item
-  end
+# Sum the numbers in a quotation.
+macro sum-all (items)
+  $items 0 1 syntax-slice emit
+  $items syntax>list list-pop-front drop drop
+  begin
+    dup list-empty? if drop break end
+    list-pop-front drop list-new swap list-append list>syntax emit
+    `+` emit
+  again
 ;
 
 word main
-  emit-all(1, 2, 3, 4, 5) + + + + puti cr  # prints: 15
+  sum-all `1 2 3 4 5` puti cr  # prints: 15
   0
 end
 ```
@@ -276,32 +339,112 @@ emitted for runtime depends on the enclosing definition's flags):
 ```
 word build-lookup-table
   # This runs at compile time
-  "lookup_table:" data-append
+  "lookup_table:" ct-output-append-data
   0 100 for i
-    i i * ct-repr "dq " swap string-append data-append
+    i i * repr "dq " swap string-append ct-output-append-data
   end
 end
 
 compile-time build-lookup-table
 ```
 
-### Pattern Macros & Rewrites
+### Quotations and `emit`
 
-Use pattern-matching macros and rewrite rules for deep code transformation:
+Backticks quote source as a compile-time value: `` `1 2 +` `` is an immutable
+`Syntax` value holding those tokens, and nothing inside runs when it is
+built. `emit` inserts a Syntax value into the code being compiled, so a
+compile-time word can generate definitions:
 
 ```
-# Eliminate redundant operations at parse time
+word define_answer
+  `word answer 42 end` emit
+end
+compile-time define_answer
+
+word main answer puti cr 0 end   # prints: 42
+```
+
+Quotations exist only at compile time, so words that use them are run with
+`compile-time` or marked `compile-only`.
+
+`$( … )` inside a quotation runs compile-time code and splices its value: a token
+or Syntax as is, a string as a word, an integer as a literal. Text written directly
+against it is pasted on, so a word can generate named definitions:
+
+```
+# getter NAME: defines get-NAME, which pushes 42
+word getter
+  ct-parser-consume                       # the name token
+  `word get-$(dup token-lexeme) 42 end` emit
+  drop
+end
+immediate compile-only
+
+getter answer        # defines get-answer
+```
+
+A macro can generate another macro. Quotations do not nest, so the inner macro's
+quotation is written with escapes: `` \` `` for its backticks and `\$name` for its own
+parameters, while `$name` and `$( … )` still splice the outer macro's values:
+
+```
+macro def-adder (name n)
+  `macro $name (x) \` \$x $n + \` emit ;` emit
+;
+def-adder add5 5        # add5 1 -> 6
+```
+
+The spliced value is the top of the stack after the code runs; the code may consume one
+value below it, so `$( )` splices (and consumes) the top value and `$(dup)` a copy. Macros are not hygienic: a name a macro introduces can clash with yours.
+Use `gensym` for helper names, for example `` `word $("tmp" gensym) … end` ``.
+
+`match` dispatches on the upcoming input tokens at compile time. The first
+clause whose pattern fits is consumed, and its `$name` bindings can be
+spliced into quotations:
+
+```
 macro simplify
-  $x:int + 0 => $x ;
-  0 + $x:int => $x ;
-  $x:int * 1 => $x ;
+  match
+    [$x:int, +, 0] => `$x` emit   # simplify 5 + 0  becomes  5
+    [0, +, $x:int] => `$x` emit
+    [_] =>                        # anything else passes through
+  end
 ;
 ```
 
-This token hook adds simple comma-separated function-call syntax. Installing
-it on the language pack takes effect immediately; pack activation only affects
-active-pack queries and validator selection, not hook or rewrite enablement.
-It rewrites `sum3(1, 2, 3)` to the stack-based call `1 2 3 sum3` (arguments
+Repetition groups match any number of values: `$( … )*` (zero or more) or `$( … )+`
+(one or more), with an optional separator written against the quantifier. Each name
+inside binds to a list, and `$( … )*` in a quotation repeats once per element:
+
+```
+# pairs a = 10 , b = 32 end   defines the words a and b
+macro pairs
+  match
+    [ $( $k, =, $v:int ),+, end ] => `$( word $k $v end )*` emit
+  end
+;
+```
+
+### Stack effects of generated code
+
+Effect comments (`# name [*, a | b] -> [* | c]`) document words but count items, not
+cells (a string is one item and two cells), so the stack checker does not rely on
+them for calls. Code that knows its exact effect declares it in cells:
+
+```
+word two 1 2 end
+stack-effect two 0 2          # NAME INPUTS OUTPUTS
+```
+
+`stack-effect` (or `ct-definition-set-effect` from compile-time code) lets the
+checker verify calls to the word and that its body leaves that many cells. `fn`
+declares the effect of every function it defines.
+
+### Rewrites and Token Hooks
+
+This token hook adds simple comma-separated function-call syntax. A hook owned
+by a language pack runs only while the pack is active; activation likewise
+enables the pack's rewrites, words, and macros. It rewrites `sum3(1, 2, 3)` to the stack-based call `1 2 3 sum3` (arguments
 here must not contain nested calls):
 
 ```
@@ -309,23 +452,24 @@ import stdlib.sl
 
 word call-syntax-rewrite
   dup token-lexeme identifier? 0 == if drop 0 exit end
-  peek-token dup nil? if drop drop 0 exit end
-  dup token-lexeme "(" string= 0 == if drop drop 0 exit end
+  0 ct-parser-peek dup nil? if drop drop 0 exit end
+  dup token-lexeme "(" string-equal? 0 == if drop drop 0 exit end
   swap >r
   drop
-  next-token drop
+  ct-parser-consume drop
   list-new
   list-new
 begin
-  next-token dup nil? if "unterminated call" parse-error end
-  dup token-lexeme ")" string= if
+  ct-parser-eof? if "unterminated call" ct-parser-error end
+  ct-parser-consume
+  dup token-lexeme ")" string-equal? if
     drop
     list-extend
     r> list-append
-    inject-tokens
+    ct-parser-inject
     1 exit
   end
-  dup token-lexeme "," string= if
+  dup token-lexeme "," string-equal? if
     drop
     list-extend
     list-new
@@ -339,7 +483,8 @@ compile-only
 
 word install-call-syntax
   "simple-calls" ct-lang-create drop
-  "simple-calls" "call-syntax-rewrite" ct-lang-set-token-hook drop
+  "simple-calls" ct-lang-activate drop
+  "simple-calls" "call-syntax-rewrite" ct-lang-add-token-hook drop
 end
 compile-time install-call-syntax
 
@@ -359,17 +504,30 @@ This code might look scary and complicated but after reading the documentations 
 
 L2 has extensive CT APIs for:
 
-- Template control flow: `ct-if`, `ct-for`, `ct-each`, `ct-fold`, `ct-let`, `ct-switch`
-- Capture/scope management for hygienic macros
-- Pattern matching with guards
+- Quotations, Syntax values, `emit`, and `match`
+- Definition candidates, priorities, and macro records (`ct-definition-*`, `ct-macro-*`)
 - Language extension packs and owned-resource cleanup
-- CT-call policies: memoization, allowlists, exception handling, and recursion/time limits
 - Rewrite rule priority, pipelines, and analysis
+
+Small stdlib libraries build on these APIs:
+
+| Library | What it gives |
+|---------|---------------|
+| `ct_store.sl` | A compile-time key/value store shared by all macros (`ct-store-set`, `ct-store-get`, `ct-store-keys`, ...) |
+| `macro_variadic.sl` | Variadic macro arguments: `"end" variadic-rest` takes the input up to a terminator, `"(" ")" variadic-balanced` a balanced group |
+| `macro_switch.sl` | `macros-off` ... `macros-on`: macro names in between compile as ordinary word calls |
+| `rewrite_trace.sl` | `rewrite-trace-on` ... `rewrite-trace-off`: each applied rewrite is reported as a note with its location |
+| `meta.sl` | Helpers for generating definitions, macros, and rewrites |
+| `lambda.sl` | `lambda( ... )`: an anonymous word, pushed as a word pointer |
 
 **For the complete API reference:**
 
 - Read the docs: `python3 main.py --docs`
 - Serve in browser: `python3 main.py --docs-serve --docs-port 8018`
+
+The explorer lists words with their effect comments, and macros and constants as the
+compiler parses them: parameters, the `doc` metadata a library sets with
+`ct-macro-set` (else the comment above the definition), and the declared value.
 
 ---
 
@@ -390,47 +548,116 @@ Common options:
 - `-o FILE`: Output executable name
 - `-l PATH`: Link against a library (`.so`, `.a`, or system lib like `c`)
 - `--check`: Parse and check without generating output
+- `--check-references`: Also report unknown words in every definition and macro, even
+  unused ones (normally an unknown word is reported only when its definition is used,
+  which keeps forward references working)
 - `--emit-asm`: Emit assembly (.asm file) without assembling/linking
 - `--no-artifact`: Skip final linking (useful with `--emit-asm`)
 - `--force`: Rebuild everything (ignore cache)
+- `--force-stdlib`: Rebuild the daemon's pre-parsed stdlib (see below)
 - `--no-cache`: Skip compiler caches but allow tool-level incremental builds
 - `-v LEVEL`: Verbosity (1-3 for timing and diagnostics)
 - `--no-daemon`: Bypass the daemon for this invocation and run in-process
 
 Daemon mode is enabled by default. Set `L2_DAEMON=0` to disable it, or
-`L2_DAEMON=1` to enable it explicitly.
+`L2_DAEMON=1` to enable it explicitly. `--daemon` requires the daemon: the compile
+fails instead of running in-process when the daemon cannot be used.
 
-With daemon mode enabled, eligible `main.py` compiler invocations check for the
-background compiler, start it on demand when necessary, and forward the
-compiler arguments. Local-only commands, such as `--docs`, `--repl`, and
-`--run`, stay in-process. The daemon is hosted internally by
-`l2_main.py --daemon-serve`; users do not need a daemon lifecycle command. It
-records bounded compilation history, per-request logs under `build/logs/req/`,
-and a rotating global log at `build/logs/daemon.log`. It watches `main.py`,
-`l2_main.py`, and `docs.py` for changes, then reloads after active requests drain
-while preserving recent history in `build/.l2_daemon_state.json`. Set
-`L2_DAEMON_NO_AUTO_RELOAD=1` to disable automatic reloads, for example in
-deterministic CI or daemon integration tests. Each compiler request also carries
-the client's current `PATH`; when it differs from the daemon's, the daemon uses
-it for the request and reloads so newly started workers inherit the updated
-toolchain environment. Embedding and tooling clients can query the internal
-status API for uptime, memory, open file descriptors, queue depth, cache
-counters, request history, its instance ID, and event-bus statistics. The
-daemon also exposes a live event stream over its Unix socket via
-`subscribe_events`.
+**One daemon per checkout.** `main.py` from any directory talks to the same daemon:
+it is found by the compiler checkout, the Python interpreter and an instance name, in
+a private per-user runtime directory (`$XDG_RUNTIME_DIR/l2/`, else `/tmp/l2-<uid>/`;
+only your processes may connect). Each request carries the caller's working
+directory, umask, `PATH` and per-compile environment, so relative paths, `-o`, `-I`
+and the `build/` directory behave exactly as without the daemon. Simultaneous
+clients from any number of directories start one daemon. Another checkout or Python
+gets its own daemon. Daemon logs and state live in `$XDG_STATE_HOME/l2/` (else
+`~/.local/state/l2/`), not in the project.
+
+The daemon starts one worker and adds more while jobs queue, up to `min(cpu, 8)`
+(`--daemon-workers N` or `L2_DAEMON_WORKERS` when it starts); extra workers idle for
+5 minutes are stopped, and a worker using more than 1 GB is replaced after its job
+(`L2_DAEMON_WORKER_IDLE` seconds, `L2_DAEMON_WORKER_MAX_RSS_MB`). With no compile for
+30 minutes the daemon exits (`--daemon-idle-timeout MIN` or `L2_DAEMON_IDLE_TIMEOUT`,
+0 = never); the next compile starts it again. It reloads itself after active requests
+drain when `main.py`, `l2_main.py` or `docs.py` change (`L2_DAEMON_NO_AUTO_RELOAD=1`
+turns that off). A daemon that holds its socket but stops answering is replaced by
+the next client. Daemons of the old per-directory layout (`build/.l2_daemon.sock`)
+are stopped when a new daemon starts, unless they were used recently: one of this
+checkout after a minute without requests, one of another checkout after 30 minutes.
+
+Managing daemons (add `--json` for machine-readable output, `--daemon-name NAME` or
+`L2_DAEMON_NAME` to select a named instance with its own workers and settings):
+
+| Flag | Does |
+|---|---|
+| `--daemon-status` | pid, uptime, workers (busy, jobs, memory), queue, requests, settings, recent compiles |
+| `--daemon-start` | start now (with `--daemon-workers N`, `--daemon-idle-timeout MIN`) |
+| `--daemon-stop` | stop after running jobs finish |
+| `--daemon-kill` | stop now: daemon, workers and running jobs |
+| `--daemon-restart` | graceful stop and start, keeping its settings |
+| `--daemon-reload` | re-execute in place after running jobs finish |
+| `--daemon-list` | every daemon of yours: instances of all checkouts and old-layout daemons |
+| `--daemon-logs [N or REQUEST]` | last N lines of the daemon log, or one request's log; `--follow` |
+| `--daemon-events [PATTERN]` | recent events; `--follow` streams them |
+| `--daemon-clear` | drop the request history and restart workers with empty caches |
+| `--daemon-prune [--days N]` | remove files of stopped daemons and request logs older than N days |
+| `--daemon-config` | settings for a new daemon, where each comes from, and where the running one differs |
+
+`--daemon-stop`, `--daemon-kill`, `--daemon-reload` and `--daemon-clear` take `--all`
+for every instance (stop and kill also stop old-layout daemons). `L2_DAEMON_SCOPE`
+chooses what shares a daemon: `checkout` (default), `project` (the nearest directory
+with `.git` or `l2.toml`) or `directory`. `L2_DAEMON_SOCKET` names a socket path
+directly. `L2_DAEMON_RUNTIME_DIR` and `L2_DAEMON_STATE_DIR` move the runtime and
+state directories. The daemon keeps the last 200 request logs.
+
+Each daemon worker keeps a pre-parsed copy of the stdlib, and each job starts from it.
+A job uses it when its file imports `stdlib.sl` as its first form and no setting that
+changes parsing is given (`-D`, `-W`/`-Werror`, `--preview`, `--macro-preview`,
+`--macro-profile`, `--macro-expansion-limit`, event streams). The copy is rebuilt when a
+stdlib file changes (any write), or with `--force-stdlib`; `--force`
+rebuilds your program but not the pre-parsed stdlib. The same is done for the compiler's
+other libraries a program imports first (for example `libs/fn.sl`), and per `-D`/`-W`
+setting. Set `L2_NO_WARM_PREFIX=1` (when the daemon starts) to turn this off.
+`L2_DAEMON_TRUSTED_DIRS` (colon-separated directories, sent with each request) extends it to your own files:
+leading imports from those directories are pre-parsed too, so editing `main.sl` reuses
+the parsed project libraries until one of them changes. Only list directories whose
+compile-time code you trust, since it runs in the long-lived worker.
+
+Machine code assembled for compile-time `:asm` words (and the `--script` JIT) is cached
+by its exact assembly text, so a changed definition always gets new code. The cache is
+kept in memory, in a pack file under `$XDG_CACHE_HOME/l2` (or `~/.cache/l2`, or
+`L2_ASM_CACHE_DIR`) shared by all compiler processes, and in each daemon worker, which
+loads keystone and the stdlib's code before forking a job. A compile whose code is all
+cached does not load keystone at all. The result of the post-emission assembly optimizer
+is cached the same way (by the exact assembly text, in a second pack file tied to the
+compiler's source), so compiling an unchanged program again skips that pass.
+Large executables are assembled by several nasm processes at once: whole word
+definitions that cannot fall through into each other are split into parts, labels used
+across parts get hidden aliases, and `ld -r` joins the parts into the usual object file.
+Anything unusual (nasm macros, alignment or data directives inside a word, exported
+labels, a part that fails or warns) assembles the file in one piece instead, so errors
+and warnings are nasm's own. `L2_NASM_PARALLEL=0` turns it off. These variables, like
+`L2_ASM_CACHE`, are sent with each request, so a daemon compile uses the client's values.
+`L2_ASM_CACHE=0` turns both pack files off;
+`L2_NO_ASM_PREWARM=1` (when the daemon starts) turns off the worker's preparation.
+
+Imports are searched in the importing file's directory, then `.`, `./stdlib`, the `-I`
+paths, and finally the compiler's own directory and its `stdlib/`, so `import
+stdlib.sl` works from any directory.
 
 ### Compiler events
 
 L2 compile-time source is the primary event API. The compiler emits detailed
 event objects for parsing, imports, macro expansion, compile-time execution,
 word compilation, optimization, emission, diagnostics, and user events.
-`on-event` can register a compile-only word whose event object is pushed on the
-compile-time stack:
+`on-event` subscribes a compile-only word as a handler. Each handler receives
+its own copy of the event, a map `{event, timestamp_ns, payload}`, and must
+consume it (stack effect `event --`):
 
 ```l2
 word inspect_compile_event
-  get-event-type "compile" string= static_assert
-  get-event-name string-length 0 > static_assert
+  dup event-name "compile" string-equal? static-assert
+  event-name string-length 0 > static-assert
 end on-event compile
 ```
 
@@ -439,21 +666,21 @@ stack operations as the rest of the language:
 
 ```l2
 word inspect_word_compile_event
-  get-event-payload
-  "name" map-get static_assert
-  drop drop
+  event-payload
+  "name" map-get static-assert
+  drop
 end on-event word.compile.begin
 ```
 
-Patterns use glob matching (`word.compile.*`, `import.*`, `*`). Event objects
-expose `type`, `name`, `timestamp_ns`, `location`, and `payload`/`data`.
-Compile-time code can construct and emit its own objects:
+Patterns use glob matching (`word.compile.*`, `import.*`, `*`). Compile-time
+code can build and publish its own events:
 
 ```l2
 word emit_build_event
-  "build.note" event-object-create
-  "message" "generated" event-object-prop-append
-  event-object-emit
+  drop
+  "build.note" event-new
+  "message" "generated" event-payload-set
+  ct-event-emit-object drop
 end on-event build.request
 
 emit-event build.request
@@ -463,13 +690,14 @@ word main
 end
 ```
 
-The event builtins are `get-event-type`, `get-event-name`,
-`get-event-timestamp`, `get-event-payload`, `event-object-create`,
-`event-object-prop-append`, `event-object-prop-get`, and
-`event-object-emit`. `ct-repr` consumes a compile-time value and pushes its
-normalized JSON representation as a string; use `puts` to print it while
-inspecting an event payload. Lower-level `event-subscribe`, `event-unsubscribe`, and
-`event-emit` remain available for compiler extensions. Python tooling can use
+The event words are `event-new`, `event-payload-set`, `event-payload-get`,
+`event-name`, `event-timestamp`, `event-payload`, `ct-event-emit`,
+`ct-event-emit-object`, `ct-event-subscribe`, and `ct-event-unsubscribe`;
+`ct-event-set-enabled` and `--no-events` turn events off, while
+`ct-event-stream-set-enabled` and `--no-events-json` affect only the JSON Lines
+file. `repr` consumes a
+compile-time value and pushes a readable debug representation (not a stable
+format); use `puts` to print it while inspecting an event payload. Python tooling can use
 `EventBus`, while external IDEs can subscribe to the daemon's Unix-socket
 `subscribe_events` request or consume `--events-stream` JSON Lines.
 
@@ -480,12 +708,22 @@ through the daemon:
 ```bash
 python3 main.py tests/general/hello.sl --no-artifact --events-stream build/events.jsonl
 python3 tools/event_tail.py --pattern 'word.compile.*' --replay
+python3 main.py --daemon-events 'word.compile.*' --follow
 ```
 
 Events include compile/import boundaries, word emission, macro expansion,
 compile-time execution, diagnostics, and emitted sections. Daemon clients can
 subscribe with the `subscribe_events` JSON-socket request; `event_tail.py` is
 the supplied human-readable client.
+
+`--events-filter` limits what `--events-stream` writes, as comma-separated glob
+patterns, for example `--events-filter 'compiler.error*,definition.*'`. The
+compiler keeps the newest 8,192 events for replay; `--events-ring N` changes that.
+
+High-volume events (`ct.execute.*`, `macro.expansion`, and `definition.*`) are only
+built when a subscription, observer, or stream wants them. Replay
+(`subscribe(replay=True)`, `event_tail.py --replay`) returns only retained events,
+so an event that nobody wanted at the time it happened cannot be replayed later.
 
 ### C ABI library exports
 
@@ -518,11 +756,24 @@ L2 has multi-layer caching to speed up recompilation:
 
 Use `--no-cache` to skip compiler caches (but keep NASM/linker incremental builds). Use `--force` to rebuild from scratch.
 
+Compile-time performance is tracked with `tools/bench_compile.py`. To compare this
+checkout against another one (for example a worktree of `main`), run an interleaved A/B:
+
+```bash
+python3 tools/bench_compile.py --ab ../l2-main --runs 9 --max-file-regression 5 --max-geomean 0
+```
+
+It exits with status 1 when a file is more than 5% slower, or the geometric mean is
+slower at all.
+
 ### Debugging & Profiling
 
 Inspect macro expansion and compile-time behavior:
 
 ```bash
+# Print each macro expansion and rewrite, at its source location
+python3 main.py source.sl --macro-preview
+
 # Show timing for each macro expansion
 python3 main.py source.sl --macro-profile
 
@@ -562,6 +813,14 @@ python3 main.py --docs-serve --docs-port 8018
 You can call L2 from C (and vice versa) via the L2 runtime library built from [main.c](main.c). The library exposes `eval`, `eval_env`, and `compile()` (runtime code compilation) — everything needed to embed L2 in a host program.
 
 For scalar evaluation, prefer `l2_eval_ex()` from [libs/l2.h](libs/l2.h): it returns an explicit status and writes the full `int64_t` result through an output pointer. The legacy `l2_eval()` API returns `int` and can truncate results or make a valid `-1` indistinguishable from failure.
+
+The library has its own compiler (in C), which supports a subset of the compile-time
+language: the core value, list, map, string, token and parser words, output buffers,
+token hooks, `const`, and macros (general bodies, quotations with `$name` and `$( … )`,
+quotation arguments). Language packs, the rewrite engine, `match`, events and custom
+frontends are not supported there yet, so libraries such as `libs/fn.sl` need the Python
+compiler. `tools/test_c_vm_parity.py` checks that every word the C compiler implements
+behaves as in the Python compiler.
 
 > **Note:** The library was previously called `libl2eval`. It has been renamed to `libl2` to reflect its expanded scope. Backwards-compatible symlinks (`libl2eval.a`, `libl2eval.so`) and a forwarding header (`libs/l2eval.h`) are still generated so existing consumers keep working.
 

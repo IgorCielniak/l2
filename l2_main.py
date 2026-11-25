@@ -21510,6 +21510,23 @@ def _import_links_fresh(links: Any) -> bool:
     return all(isinstance(path, str) and os.path.realpath(path) == target for path, target in links.items())
 
 
+def _write_text_if_changed(path: Path, text: str, *, force: bool = False,
+                           encoding: str = "utf-8") -> bool:
+    """Write text to path unless the file already holds exactly that text
+    (or force is set).  Returns whether it wrote.  On a disk with slow
+    writes any write can stall a compile, and most compiles would rewrite
+    build files with what they already hold."""
+    data = text.encode(encoding)
+    if not force:
+        try:
+            if path.stat().st_size == len(data) and path.read_bytes() == data:
+                return False
+        except OSError:
+            pass
+    path.write_bytes(data)
+    return True
+
+
 class SourceGraphCache:
     """Caches fully preprocessed source graphs keyed by source/import state."""
 
@@ -21658,7 +21675,7 @@ class SourceGraphCache:
         manifest_path = self._manifest_path(source, defines=defines, include_paths=include_paths)
         try:
             import json
-            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            _write_text_if_changed(manifest_path, json.dumps(payload))
         except OSError:
             return
 
@@ -21786,7 +21803,7 @@ class BuildCache:
                 pass
         asm_hash = self._hash_str(asm_text)
         asm_path = self.cache_dir / f"{asm_hash}.asm"
-        asm_path.write_text(asm_text)
+        _write_text_if_changed(asm_path, asm_text)
         manifest = {
             "format_version": self._FORMAT_VERSION,
             "source": str(source.resolve()),
@@ -21798,7 +21815,7 @@ class BuildCache:
             "links": dict(links or {}),
         }
         import json
-        self._manifest_path(source).write_text(json.dumps(manifest))
+        _write_text_if_changed(self._manifest_path(source), json.dumps(manifest))
 
     def clean(self) -> None:
         if self.cache_dir.exists():
@@ -23090,6 +23107,29 @@ def _build_ct_ref_function_appendix(base_doc_text: str) -> str:
     return str(bundle.get("appendix_text", ""))
 
 
+# A file can only declare a macro or constant if it mentions `macro` or
+# `const` (as a whole word); other files are not parsed for --docs.
+_DOCS_DEFINITION_HINT_RE = re.compile(r"(?<![\w.-])(?:macro|const)(?![\w.-])")
+# path -> (identity of every file its parse loaded, rows): --docs reloads
+# reuse the rows of files whose parse inputs are unchanged.
+_DEFINITION_METADATA_CACHE: Dict[str, Tuple[Tuple[Tuple[str, Tuple[int, int, int, int]], ...],
+                                             List[Dict[str, Any]]]] = {}
+
+
+def _definition_metadata_cached(target: str) -> Optional[List[Dict[str, Any]]]:
+    entry = _DEFINITION_METADATA_CACHE.get(target)
+    if entry is None:
+        return None
+    identities, rows = entry
+    for dep, identity in identities:
+        try:
+            if _file_identity(os.stat(dep)) != identity:
+                return None
+        except OSError:
+            return None
+    return rows
+
+
 def _collect_definition_metadata(files: Sequence[Path]) -> List[Dict[str, Any]]:
     """The macros and constants each file defines, read from a parse of
     the file: name, kind (macro/const), parameters as the stack-effect text,
@@ -23098,45 +23138,70 @@ def _collect_definition_metadata(files: Sequence[Path]) -> List[Dict[str, Any]]:
     for path in files:
         try:
             resolved = Path(path).resolve()
+            source_text = resolved.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        target = str(resolved)
-        compiler = Compiler()
-        text = f"import {_l2_string_literal(target)}\n"
-        try:
-            tokens = compiler.reader.tokenize(text, None, "<docs>")
-            compiler._parse_seen = set()
-            compiler.parser.file_spans = []
-            compiler.parser._warm_pause = True
-            compiler.parser.parse(tokens, text)
-        except Exception:
+        if not _DOCS_DEFINITION_HINT_RE.search(source_text):
             continue
-        dictionary = compiler.dictionary
-        for name, (const_token, _name_token, value_token) in dictionary.pending_consts.items():
-            origin = const_token.origin
-            if origin.path != target:
-                continue
-            rows.append({"name": name, "kind": "const", "stack_effect": f"-> {value_token.lexeme}",
-                         "doc": None, "path": target, "line": origin.start_line,
-                         "source": f"const {name} {value_token.lexeme}"})
-        for name, word in dictionary.words.items():
-            macro = word.macro_def
-            token = word.source_origin
-            if macro is None or not isinstance(token, Token):
-                continue
-            origin = token.origin
-            if origin.path != target:
-                continue
-            source_text = word.source_text or ""
-            metadata = macro.metadata if isinstance(macro.metadata, dict) else {}
-            doc = metadata.get("doc") if isinstance(metadata.get("doc"), str) else None
-            if source_text.startswith("const "):
-                kind, effect = "const", "-> " + source_text.split(None, 2)[-1].strip()
-            else:
-                kind = "macro"
-                effect = f"macro ({' '.join(macro.params)})" if macro.params else "macro"
-            rows.append({"name": name, "kind": kind, "stack_effect": effect, "doc": doc,
-                         "path": target, "line": origin.start_line, "source": source_text})
+        target = str(resolved)
+        cached = _definition_metadata_cached(target)
+        if cached is not None:
+            rows.extend(cached)
+            continue
+        file_rows = _parse_definition_metadata(target)
+        if file_rows is not None:
+            rows.extend(file_rows)
+    return rows
+
+
+def _parse_definition_metadata(target: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse target (and its imports) and return its macro/const rows, or
+    None when it does not parse.  The rows are cached against the identity
+    of every file the parse read."""
+    rows: List[Dict[str, Any]] = []
+    compiler = Compiler()
+    text = f"import {_l2_string_literal(target)}\n"
+    try:
+        tokens = compiler.reader.tokenize(text, None, "<docs>")
+        compiler._parse_seen = set()
+        compiler.parser.file_spans = []
+        compiler.parser._warm_pause = True
+        compiler.parser.parse(tokens, text)
+    except Exception:
+        return None
+    dictionary = compiler.dictionary
+    for name, (const_token, _name_token, value_token) in dictionary.pending_consts.items():
+        origin = const_token.origin
+        if origin.path != target:
+            continue
+        rows.append({"name": name, "kind": "const", "stack_effect": f"-> {value_token.lexeme}",
+                     "doc": None, "path": target, "line": origin.start_line,
+                     "source": f"const {name} {value_token.lexeme}"})
+    for name, word in dictionary.words.items():
+        macro = word.macro_def
+        token = word.source_origin
+        if macro is None or not isinstance(token, Token):
+            continue
+        origin = token.origin
+        if origin.path != target:
+            continue
+        source_text = word.source_text or ""
+        metadata = macro.metadata if isinstance(macro.metadata, dict) else {}
+        doc = metadata.get("doc") if isinstance(metadata.get("doc"), str) else None
+        if source_text.startswith("const "):
+            kind, effect = "const", "-> " + source_text.split(None, 2)[-1].strip()
+        else:
+            kind = "macro"
+            effect = f"macro ({' '.join(macro.params)})" if macro.params else "macro"
+        rows.append({"name": name, "kind": kind, "stack_effect": effect, "doc": doc,
+                     "path": target, "line": origin.start_line, "source": source_text})
+    identities = []
+    for dep in sorted(str(p) for p in compiler._parse_seen | {Path(target)}):
+        try:
+            identities.append((dep, _file_identity(os.stat(dep))))
+        except OSError:
+            return rows  # changed while parsing: do not cache
+    _DEFINITION_METADATA_CACHE[target] = (tuple(identities), rows)
     return rows
 
 
@@ -26309,8 +26374,8 @@ def cli(
                     if use_asm_opt_cache and asm_digest is not None:
                         try:
                             asm_opt_key_path.parent.mkdir(parents=True, exist_ok=True)
-                            asm_opt_cache_path.write_text(asm_text, encoding="utf-8")
-                            asm_opt_key_path.write_text(f"{asm_opt_cache_version}:{asm_digest}", encoding="utf-8")
+                            _write_text_if_changed(asm_opt_cache_path, asm_text)
+                            _write_text_if_changed(asm_opt_key_path, f"{asm_opt_cache_version}:{asm_digest}")
                         except OSError:
                             pass
 
@@ -26519,13 +26584,7 @@ def cli(
             print(f"[info] wrote {header_path}")
 
     # --- incremental: skip nasm if assembly unchanged ---
-    asm_changed = True
-    if not args.force and asm_path.exists():
-        existing_asm = asm_path.read_text()
-        if existing_asm == asm_text:
-            asm_changed = False
-    if asm_changed or args.force:
-        asm_path.write_text(asm_text)
+    asm_changed = _write_text_if_changed(asm_path, asm_text, force=args.force)
 
     if args.emit_asm:
         if args.output is not None and not output_was_auto:
@@ -26629,7 +26688,7 @@ def cli(
             )
 
     if need_link:
-        link_stamp.write_text(link_fingerprint)
+        _write_text_if_changed(link_stamp, link_fingerprint, force=args.force)
         print(f"[info] built {args.output}")
     else:
         print(f"[info] {args.output} is up to date")
@@ -27246,10 +27305,61 @@ class _IntegratedCompilerDaemon:
         self.log = logging.getLogger(f"l2.integrated.daemon.{os.getpid()}.{id(self)}")
         level_name = os.environ.get("L2_DAEMON_LOG_LEVEL", "INFO").upper()
         self.log.setLevel(getattr(logging, level_name, logging.INFO))
+        # Disk writes (this log, the per-request logs) happen on a
+        # background thread: a request must not wait for a slow disk before
+        # its client gets the answer.
+        import queue
         from logging.handlers import RotatingFileHandler
-        handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        self.log.addHandler(handler)
+        file_handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        self._disk_queue: "queue.SimpleQueue[Optional[Callable[[], None]]]" = queue.SimpleQueue()
+        disk_queue = self._disk_queue
+
+        class _BackgroundHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                record.message = record.getMessage()  # format now, write later
+                record.msg, record.args = record.message, None
+                disk_queue.put(lambda: file_handler.handle(record))
+
+        self.log.addHandler(_BackgroundHandler())
+        self._disk_writer = threading.Thread(target=self._disk_writer_loop, name="l2-daemon-disk",
+                                             daemon=True)
+        self._disk_writer.start()
+
+    def _disk_writer_loop(self) -> None:
+        while True:
+            task = self._disk_queue.get()
+            if task is None:
+                return
+            try:
+                task()
+            except Exception:
+                pass
+
+    def wait_disk_writes(self, timeout: float = 10.0) -> None:
+        """Wait until the writes queued so far are on disk (page cache)."""
+        if not self._disk_writer.is_alive():
+            return
+        done = threading.Event()
+        self._disk_queue.put(done.set)
+        done.wait(timeout)
+
+    def flush_disk_writes(self) -> None:
+        """Finish pending request-log and log writes and stop the writer
+        (before exiting or re-executing)."""
+        if self._disk_writer.is_alive():
+            self._disk_queue.put(None)
+            self._disk_writer.join(timeout=10.0)
+
+    def _write_request_log(self, req_id: str, text: str) -> None:
+        try:
+            self.request_log_dir.mkdir(parents=True, exist_ok=True)
+            (self.request_log_dir / f"{req_id}.log").write_text(text, encoding="utf-8")
+        except OSError:
+            return
+        self._logs_written += 1
+        if self._logs_written % 25 == 0:
+            self._prune_request_logs()
 
     def settings(self) -> Dict[str, Any]:
         values: Dict[str, Any] = {
@@ -27567,18 +27677,9 @@ class _IntegratedCompilerDaemon:
             "finished_at": time.time(),
         }
         self.history.append(record); self.success += return_code == 0; self.failure += return_code != 0
-        try:
-            self.request_log_dir.mkdir(parents=True, exist_ok=True)
-            (self.request_log_dir / f"{req_id}.log").write_text(
-                f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} INFO req_id={req_id} cwd={cwd} result={record}\n"
-                f"--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}",
-                encoding="utf-8",
-            )
-            self._logs_written += 1
-            if self._logs_written % 25 == 0:
-                self._prune_request_logs()
-        except OSError:
-            pass
+        log_text = (f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} INFO req_id={req_id} cwd={cwd} result={record}\n"
+                    f"--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}")
+        self._disk_queue.put(lambda: self._write_request_log(req_id, log_text))
         self.log.info("req_id=%s finish code=%s duration_ns=%s", req_id, return_code, record["duration_ns"])
         return result
 
@@ -27626,6 +27727,7 @@ class _IntegratedCompilerDaemon:
             return self.status()
         if cmd == "events": return {"ok": True, "events": self.bus.recent(str(payload.get("pattern", "*")), payload.get("limit"))}
         if cmd == "logs":
+            self.wait_disk_writes()
             requested = payload.get("req")
             log_path = (self.request_log_dir / f"{Path(str(requested)).name}.log") if requested else (self.state_dir / "daemon.log")
             try:
@@ -27889,10 +27991,12 @@ def daemon_serve(argv: Sequence[str]) -> int:
     daemon._snapshot_state(reload_restore=daemon.reload_requested.is_set())
     if daemon.reload_requested.is_set() and (daemon.auto_reload or daemon.reload_forced):
         daemon.log.info("re-executing for reload")
+        daemon.flush_disk_writes()
         os.set_inheritable(lock_fd, True)
         os.environ["L2_DAEMON_LOCK_FD"] = str(lock_fd)
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), "--daemon-serve", *list(argv)])
     daemon.log.info("daemon exiting")
+    daemon.flush_disk_writes()
     os.close(lock_fd)
     signal.signal(signal.SIGTERM, previous_sigterm_handler)
     return 0

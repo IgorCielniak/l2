@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import html
 import json
+import os
 import re
 
 _CT_REF_SECTION_RE = re.compile(r"^\s*§\s*\d+[A-Za-z]?\s+(.+?)\s*$")
@@ -236,11 +237,15 @@ def _iter_doc_files(
         if not resolved.is_dir():
             continue
         root_files: List[Path] = []
-        for path in resolved.rglob("*.sl"):
-            if _should_skip(path):
-                continue
-            candidate = path.resolve()
-            root_files.append(candidate)
+        # Skipped directories (matched below the root) are pruned from the
+        # walk: rglob would descend into each of them (build/, .git, ...)
+        # and drop their files afterwards, which from a large working
+        # directory walks a whole tree.
+        for dirpath, dirnames, filenames in os.walk(resolved):
+            dirnames[:] = [name for name in dirnames if name not in skip_parts]
+            for filename in filenames:
+                if filename.endswith(".sl"):
+                    root_files.append(Path(dirpath, filename).resolve())
         root_files.sort()
         for candidate in root_files:
             if candidate in seen:
@@ -258,9 +263,12 @@ def collect_docs(
     include_macros: bool = False,
     include_tests: bool = False,
     include_libs: bool = False,
+    files: Optional[Sequence[Path]] = None,
 ) -> List[DocEntry]:
     entries: List[DocEntry] = []
-    for doc_file in _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs):
+    if files is None:
+        files = _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs)
+    for doc_file in files:
         entries.extend(
             _scan_doc_file(
                 doc_file,
@@ -5030,6 +5038,7 @@ def _collect_docs_for_runtime(
     include_libs: bool = False,
     extra_roots: Sequence[Path],
 ) -> List[DocEntry]:
+    doc_files = _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs)
     entries = collect_docs(
         roots,
         include_undocumented=include_undocumented,
@@ -5037,10 +5046,10 @@ def _collect_docs_for_runtime(
         include_tests=include_tests,
         include_macros=include_macros,
         include_libs=include_libs,
+        files=doc_files,
     )
     compiled = _definition_metadata_entries(
-        _iter_doc_files(roots, include_tests=include_tests, include_libs=include_libs),
-        include_undocumented=include_undocumented, include_private=include_private)
+        doc_files, include_undocumented=include_undocumented, include_private=include_private)
     if compiled:
         by_name = {entry.name: entry for entry in compiled}
         entries = [entry for entry in entries if entry.name not in by_name] + list(by_name.values())

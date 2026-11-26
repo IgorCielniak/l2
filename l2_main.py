@@ -14872,13 +14872,22 @@ class Assembler:
         del text[n - 3:n]
         return value
 
+    def _extern_call(self, name: str) -> str:
+        """The call of extern function `name`. A library (shared, static or obj artifact) may become
+        position-independent code, where a function from outside it is reached through the PLT:
+        `ld -shared` refuses a direct `call` to one. The linker turns a PLT call into a direct
+        one when the function ends up in the same image."""
+        if self._export_all_defs:
+            return f"    call {name} wrt ..plt"
+        return f"    call {name}"
+
     def _emit_extern_wordref(self, name: str, word: Word, builder: FunctionEmitter) -> None:
         inputs = getattr(word, "extern_inputs", 0)
         outputs = getattr(word, "extern_outputs", 0)
         signature = getattr(word, "extern_signature", None)
 
         if signature is None and inputs <= 0 and outputs <= 0:
-            builder.emit(f"    call {name}")
+            builder.emit(self._extern_call(name))
             return
 
         arg_types = list(signature[0]) if signature else ["long"] * inputs
@@ -15025,7 +15034,7 @@ class Assembler:
             builder.emit(f"    add r12, {total_args * 8}")
 
         builder.emit(f"    mov al, {xmm_idx}")
-        builder.emit(f"    call {name}")
+        builder.emit(self._extern_call(name))
 
         builder.emit("    mov rsp, r14")
 

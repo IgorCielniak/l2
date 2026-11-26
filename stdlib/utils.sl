@@ -1,11 +1,27 @@
 
-#strcmp [*, addr, len, addr | len] -> [* | bool]
-word strcmp
+# prefix= [*, addr, len, addr | len] -> [* | bool]
+# 1 when the first len2 bytes at addr1 equal the second string.  The first
+# length is ignored; callers must make sure addr1 has len2 readable bytes.
+word prefix=
     >r nip r> for
         2dup c@ swap c@ != if drop drop 0 rdrop ret end
         1 + swap 1 +
     end
     drop drop 1
+end
+
+# startswith [*, addr, len, addr | len] -> [* | bool]
+# 1 when the first string begins with the second.
+word startswith
+    dup 3 pick > if 2drop 2drop 0 ret end
+    prefix=
+end
+
+#strcmp [*, addr, len, addr | len] -> [* | bool]
+# 1 when both strings have the same length and bytes.
+word strcmp
+    dup 3 pick != if 2drop 2drop 0 ret end
+    prefix=
 end
 
 # strdup [*, addr | len] -> [*, addr, len, addr1 | len1]
@@ -83,6 +99,38 @@ word toint
         nip
     end
     rdrop rdrop
+end
+
+#toint? [*, addr | len] -> [*, value | ok]
+# Strict string to int: an optional leading '-' followed by one or more
+# decimal digits, within the signed 64-bit range.  ok is 1 on success;
+# on an empty string, any other character, or overflow it is 0 and value is 0.
+word toint?
+    dup 0 == if 2drop 0 0 ret end
+    over c@ 45 == if                           # leading '-'
+        1 - swap 1 + swap
+        dup 0 == if 2drop 0 0 ret end
+        1
+    else
+        0
+    end
+    >r                                          # addr len      R: negative?
+    # Accumulate as a negative number so INT64_MIN is reachable.
+    0 swap                                      # addr acc len
+    for
+        over c@ 48 -                            # addr acc digit
+        dup 0 < over 9 > or if 2drop drop rdrop rdrop 0 0 ret end
+        dup 1 63 shl + 10 /                     # addr acc digit lowest-acc
+        2 pick > if 2drop drop rdrop rdrop 0 0 ret end
+        swap 10 * swap -
+        swap 1 + swap
+    end
+    nip
+    r> 0 == if
+        dup 1 63 shl == if drop 0 0 ret end
+        neg
+    end
+    1
 end
 
 #count_digits [* | int] -> [* | int]
@@ -456,7 +504,7 @@ end
 word splitby_str
     2 pick for
         3 pick 0 2 pick 4 pick swap
-        strcmp 1 == if 3 pick over 0 memset_bytes end
+        prefix= 1 == if 3 pick over 0 memset_bytes end
         >r >r swap 1 + swap r> r>
     end
     2drop 2dup - >r nip r> swap emit_strs r>
@@ -521,21 +569,16 @@ word trim
     ltrim rtrim
 end
 
-# startswith [*, addr, len, addr | len] -> [*, bool]
-inline word startswith
-    strcmp
-end
-
 # endswith [*, addr, len, addr | len] -> [*, bool]
 word endswith
-    dup 3 pick swap - 4 pick + over 2 pick 4 pick swap strcmp
+    dup 3 pick swap - 4 pick + over 2 pick 4 pick swap startswith
     nip nip nip nip
 end
 
 # contains [*, addr, len, addr | len] -> [* | bool]
 word contains
     2 pick for
-        4dup strcmp 1 == if 1 nip nip nip nip rdrop ret end
+        4dup startswith 1 == if 1 nip nip nip nip rdrop ret end
         >r >r >r 1 + r> r> r>
     end 0 nip nip nip nip
 end
@@ -544,7 +587,7 @@ end
 # find [*, addr, len, addr | len] -> [* | index]
 word find
     0 >r 2 pick for
-        4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
+        4dup startswith 1 == if rswap r> nip nip nip nip rdrop ret end
         >r >r >r 1 + r> r> r> rswap r> 1 + >r rswap
     end -1 nip nip nip nip
 end
@@ -554,7 +597,7 @@ end
 word rfind
     >r >r dup >r + 1 - r> r> r>
     2 pick 1 - >r 2 pick for
-        4dup strcmp 1 == if rswap r> nip nip nip nip rdrop ret end
+        4dup startswith 1 == if rswap r> nip nip nip nip rdrop ret end
         >r >r >r 1 - r> r> r> rswap r> 1 - >r rswap
     end -1 nip nip nip nip
 end

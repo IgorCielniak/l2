@@ -102,6 +102,10 @@ python3 main.py examples/game_of_life.sl -o life
 # Interactive Snake game
 python3 main.py examples/snake.sl -o snake
 ./snake
+
+# HTTP server on raw syscalls (http://127.0.0.1:8080, /shutdown stops it)
+python3 main.py examples/http_server.sl -o http_server
+./http_server
 ```
 
 ---

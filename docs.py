@@ -6502,8 +6502,6 @@ _OVERVIEW_OVERRIDES: Dict[str, str] = {
     "ct-lang-create": "Creates or updates a named language-extension pack record and returns whether it was newly created.",
     "ct-lang-exists?": "Returns 1 when a named language-extension pack exists.",
     "ct-lang-list": "Returns sorted list of registered language-extension pack names.",
-    "ct-lang-activate": "Marks a named language pack active. This controls active-pack queries and active-validator selection; it does not automatically enable or disable the pack's registered macros, rewrites, or token hook.",
-    "ct-lang-deactivate": "Marks a language pack inactive without removing or disabling its registered macros, rewrites, or token hook. Use the explicit rule/hook controls when those resources themselves must stop affecting parsing.",
     "ct-lang-active?": "Returns 1 when a named language-extension pack is active.",
     "ct-lang-add-reader-rewrite-named": "Registers a named reader-stage rewrite under a language-extension pack.",
     "ct-lang-add-grammar-rewrite-named": "Registers a named grammar-stage rewrite under a language-extension pack.",

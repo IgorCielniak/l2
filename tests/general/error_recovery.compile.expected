@@ -1,4 +1,4 @@
-error[parser-unexpected-end]: unexpected 'end' at 6:8
+error[parser-unexpected-end]: unexpected 'end' at 6:9
   --> error_recovery.sl:6:9
     |
   6 |     end end
@@ -7,7 +7,7 @@ error[parser-unexpected-end]: unexpected 'end' at 6:8
     |
     = help: remove this `end` or add its matching opener earlier
     = help: check nesting around `if`/`else`/`for`/`while`/`begin`/`word`
-error[parser-unexpected-end]: unexpected 'end' at 10:8
+error[parser-unexpected-end]: unexpected 'end' at 10:9
   --> error_recovery.sl:10:9
      |
   10 |     end end

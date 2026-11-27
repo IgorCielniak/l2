@@ -5,7 +5,7 @@ error[parser-control-mismatch]: 'begin' loops close with 'again', not 'end'
     |           ^^^
     | = note: a control keyword tried to close a different control frame
     | = note: while parsing definition 'main'
-    | = note: inside 'begin' block opened at 5:2
+    | = note: inside 'begin' block opened at 5:3
     |
     = help: verify proper control flow order: `while ... do ... end`, `if ... else ... end`, `for ... end`
     = help: check source location notes for where the block was opened

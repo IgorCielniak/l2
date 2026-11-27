@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "a while loop closed by end before its do is a parser error"
+}

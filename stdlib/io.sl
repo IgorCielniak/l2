@@ -47,7 +47,9 @@ end
 ;
 
 #read_file [*, path_addr, path_len, buf_addr | buf_len] -> [* | bytes_read] || [* | neg_errno]
-# path_addr must point to a NUL-terminated path.
+# path_addr must point to a NUL-terminated path.  Reads until the buffer is
+# full or the file ends (one read() can return less, e.g. from a pipe); an
+# error is returned only when nothing was read.
 :asm read_file {
     mov r14, [r12]
     mov r15, [r12 + 8]
@@ -60,12 +62,28 @@ end
     test rax, rax
     js .return
     mov r8, rax
-    mov rax, 0
+    xor r10, r10
+.read_loop:
+    test r14, r14
+    jz .done
+    xor eax, eax
     mov rdi, r8
-    mov rsi, r15
+    lea rsi, [r15 + r10]
     mov rdx, r14
     syscall
+    cmp rax, -4
+    je .read_loop
+    test rax, rax
+    jz .done
+    js .read_error
+    add r10, rax
+    sub r14, rax
+    jmp .read_loop
+.read_error:
+    test r10, r10
+    jnz .done
     mov r10, rax
+.done:
     mov rax, 3
     mov rdi, r8
     syscall
@@ -78,7 +96,9 @@ end
 ;
 
 #write_file [*, path_addr, path_len, buf_addr | buf_len] -> [* | bytes_written] || [* | neg_errno]
-# path_addr must point to a NUL-terminated path.
+# path_addr must point to a NUL-terminated path.  Writes the whole buffer,
+# retrying partial writes; an error is returned only when nothing was
+# written.
 :asm write_file {
     mov r14, [r12]
     mov r15, [r12 + 8]
@@ -91,12 +111,28 @@ end
     test rax, rax
     js .return
     mov r8, rax
-    mov rax, 1
+    xor r10, r10
+.write_loop:
+    test r14, r14
+    jz .done
+    mov eax, 1
     mov rdi, r8
-    mov rsi, r15
+    lea rsi, [r15 + r10]
     mov rdx, r14
     syscall
+    cmp rax, -4
+    je .write_loop
+    test rax, rax
+    jz .done
+    js .write_error
+    add r10, rax
+    sub r14, rax
+    jmp .write_loop
+.write_error:
+    test r10, r10
+    jnz .done
     mov r10, rax
+.done:
     mov rax, 3
     mov rdi, r8
     syscall
@@ -108,6 +144,59 @@ end
 }
 ;
 
+# One step of read_all / write_all: the new (total, go) pair for a
+# syscall result n.  EINTR retries; 0 or an error ends the loop, and an
+# error is kept only when nothing was transferred.
+# io-transfer-step [*, total | n] -> [*, total' | go]
+word io-transfer-step
+    with total n in
+        n 0 > if
+            total n + 1
+        else
+            n -4 == if
+                total 1
+            else
+                n 0 < total 0 == and if n else total end 0
+            end
+        end
+    end
+end
+
+#read_all [*, fd, buf | len] -> [* | bytes_read] || [* | neg_errno]
+# Reads until len bytes arrived or the input ended (one read() can return
+# less, e.g. from a pipe or terminal).
+word read_all
+    with fd buf len in
+        0 1
+        while do
+            with total in
+                total len >= if
+                    total 0
+                else
+                    total fd buf total + len total - syscall.read io-transfer-step
+                end
+            end
+        end
+    end
+end
+
+#write_all [*, fd, buf | len] -> [* | bytes_written] || [* | neg_errno]
+# Writes all len bytes, retrying partial writes.
+word write_all
+    with fd buf len in
+        0 1
+        while do
+            with total in
+                total len >= if
+                    total 0
+                else
+                    total fd buf total + len total - syscall.write io-transfer-step
+                end
+            end
+        end
+    end
+end
+
 #read_file2 [*, path_addr, path_len, buf_addr | buf_len] -> [* | bytes_read_or_neg_errno]
 word read_file2
     with path path_len buf len in
@@ -115,7 +204,7 @@ word read_file2
         dup 0 < if
         else
             with fd in
-                fd buf len syscall.read
+                fd buf len read_all
                 with count in
                     fd syscall.close drop
                     count
@@ -132,7 +221,7 @@ word write_file2
         dup 0 < if
         else
             with fd in
-                fd buf len syscall.write
+                fd buf len write_all
                 with count in
                     fd syscall.close drop
                     count

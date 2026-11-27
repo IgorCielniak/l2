@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "error recovery resumes after the broken definition: one error, no cascade"
+}

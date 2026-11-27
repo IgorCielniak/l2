@@ -1,0 +1,5 @@
+{
+  "description": "main.c: a compile-time :asm word that writes rbx runs without corrupting the C compiler",
+  "use_l2": true,
+  "requires": ["keystone"]
+}

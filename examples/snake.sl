@@ -323,7 +323,7 @@ end
 word draw_game
     with b xs ys s in
         "Snake (WASD to steer, q to quit)" puts
-        "Score: " puts
+        "Score: " write_buf
         s state_len@ 3 - puti
         10 putc
 

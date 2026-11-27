@@ -1,0 +1,4 @@
+{
+  "description": "lambda.sl works inside eval",
+  "use_l2": true
+}

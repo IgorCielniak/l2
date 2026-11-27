@@ -1,0 +1,4 @@
+{
+  "description": "eval_env supports &name word pointers and calling them",
+  "use_l2": true
+}

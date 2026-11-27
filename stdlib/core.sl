@@ -51,6 +51,21 @@
 }
 ;
 
+#envp [*] -> [* | ptr]
+# The environment: a NULL-terminated array of "NAME=value" C strings, which
+# Linux places right after argv's terminating NULL.
+:asm envp {
+    extern sys_argc
+    extern sys_argv
+    mov rax, [rel sys_argc]
+    mov rcx, [rel sys_argv]
+    lea rax, [rcx + rax*8 + 8]
+    sub r12, 8
+    mov [r12], rax
+    ret
+}
+;
+
 #argv@ [* | n] -> [* | ptr]
 :asm argv@ {
     extern sys_argv

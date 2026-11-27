@@ -334,8 +334,9 @@ class LifecycleWordTests(DefinitionTestBase):
         self.assertEqual(bus.recent()[-1]["payload"]["operation"], "update")
         self.assertCode(compiler, "definition-flags-conflict", "ct-definition-set-flags", handle, {"runtime-only": 1})
         self.assertCode(compiler, "definition-argument-invalid", "ct-definition-set-flags", handle, {"bogus": 1})
-        self.assertCode(compiler, "definition-flags-conflict", "ct-definition-set-flags", handle, {"preserve": 1})
-        self.assertEqual(self.candidates(compiler, "flagged")[0]["runtime-only?"], 0)
+        self.assertEqual(self.run_word(compiler, "ct-definition-set-flags", handle, {"preserve": 1}), [1])
+        record = self.candidates(compiler, "flagged")[0]
+        self.assertEqual((record["inline?"], record["preserve?"]), (0, 1))
         self.assertEqual(self.run_word(compiler, "ct-definition-set-flags-by-name", "flagged",
                                        {"compile-only": 0, "inline": 1, "preserve": 1}), [1])
         record = self.candidates(compiler, "flagged")[0]

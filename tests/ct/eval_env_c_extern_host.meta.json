@@ -1,0 +1,5 @@
+{
+  "description": "eval_env parses multi-token C extern signatures and calls host words (source embedded)",
+  "use_l2": true,
+  "compile_args": ["--source-embed"]
+}

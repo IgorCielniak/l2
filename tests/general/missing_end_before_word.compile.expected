@@ -1,0 +1,8 @@
+error[parser-nested-definition]: 'word' inside the definition of 'first': nested definitions are not supported; is an 'end' missing before it, to close 'first'?
+  --> missing_end_before_word.sl:6:1
+    |
+  6 | word second 3 drop end
+    | ^^^^
+    | = note: while parsing definition 'first'
+
+1 error(s) emitted

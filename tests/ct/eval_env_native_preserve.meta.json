@@ -1,0 +1,5 @@
+{
+  "description": "an inline preserve word is in the word table without --no-dce",
+  "use_l2": true,
+  "compile_args": ["--word-table"]
+}

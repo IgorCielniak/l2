@@ -500,14 +500,16 @@ def _run_docs_tui(
         {
             "name": "preserve",
             "category": "Definitions",
-            "syntax": "inline preserve <definition>",
-            "summary": "Keep an inline definition emitted as a standalone word.",
+            "syntax": "preserve <definition>",
+            "summary": "Keep a definition emitted as a standalone word.",
             "detail": (
-                "Use `preserve` immediately after `inline` and before a `word` or "
-                "`:asm` definition. Calls are still expanded inline, but the original "
-                "definition is also emitted, even when it has no runtime callers. "
-                "This is useful when taking its word pointer or exposing its symbol.\n\n"
+                "Use `preserve` before a `word` or `:asm` definition to retain the "
+                "standalone definition, even when it has no runtime callers. It works "
+                "with or without `inline`; `inline preserve` also expands native uses "
+                "while retaining the original definition. This is useful when taking "
+                "a word pointer or exposing a symbol.\n\n"
                 "Examples:\n"
+                "  preserve word inc 1 + end\n"
                 "  inline preserve word inc 1 + end\n"
                 "  inline preserve :asm fast_inc { inc qword [r12] } ;"
             ),
@@ -2926,7 +2928,7 @@ def _run_docs_tui(
         "    - Loop unrolling (--no-loop-unroll)\n"
         "    - Auto-inlining of small asm bodies (--no-auto-inline)\n"
         "    - String literal deduplication (--no-string-dedup to disable)\n"
-        "    - Dead code elimination (automatic)\n"
+        "    - Dead code elimination (--no-dce to keep every word)\n"
         "    - -O0 disables all optimizations\n"
         "    - -O2 disables all optimizations AND checks\n"
         "\n"

@@ -6,6 +6,5 @@ error[parser-definition-unclosed]: unclosed definition at EOF
     | = note: a definition was opened but not closed before end-of-file
     |
     = help: add a matching `end` for the current definition
-    = help: add a matching `end` for the current definition
 
 1 error(s) emitted

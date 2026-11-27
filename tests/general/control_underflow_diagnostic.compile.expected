@@ -1,4 +1,4 @@
-error[parser-control-underflow]: control stack underflow
+error[parser-control-underflow]: 'do' without a matching 'while'
   --> control_underflow_diagnostic.sl:2:5
     |
   2 |     do

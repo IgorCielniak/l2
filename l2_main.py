@@ -545,6 +545,7 @@ _register_codes("parser_error", "parse", (
     "parser-effect-clause-invalid", "parser-bss-list-invalid", "parser-word-pointer-invalid",
     "parser-directive-invalid", "parser-label-invalid", "parser-with-invalid", "parser-struct-invalid",
     "parser-definition-scan-failed", "parser-macro-unterminated", "ct-parser-error-raised",
+    "parser-literal-invalid",
 ))
 _register_codes("reference_error", "lint", ("reference-unknown",))
 _register_codes("definition_error", "definition", (
@@ -570,7 +571,7 @@ _register_codes("language_pack_error", "language-pack", (
 _register_codes("language_pack_error", "language-pack-metadata", ("language-pack-metadata-invalid",))
 _register_codes("lexer_error", "token-hook", ("token-hook-failed", "token-hook-handler-invalid"))
 _register_codes("ct_execution_error", "ct-execution", (
-    "ct-stack-underflow", "ct-argument-type", "ct-argument-invalid", "ct-index-out-of-range",
+    "ct-stack-underflow", "ct-stack-overflow", "ct-argument-type", "ct-argument-invalid", "ct-index-out-of-range",
     "ct-collection-empty", "ct-map-key-invalid", "ct-map-immutable", "ct-word-unavailable",
     "ct-runtime-only-target", "ct-word-failed", "ct-control-flow-invalid", "ct-loop-index-unavailable",
     "ct-asm-failed", "ct-jit-failed", "ct-extern-unavailable", "extern-type-invalid", "ct-runtime-call-invalid",
@@ -777,7 +778,8 @@ class Diagnostic:
         help_lines: List[str] = []
         if self.suggestion:
             help_lines.extend(self._split_nonempty_lines(self.suggestion))
-        help_lines.extend(self.helps)
+        # A code's default help can repeat the suggestion; show each once.
+        help_lines.extend(h for h in self.helps if h not in help_lines)
 
         if self.path and self.line > 0:
             loc = f"{self.path}:{self.line}"
@@ -1490,7 +1492,7 @@ def _quotation_escape_error(token: "Token") -> Optional["ParseError"]:
     if lexeme == "\\`" or lexeme == "\\\\" or (lexeme.startswith("\\$") and len(lexeme) > 2):
         return None
     return ParseError(
-        f"invalid escape '{lexeme}' in quotation at {token.line}:{token.column}; "
+        f"invalid escape '{lexeme}' in quotation at {token.line}:{token.column + 1}; "
         "only \\$name, \\` and \\\\ are allowed",
         code="syntax-escape-invalid",
     )
@@ -2163,29 +2165,85 @@ def _asm_raw_body_end(source: str, pos: int) -> int:
     return -1
 
 
-class _AsmHeaderTracker:
-    """Recognizes `:asm <name> [( effects )] {` in a token stream; `feed`
-    returns True on the `{` that opens a raw assembly body."""
+def _py_raw_body_end(source: str, pos: int) -> int:
+    """Index of the `}` that closes a `:py` body starting at `pos`, or -1.
+    The body is raw Python: `#` comments run to the end of the line, string
+    literals (including triple-quoted ones) to their closing quote, and
+    nested braces must balance, so a dict or set literal, an f-string, or a
+    quote inside the body neither closes it nor confuses the lexer."""
+    n = len(source)
+    i = pos
+    depth = 0
+    find = source.find
+    while i < n:
+        ch = source[i]
+        if ch == "}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif ch == "{":
+            depth += 1
+        elif ch == "#":
+            nl = find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        elif ch == "'" or ch == '"':
+            if source.startswith(ch * 3, i):
+                close = find(ch * 3, i + 3)
+                while close != -1 and _odd_backslashes_before(source, close, i + 3):
+                    close = find(ch * 3, close + 1)
+                i = n if close == -1 else close + 3
+                continue
+            j = i + 1
+            while j < n and source[j] != ch and source[j] != "\n":
+                j += 2 if source[j] == "\\" else 1
+            i = j + 1 if j < n and source[j] == ch else j
+            continue
+        i += 1
+    return -1
 
-    __slots__ = ('state',)
+
+def _odd_backslashes_before(source: str, index: int, floor: int) -> bool:
+    """Whether the character at `index` is escaped by an odd run of
+    backslashes that starts at or after `floor`."""
+    count = 0
+    index -= 1
+    while index >= floor and source[index] == "\\":
+        count += 1
+        index -= 1
+    return count % 2 == 1
+
+
+class _AsmHeaderTracker:
+    """Recognizes `:asm <name> [( effects )] {` and `:py <name> {` in a
+    token stream; `feed` returns True on the `{` that opens a raw body, and
+    `kind` then tells which header it closed (":asm" or ":py")."""
+
+    __slots__ = ('state', 'kind')
 
     def __init__(self) -> None:
         self.state = 0
+        self.kind = ""
 
     def feed(self, lexeme: str) -> bool:
         state = self.state
         if state == 0:
-            if lexeme == ":asm":
+            if lexeme == ":asm" or lexeme == ":py":
+                self.kind = lexeme
                 self.state = 1
             return False
         if state == 1:
             self.state = 2
             return False
         if state == 2:
-            if lexeme == "(":
+            if lexeme == "(" and self.kind == ":asm":
                 self.state = 3
                 return False
-            self.state = 1 if lexeme == ":asm" else 0
+            if lexeme == ":asm" or lexeme == ":py":
+                self.kind = lexeme
+                self.state = 1
+                return False
+            self.state = 0
             return lexeme == "{"
         if lexeme == ")":
             self.state = 2
@@ -2277,7 +2335,12 @@ class Reader:
         _READER_REGEX_CACHE[cache_key] = compiled
         return compiled
 
-    def _check_literal(self, text: str, start: int, end: int, origin_at: Callable[[int, int], SourceOrigin]) -> None:
+    def _check_literal(self, text: str, start: int, end: int, origin_at: Callable[[int, int], SourceOrigin],
+                       multiline_string: Optional[Tuple[int, int]] = None) -> None:
+        """Validate a string or character literal token.  `multiline_string`
+        is the span of the latest earlier string literal that crossed a line
+        break: a stray quote there is the usual cause of an unterminated
+        string reported further down, so the error points at it too."""
         first = text[start]
         # Closed iff the match ends with the opening quote character and
         # that quote is not escaped (an even run of backslashes before it).
@@ -2291,8 +2354,14 @@ class Reader:
             closed = backslashes % 2 == 0
         if first == '"':
             if not closed:
-                raise _lexer_error("lexer-unterminated-string", "unterminated string literal",
-                                   origin_at(start, len(text)))
+                related: List[Tuple[str, Optional[str], SourceOrigin]] = []
+                if multiline_string is not None:
+                    prev_start, prev_end = multiline_string
+                    prev_origin = origin_at(prev_start, prev_end)
+                    related.append(("note", f"the string literal opened here runs to line {prev_origin.end_line}; "
+                                    "check it for a stray '\"'", origin_at(prev_start, prev_start + 1)))
+                raise ParseError("unterminated string literal", code="lexer-unterminated-string",
+                                 origin=origin_at(start, len(text)), related=related)
             return
         if not closed:
             raise _lexer_error("lexer-unterminated-char", "unterminated character literal",
@@ -2342,6 +2411,7 @@ class Reader:
         _asm_feed = asm_header.feed
         in_quotation = False
         quoted_asm = False  # inside an `:asm` body written in a quotation
+        multiline_string: Optional[Tuple[int, int]] = None
         scan_from = 0
         while True:
             raw_start = -1
@@ -2369,7 +2439,7 @@ class Reader:
                     _append(tok)
                     if asm_header.state and _asm_feed(lexeme):
                         if in_quotation:
-                            quoted_asm = True
+                            quoted_asm = asm_header.kind == ":asm"
                         else:
                             raw_start = end
                             break
@@ -2384,7 +2454,9 @@ class Reader:
                         end = len(source)
                     resume_at = end
                 elif fc == '"' or fc == "'":
-                    self._check_literal(source, start, end, origin_at)
+                    self._check_literal(source, start, end, origin_at, multiline_string)
+                    if fc == '"' and source.find('\n', start, end) >= 0:
+                        multiline_string = (start, end)
                 # Advance line index to find the correct line for this position
                 while start >= _next_line_start:
                     _cur_li += 1
@@ -2411,7 +2483,7 @@ class Reader:
                         quoted_asm = False
                 elif (fc == ':' or fc == '{' or asm_header.state) and _asm_feed(lexeme):
                     if in_quotation:
-                        quoted_asm = True
+                        quoted_asm = asm_header.kind == ":asm"
                     else:
                         raw_start = end
                         break
@@ -2420,7 +2492,10 @@ class Reader:
                 continue
             if raw_start < 0:
                 break
-            close = _asm_raw_body_end(source, raw_start)
+            if asm_header.kind == ":py":
+                close = _py_raw_body_end(source, raw_start)
+            else:
+                close = _asm_raw_body_end(source, raw_start)
             if close < 0:
                 scan_from = raw_start  # unterminated: the parser reports the missing '}'
                 continue
@@ -2468,6 +2543,7 @@ class Reader:
         asm_header = _AsmHeaderTracker()
         in_quotation = False
         quoted_asm = False
+        multiline_string: Optional[Tuple[int, int]] = None
         scan_from = 0
         while True:
             raw_start = -1
@@ -2483,7 +2559,9 @@ class Reader:
                         end = len(text)
                     resume_at = end
                 elif fc == '"' or fc == "'":
-                    self._check_literal(text, start, end, origin_at)
+                    self._check_literal(text, start, end, origin_at, multiline_string)
+                    if fc == '"' and ('\n' in text[start:end] or '\r' in text[start:end]):
+                        multiline_string = (start, end)
                 origin = origin_at(start, end)
                 lexeme = text[start:end]
                 result.append(Token(lexeme, origin.start_line, origin.start_column - 1, start, end,
@@ -2498,7 +2576,7 @@ class Reader:
                         quoted_asm = False
                 elif asm_header.feed(lexeme):
                     if in_quotation:
-                        quoted_asm = True
+                        quoted_asm = asm_header.kind == ":asm"
                     else:
                         raw_start = end
                         break
@@ -2507,7 +2585,10 @@ class Reader:
                 continue
             if raw_start < 0:
                 break
-            close = _asm_raw_body_end(text, raw_start)
+            if asm_header.kind == ":py":
+                close = _py_raw_body_end(text, raw_start)
+            else:
+                close = _asm_raw_body_end(text, raw_start)
             if close < 0:
                 scan_from = raw_start
                 continue
@@ -2746,6 +2827,18 @@ _PEEPHOLE_SHIFT_OPS = frozenset({"shl", "shr", "sar"})
 _DEFAULT_CONTROL_WORDS = frozenset({"if", "else", "for", "while", "do", "begin", "again", "break", "continue", "match"})
 # Control frames that are loops (targets of break/continue).
 _LOOP_FRAME_TYPES = frozenset({"for", "while", "begin"})
+# Keywords that start a top-level definition (a scan for the end of the
+# current definition stops at one of these in column 0).
+_DEFINITION_START_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "inline"})
+# A decimal integer with leading zeros, which int(..., 0) rejects (it would
+# be octal in C).
+_LEADING_ZERO_INT_RE = re.compile(r"[+-]?0+[1-9][0-9_]*")
+# Top-level forms that error recovery resumes at.
+_RECOVERY_RESUME_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "macro", "const", "import",
+                                       "inline", "preserve", "priority"})
+# The keyword that opens each built-in control frame type, for messages.
+_CONTROL_FRAME_OPENERS = {"if": "if", "else": "else", "for": "for", "while_open": "while", "while": "do",
+                          "begin": "begin", "match": "match", "list": "["}
 
 _PARSE_PRIORITY_KEYWORDS = frozenset({"word", ":asm", ":py", "extern", "inline", "preserve", "priority", "macro",
                                       "const"})
@@ -3667,7 +3760,7 @@ def _macro_preview(parser: "Parser", name: str, trigger: "Token", output: Sequen
         preview = preview[:237] + "..."
     origin = parser._token_origin(trigger)
     where = (f"{origin.path}:{origin.start_line}:{origin.start_column}" if origin is not None
-             else f"{trigger.line}:{trigger.column}")
+             else f"{trigger.line}:{trigger.column + 1}")
     sys.stderr.write(f"[macro-preview] {name} at {where}\n  expand: {preview}\n")
 
 
@@ -3699,7 +3792,7 @@ def _rewrite_preview(parser: "Parser", rule: RewriteRule, token: "Token", replac
     else:
         path = None
         line = token.line
-        where = f"{token.line}:{token.column}"
+        where = f"{token.line}:{token.column + 1}"
         src_lines = parser.source.splitlines()
     line_start = max(1, line - 2)
     line_end = min(len(src_lines), line + 2) if src_lines else line + 2
@@ -5004,7 +5097,7 @@ class Parser:
             ctype = top.get("type")
             if ctype:
                 if "line" in top and "column" in top:
-                    notes.append(f"inside '{ctype}' block opened at {top['line']}:{top['column']}")
+                    notes.append(f"inside '{ctype}' block opened at {top['line']}:{top['column'] + 1}")
                 else:
                     notes.append(f"inside '{ctype}' block")
         if token is not None and int(getattr(token, "expansion_depth", 0)) > 0:
@@ -5126,32 +5219,46 @@ class Parser:
         )
 
     def _skip_to_recovery_point(self) -> None:
-        """Skip tokens until we reach a safe recovery point (end, ;, or top-level definition keyword)."""
-        _recovery_keywords = {"word", "end", ";", ":asm", ":py", "extern", "macro"}
-        depth = 0
-        while self.pos < len(self.tokens):
-            lex = self.tokens[self.pos].lexeme
-            if lex == "word" or lex == ":asm" or lex == ":py":
-                if depth == 0:
-                    break  # Don't consume — let the main loop pick it up
-                depth += 1
-            elif lex == "end":
-                if depth <= 1:
+        """After an unrecovered error, skip to a safe point to resume.
+
+        Inside a word definition that is the end of the definition: an `end`
+        in column 0, or the next top-level form (a definition keyword outside
+        a quotation), whichever comes first.  Inner blocks are not counted, so
+        an `end` that closes an `if` cannot end the skip early and leave the
+        rest of the body to be parsed as top-level code.  Inside a macro
+        body it is the terminating `;`, and at top level the next `;`,
+        `end`, or definition keyword."""
+        tokens = self.tokens
+        ctx = self.context_stack[-1] if self.context_stack else None
+        in_word = isinstance(ctx, Definition) and ctx.terminator == "end"
+        in_macro = bool(self._macro_body_stack)
+        in_quotation = False
+        while self.pos < len(tokens):
+            tok = tokens[self.pos]
+            lex = tok.lexeme
+            if lex == "`":
+                in_quotation = not in_quotation
+            elif in_quotation:
+                pass  # quoted code is data, not the program's structure
+            elif lex in _RECOVERY_RESUME_KEYWORDS:
+                break  # Don't consume: the main loop picks the next form up
+            elif in_word:
+                if lex == "end" and tok.column == 0:
                     self.pos += 1
                     break
-                depth -= 1
-            elif lex == ";":
+            elif lex == ";" or (lex == "end" and not in_macro):
                 self.pos += 1
                 break
-            elif lex == "extern" and depth == 0:
-                break
             self.pos += 1
+        if self.pos > 0 and self.pos <= len(tokens):
+            self._last_token = tokens[self.pos - 1]
         # Reset state for recovery
-        if self._macro_body_stack:
-            del self._binding_scopes[-len(self._macro_body_stack):]
-            self._macro_body_stack.clear()
+        self._macro_body_stack.clear()
+        self._binding_scopes.clear()
         self._pending_priority = None
         self._pending_inline_definition = False
+        self._pending_preserve_definition = False
+        self._emit_anchor = None
         while self.definition_stack:
             self.definition_stack.pop()
         while len(self.context_stack) > 1:
@@ -5630,6 +5737,12 @@ class Parser:
         entry = self.control_stack[-1]
         if isinstance(entry, dict) and entry.get("type") == "begin":
             raise ParseError("'begin' loops close with 'again', not 'end'", code="parser-control-mismatch")
+        if isinstance(entry, dict) and entry.get("type") == "while_open":
+            raise ParseError("'while' loop has no 'do': write 'while <condition> do <body> end'",
+                             code="parser-control-mismatch")
+        if isinstance(entry, dict) and entry.get("type") == "list":
+            raise ParseError("'end' inside an unclosed '[' list literal (missing ']')",
+                             code="parser-control-mismatch")
         if isinstance(entry, dict) and entry.get("type") == "match":
             self._finish_match()
             return
@@ -5652,26 +5765,75 @@ class Parser:
         for node in staged:
             self._append_op(node)
 
-    def _count_remaining_end_tokens(self, start_index: int) -> int:
-        count = 0
-        idx = start_index
+    def _free_end_count(self, start_index: int) -> int:
+        """Number of `end` tokens from `start_index` on that close blocks
+        opened before `start_index`: ends of blocks opened inside the scanned
+        range are matched to their openers and not counted.  The scan stops
+        at the next top-level definition (a definition keyword in column 0)
+        while inside a definition, at the `;` ending a macro body, and at the
+        end of input; quotations are skipped.  An `if` on the same line as
+        the preceding `else` continues that else-chain and opens nothing."""
         toks = self.tokens
         n = len(toks)
-        in_definition = bool(self.context_stack and isinstance(self.context_stack[-1], Definition))
-        definition_starters = {"word", ":asm", ":py", "extern", "inline"}
+        ctx = self.context_stack[-1] if self.context_stack else None
+        in_definition = isinstance(ctx, Definition)
+        in_macro = in_definition and ctx.terminator == ";"
+        openers = self.block_openers - {"begin"}
+        free = 0
+        depth = 0
+        else_line = -1
+        idx = start_index
         while idx < n:
             tok = toks[idx]
-            if (
-                in_definition
-                and idx > start_index
-                and tok.column == 0
-                and tok.lexeme in definition_starters
-            ):
+            lexeme = tok.lexeme
+            if lexeme == "`":
+                close = idx + 1
+                while close < n and toks[close].lexeme != "`":
+                    close += 1
+                idx = close + 1
+                continue
+            if in_definition and tok.column == 0 and lexeme in _DEFINITION_START_KEYWORDS:
                 break
-            if tok.lexeme == "end":
-                count += 1
+            if lexeme == "end":
+                if depth:
+                    depth -= 1
+                else:
+                    free += 1
+            elif lexeme == "if":
+                if else_line != tok.line:
+                    depth += 1
+            elif lexeme == "else":
+                else_line = tok.line
+            elif lexeme == "match" or lexeme in openers:
+                depth += 1
+            elif lexeme == ";" and in_macro and depth == 0:
+                break
             idx += 1
-        return count
+        return free
+
+    def _unmerge_else_chain(self, levels: int) -> None:
+        """Split `levels` enclosing `else` frames back out of the innermost
+        frame of an `else ... if` chain (see _handle_builtin_if), so that
+        explicit `end`s close them one at a time.  All levels share one end
+        label, emitted by the outermost split-off frame."""
+        top = self.control_stack[-1]
+        end_label = top["end"]
+        chain = top.get("chain", 0)
+        top["close_ops"] = [op for op in top["close_ops"]
+                            if not (op.get("op") == "label" and op.get("data") == end_label)]
+        top["chain"] = 0
+        split: List[Dict[str, Any]] = []
+        for index in range(levels):
+            outermost = index == 0
+            split.append({
+                "type": "else",
+                "end": end_label,
+                "chain": chain - levels if outermost else 0,
+                "close_ops": [{"op": "label", "data": end_label}] if outermost else [],
+                "line": None,
+                "column": None,
+            })
+        self.control_stack[-1:-1] = split
 
     def _auto_close_if_else_frames(self, limit: int) -> int:
         """Implicitly close up to `limit` trailing if/else control frames."""
@@ -5689,37 +5851,49 @@ class Parser:
 
         If explicit `end` tokens are fewer than currently open control frames,
         trailing `if`/`else` frames are implicitly closed first so legacy and
-        shorthand-heavy styles can coexist.
+        shorthand-heavy styles can coexist.  Conversely, an `else ... if`
+        chain written on one line shares a single `end`, unless more `end`s
+        follow than the other open blocks need: then the chain is nested
+        blocks closed one `end` each (`if a else b if c end end`).
         """
         if not self.control_stack:
-            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}", code="parser-unexpected-end")
+            raise ParseError(f"unexpected 'end' at {token.line}:{token.column + 1}", code="parser-unexpected-end")
+
+        ctx = self.context_stack[-1] if self.context_stack else None
+        # A word definition keeps one later `end` for itself (a macro body
+        # ends with `;`).
+        in_definition = isinstance(ctx, Definition) and ctx.terminator == "end"
+        # `begin` frames close with `again`, not `end`.
+        open_controls = sum(1 for entry in self.control_stack
+                            if not (isinstance(entry, dict) and entry.get("type") == "begin"))
+        top = self.control_stack[-1]
+        chain = top.get("chain", 0) if isinstance(top, dict) else 0
+        free_after: Optional[int] = None
+        if chain:
+            free_after = self._free_end_count(self.pos)
+            surplus = free_after - (1 if in_definition else 0) - (open_controls - 1)
+            if surplus > 0:
+                levels = min(surplus, chain)
+                self._unmerge_else_chain(levels)
+                open_controls += levels
 
         # Common case: one open control frame, so this `end` must close it.
         if len(self.control_stack) == 1:
             self._handle_end_control()
             return
 
-        current_end_index = self.pos - 1
-        remaining_ends = self._count_remaining_end_tokens(current_end_index)
-        reserved_definition_end = 0
-        if self.context_stack and isinstance(self.context_stack[-1], Definition):
-            reserved_definition_end = 1
-        if reserved_definition_end > 0:
-            remaining_ends = max(0, remaining_ends - reserved_definition_end)
-        # `begin` frames close with `again`, not `end`.
-        open_controls = sum(1 for entry in self.control_stack
-                            if not (isinstance(entry, dict) and entry.get("type") == "begin"))
-        if remaining_ends < open_controls:
-            needed_implicit = open_controls - remaining_ends
-            # The current `end` must still close one active control frame.
-            # Never consume all open controls via implicit closure.
-            max_implicit = max(0, open_controls - 1)
-            if needed_implicit > max_implicit:
-                needed_implicit = max_implicit
-            self._auto_close_if_else_frames(needed_implicit)
+        if free_after is None:
+            free_after = self._free_end_count(self.pos)
+        # Ends still to come for the open frames below the one this `end`
+        # closes (the definition keeps its own `end`).
+        later_ends = max(0, free_after - (1 if in_definition else 0))
+        if later_ends < open_controls - 1:
+            # Never consume all open controls via implicit closure: the
+            # current `end` must still close one.
+            self._auto_close_if_else_frames(open_controls - 1 - later_ends)
 
         if not self.control_stack:
-            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}", code="parser-unexpected-end")
+            raise ParseError(f"unexpected 'end' at {token.line}:{token.column + 1}", code="parser-unexpected-end")
 
         self._handle_end_control()
 
@@ -5878,7 +6052,7 @@ class Parser:
                         elif _try_end_definition(token):
                             pass
                         else:
-                            raise ParseError(f"unexpected 'end' at {token.line}:{token.column}", code="parser-unexpected-end")
+                            raise ParseError(f"unexpected 'end' at {token.line}:{token.column + 1}", code="parser-unexpected-end")
                     elif kw == _PARSE_KW_ASM:
                         _parse_asm_definition(token)
                         _tokens = self.tokens
@@ -5948,7 +6122,7 @@ class Parser:
                 ) from None
             loc = self.location_for_token(tok)
             raise ParseError(
-                f"unexpected error near '{tok.lexeme}' at {tok.line}:{tok.column}: {exc}",
+                f"unexpected error near '{tok.lexeme}' at {tok.line}:{tok.column + 1}: {exc}",
                 path=loc.path,
                 line=loc.line,
                 column=loc.column,
@@ -6031,14 +6205,14 @@ class Parser:
         values: List[int] = []
         while True:
             if self._eof():
-                raise ParseError(f"missing '}}' for '{{' opened at {token.line}:{token.column}", code="parser-bss-list-invalid")
+                raise ParseError(f"missing '}}' for '{{' opened at {token.line}:{token.column + 1}", code="parser-bss-list-invalid")
             cur = self._consume()
             if cur.lexeme == "}":
                 break
             parsed = _parse_int_or_char_literal(cur)
             if parsed is None:
                 raise ParseError(
-                    f"only int/char literals are allowed in '{{}}' lists; got '{cur.lexeme}' at {cur.line}:{cur.column}",
+                    f"only int/char literals are allowed in '{{}}' lists; got '{cur.lexeme}' at {cur.line}:{cur.column + 1}",
                     code="parser-bss-list-invalid",
                 )
             values.append(parsed)
@@ -6046,15 +6220,15 @@ class Parser:
         list_size = len(values)
         if not self._eof():
             peek = self.peek_token()
-            if peek is not None and peek.lexeme.startswith(":"):
+            if peek is not None and peek.lexeme.startswith(":") and peek.lexeme not in _PARSE_KEYWORD_DISPATCH:
                 size_tok = self._consume()
                 raw = size_tok.lexeme[1:]
                 if not raw:
-                    raise ParseError(f"missing size after ':' at {size_tok.line}:{size_tok.column}", code="parser-bss-list-invalid")
+                    raise ParseError(f"missing size after ':' at {size_tok.line}:{size_tok.column + 1}", code="parser-bss-list-invalid")
                 try:
                     list_size = int(raw, 0)
                 except ValueError:
-                    raise ParseError(f"invalid bss list size '{size_tok.lexeme}' at {size_tok.line}:{size_tok.column}", code="parser-bss-list-invalid")
+                    raise ParseError(f"invalid bss list size '{size_tok.lexeme}' at {size_tok.line}:{size_tok.column + 1}", code="parser-bss-list-invalid")
                 if list_size < 0:
                     raise ParseError("bss list size must be >= 0", code="parser-bss-list-invalid")
                 if len(values) > list_size:
@@ -6131,6 +6305,10 @@ class Parser:
                 and isinstance(top.get("line"), int)
                 and top["line"] == token.line
             ):
+                # `else <cond> if` on one line continues an else-chain: the
+                # new `if` replaces the `else` frame and shares its end label
+                # (`chain` counts the else frames it stands in for; see
+                # _handle_flexible_end for when they are split back out).
                 prev_else = self._pop_control(("else",))
                 shared_end = prev_else.get("end")
                 if not isinstance(shared_end, str):
@@ -6142,6 +6320,7 @@ class Parser:
                         "type": "if",
                         "false": false_label,
                         "end": shared_end,
+                        "chain": prev_else.get("chain", 0) + 1,
                         "close_ops": [
                             {"op": "label", "data": false_label},
                             {"op": "label", "data": shared_end},
@@ -6179,6 +6358,7 @@ class Parser:
             {
                 "type": "else",
                 "end": end_label,
+                "chain": entry.get("chain", 0),
                 "close_ops": [{"op": "label", "data": end_label}],
                 "line": token.line,
                 "column": token.column,
@@ -6263,7 +6443,7 @@ class Parser:
                                   origin.start_column, last_origin.end_line, last_origin.end_column)
         raise ParseError(
             f"unterminated quotation: no closing backtick before end of input "
-            f"(opened at {open_token.line}:{open_token.column})",
+            f"(opened at {open_token.line}:{open_token.column + 1})",
             code="syntax-unterminated-quotation",
             origin=origin,
         )
@@ -6306,7 +6486,7 @@ class Parser:
             marker = tokens[index]
             close = _unquote_close(tokens, index + 1, end_index)
             if close < 0:
-                raise ParseError(f"unterminated '$(' in quotation at {marker.line}:{marker.column}",
+                raise ParseError(f"unterminated '$(' in quotation at {marker.line}:{marker.column + 1}",
                                  code="syntax-splice-invalid")
             begin = _derive_token(marker, _UNQUOTE_BEGIN)
             end = _derive_token(tokens[close], _UNQUOTE_END)
@@ -6365,7 +6545,7 @@ class Parser:
                 if lexeme == ")":
                     break
                 if not _is_l2_identifier(lexeme):
-                    raise ParseError(f"invalid macro parameter name '{lexeme}' in macro '{name}' at {tok.line}:{tok.column}",
+                    raise ParseError(f"invalid macro parameter name '{lexeme}' in macro '{name}' at {tok.line}:{tok.column + 1}",
                                      code="macro-signature-invalid")
                 if self._reserved_binding_name(lexeme):
                     raise ParseError(f"'{lexeme}' is a reserved word and cannot be a parameter of macro '{name}'",
@@ -6435,7 +6615,8 @@ class Parser:
         name_token = self.tokens[self.pos]
         value_token = self.tokens[self.pos + 1]
         name = name_token.lexeme
-        if not _is_l2_identifier(name.replace(".", "_")) or name in _PARSE_KEYWORD_DISPATCH:
+        if (not _is_l2_identifier(name.replace(".", "_")) or name in _PARSE_KEYWORD_DISPATCH
+                or name in _DEFAULT_CONTROL_WORDS):
             raise ParseError(f"invalid const name '{name}'", code="definition-const-invalid")
         if value_token.lexeme in ("`", ";") or value_token.lexeme in _PARSE_KEYWORD_DISPATCH:
             raise ParseError(f"const '{name}' needs a single-token value, got '{value_token.lexeme}'",
@@ -6617,7 +6798,7 @@ class Parser:
         return name in _RESERVED_BINDING_WORDS or name in self.block_openers
 
     def _match_pattern_error(self, token: Token, message: str) -> ParseError:
-        return ParseError(f"{message} at {token.line}:{token.column}", code="match-pattern-invalid",
+        return ParseError(f"{message} at {token.line}:{token.column + 1}", code="match-pattern-invalid",
                           origin=self._token_origin(token))
 
     def _match_header_end(self, open_index: int) -> Optional[int]:
@@ -6731,7 +6912,7 @@ class Parser:
         self._push_control(frame)
         arrow = self._match_header_end(self.pos) if self.pos < len(self.tokens) and self.tokens[self.pos].lexeme == "[" else None
         if arrow is None:
-            raise ParseError(f"'match' must be followed by a '[pattern] =>' clause at {token.line}:{token.column}",
+            raise ParseError(f"'match' must be followed by a '[pattern] =>' clause at {token.line}:{token.column + 1}",
                              code="match-pattern-invalid")
         self._start_match_clause(frame, self.pos, arrow)
 
@@ -6819,7 +7000,7 @@ class Parser:
             elif lexeme.startswith("\\$") and len(lexeme) > 2:
                 tokens.append(_derive_token(token, lexeme[1:]))
             elif lexeme[0] == "\\":
-                raise ParseError(f"invalid escape '{lexeme}' in quotation at {token.line}:{token.column}",
+                raise ParseError(f"invalid escape '{lexeme}' in quotation at {token.line}:{token.column + 1}",
                                  code="syntax-escape-invalid")
             else:
                 tokens.append(token)
@@ -6856,7 +7037,7 @@ class Parser:
             if isinstance(entry, dict) and entry.get("type") == "match":
                 crossed_matches += 1
         if frame is None:
-            raise ParseError(f"'{token.lexeme}' outside a loop at {token.line}:{token.column}",
+            raise ParseError(f"'{token.lexeme}' outside a loop at {token.line}:{token.column + 1}",
                              code="parser-loop-control-outside-loop")
         # Leaving match clauses restores their enclosing bindings first.
         for _ in range(crossed_matches):
@@ -6885,13 +7066,13 @@ class Parser:
 
     def _parse_priority_directive(self, token: Token) -> None:
         if self._eof():
-            raise ParseError(f"priority value missing at {token.line}:{token.column}", code="parser-priority-invalid")
+            raise ParseError(f"priority value missing at {token.line}:{token.column + 1}", code="parser-priority-invalid")
         value_tok = self._consume()
         try:
             value = int(value_tok.lexeme, 0)
         except ValueError:
             raise ParseError(
-                f"invalid priority '{value_tok.lexeme}' at {value_tok.line}:{value_tok.column}",
+                f"invalid priority '{value_tok.lexeme}' at {value_tok.line}:{value_tok.column + 1}",
                 code="parser-priority-invalid",
             )
         self._pending_priority = value
@@ -6914,7 +7095,7 @@ class Parser:
         # extern <ret_type> <name>(<args>)
 
         if self._eof():
-            raise ParseError(f"extern missing name at {token.line}:{token.column}", code="parser-extern-invalid")
+            raise ParseError(f"extern missing name at {token.line}:{token.column + 1}", code="parser-extern-invalid")
 
         priority = self._consume_pending_priority(default=self.EXTERN_DEFAULT_PRIORITY)
         self._extern_start_token = token
@@ -6934,10 +7115,10 @@ class Parser:
         word = Word(name=name_token.lexeme, priority=priority)
         word.is_extern = True
         peek = self.peek_token()
-        if peek is not None and peek.lexeme.isdigit():
+        if peek is not None and peek.lexeme.isascii() and peek.lexeme.isdigit():
             word.extern_inputs = int(self._consume().lexeme)
             peek = self.peek_token()
-            if peek is not None and peek.lexeme.isdigit():
+            if peek is not None and peek.lexeme.isascii() and peek.lexeme.isdigit():
                 word.extern_outputs = int(self._consume().lexeme)
             else:
                 word.extern_outputs = 0
@@ -6957,7 +7138,11 @@ class Parser:
             lookahead = self._consume()
             if lookahead.lexeme == "(":
                 break
-            if lookahead.lexeme.isdigit():
+            if not _c_type_prefix_token(lookahead.lexeme):
+                # A count, a keyword, or anything else that cannot be part
+                # of a C return type or name: this is a legacy declaration
+                # (`extern name [inputs outputs]`), so the C form must not
+                # read on into the declarations that follow it.
                 self.pos = saved_pos
                 return False
             prefix_tokens.append(lookahead.lexeme)
@@ -7108,7 +7293,7 @@ class Parser:
         if first == '&':
             target_name = lexeme[1:]
             if not target_name:
-                raise ParseError(f"missing word name after '&' at {token.line}:{token.column}", code="parser-word-pointer-invalid")
+                raise ParseError(f"missing word name after '&' at {token.line}:{token.column + 1}", code="parser-word-pointer-invalid")
             _append_op(_make_op("word_ptr", target_name))
             return False
 
@@ -7192,19 +7377,25 @@ class Parser:
         self.control_stack.append(entry)
 
     def _pop_control(self, expected: Tuple[str, ...]) -> Dict[str, str]:
+        """Pop the innermost control frame, which must have one of the
+        `expected` types.  On a mismatch the frame stays on the stack."""
+        tok = self._last_token
+        keyword = tok.lexeme if tok is not None else "control word"
+        wanted = " or ".join(f"'{_CONTROL_FRAME_OPENERS.get(kind, kind)}'" for kind in expected)
         if not self.control_stack:
-            raise ParseError("control stack underflow", code="parser-control-underflow")
-        entry = self.control_stack.pop()
-        if entry.get("type") not in expected:
-            tok = self._last_token
-            location = ""
-            if tok is not None:
-                location = f" at {tok.line}:{tok.column} near '{tok.lexeme}'"
-            origin = ""
-            if "line" in entry and "column" in entry:
-                origin = f" (opened at {entry['line']}:{entry['column']})"
-            raise ParseError(f"mismatched control word '{entry.get('type')}'" + origin + location, code="parser-control-mismatch")
-        return entry
+            raise ParseError(f"'{keyword}' without a matching {wanted}", code="parser-control-underflow")
+        entry = self.control_stack[-1]
+        kind = entry.get("type")
+        if kind not in expected:
+            opened = ""
+            if isinstance(entry.get("line"), int) and isinstance(entry.get("column"), int):
+                opened = f" (opened at {entry['line']}:{entry['column'] + 1})"
+            raise ParseError(
+                f"'{keyword}' needs an open {wanted}, but the innermost open block is "
+                f"'{_CONTROL_FRAME_OPENERS.get(kind, kind)}'{opened}",
+                code="parser-control-mismatch",
+            )
+        return self.control_stack.pop()
 
     def _new_label(self, prefix: str) -> str:
         label = f"L_{prefix}_{self.label_counter}"
@@ -7269,8 +7460,17 @@ class Parser:
                           preserve: bool = False) -> None:
         if self._eof():
             raise ParseError(
-                f"definition name missing after '{token.lexeme}' at {token.line}:{token.column}",
+                f"definition name missing after '{token.lexeme}' at {token.line}:{token.column + 1}",
                 code="parser-definition-name-missing",
+            )
+        enclosing = self.context_stack[-1] if self.context_stack else None
+        if isinstance(enclosing, Definition):
+            hint = (f"; is an 'end' missing before it, to close '{enclosing.name}'?"
+                    if enclosing.terminator == "end" else "")
+            raise ParseError(
+                f"'{token.lexeme}' inside the definition of '{enclosing.name}': nested definitions are not supported"
+                + hint,
+                code="parser-nested-definition",
             )
         name_token = self._consume()
         priority = self._consume_pending_priority()
@@ -7301,7 +7501,7 @@ class Parser:
 
     def _end_definition(self, token: Token) -> None:
         if len(self.context_stack) <= 1:
-            raise ParseError(f"unexpected '{token.lexeme}' at {token.line}:{token.column}", code="parser-definition-terminator")
+            raise ParseError(f"unexpected '{token.lexeme}' at {token.line}:{token.column + 1}", code="parser-definition-terminator")
         ctx = self.context_stack.pop()
         if not isinstance(ctx, Definition):
             raise ParseError(f"'{token.lexeme}' can only close definitions", code="parser-definition-terminator")
@@ -7363,7 +7563,7 @@ class Parser:
             canonical = _WORD_EFFECT_ALIASES.get(normalized)
             if canonical is None:
                 raise ParseError(
-                    f"unknown effect '{tok.lexeme}' at {tok.line}:{tok.column}",
+                    f"unknown effect '{tok.lexeme}' at {tok.line}:{tok.column + 1}",
                     code="parser-effect-clause-invalid",
                 )
             if canonical not in effect_names:
@@ -7374,7 +7574,7 @@ class Parser:
 
     def _parse_asm_definition(self, token: Token) -> None:
         if self._eof():
-            raise ParseError(f"definition name missing after ':asm' at {token.line}:{token.column}", code="parser-asm-invalid")
+            raise ParseError(f"definition name missing after ':asm' at {token.line}:{token.column + 1}", code="parser-asm-invalid")
         inline_def = self._consume_pending_inline()
         preserve_def = self._consume_pending_preserve()
         name_token = self._consume()
@@ -7383,9 +7583,11 @@ class Parser:
             next_token = self.peek_token()
             if next_token is not None and next_token.lexeme == "(":
                 effect_names = self._parse_effect_annotations()
+        if self._eof():
+            raise ParseError(f"expected '{{' after asm name '{name_token.lexeme}', got end of input", code="parser-asm-invalid")
         brace_token = self._consume()
         if brace_token.lexeme != "{":
-            raise ParseError(f"expected '{{' after asm name at {brace_token.line}:{brace_token.column}", code="parser-asm-invalid")
+            raise ParseError(f"expected '{{' after asm name at {brace_token.line}:{brace_token.column + 1}", code="parser-asm-invalid")
         block_start = brace_token.end
         block_end: Optional[int] = None
         body_tokens: List[Token] = []
@@ -7448,7 +7650,7 @@ class Parser:
             raise ParseError("asm definition missing terminator ';'", code="parser-asm-invalid")
         terminator = self._consume()
         if terminator.lexeme != ";":
-            raise ParseError(f"expected ';' after asm definition at {terminator.line}:{terminator.column}", code="parser-asm-invalid")
+            raise ParseError(f"expected ';' after asm definition at {terminator.line}:{terminator.column + 1}", code="parser-asm-invalid")
         candidate.source_text = self._declaration_source(token, terminator)
         changes: List[Dict[str, Any]] = []
         word = self._commit_source_candidate(candidate, changes)
@@ -7460,11 +7662,13 @@ class Parser:
 
     def _parse_py_definition(self, token: Token) -> None:
         if self._eof():
-            raise ParseError(f"definition name missing after ':py' at {token.line}:{token.column}", code="parser-py-invalid")
+            raise ParseError(f"definition name missing after ':py' at {token.line}:{token.column + 1}", code="parser-py-invalid")
         name_token = self._consume()
+        if self._eof():
+            raise ParseError(f"expected '{{' after py name '{name_token.lexeme}', got end of input", code="parser-py-invalid")
         brace_token = self._consume()
         if brace_token.lexeme != "{":
-            raise ParseError(f"expected '{{' after py name at {brace_token.line}:{brace_token.column}", code="parser-py-invalid")
+            raise ParseError(f"expected '{{' after py name at {brace_token.line}:{brace_token.column + 1}", code="parser-py-invalid")
         block_start = brace_token.end
         block_end: Optional[int] = None
         _tokens = self.tokens
@@ -7505,7 +7709,7 @@ class Parser:
             raise ParseError("py definition missing terminator ';'", code="parser-py-invalid")
         terminator = self._consume()
         if terminator.lexeme != ";":
-            raise ParseError(f"expected ';' after py definition at {terminator.line}:{terminator.column}", code="parser-py-invalid")
+            raise ParseError(f"expected ';' after py definition at {terminator.line}:{terminator.column + 1}", code="parser-py-invalid")
         word.source_text = self._declaration_source(token, terminator)
         self._commit_source_candidate(word)
 
@@ -7647,6 +7851,12 @@ class Parser:
 
         first = lexeme[0] if lexeme else '\0'
         if first.isdigit() or first == '-' or first == '+':
+            if _LEADING_ZERO_INT_RE.fullmatch(lexeme):
+                raise ParseError(
+                    f"integer literal '{lexeme}' has a leading zero; write it without the zeros, "
+                    f"or use 0o for octal",
+                    code="parser-literal-invalid",
+                )
             try:
                 value = int(lexeme, 0)
                 _PARSE_LITERAL_CACHE[lexeme] = value
@@ -7812,12 +8022,23 @@ class CTMemory:
             buf = ctypes.create_string_buffer(encoded, len(encoded))
             self._buffers.append(buf)
             argv_bufs.append(buf)
-        # pointer array (+ NULL sentinel)
-        arr_type = ctypes.c_int64 * (len(args) + 1)
+        # The environment follows argv's NULL, as Linux lays them out at
+        # process start (`envp` reads it from there).
+        env_bufs: List[Any] = []
+        for key, value in os.environb.items():
+            encoded = key + b"=" + value + b"\x00"
+            buf = ctypes.create_string_buffer(encoded, len(encoded))
+            self._buffers.append(buf)
+            env_bufs.append(buf)
+        # pointer array: argv, NULL, envp, NULL
+        arr_type = ctypes.c_int64 * (len(args) + len(env_bufs) + 2)
         self._sys_argv_ptrs = arr_type()
         for i, buf in enumerate(argv_bufs):
             self._sys_argv_ptrs[i] = ctypes.addressof(buf)
         self._sys_argv_ptrs[len(args)] = 0
+        for i, buf in enumerate(env_bufs):
+            self._sys_argv_ptrs[len(args) + 1 + i] = ctypes.addressof(buf)
+        self._sys_argv_ptrs[len(args) + 1 + len(env_bufs)] = 0
         self._buffers.append(self._sys_argv_ptrs)
         self._sys_argv.value = ctypes.addressof(self._sys_argv_ptrs)
 
@@ -8067,6 +8288,8 @@ class CompileTimeVM:
         self._ct_libs: List[str] = []  # library names from -l flags
         self._ct_source_embed_text: Optional[str] = None
         self._ct_source_embed_buf: Optional[Any] = None
+        self._ct_host_source_text: Optional[str] = None
+        self._ct_host_source_buf: Optional[Any] = None
         self._ctypes_struct_cache: Dict[str, Any] = {}
         self._in_fork_child: bool = False
         self.current_location: Optional[SourceLocation] = None
@@ -8078,6 +8301,11 @@ class CompileTimeVM:
         """Set expanded source text exposed to runtime eval bridges during ct-run-main."""
         self._ct_source_embed_text = source_text if source_text else None
         self._ct_source_embed_buf = None
+
+    def set_runtime_host_source(self, source_text: Optional[str]) -> None:
+        """Set the host program used as fallback source by runtime eval bridges."""
+        self._ct_host_source_text = source_text if source_text else None
+        self._ct_host_source_buf = None
 
     def _notify_eval_runtime_bridges(self) -> None:
         """Push stack/source bridge state into loaded eval runtime libraries if available."""
@@ -8097,7 +8325,9 @@ class CompileTimeVM:
                 except Exception:
                     continue
 
-        source_text = self._ct_source_embed_text
+        self._install_host_word_caller()
+
+        source_text = self._ct_host_source_text
         if not source_text:
             return
         source_bytes = source_text.encode("utf-8", errors="replace")
@@ -8105,8 +8335,8 @@ class CompileTimeVM:
             return
 
         # Keep the backing buffer alive for the invocation lifetime.
-        self._ct_source_embed_buf = ctypes.create_string_buffer(source_bytes + b"\0")
-        source_addr = ctypes.addressof(self._ct_source_embed_buf)
+        self._ct_host_source_buf = ctypes.create_string_buffer(source_bytes + b"\0")
+        source_addr = ctypes.addressof(self._ct_host_source_buf)
         source_len = len(source_bytes)
         for handle in self._dl_handles:
             setter = getattr(handle, "l2_set_embedded_source", None)
@@ -8118,6 +8348,65 @@ class CompileTimeVM:
                 setter(source_addr, source_len)
             except Exception:
                 continue
+
+    _HOST_WORD_CALLER_TYPE = None
+
+    def _install_host_word_caller(self) -> None:
+        """Let eval in libl2 run the program's own words in this VM.  A
+        compiled program gives libl2 their native addresses (l2_word_table);
+        here they exist only in this VM, with globals in its memory, so libl2
+        calls back with the word's name and its stack cells instead."""
+        if CompileTimeVM._HOST_WORD_CALLER_TYPE is None:
+            CompileTimeVM._HOST_WORD_CALLER_TYPE = ctypes.CFUNCTYPE(
+                ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
+        caller = getattr(self, "_host_word_caller_fn", None)
+        if caller is None:
+            caller = CompileTimeVM._HOST_WORD_CALLER_TYPE(self._host_word_call)
+            self._host_word_caller_fn = caller  # keep the thunk alive
+        for handle in self._dl_handles:
+            setter = getattr(handle, "l2_set_host_word_caller", None)
+            if setter is None:
+                continue
+            try:
+                setter.argtypes = [CompileTimeVM._HOST_WORD_CALLER_TYPE]
+                setter.restype = None
+                setter(caller)
+            except Exception:
+                continue
+
+    def _host_word_call(self, name_ptr: bytes, sp: int, top: int, capacity: int) -> int:
+        """libl2 callback: run word `name` on the cells [sp, top) of libl2's
+        stack and return its new stack pointer (0: no such word here).  The
+        cells move onto this VM's stack for the call and back afterwards.  An
+        error is kept for the caller of the extern to raise, and the cells are
+        then left as they were."""
+        if getattr(self, "_host_call_error", None) is not None:
+            return sp
+        word = self.dictionary.lookup(name_ptr.decode("utf-8", errors="replace"))
+        if word is None or not isinstance(word.definition, (Definition, AsmDefinition)):
+            return 0
+        cells = (top - sp) // 8
+        saved_r12 = self.r12
+        base = saved_r12 - cells * 8
+        try:
+            ctypes.memmove(base, sp, cells * 8)
+            self.r12 = base
+            self._call_word(word)
+            out_cells = (saved_r12 - self.r12) // 8
+            if self.r12 > saved_r12:
+                raise ParseError(f"eval: word '{word.name}' took more values than eval's stack holds",
+                                 code="ct-stack-underflow")
+            if out_cells > capacity // 2:
+                raise ParseError(f"eval: word '{word.name}' left more values than eval's stack holds",
+                                 code="ct-stack-overflow")
+            new_sp = top - out_cells * 8
+            ctypes.memmove(new_sp, self.r12, out_cells * 8)
+            return new_sp
+        except BaseException as exc:  # a ctypes callback must not raise
+            self._host_call_error = exc
+            return sp
+        finally:
+            self.r12 = saved_r12
 
     @property
     def memory(self) -> CTMemory:
@@ -9452,8 +9741,18 @@ class CompileTimeVM:
             # C extern words: call via dlopen/dlsym in runtime_mode
             if self.runtime_mode and getattr(word, "is_extern", False):
                 self._call_extern_ct(word)
+                host_error = getattr(self, "_host_call_error", None)
+                if host_error is not None:
+                    self._host_call_error = None
+                    raise host_error
                 return
             if definition is None:
+                if self.runtime_mode:
+                    baseline = self.dictionary.baselines.get(word.name)
+                    if (baseline is not None and baseline.compile_only
+                            and baseline.compile_time_intrinsic is not None):
+                        baseline.compile_time_intrinsic(self)
+                        return
                 raise ParseError(f"word '{word.name}' has no compile-time definition", code="ct-word-unavailable")
             if isinstance(definition, AsmDefinition):
                 if self.runtime_mode:
@@ -12613,6 +12912,20 @@ def _classify_struct_eightbytes(
     return classes
 
 
+# L2 keywords that end a C-style extern prefix (`const` stays: it is also C).
+_C_EXTERN_STOP_WORDS = frozenset({"word", "end", ":asm", ":py", "extern", "import", "priority", "macro",
+                                  "inline", "preserve", "ret"}) | _DEFAULT_CONTROL_WORDS
+
+
+def _c_type_prefix_token(lexeme: str) -> bool:
+    """Whether `lexeme` can be part of the return type and name before the
+    `(` of a C-style extern declaration (`unsigned`, `char*`, `*name`)."""
+    if not lexeme or lexeme in _C_EXTERN_STOP_WORDS:
+        return False
+    bare = lexeme.replace("*", "")
+    return bare == "" or _is_identifier(bare)
+
+
 def _split_trailing_identifier(text: str) -> Tuple[str, Optional[str]]:
     if not text:
         return text, None
@@ -12682,7 +12995,7 @@ def _parse_string_literal(token: Token) -> Optional[str]:
         idx += 1
         if idx >= len(body):
             raise ParseError(
-                f"unterminated escape sequence in string literal at {token.line}:{token.column}",
+                f"unterminated escape sequence in string literal at {token.line}:{token.column + 1}",
                 code="lexer-invalid-escape",
             )
         escape = body[idx]
@@ -12701,7 +13014,7 @@ def _parse_string_literal(token: Token) -> Optional[str]:
             result.append("\\")
         else:
             raise ParseError(
-                f"unsupported escape sequence '\\{escape}' in string literal at {token.line}:{token.column}",
+                f"unsupported escape sequence '\\{escape}' in string literal at {token.line}:{token.column + 1}",
                 code="lexer-invalid-escape",
             )
     return "".join(result)
@@ -12713,13 +13026,13 @@ def _parse_char_literal(token: Token) -> Optional[int]:
         return None
     body = text[1:-1]
     if not body:
-        raise ParseError(f"empty char literal at {token.line}:{token.column}", code="lexer-invalid-char-literal")
+        raise ParseError(f"empty char literal at {token.line}:{token.column + 1}", code="lexer-invalid-char-literal")
     if body[0] != "\\":
         if len(body) != 1:
-            raise ParseError(f"char literal must contain exactly one character at {token.line}:{token.column}", code="lexer-invalid-char-literal")
+            raise ParseError(f"char literal must contain exactly one character at {token.line}:{token.column + 1}", code="lexer-invalid-char-literal")
         return ord(body)
     if len(body) < 2:
-        raise ParseError(f"unterminated escape in char literal at {token.line}:{token.column}", code="lexer-invalid-escape")
+        raise ParseError(f"unterminated escape in char literal at {token.line}:{token.column + 1}", code="lexer-invalid-escape")
     esc = body[1:]
     if esc == "n":
         return ord("\n")
@@ -12740,7 +13053,7 @@ def _parse_char_literal(token: Token) -> Optional[int]:
             return int(esc[1:], 16)
         except ValueError:
             pass
-    raise ParseError(f"unsupported char escape '\\{esc}' at {token.line}:{token.column}", code="lexer-invalid-escape")
+    raise ParseError(f"unsupported char escape '\\{esc}' at {token.line}:{token.column + 1}", code="lexer-invalid-escape")
 
 
 def _parse_int_or_char_literal(token: Token) -> Optional[int]:
@@ -12817,6 +13130,10 @@ class Assembler:
         self.enable_peephole_optimization = enable_peephole_optimization
         self.enable_loop_unroll = enable_loop_unroll
         self.enable_auto_inline = enable_auto_inline
+        # --no-dce: emit every runtime definition, reachable from main or not.
+        self.enable_dce = True
+        # --word-table: emit `l2_word_table` (name -> native code address).
+        self.emit_word_table = False
         self.enable_string_deduplication = enable_string_deduplication
         self.enable_extern_type_check = enable_extern_type_check
         self.enable_stack_check = enable_stack_check
@@ -14054,13 +14371,13 @@ class Assembler:
 
             # --- Early DCE: compute reachable set before optimization passes
             # so we skip optimizing definitions that will be eliminated. ---
-            if is_program:
+            if is_program and self.enable_dce:
                 _early_rt = [d for d in definitions if not getattr(d, "compile_only", False)]
                 _early_reachable = self._reachable_runtime_defs(_early_rt)
                 # Also include inline defs that are referenced by reachable defs
                 # (they need optimization for correct inlining).
             else:
-                _early_reachable = None  # library mode: optimize everything
+                _early_reachable = None  # library mode or --no-dce: optimize everything
 
             if self.enable_loop_unroll:
                 if self.event_bus is not None:
@@ -14192,7 +14509,11 @@ class Assembler:
                 if asm_start is not None and asm_start not in runtime_defs:
                     runtime_defs.append(asm_start)
 
-                reachable = self._reachable_runtime_defs(runtime_defs, extra_roots=extra_roots)
+                if not self.enable_dce:
+                    # --no-dce: every runtime definition is emitted.
+                    reachable = {defn.name for defn in runtime_defs}
+                else:
+                    reachable = self._reachable_runtime_defs(runtime_defs, extra_roots=extra_roots)
                 if len(reachable) != len(runtime_defs):
                     eliminated = [defn.name for defn in runtime_defs if defn.name not in reachable]
                     _n_before_dce = len(runtime_defs)
@@ -14330,6 +14651,11 @@ class Assembler:
 
             if module.data and self._data_section is not None:
                 self._data_section.extend(module.data)
+            if self.emit_word_table:
+                self._ensure_data_start()
+                self._data_section.extend(_render_native_word_table(
+                    defn.name for defn in runtime_defs
+                    if defn.name != "_start" and not getattr(defn, "compile_only", False)))
 
             self._emit_variables(module.variables)
 
@@ -15405,8 +15731,6 @@ def macro_inline(ctx: MacroContext) -> Optional[List[Op]]:
 def macro_preserve(ctx: MacroContext) -> Optional[List[Op]]:
     parser = ctx.parser
     next_tok = parser.peek_token()
-    if not parser._pending_inline_definition:
-        raise ParseError("'preserve' must follow 'inline'", code="definition-modifier-invalid")
     if parser._pending_preserve_definition:
         raise ParseError("duplicate 'preserve' before definition", code="definition-modifier-invalid")
     if next_tok is None or next_tok.lexeme not in ("word", ":asm"):
@@ -15949,7 +16273,7 @@ def macro_with(ctx: MacroContext) -> Optional[List[Op]]:
             else_line = tok.line
         elif tok.lexeme == "again":
             depth -= 1  # closes a `begin`, which counted as an opener
-        elif tok.lexeme in parser.block_openers:
+        elif tok.lexeme == "match" or tok.lexeme in parser.block_openers:
             depth += 1
         body.append(tok)
 
@@ -17490,8 +17814,6 @@ def _apply_definition_flags(word: str, candidate: Word, flags: Dict[str, bool]) 
     if merged["runtime-only"] and candidate.prefer_l2:
         raise ParseError(f"{word}: '{candidate.name}' prefers its L2 definition at compile time and cannot be runtime-only",
                          code="definition-flags-conflict")
-    if merged["preserve"] and not merged["inline"]:
-        raise ParseError(f"{word}: 'preserve' requires 'inline'", code="definition-flags-conflict")
     if (merged["inline"] or merged["preserve"]) and not isinstance(candidate.definition, (Definition, AsmDefinition)):
         raise ParseError(f"{word}: only word and :asm definitions can be inline", code="definition-kind-invalid")
     return merged != current
@@ -17875,22 +18197,47 @@ def _ct_parser_eof(vm: CompileTimeVM) -> None:
     vm.push(1 if vm.parser.pos >= len(vm.parser.tokens) else 0)
 
 
+def _scan_to_block_close(tokens: Sequence[Token], start: int, depth: int, openers: AbstractSet[str]) -> int:
+    """Index of the token that closes the `depth` blocks open at `start`
+    (`end`, or `again` for a `begin`), or -1 when input ends first.  An `if`
+    on the same line as the preceding `else` continues that else-chain and
+    shares its `end`; quotations are skipped."""
+    n = len(tokens)
+    index = start
+    else_line = -1
+    while index < n:
+        token = tokens[index]
+        lexeme = token.lexeme
+        if lexeme == "`":
+            index += 1
+            while index < n and tokens[index].lexeme != "`":
+                index += 1
+        elif lexeme == "end" or lexeme == "again":
+            depth -= 1
+            if depth <= 0:
+                return index
+        elif lexeme == "if":
+            if else_line != token.line:
+                depth += 1
+        elif lexeme == "else":
+            else_line = token.line
+        elif lexeme == "match" or lexeme in openers:
+            depth += 1
+        index += 1
+    return -1
+
+
 def _ct_definition_predeclare_all(vm: CompileTimeVM) -> None:
     parser = vm.parser
     tokens = parser.tokens
     scan_pos = parser.pos
+    openers = parser.block_openers - {"word"}
 
     if parser.context_stack and isinstance(parser.context_stack[-1], Definition):
-        depth = 1 + len(parser.control_stack)
-        while scan_pos < len(tokens) and depth:
-            lexeme = tokens[scan_pos].lexeme
-            if lexeme == "end" or lexeme == "again":
-                depth -= 1
-            elif lexeme == "if" or lexeme in parser.block_openers - {"word"}:
-                depth += 1
-            scan_pos += 1
-        if depth:
+        close = _scan_to_block_close(tokens, scan_pos, 1 + len(parser.control_stack), openers)
+        if close < 0:
             raise ParseError("ct-definition-predeclare-all could not find the end of the current word", code="parser-definition-scan-failed")
+        scan_pos = close + 1
 
     while scan_pos + 1 < len(tokens):
         if tokens[scan_pos].lexeme != "word":
@@ -17898,20 +18245,8 @@ def _ct_definition_predeclare_all(vm: CompileTimeVM) -> None:
             continue
 
         name = tokens[scan_pos + 1].lexeme
-        end_pos = scan_pos + 2
-        depth = 0
-        while end_pos < len(tokens):
-            lexeme = tokens[end_pos].lexeme
-            if lexeme == "end":
-                if depth == 0:
-                    break
-                depth -= 1
-            elif lexeme == "again":
-                depth -= 1
-            elif lexeme == "if" or lexeme in parser.block_openers - {"word"}:
-                depth += 1
-            end_pos += 1
-        if end_pos >= len(tokens):
+        end_pos = _scan_to_block_close(tokens, scan_pos + 2, 1, openers)
+        if end_pos < 0:
             raise ParseError(f"ct-definition-predeclare-all could not find the end of word '{name}'", code="parser-definition-scan-failed")
 
         if name in parser._predeclared:
@@ -22246,6 +22581,21 @@ def _render_source_embed_asm(source_text: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_native_word_table(names: Iterable[str]) -> List[str]:
+    """Data lines of `l2_word_table` (--word-table): a count followed by
+    (name pointer, name bytes, code address) records of the emitted words,
+    which eval in the runtime library calls natively.  Layout private to
+    main.c."""
+    ordered = sorted(set(names))
+    lines: List[str] = ["global l2_word_table", "align 8", "l2_word_table:", f"    dq {len(ordered)}"]
+    for index, name in enumerate(ordered):
+        lines.append(f"    dq l2_wtab_name_{index}, {len(name.encode('utf-8'))}, {sanitize_label(name)}")
+    for index, name in enumerate(ordered):
+        data = name.encode("utf-8") + b"\0"
+        lines.append(f"l2_wtab_name_{index}: db " + ", ".join(str(byte) for byte in data))
+    return lines
+
+
 def _render_source_catalog_asm(catalog: Sequence[Tuple[str, str]]) -> str:
     """The selected-definition source catalog: a count followed by
     (name pointer, name bytes, source pointer, source bytes) records, sorted
@@ -25536,6 +25886,12 @@ def cli(
     parser.add_argument("--no-peephole", action="store_true", help="disable peephole optimizations")
     parser.add_argument("--no-loop-unroll", action="store_true", help="disable loop unrolling optimization")
     parser.add_argument("--no-auto-inline", action="store_true", help="disable auto-inlining of small asm bodies")
+    parser.add_argument("--no-dce", action="store_true",
+                        help="disable dead-code elimination: emit every runtime word, even ones main never reaches "
+                             "(needed for eval to call words only named in eval'd source)")
+    parser.add_argument("--word-table", action="store_true",
+                        help="emit l2_word_table (word name -> native code address) so eval in libl2 calls "
+                             "the program's own words natively")
     parser.add_argument("--no-string-dedup", action="store_true", help="disable string literal deduplication in emitted data section")
     parser.add_argument("--no-asm-opt", action="store_true", help="disable post-emission assembly optimization pass")
     parser.add_argument("-O0", dest="O0", action="store_true", help="disable all optimizations")
@@ -25998,6 +26354,8 @@ def cli(
         compiler.assembler.enable_peephole_optimization = peephole_enabled
         compiler.assembler.enable_loop_unroll = loop_unroll_enabled
         compiler.assembler.enable_auto_inline = auto_inline_enabled
+        compiler.assembler.enable_dce = not args.no_dce
+        compiler.assembler.emit_word_table = bool(args.word_table)
         compiler.assembler.enable_string_deduplication = string_deduplication_enabled
         compiler.assembler.enable_extern_type_check = extern_type_check_enabled
         compiler.assembler.enable_stack_check = stack_check_enabled
@@ -26042,6 +26400,8 @@ def cli(
             f"stack_check={int(bool(stack_check_enabled))}",
             f"extern_type_check={int(bool(extern_type_check_enabled))}",
             f"macro_expansion_limit={args.macro_expansion_limit}",
+            f"dce={int(not args.no_dce)}",
+            f"word_table={int(bool(args.word_table))}",
         ])
         return cache.flags_hash(
             args.debug,
@@ -26223,6 +26583,8 @@ def cli(
         compiler.assembler.enable_peephole_optimization = peephole_enabled
         compiler.assembler.enable_loop_unroll = loop_unroll_enabled
         compiler.assembler.enable_auto_inline = auto_inline_enabled
+        compiler.assembler.enable_dce = not args.no_dce
+        compiler.assembler.emit_word_table = bool(args.word_table)
         compiler.assembler.enable_string_deduplication = string_deduplication_enabled
         compiler.assembler.enable_extern_type_check = extern_type_check_enabled
         compiler.assembler.enable_stack_check = stack_check_enabled
@@ -26473,10 +26835,15 @@ def cli(
             print(f"[info] wrote {cfg_output}")
 
         if args.ct_run_main:
-            bridge_source = compiler._last_loaded_source if args.source_embed else None
-            compiler.parser.compile_time_vm.set_runtime_embedded_source(bridge_source)
+            compiler.parser.compile_time_vm.set_runtime_embedded_source(
+                compiler._last_loaded_source if args.source_embed else None
+            )
+            compiler.parser.compile_time_vm.set_runtime_host_source(
+                compiler._last_loaded_source
+            )
         else:
             compiler.parser.compile_time_vm.set_runtime_embedded_source(None)
+            compiler.parser.compile_time_vm.set_runtime_host_source(None)
 
         if args.ct_run_main:
             ct_entry = "main"

@@ -2,7 +2,7 @@ import ../stdlib/hma.sl
 import ../stdlib/debug.sl
 
 word hp_puts
-    swap write_buf 10 putc
+    write_buf 10 putc
 end
 
 word t_mini_hinit

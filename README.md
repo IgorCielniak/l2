@@ -919,6 +919,49 @@ for more complex cases. In other words, the current runtime already supports
 native code generation for compatible snippets, while still preserving the more
 general fallback path for cases that cannot be emitted safely.
 
+### Example: calling the program's own words from eval
+
+Eval'd source can call words of the running program. Build with two flags:
+`--no-dce` keeps every word in the binary (dead-code elimination would drop
+`some`, which only the eval'd string uses) and `--word-table` emits a table of
+word names and native addresses, through which eval calls the program's
+compiled code directly.
+
+```
+import stdlib.sl
+
+extern eval_env 3 0
+
+word some 1 2 end
+
+word main
+  "some 3 + +" get_stack_top eval_env   # runs the native `some`
+  puti cr                                # prints: 6
+  0
+end
+```
+
+```bash
+python3 main.py program.sl --no-dce --word-table -o program -lbuild/libl2.a -lc
+```
+
+To keep only the words eval needs instead of everything, leave out `--no-dce`
+and mark them `preserve word …` (or `inline preserve word …`): a preserved
+word is always emitted (and gets a table entry); `inline preserve` also
+inlines native uses while retaining the standalone definition.
+
+An error in eval'd source (an unknown word, a stack underflow, ...) is
+reported on stderr and ends only that eval: the data stack is left as it was
+before the call (minus eval's own arguments) and the program carries on.
+`l2_eval_last_failed` tells whether the last eval failed:
+
+```
+extern l2_eval_last_failed 0 1
+
+  "nosuchword" get_stack_top eval_env
+  l2_eval_last_failed if "eval failed" puts end
+```
+
 ---
 
 ## Architecture & Design

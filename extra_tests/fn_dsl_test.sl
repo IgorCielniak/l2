@@ -186,7 +186,7 @@ word main
     pipe2(3, 5, add) puti cr
     thread(4, square) puti cr
     chain 2 inc1 square puti cr
-    invoke add 20 22 puti cr
+    invoke add ( 20 22 ) puti cr
     tapn 3 add 9 puti cr
     apply2 add 6 7 puti cr
     apply3 mix 2 3 4 puti cr

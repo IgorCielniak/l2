@@ -1,0 +1,4 @@
+{
+  "expect_compile_error": true,
+  "description": "a definition left open is reported at the next 'word', not at a later 'end'"
+}

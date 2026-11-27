@@ -1,4 +1,5 @@
 import ct_store.sl
+import macro_variadic.sl
 
 # fn-error [* | message] -> (raises)
 # While a statement is being compiled, errors point at its first token
@@ -1337,8 +1338,8 @@ macro compose2 (f g x) `$x $g $f` emit ;
 macro compose3 (f g h x) `$x $h $g $f` emit ;
 # variadic thread-first pipeline
 macro chain (value funcs) `$value $funcs` emit ;
-# apply function to variadic args
-macro invoke (func args) `$args $func` emit ;
+# apply function to the arguments in ( ... ): invoke add ( 20 22 )
+macro invoke (func) "(" ")" variadic-balanced `$( ) $func` emit ;
 # tap with one function argument
 macro tapn (value func args) `$value dup $args $func drop` emit ;
 # apply binary function
@@ -1445,7 +1446,7 @@ word fn-dsl-register-macros
 	"chain" "variadic thread-first pipeline" fn-dsl-set-doc
 	"chain" "pipeline" fn-dsl-set-attrs
 	fn-dsl-lang-name "invoke" ct-lang-register-macro drop
-	"invoke" "apply function to variadic args" fn-dsl-set-doc
+	"invoke" "apply function to the arguments in ( ... )" fn-dsl-set-doc
 	"invoke" "functional" fn-dsl-set-attrs
 	fn-dsl-lang-name "tapn" ct-lang-register-macro drop
 	"tapn" "tap with one function argument" fn-dsl-set-doc

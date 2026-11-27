@@ -424,8 +424,9 @@ word hfree
     dup r@ h_should_unmap_region
     0 == if
         h_free_list_insert
+    else
+        drop
     end
-    drop
 
     h_alloc_count@ dup 0 > if
         1 - dup h_alloc_count!

@@ -177,6 +177,62 @@ immediate compile-only
     "ct-definition-prefer-l2-by-name": ("""
 word twice dup + end
 """, '"twice" ct-definition-prefer-l2-by-name puti cr'),
+    # more stack words
+    "nip": ("", "1 2 nip puti cr"),
+    "tuck": ("", "1 2 tuck puti cr puti cr puti cr"),
+    "-rot": ("", "1 2 3 -rot puti cr puti cr puti cr"),
+    "2dup": ("", "1 2 2dup + puti cr + puti cr"),
+    "2drop": ("", "1 2 3 2drop puti cr"),
+    "r@": ("", "5 >r r@ puti cr r> puti cr"),
+    # strings, names and Syntax values
+    "string-replace": ("", '"a-b-c" "-" "+" string-replace puts cr "aaa" "a" "bb" string-replace puts cr'),
+    "gensym": ("", '"my-x" gensym dup "my_x_" string-starts-with? puti cr "my-x" gensym string-equal? puti cr'),
+    "ct-label-new": ("", '"L" ct-label-new "L" ct-label-new string-equal? puti cr'),
+    "syntax-concat": ("", "`a b` `c` syntax-concat syntax-length puti cr"),
+    # control frames and the control stack
+    "ct-control-frame-new": ("", '"if" ct-control-frame-new "type" ct-control-get? puts cr'),
+    "ct-control-set": ("", '"if" ct-control-frame-new "k" 5 ct-control-set "k" ct-control-get? puti cr'),
+    "ct-control-get": ("", '"if" ct-control-frame-new "k" 5 ct-control-set dup "k" ct-control-get puti cr puti cr'
+                           ' "z" ct-control-get puti cr nil? puti cr'),
+    "ct-control-get?": ("", '"if" ct-control-frame-new "z" ct-control-get? nil? puti cr'),
+    "ct-control-add-close-op": ("", '"x" ct-control-frame-new "literal" 5 ct-control-add-close-op'
+                                    ' "close_ops" ct-control-get? list-length puti cr'),
+    "ct-control-push": ("", 'ct-control-depth "x" ct-control-frame-new ct-control-push'
+                            ' ct-control-depth swap - puti cr ct-control-pop drop'),
+    "ct-control-pop": ("", '"x" ct-control-frame-new ct-control-push ct-control-pop "type" ct-control-get? puts cr'),
+    "ct-control-peek": ("", '"x" ct-control-frame-new ct-control-push'
+                            ' ct-control-peek "type" ct-control-get? puts cr ct-control-pop drop'),
+    "ct-control-depth": ("", 'ct-control-depth "x" ct-control-frame-new ct-control-push ct-control-pop drop'
+                             ' ct-control-depth - puti cr'),
+    "ct-control-register-override": ("", '"for" ct-control-register-override'
+                                         ' "for" ct-control-unregister-override 1 puti cr'),
+    "ct-control-unregister-override": ("", '"for" ct-control-unregister-override 2 puti cr'),
+    # emitting ops and moving through the token stream
+    "ct-op-emit": ("""
+word put-9 "literal" 9 ct-op-emit end
+immediate compile-only
+""", "put-9 puti cr"),
+    "ct-parser-last-line": ("""
+word last-line ct-parser-last-line 0 > puti cr end
+immediate compile-only
+""", "last-line"),
+    "ct-parser-register-block-opener": ("", '"myblock" ct-parser-register-block-opener 1 puti cr'),
+    "ct-parser-get-pos": ("""
+word step ct-parser-get-pos ct-parser-consume drop ct-parser-get-pos swap - puti cr end
+immediate compile-only
+""", "step x"),
+    "ct-parser-set-pos": ("""
+word rewind ct-parser-get-pos ct-parser-consume drop ct-parser-set-pos ct-parser-get-pos - puti cr end
+immediate compile-only
+""", "rewind 7 puti cr"),
+    "ct-parser-remaining": ("""
+word rem ct-parser-remaining 0 > puti cr end
+immediate compile-only
+""", "rem"),
+    "ct-parser-collect-balanced": ("""
+word coll "(" ")" ct-parser-collect-balanced puti cr list-length puti cr end
+immediate compile-only
+""", "coll a ( b ) c )"),
 }
 
 # Words main.c implements that are not CT API words of their own here.

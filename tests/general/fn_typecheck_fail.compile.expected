@@ -4,6 +4,6 @@ error[ct-parser-error-raised]: fn type error: incompatible let initializer
   9 |     let float f = i;
     |     ^^^
     | = note: compile-time stack: fn -> fn-build-body -> fn-compile-statements -> fn-compile-statement -> fn-compile-let-stmt -> fn-error -> ct-parser-error-at
-    | = note: raised by compile-time code at: libs/fn.sl:8:36
+    | = note: raised by compile-time code at: libs/fn.sl:9:36
 
 1 error(s) emitted

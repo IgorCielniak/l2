@@ -10,7 +10,9 @@
 #   GET /stats     number of requests served so far (built at runtime)
 #   GET /echo      sends the raw request back
 #   GET /shutdown  stops the server
-#   anything else  404 Not Found (405 for methods other than GET)
+#   anything else  404 Not Found
+#
+# HEAD gets the same headers as GET without the body; other methods get 405.
 #
 # One connection is handled at a time; every response closes the connection.
 
@@ -31,6 +33,7 @@ global server_fd
 global client_fd
 global port
 global running
+global head_only
 global served
 global req_len
 global path_addr
@@ -65,17 +68,34 @@ word send_num
     digit 1 send_all
 end
 
-#respond [*, status_addr, status_len, type_addr, type_len, body_addr | body_len] -> [*]
-word respond
-    >r >r                                       # status type     R: body_len body_addr
+#respond_headers [*, status_addr, status_len, type_addr, type_len | body_len] -> [*]
+# The status line and the common headers; the caller ends the header block.
+word respond_headers
+    >r                                          # status type     R: body_len
     "HTTP/1.1 " send_all
     2swap send_all                              # type
     "\r\nContent-Type: " send_all send_all
     "\r\nContent-Length: " send_all
+    r> send_num
+    "\r\nServer: l2\r\nConnection: close\r\n" send_all
+end
+
+#respond [*, status_addr, status_len, type_addr, type_len, body_addr | body_len] -> [*]
+# The body is left out for a HEAD request.
+word respond
+    >r >r                                       # status type     R: body_len body_addr
+    1 rpick respond_headers
+    "\r\n" send_all
     r> r>                                       # body_addr body_len
-    dup send_num
-    "\r\nServer: l2\r\nConnection: close\r\n\r\n" send_all
-    send_all
+    head_only @ if 2drop else send_all end
+end
+
+word method_not_allowed
+    "405 Method Not Allowed" "text/plain" "only GET and HEAD are supported\n"
+    >r >r
+    1 rpick respond_headers
+    "Allow: GET, HEAD\r\n\r\n" send_all
+    r> r> send_all
 end
 
 # ---------------------------------------------------------------------------
@@ -139,7 +159,7 @@ word route
         "200 OK" "text/plain" req_buf req_len @ respond
     else "/shutdown" path= if
         "200 OK" "text/plain" "bye\n" respond
-        running 0 !
+        head_only @ 0 == if running 0 ! end     # HEAD changes nothing
     else
         "404 Not Found" "text/plain" "not found\n" respond
     end
@@ -157,6 +177,7 @@ end
 #handle_client [*] -> [*]
 # Reads one request, parses its request line and answers it.
 word handle_client
+    head_only 0 !
     client_fd @ req_buf REQ_CAP syscall.read
     dup 0 <= if drop else
         req_len swap !
@@ -175,10 +196,12 @@ word handle_client
             dup 0 >= if path_len swap ! else drop end
             req_buf swap                            # method_addr method_len
             2dup log_request
-            "GET" strcmp if
-                route
+            2dup "GET" strcmp if
+                2drop route
+            else "HEAD" strcmp if
+                head_only 1 ! route
             else
-                "405 Method Not Allowed" "text/plain" "only GET is supported\n" respond
+                method_not_allowed
             end
         end
     end

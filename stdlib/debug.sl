@@ -30,19 +30,16 @@ word rdump
 end
 
 #fdump [* | n] -> [*]
-#dump the stack with additional formatting
+#dump the stack with additional formatting: [*, a, b | c]
 word fdump
-	"[*, " write_buf
-	1 swap 1 +
-	while dup 3 > do
-		dup pick
-		puti
+	"[*" write_buf
+	dup
+	while dup 0 > do
+		dup 1 == if " | " write_buf else ", " write_buf end
+		dup 1 + pick puti
 		1 -
-		", " write_buf
 	end
-	1 - pick puti
-	" | " write_buf
-	1 - pick puti
+	2drop
 	"]\n" write_buf
 end
 

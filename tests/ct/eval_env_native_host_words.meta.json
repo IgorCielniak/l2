@@ -1,0 +1,5 @@
+{
+  "description": "with --no-dce --word-table, eval calls the program's own words natively",
+  "use_l2": true,
+  "compile_args": ["--no-dce", "--word-table"]
+}

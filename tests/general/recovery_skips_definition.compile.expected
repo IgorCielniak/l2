@@ -1,0 +1,13 @@
+error[parser-control-mismatch]: 'else' needs an open 'if', but the innermost open block is 'else' (opened at 7:5)
+  --> recovery_skips_definition.sl:7:10
+    |
+  7 |     else else
+    |          ^^^^
+    | = note: a control keyword tried to close a different control frame
+    | = note: while parsing definition 'broken'
+    | = note: inside 'else' block opened at 7:5
+    |
+    = help: verify proper control flow order: `while ... do ... end`, `if ... else ... end`, `for ... end`
+    = help: check source location notes for where the block was opened
+
+1 error(s) emitted
